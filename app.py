@@ -6,5 +6,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("Spanish Energy Market App")
-st.write("Select a section from the sidebar.")
+pg = st.navigation([
+    st.Page("app.py", title="Home"),
+    st.Page("pages/1_Day_Ahead.py", title="Day Ahead"),
+    st.Page("pages/2_Forward_Market.py", title="Forward Market"),
+    st.Page("pages/3_BESS.py", title="BESS"),
+])
+
+pg.run()
