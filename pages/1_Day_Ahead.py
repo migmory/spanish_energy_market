@@ -51,11 +51,17 @@ def resolve_time_trunc(day: date) -> str:
 # FETCH
 # =========================================================
 def fetch_esios_day(day: date, token: str) -> dict:
-    next_day = day + timedelta(days=1)
+    # Construimos el día en Europe/Madrid y lo convertimos a UTC
+    # para no perder horas por DST o por el filtro posterior.
+    start_local = pd.Timestamp(day, tz="Europe/Madrid")
+    end_local = start_local + pd.Timedelta(days=1)
+
+    start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
     params = {
-        "start_date": f"{day}T00:00:00Z",
-        "end_date": f"{next_day}T00:00:00Z",
+        "start_date": start_utc,
+        "end_date": end_utc,
         "time_trunc": resolve_time_trunc(day),
     }
 
@@ -73,8 +79,13 @@ def fetch_esios_day(day: date, token: str) -> dict:
 # PARSE
 # =========================================================
 def parse_datetime_label(series: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(series, utc=True, errors="coerce")
-    return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    dt = pd.to_datetime(series, errors="coerce")
+
+    # Si viene con tz, lo normalizamos a Europe/Madrid y quitamos tz
+    if getattr(dt.dt, "tz", None) is not None:
+        dt = dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+    return dt
 
 
 def expected_rows_for_day(day: date) -> tuple[int, ...]:
@@ -99,7 +110,7 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
                 st.write("geo_name únicos:", sorted(df["geo_name"].dropna().astype(str).unique().tolist()))
             st.dataframe(df.head(50), use_container_width=True)
 
-    # 1) Filtro fuerte: Península
+    # Filtro geográfico: nos quedamos solo con Península
     if "geo_name" in df.columns:
         geo_series = df["geo_name"].astype(str).str.strip().str.lower()
         if (geo_series == "península").any():
@@ -111,21 +122,12 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
         elif (geo_series == "espana").any():
             df = df[geo_series == "espana"].copy()
 
-    # 2) Si no filtró nada por nombre, intentar por geo_id conocido
-    if df.empty and values:
-        df = pd.DataFrame(values)
-        if "geo_id" in df.columns:
-            # Península suele venir como 8741 en los ejemplos vistos
-            if (df["geo_id"] == 8741).any():
-                df = df[df["geo_id"] == 8741].copy()
-            elif (df["geo_id"] == 3).any():
-                df = df[df["geo_id"] == 3].copy()
-
     if df.empty:
         return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
 
+    # Priorizar datetime local
     dt_col = None
-    for candidate in ["datetime", "datetime_utc", "date", "value_date"]:
+    for candidate in ["datetime", "date", "value_date", "datetime_utc"]:
         if candidate in df.columns:
             dt_col = candidate
             break
@@ -155,7 +157,6 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
         df.loc[dup_mask, "datetime"] = df.loc[dup_mask, "datetime"] + pd.Timedelta(minutes=1)
 
     df["source"] = "esios_600"
-
     df = df[["datetime", "price", "source", "geo_name", "geo_id"]].copy()
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
 
@@ -308,7 +309,7 @@ try:
         st.error("No hay datos disponibles todavía.")
         st.stop()
 
-    # Validación rápida: filas por día
+    # Validación de filas por día
     day_counts = hist.copy()
     day_counts["day"] = day_counts["datetime"].dt.date
     day_counts = day_counts.groupby("day", as_index=False).size().rename(columns={"size": "rows_per_day"})
@@ -319,7 +320,7 @@ try:
 
     if not bad_counts.empty:
         st.warning("Todavía hay días con conteos raros. Revisa la tabla de validación.")
-        st.dataframe(bad_counts.tail(20), use_container_width=True)
+        st.dataframe(bad_counts.tail(30), use_container_width=True)
 
     # Monthly average
     monthly_avg = hist.copy()
@@ -335,7 +336,7 @@ try:
     st.line_chart(monthly_avg.set_index("month")["avg_monthly_price"])
     st.dataframe(monthly_avg, use_container_width=True)
 
-    # Check mayo/junio 2025
+    # Check mayo / junio 2025
     st.subheader("Check May / June 2025")
     monthly_check = monthly_avg.copy()
     monthly_check["month_str"] = monthly_check["month"].dt.strftime("%Y-%m")
@@ -363,7 +364,7 @@ try:
     col2.metric("Last price", f"{latest_price:.2f} €/MWh")
     col3.metric("Rows saved", f"{len(hist):,}")
 
-    # Hourly profile by range
+    # Hourly profile
     st.subheader("Average 24h hourly profile for selected period")
 
     min_date = hist["datetime"].dt.date.min()
@@ -409,7 +410,7 @@ try:
             st.line_chart(hourly_profile.set_index("hour")["avg_price"])
             st.dataframe(hourly_profile, use_container_width=True)
 
-    # Historical data view / download
+    # Historical data
     st.subheader("Historical data saved")
     st.write("Rows:", len(hist))
     st.dataframe(hist, use_container_width=True)
