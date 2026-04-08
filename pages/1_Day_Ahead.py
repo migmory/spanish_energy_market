@@ -7,21 +7,29 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parents[1]
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 st.set_page_config(page_title="Day Ahead", layout="wide")
 st.title("Day Ahead - Spain Spot Prices")
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+# =========================================================
+# CONFIG
+# =========================================================
 DATA_DIR = BASE_DIR / "historical_data"
 DATA_DIR.mkdir(exist_ok=True)
 
-CSV_PATH = DATA_DIR / "day_ahead_spain_1001.csv"
-ESIOS_BASE_URL = "https://api.esios.ree.es/indicators/1001"
+CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600.csv"
+INDICATOR_ID = 600
+ESIOS_BASE_URL = f"https://api.esios.ree.es/indicators/{INDICATOR_ID}"
 
 
+# =========================================================
+# TOKEN / HEADERS
+# =========================================================
 def require_esios_token() -> str:
-    token = os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or ""
+    token = (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip()
     if not token:
         raise ValueError("No se encontró el token ESIOS en .env")
     return token
@@ -29,19 +37,26 @@ def require_esios_token() -> str:
 
 def build_headers(token: str) -> dict:
     return {
-        "Accept": "application/json; application/vnd.esios-api-v2+json",
+        "Accept": "application/json; application/vnd.esios-api-v1+json",
         "Content-Type": "application/json",
         "x-api-key": token,
     }
 
 
-def fetch_esios_1001(day: date, token: str) -> dict:
+def resolve_time_trunc(day: date) -> str:
+    return "hour" if day < date(2025, 10, 1) else "quarter_hour"
+
+
+# =========================================================
+# FETCH
+# =========================================================
+def fetch_esios_day(day: date, token: str) -> dict:
     next_day = day + timedelta(days=1)
 
     params = {
-        "start_date": f"{day}T00:00:00",
-        "end_date": f"{next_day}T00:00:00",
-        "time_trunc": "hour",
+        "start_date": f"{day}T00:00:00Z",
+        "end_date": f"{next_day}T00:00:00Z",
+        "time_trunc": resolve_time_trunc(day),
     }
 
     resp = requests.get(
@@ -54,7 +69,21 @@ def fetch_esios_1001(day: date, token: str) -> dict:
     return resp.json()
 
 
-def parse_esios_peninsula(raw_json: dict) -> pd.DataFrame:
+# =========================================================
+# PARSE
+# =========================================================
+def parse_datetime_label(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series, utc=True, errors="coerce")
+    return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+
+def expected_rows_for_day(day: date) -> tuple[int, ...]:
+    if day < date(2025, 10, 1):
+        return (23, 24, 25)
+    return (92, 96, 100)
+
+
+def parse_esios_600(raw_json: dict, filter_date: date | None = None) -> pd.DataFrame:
     values = raw_json.get("indicator", {}).get("values", [])
 
     if not values:
@@ -62,8 +91,14 @@ def parse_esios_peninsula(raw_json: dict) -> pd.DataFrame:
 
     df = pd.DataFrame(values)
 
-    if "geo_id" in df.columns:
-        df = df[df["geo_id"] == 8741].copy()
+    if "geo_id" in df.columns and (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
+    elif "geo_name" in df.columns:
+        geo_series = df["geo_name"].astype(str).str.strip().str.lower()
+        if (geo_series == "península").any():
+            df = df[geo_series == "península"].copy()
+        elif (geo_series == "españa").any():
+            df = df[geo_series == "españa"].copy()
 
     if df.empty:
         return pd.DataFrame(columns=["datetime", "price", "source"])
@@ -80,17 +115,27 @@ def parse_esios_peninsula(raw_json: dict) -> pd.DataFrame:
     if "value" not in df.columns:
         raise ValueError(f"No se encontró columna 'value'. Columnas: {df.columns.tolist()}")
 
-    df["datetime"] = pd.to_datetime(df[dt_col], errors="coerce", utc=True)
-    df["datetime"] = df["datetime"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    df["datetime"] = parse_datetime_label(df[dt_col])
     df["price"] = pd.to_numeric(df["value"], errors="coerce")
-    df["source"] = "esios_1001"
+    df = df.dropna(subset=["datetime", "price"]).copy()
 
-    df = df[["datetime", "price", "source"]].dropna().copy()
+    if filter_date is not None:
+        df = df[df["datetime"].dt.date == filter_date].copy()
+
+    if not df.empty and df["datetime"].duplicated().any():
+        dup_mask = df["datetime"].duplicated(keep="first")
+        df.loc[dup_mask, "datetime"] = df.loc[dup_mask, "datetime"] + pd.Timedelta(minutes=1)
+
+    df["source"] = "esios_600"
+    df = df[["datetime", "price", "source"]].copy()
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
 
     return df
 
 
+# =========================================================
+# HISTORICAL CSV
+# =========================================================
 def load_historical() -> pd.DataFrame:
     if not CSV_PATH.exists():
         return pd.DataFrame(columns=["datetime", "price", "source"])
@@ -104,11 +149,10 @@ def load_historical() -> pd.DataFrame:
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
     if "source" not in df.columns:
-        df["source"] = "esios_1001"
+        df["source"] = "esios_600"
 
     df = df.dropna(subset=["datetime", "price"]).copy()
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
-
     return df
 
 
@@ -117,11 +161,20 @@ def save_historical(df: pd.DataFrame) -> None:
     df.to_csv(CSV_PATH, index=False)
 
 
-def upsert_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
-    if new_df.empty:
+def upsert_day_data(existing_df: pd.DataFrame, new_day_df: pd.DataFrame) -> pd.DataFrame:
+    if new_day_df.empty:
         return existing_df.copy()
 
-    combined = pd.concat([existing_df, new_df], ignore_index=True)
+    target_day = new_day_df["datetime"].dt.date.iloc[0]
+
+    if existing_df.empty:
+        combined = new_day_df.copy()
+    else:
+        tmp = existing_df.copy()
+        tmp["date_only"] = tmp["datetime"].dt.date
+        tmp = tmp[tmp["date_only"] != target_day].drop(columns="date_only")
+        combined = pd.concat([tmp, new_day_df], ignore_index=True)
+
     combined = (
         combined.sort_values("datetime")
         .drop_duplicates(subset=["datetime", "source"], keep="last")
@@ -130,6 +183,9 @@ def upsert_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame
     return combined
 
 
+# =========================================================
+# UPDATE LOGIC
+# =========================================================
 def daterange(start_date: date, end_date: date):
     current = start_date
     while current <= end_date:
@@ -144,16 +200,19 @@ def bootstrap_history_if_needed(token: str, start_day: date) -> pd.DataFrame:
 
     end_day = date.today()
     collected = []
-
     all_days = list(daterange(start_day, end_day))
     progress = st.progress(0.0)
 
     for i, day in enumerate(all_days, start=1):
         try:
-            raw = fetch_esios_1001(day, token)
-            daily_df = parse_esios_peninsula(raw)
+            raw = fetch_esios_day(day, token)
+            daily_df = parse_esios_600(raw, filter_date=day)
+
             if not daily_df.empty:
+                if len(daily_df) not in expected_rows_for_day(day):
+                    st.warning(f"{day}: filas inesperadas ({len(daily_df)})")
                 collected.append(daily_df)
+
         except Exception as e:
             st.warning(f"Fallo en {day}: {e}")
 
@@ -177,9 +236,12 @@ def refresh_recent_days(hist: pd.DataFrame, token: str, days_back: int = 10) -> 
 
     for day in daterange(start_day, today):
         try:
-            raw = fetch_esios_1001(day, token)
-            daily_df = parse_esios_peninsula(raw)
-            updated = upsert_data(updated, daily_df)
+            raw = fetch_esios_day(day, token)
+            daily_df = parse_esios_600(raw, filter_date=day)
+
+            if not daily_df.empty:
+                updated = upsert_day_data(updated, daily_df)
+
         except Exception as e:
             st.warning(f"No se pudo actualizar {day}: {e}")
 
@@ -187,8 +249,18 @@ def refresh_recent_days(hist: pd.DataFrame, token: str, days_back: int = 10) -> 
     return updated
 
 
+# =========================================================
+# MAIN
+# =========================================================
 try:
     token = require_esios_token()
+
+    with st.expander("Debug token / config"):
+        st.write("ENV path:", str(ENV_PATH))
+        st.write("Indicator:", INDICATOR_ID)
+        st.write("CSV path:", str(CSV_PATH))
+        st.write("Token loaded:", bool(token))
+        st.write("Token first chars:", token[:12] if token else "")
 
     with st.spinner("Cargando histórico y actualizando últimos días..."):
         hist = bootstrap_history_if_needed(token, start_day=date(2025, 1, 1))
@@ -209,7 +281,7 @@ try:
         .sort_values("month")
     )
 
-    st.subheader("Monthly average spot price - Península")
+    st.subheader("Monthly average spot price - Spain")
     st.line_chart(monthly_avg.set_index("month")["avg_monthly_price"])
     st.dataframe(monthly_avg, use_container_width=True)
 
@@ -237,19 +309,9 @@ try:
 
     c1, c2 = st.columns(2)
     with c1:
-        start_sel = st.date_input(
-            "Start date",
-            value=min_date,
-            min_value=min_date,
-            max_value=max_date,
-        )
+        start_sel = st.date_input("Start date", value=min_date, min_value=min_date, max_value=max_date, key="profile_start")
     with c2:
-        end_sel = st.date_input(
-            "End date",
-            value=max_date,
-            min_value=min_date,
-            max_value=max_date,
-        )
+        end_sel = st.date_input("End date", value=max_date, min_value=min_date, max_value=max_date, key="profile_end")
 
     if start_sel > end_sel:
         st.warning("La fecha inicial no puede ser mayor que la final.")
