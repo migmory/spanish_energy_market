@@ -1,8 +1,3 @@
-import streamlit as st
-
-st.title("Day Ahead")
-
-#____________________________________
 import os
 from datetime import date, timedelta
 from pathlib import Path
@@ -24,8 +19,8 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "historical_data"
 DATA_DIR.mkdir(exist_ok=True)
 
-CSV_PATH = DATA_DIR / "day_ahead_spain.csv"
-ESIOS_BASE_URL = "https://api.esios.ree.es/indicators/600"
+CSV_PATH = DATA_DIR / "day_ahead_spain_1001.csv"
+ESIOS_BASE_URL = "https://api.esios.ree.es/indicators/1001"
 
 
 # =========================
@@ -51,8 +46,7 @@ def build_headers(token: str) -> dict:
 # =========================
 # FETCH / PARSE
 # =========================
-def fetch_esios_600(day: date, token: str) -> dict:
-    # Según tu otro proyecto:
+def fetch_esios_1001(day: date, token: str) -> dict:
     time_trunc = "hour" if day < date(2025, 10, 1) else "quarter_hour"
     next_day = day + timedelta(days=1)
 
@@ -103,7 +97,7 @@ def parse_esios_spain(raw_json: dict, filter_day: date) -> pd.DataFrame:
         raise ValueError("No se encontró la columna 'value' en la respuesta de ESIOS.")
 
     df["price"] = pd.to_numeric(df["value"], errors="coerce")
-    df["source"] = "esios_600"
+    df["source"] = "esios_1001"
 
     df = df[["datetime", "price", "source"]].dropna().copy()
 
@@ -130,7 +124,7 @@ def load_historical() -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     if "source" not in df.columns:
-        df["source"] = "esios_600"
+        df["source"] = "esios_1001"
 
     return df.dropna(subset=["datetime", "price"])
 
@@ -152,7 +146,6 @@ def upsert_day_data(existing_df: pd.DataFrame, new_day_df: pd.DataFrame) -> pd.D
         existing_df = existing_df.copy()
         existing_df["date_only"] = existing_df["datetime"].dt.date
 
-        # Quitamos ese día y lo sustituimos por la versión más reciente
         existing_df = existing_df[existing_df["date_only"] != target_day].drop(columns="date_only")
         combined = pd.concat([existing_df, new_day_df], ignore_index=True)
 
@@ -189,7 +182,7 @@ def bootstrap_history_if_needed(token: str, years_back: int = 2) -> pd.DataFrame
 
     for i, day in enumerate(all_days, start=1):
         try:
-            raw = fetch_esios_600(day, token)
+            raw = fetch_esios_1001(day, token)
             daily_df = parse_esios_spain(raw, day)
             if not daily_df.empty:
                 collected.append(daily_df)
@@ -216,7 +209,7 @@ def refresh_recent_days(hist: pd.DataFrame, token: str, days_back: int = 7) -> p
 
     for day in daterange(start_day, today):
         try:
-            raw = fetch_esios_600(day, token)
+            raw = fetch_esios_1001(day, token)
             daily_df = parse_esios_spain(raw, day)
             updated = upsert_day_data(updated, daily_df)
         except Exception as e:
@@ -240,9 +233,6 @@ try:
         st.error("No hay datos disponibles todavía.")
         st.stop()
 
-    # -------------------------
-    # Gráfico promedio mensual
-    # -------------------------
     monthly_avg = hist.copy()
     monthly_avg["month"] = monthly_avg["datetime"].dt.to_period("M").dt.to_timestamp()
     monthly_avg = (
@@ -255,9 +245,6 @@ try:
     st.subheader("Monthly average spot price - Spain")
     st.line_chart(monthly_avg.set_index("month")["avg_monthly_price"])
 
-    # -------------------------
-    # Datos del día actual
-    # -------------------------
     st.subheader("Today latest available prices")
     today_df = hist[hist["datetime"].dt.date == date.today()].sort_values("datetime")
 
@@ -267,9 +254,6 @@ try:
         st.dataframe(today_df, use_container_width=True)
         st.line_chart(today_df.set_index("datetime")["price"])
 
-    # -------------------------
-    # Métricas rápidas
-    # -------------------------
     latest_dt = hist["datetime"].max()
     latest_price = hist.loc[hist["datetime"] == latest_dt, "price"].iloc[-1]
 
@@ -278,9 +262,6 @@ try:
     col2.metric("Last price", f"{latest_price:.2f} €/MWh")
     col3.metric("Rows saved", f"{len(hist):,}")
 
-    # -------------------------
-    # Botón para forzar refresh
-    # -------------------------
     if st.button("Force refresh"):
         with st.spinner("Actualizando..."):
             hist = refresh_recent_days(hist, token, days_back=7)
