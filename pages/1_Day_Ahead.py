@@ -51,7 +51,6 @@ def resolve_time_trunc(day: date) -> str:
 # FETCH
 # =========================================================
 def fetch_esios_day(day: date, token: str) -> dict:
-    # Construimos el día en Europe/Madrid y lo convertimos a UTC
     start_local = pd.Timestamp(day, tz="Europe/Madrid")
     end_local = start_local + pd.Timedelta(days=1)
 
@@ -78,7 +77,6 @@ def fetch_esios_day(day: date, token: str) -> dict:
 # PARSE
 # =========================================================
 def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
-    # Prioridad a datetime_utc
     if "datetime_utc" in df.columns:
         dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
         return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
@@ -103,28 +101,31 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
 
     df = pd.DataFrame(values)
 
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+
     if debug:
         with st.expander("Debug raw geographies", expanded=False):
             st.write("Columnas:", df.columns.tolist())
-            if "geo_id" in df.columns:
-                st.write("geo_id únicos:", sorted(df["geo_id"].dropna().unique().tolist()))
-            if "geo_name" in df.columns:
-                st.write("geo_name únicos:", sorted(df["geo_name"].dropna().astype(str).unique().tolist()))
+            st.write(
+                df.groupby(["geo_id", "geo_name"], dropna=False)
+                .size()
+                .reset_index(name="rows")
+                .sort_values("rows", ascending=False)
+            )
             st.dataframe(df.head(100), use_container_width=True)
 
-    # Nos quedamos solo con Península
-    if "geo_name" in df.columns:
+    # Para el indicador 600, nos quedamos SOLO con España
+    if (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
+    else:
         geo_series = df["geo_name"].astype(str).str.strip().str.lower()
-        if (geo_series == "península").any():
-            df = df[geo_series == "península"].copy()
-        elif (geo_series == "peninsula").any():
-            df = df[geo_series == "peninsula"].copy()
-
-    # Fallback por geo_id si hiciera falta
-    if df.empty:
-        df = pd.DataFrame(values)
-        if "geo_id" in df.columns and (df["geo_id"] == 8741).any():
-            df = df[df["geo_id"] == 8741].copy()
+        if (geo_series == "españa").any():
+            df = df[geo_series == "españa"].copy()
+        elif (geo_series == "espana").any():
+            df = df[geo_series == "espana"].copy()
 
     if df.empty:
         return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
@@ -134,19 +135,13 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
 
     df["datetime"] = parse_datetime_label(df)
     df["price"] = pd.to_numeric(df["value"], errors="coerce")
-
-    if "geo_name" not in df.columns:
-        df["geo_name"] = None
-    if "geo_id" not in df.columns:
-        df["geo_id"] = None
-
     df = df.dropna(subset=["datetime", "price"]).copy()
 
     if filter_date is not None:
         df = df[df["datetime"].dt.date == filter_date].copy()
 
     # Resolver duplicados por DST
-    if not df.empty and df["datetime"].duplicated().any():
+    if df["datetime"].duplicated().any():
         dup_mask = df["datetime"].duplicated(keep="first")
         df.loc[dup_mask, "datetime"] = df.loc[dup_mask, "datetime"] + pd.Timedelta(minutes=1)
 
@@ -419,7 +414,6 @@ try:
             st.line_chart(hourly_profile.set_index("hour")["avg_price"])
             st.dataframe(hourly_profile, use_container_width=True)
 
-    # Historical data
     st.subheader("Historical data saved")
     st.write("Rows in raw hist:", len(hist))
     st.write("Rows in clean hist:", len(clean_hist))
