@@ -52,7 +52,6 @@ def resolve_time_trunc(day: date) -> str:
 # =========================================================
 def fetch_esios_day(day: date, token: str) -> dict:
     # Construimos el día en Europe/Madrid y lo convertimos a UTC
-    # para no perder horas por DST o por el filtro posterior.
     start_local = pd.Timestamp(day, tz="Europe/Madrid")
     end_local = start_local + pd.Timedelta(days=1)
 
@@ -78,14 +77,17 @@ def fetch_esios_day(day: date, token: str) -> dict:
 # =========================================================
 # PARSE
 # =========================================================
-def parse_datetime_label(series: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(series, errors="coerce")
+def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
+    # Prioridad a datetime_utc
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
 
-    # Si viene con tz, lo normalizamos a Europe/Madrid y quitamos tz
-    if getattr(dt.dt, "tz", None) is not None:
-        dt = dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
 
-    return dt
+    raise ValueError("No se encontró ni datetime_utc ni datetime")
 
 
 def expected_rows_for_day(day: date) -> tuple[int, ...]:
@@ -108,37 +110,29 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
                 st.write("geo_id únicos:", sorted(df["geo_id"].dropna().unique().tolist()))
             if "geo_name" in df.columns:
                 st.write("geo_name únicos:", sorted(df["geo_name"].dropna().astype(str).unique().tolist()))
-            st.dataframe(df.head(50), use_container_width=True)
+            st.dataframe(df.head(100), use_container_width=True)
 
-    # Filtro geográfico: nos quedamos solo con Península
+    # Nos quedamos solo con Península
     if "geo_name" in df.columns:
         geo_series = df["geo_name"].astype(str).str.strip().str.lower()
         if (geo_series == "península").any():
             df = df[geo_series == "península"].copy()
         elif (geo_series == "peninsula").any():
             df = df[geo_series == "peninsula"].copy()
-        elif (geo_series == "españa").any():
-            df = df[geo_series == "españa"].copy()
-        elif (geo_series == "espana").any():
-            df = df[geo_series == "espana"].copy()
+
+    # Fallback por geo_id si hiciera falta
+    if df.empty:
+        df = pd.DataFrame(values)
+        if "geo_id" in df.columns and (df["geo_id"] == 8741).any():
+            df = df[df["geo_id"] == 8741].copy()
 
     if df.empty:
         return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
 
-    # Priorizar datetime local
-    dt_col = None
-    for candidate in ["datetime", "date", "value_date", "datetime_utc"]:
-        if candidate in df.columns:
-            dt_col = candidate
-            break
-
-    if dt_col is None:
-        raise ValueError(f"No se encontró columna de fecha. Columnas: {df.columns.tolist()}")
-
     if "value" not in df.columns:
         raise ValueError(f"No se encontró columna 'value'. Columnas: {df.columns.tolist()}")
 
-    df["datetime"] = parse_datetime_label(df[dt_col])
+    df["datetime"] = parse_datetime_label(df)
     df["price"] = pd.to_numeric(df["value"], errors="coerce")
 
     if "geo_name" not in df.columns:
@@ -151,7 +145,7 @@ def parse_esios_600(raw_json: dict, filter_date: date | None = None, debug: bool
     if filter_date is not None:
         df = df[df["datetime"].dt.date == filter_date].copy()
 
-    # Resolver duplicados por cambio horario
+    # Resolver duplicados por DST
     if not df.empty and df["datetime"].duplicated().any():
         dup_mask = df["datetime"].duplicated(keep="first")
         df.loc[dup_mask, "datetime"] = df.loc[dup_mask, "datetime"] + pd.Timedelta(minutes=1)
@@ -187,7 +181,6 @@ def load_historical() -> pd.DataFrame:
 
     df = df.dropna(subset=["datetime", "price"]).copy()
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
-
     return df
 
 
@@ -218,6 +211,11 @@ def upsert_day_data(existing_df: pd.DataFrame, new_day_df: pd.DataFrame) -> pd.D
     return combined
 
 
+def clear_historical_file() -> None:
+    if CSV_PATH.exists():
+        CSV_PATH.unlink()
+
+
 # =========================================================
 # UPDATE LOGIC
 # =========================================================
@@ -244,8 +242,6 @@ def bootstrap_history_if_needed(token: str, start_day: date, debug: bool = False
             daily_df = parse_esios_600(raw, filter_date=day, debug=debug and i == 1)
 
             if not daily_df.empty:
-                if len(daily_df) not in expected_rows_for_day(day):
-                    st.warning(f"{day}: filas inesperadas ({len(daily_df)})")
                 collected.append(daily_df)
 
         except Exception as e:
@@ -297,7 +293,14 @@ try:
         st.write("Token loaded:", bool(token))
         st.write("Token first chars:", token[:12] if token else "")
 
-    debug_geos = st.checkbox("Show geography debug", value=False)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        debug_geos = st.checkbox("Show geography debug", value=False)
+    with col_b:
+        if st.button("Rebuild history from scratch"):
+            clear_historical_file()
+            st.success("Historical CSV deleted. Reloading...")
+            st.rerun()
 
     with st.spinner("Cargando histórico y actualizando últimos días..."):
         hist = bootstrap_history_if_needed(token, start_day=date(2025, 1, 1), debug=debug_geos)
@@ -314,16 +317,22 @@ try:
     day_counts["day"] = day_counts["datetime"].dt.date
     day_counts = day_counts.groupby("day", as_index=False).size().rename(columns={"size": "rows_per_day"})
 
+    valid_days = day_counts[
+        day_counts["rows_per_day"].isin([23, 24, 25, 92, 96, 100])
+    ]["day"]
+
     bad_counts = day_counts[
         ~day_counts["rows_per_day"].isin([23, 24, 25, 92, 96, 100])
     ].copy()
 
     if not bad_counts.empty:
-        st.warning("Todavía hay días con conteos raros. Revisa la tabla de validación.")
+        st.warning("Todavía hay días con conteos raros. Esos días se excluyen del monthly average.")
         st.dataframe(bad_counts.tail(30), use_container_width=True)
 
+    clean_hist = hist[hist["datetime"].dt.date.isin(valid_days)].copy()
+
     # Monthly average
-    monthly_avg = hist.copy()
+    monthly_avg = clean_hist.copy()
     monthly_avg["month"] = monthly_avg["datetime"].dt.to_period("M").dt.to_timestamp()
     monthly_avg = (
         monthly_avg.groupby("month", as_index=False)["price"]
@@ -347,7 +356,7 @@ try:
 
     # Today prices
     st.subheader("Latest available prices for today")
-    today_df = hist[hist["datetime"].dt.date == date.today()].sort_values("datetime")
+    today_df = clean_hist[clean_hist["datetime"].dt.date == date.today()].sort_values("datetime")
 
     if today_df.empty:
         st.info("Todavía no hay datos disponibles para hoy.")
@@ -356,19 +365,19 @@ try:
         st.line_chart(today_df.set_index("datetime")["price"])
 
     # Metrics
-    latest_dt = hist["datetime"].max()
-    latest_price = hist.loc[hist["datetime"] == latest_dt, "price"].iloc[-1]
+    latest_dt = clean_hist["datetime"].max()
+    latest_price = clean_hist.loc[clean_hist["datetime"] == latest_dt, "price"].iloc[-1]
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Last timestamp", str(latest_dt))
     col2.metric("Last price", f"{latest_price:.2f} €/MWh")
-    col3.metric("Rows saved", f"{len(hist):,}")
+    col3.metric("Valid rows saved", f"{len(clean_hist):,}")
 
     # Hourly profile
     st.subheader("Average 24h hourly profile for selected period")
 
-    min_date = hist["datetime"].dt.date.min()
-    max_date = hist["datetime"].dt.date.max()
+    min_date = clean_hist["datetime"].dt.date.min()
+    max_date = clean_hist["datetime"].dt.date.max()
 
     c1, c2 = st.columns(2)
     with c1:
@@ -391,9 +400,9 @@ try:
     if start_sel > end_sel:
         st.warning("La fecha inicial no puede ser mayor que la final.")
     else:
-        range_df = hist[
-            (hist["datetime"].dt.date >= start_sel)
-            & (hist["datetime"].dt.date <= end_sel)
+        range_df = clean_hist[
+            (clean_hist["datetime"].dt.date >= start_sel)
+            & (clean_hist["datetime"].dt.date <= end_sel)
         ].copy()
 
         if range_df.empty:
@@ -412,14 +421,15 @@ try:
 
     # Historical data
     st.subheader("Historical data saved")
-    st.write("Rows:", len(hist))
-    st.dataframe(hist, use_container_width=True)
+    st.write("Rows in raw hist:", len(hist))
+    st.write("Rows in clean hist:", len(clean_hist))
+    st.dataframe(clean_hist, use_container_width=True)
 
-    csv_data = hist.to_csv(index=False).encode("utf-8")
+    csv_data = clean_hist.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download historical CSV",
+        label="Download clean historical CSV",
         data=csv_data,
-        file_name="day_ahead_spain_spot_600.csv",
+        file_name="day_ahead_spain_spot_600_clean.csv",
         mime="text/csv",
     )
 
