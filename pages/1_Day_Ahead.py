@@ -7,9 +7,6 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-# =========================
-# CONFIG
-# =========================
 load_dotenv()
 
 st.set_page_config(page_title="Day Ahead", layout="wide")
@@ -47,13 +44,12 @@ def build_headers(token: str) -> dict:
 # FETCH / PARSE
 # =========================
 def fetch_esios_1001(day: date, token: str) -> dict:
-    time_trunc = "hour" if day < date(2025, 10, 1) else "quarter_hour"
     next_day = day + timedelta(days=1)
 
     params = {
-        "start_date": f"{day}T00:00:00Z",
-        "end_date": f"{next_day}T00:00:00Z",
-        "time_trunc": time_trunc,
+        "start_date": f"{day}T00:00:00",
+        "end_date": f"{next_day}T00:00:00",
+        "time_trunc": "hour",
     }
 
     resp = requests.get(
@@ -66,52 +62,43 @@ def fetch_esios_1001(day: date, token: str) -> dict:
     return resp.json()
 
 
-def parse_esios_spain(raw_json: dict, filter_day: date) -> pd.DataFrame:
+def parse_esios_spain(raw_json: dict) -> pd.DataFrame:
     values = raw_json.get("indicator", {}).get("values", [])
     if not values:
         return pd.DataFrame(columns=["datetime", "price", "source"])
 
     df = pd.DataFrame(values)
 
-    # Filtrar España
     if "geo_id" in df.columns:
         df = df[df["geo_id"] == 3].copy()
 
     if df.empty:
         return pd.DataFrame(columns=["datetime", "price", "source"])
 
-    # Detectar columna de fecha
     dt_col = None
     for candidate in ["datetime", "datetime_utc", "date", "value_date"]:
         if candidate in df.columns:
             dt_col = candidate
             break
 
-    if dt_col is None:
-        raise ValueError("No se encontró columna de fecha en la respuesta de ESIOS.")
+    if dt_col is None or "value" not in df.columns:
+        return pd.DataFrame(columns=["datetime", "price", "source"])
 
-    df["datetime"] = pd.to_datetime(df[dt_col], utc=True, errors="coerce")
-    df["datetime"] = df["datetime"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
-
-    if "value" not in df.columns:
-        raise ValueError("No se encontró la columna 'value' en la respuesta de ESIOS.")
+    df["datetime"] = pd.to_datetime(df[dt_col], errors="coerce")
+    if getattr(df["datetime"].dt, "tz", None) is not None:
+        df["datetime"] = df["datetime"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
 
     df["price"] = pd.to_numeric(df["value"], errors="coerce")
     df["source"] = "esios_1001"
 
     df = df[["datetime", "price", "source"]].dropna().copy()
-
-    # Quedarnos solo con el día pedido en hora local
-    df = df[df["datetime"].dt.date == filter_day].copy()
-
-    # Si hubiera duplicados por re-publicación, nos quedamos con el último
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
 
     return df
 
 
 # =========================
-# CSV HISTÓRICO
+# HISTORICAL CSV
 # =========================
 def load_historical() -> pd.DataFrame:
     if not CSV_PATH.exists():
@@ -123,32 +110,25 @@ def load_historical() -> pd.DataFrame:
 
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
     if "source" not in df.columns:
         df["source"] = "esios_1001"
 
-    return df.dropna(subset=["datetime", "price"])
+    df = df.dropna(subset=["datetime", "price"]).copy()
+    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
+    return df
 
 
 def save_historical(df: pd.DataFrame) -> None:
-    df = df.sort_values("datetime").copy()
+    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
     df.to_csv(CSV_PATH, index=False)
 
 
-def upsert_day_data(existing_df: pd.DataFrame, new_day_df: pd.DataFrame) -> pd.DataFrame:
-    if new_day_df.empty:
+def upsert_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    if new_df.empty:
         return existing_df.copy()
 
-    target_day = new_day_df["datetime"].dt.date.iloc[0]
-
-    if existing_df.empty:
-        combined = new_day_df.copy()
-    else:
-        existing_df = existing_df.copy()
-        existing_df["date_only"] = existing_df["datetime"].dt.date
-
-        existing_df = existing_df[existing_df["date_only"] != target_day].drop(columns="date_only")
-        combined = pd.concat([existing_df, new_day_df], ignore_index=True)
-
+    combined = pd.concat([existing_df, new_df], ignore_index=True)
     combined = (
         combined.sort_values("datetime")
         .drop_duplicates(subset=["datetime", "source"], keep="last")
@@ -158,7 +138,7 @@ def upsert_day_data(existing_df: pd.DataFrame, new_day_df: pd.DataFrame) -> pd.D
 
 
 # =========================
-# ACTUALIZACIÓN HISTÓRICA
+# UPDATE LOGIC
 # =========================
 def daterange(start_date: date, end_date: date):
     current = start_date
@@ -167,23 +147,21 @@ def daterange(start_date: date, end_date: date):
         current += timedelta(days=1)
 
 
-def bootstrap_history_if_needed(token: str, years_back: int = 2) -> pd.DataFrame:
+def bootstrap_history_if_needed(token: str, start_day: date) -> pd.DataFrame:
     hist = load_historical()
-
     if not hist.empty:
         return hist
 
     end_day = date.today()
-    start_day = date(end_day.year - years_back, 1, 1)
-
     collected = []
-    progress = st.progress(0)
+
     all_days = list(daterange(start_day, end_day))
+    progress = st.progress(0.0)
 
     for i, day in enumerate(all_days, start=1):
         try:
             raw = fetch_esios_1001(day, token)
-            daily_df = parse_esios_spain(raw, day)
+            daily_df = parse_esios_spain(raw)
             if not daily_df.empty:
                 collected.append(daily_df)
         except Exception:
@@ -193,13 +171,13 @@ def bootstrap_history_if_needed(token: str, years_back: int = 2) -> pd.DataFrame
 
     progress.empty()
 
-    if collected:
-        hist = pd.concat(collected, ignore_index=True)
-        hist = hist.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
-        save_historical(hist)
-        return hist
+    if not collected:
+        return pd.DataFrame(columns=["datetime", "price", "source"])
 
-    return pd.DataFrame(columns=["datetime", "price", "source"])
+    hist = pd.concat(collected, ignore_index=True)
+    hist = hist.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
+    save_historical(hist)
+    return hist
 
 
 def refresh_recent_days(hist: pd.DataFrame, token: str, days_back: int = 7) -> pd.DataFrame:
@@ -210,8 +188,8 @@ def refresh_recent_days(hist: pd.DataFrame, token: str, days_back: int = 7) -> p
     for day in daterange(start_day, today):
         try:
             raw = fetch_esios_1001(day, token)
-            daily_df = parse_esios_spain(raw, day)
-            updated = upsert_day_data(updated, daily_df)
+            daily_df = parse_esios_spain(raw)
+            updated = upsert_data(updated, daily_df)
         except Exception as e:
             st.warning(f"No se pudo actualizar {day}: {e}")
 
@@ -225,14 +203,22 @@ def refresh_recent_days(hist: pd.DataFrame, token: str, days_back: int = 7) -> p
 try:
     token = require_esios_token()
 
+    # Puedes cambiar esta fecha para que la primera carga tarde menos
+    initial_start_day = date(2024, 1, 1)
+
     with st.spinner("Cargando histórico y actualizando últimos días..."):
-        hist = bootstrap_history_if_needed(token, years_back=2)
-        hist = refresh_recent_days(hist, token, days_back=7)
+        hist = bootstrap_history_if_needed(token, start_day=initial_start_day)
+        hist = refresh_recent_days(hist, token, days_back=10)
 
     if hist.empty:
         st.error("No hay datos disponibles todavía.")
         st.stop()
 
+    hist = hist[hist["datetime"].dt.date <= date.today()].copy()
+
+    # =========================
+    # MONTHLY AVERAGE
+    # =========================
     monthly_avg = hist.copy()
     monthly_avg["month"] = monthly_avg["datetime"].dt.to_period("M").dt.to_timestamp()
     monthly_avg = (
@@ -245,15 +231,21 @@ try:
     st.subheader("Monthly average spot price - Spain")
     st.line_chart(monthly_avg.set_index("month")["avg_monthly_price"])
 
-    st.subheader("Today latest available prices")
+    # =========================
+    # TODAY DATA
+    # =========================
+    st.subheader("Latest available prices for today")
     today_df = hist[hist["datetime"].dt.date == date.today()].sort_values("datetime")
 
     if today_df.empty:
-        st.info("Todavía no hay datos cargados para hoy.")
+        st.info("Todavía no hay datos disponibles para hoy.")
     else:
         st.dataframe(today_df, use_container_width=True)
         st.line_chart(today_df.set_index("datetime")["price"])
 
+    # =========================
+    # METRICS
+    # =========================
     latest_dt = hist["datetime"].max()
     latest_price = hist.loc[hist["datetime"] == latest_dt, "price"].iloc[-1]
 
@@ -262,9 +254,60 @@ try:
     col2.metric("Last price", f"{latest_price:.2f} €/MWh")
     col3.metric("Rows saved", f"{len(hist):,}")
 
+    # =========================
+    # HOURLY PROFILE BY DATE RANGE
+    # =========================
+    st.subheader("Average 24h hourly profile for selected period")
+
+    min_date = hist["datetime"].dt.date.min()
+    max_date = hist["datetime"].dt.date.max()
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        selected_start = st.date_input(
+            "Start date",
+            value=max(min_date, date(max_date.year, max(1, max_date.month - 1), 1)),
+            min_value=min_date,
+            max_value=max_date,
+            key="hourly_profile_start",
+        )
+    with col_b:
+        selected_end = st.date_input(
+            "End date",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key="hourly_profile_end",
+        )
+
+    if selected_start > selected_end:
+        st.warning("La fecha inicial no puede ser mayor que la final.")
+    else:
+        range_df = hist[
+            (hist["datetime"].dt.date >= selected_start)
+            & (hist["datetime"].dt.date <= selected_end)
+        ].copy()
+
+        if range_df.empty:
+            st.info("No hay datos en el rango seleccionado.")
+        else:
+            range_df["hour"] = range_df["datetime"].dt.hour
+            hourly_profile = (
+                range_df.groupby("hour", as_index=False)["price"]
+                .mean()
+                .rename(columns={"price": "avg_price"})
+                .sort_values("hour")
+            )
+
+            st.line_chart(hourly_profile.set_index("hour")["avg_price"])
+            st.dataframe(hourly_profile, use_container_width=True)
+
+    # =========================
+    # FORCE REFRESH
+    # =========================
     if st.button("Force refresh"):
         with st.spinner("Actualizando..."):
-            hist = refresh_recent_days(hist, token, days_back=7)
+            hist = refresh_recent_days(hist, token, days_back=10)
         st.success("Datos actualizados.")
         st.rerun()
 
