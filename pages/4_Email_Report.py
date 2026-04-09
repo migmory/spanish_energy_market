@@ -1,7 +1,12 @@
-import os
+import smtplib
 from datetime import date, timedelta
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from io import BytesIO
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
@@ -94,21 +99,13 @@ def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
     }
 
 
-def fmt_num(x):
-    return "" if pd.isna(x) or x is None else f"{x:.2f}"
+def make_metrics_df(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, report_day: date) -> pd.DataFrame:
+    month_start = report_day.replace(day=1)
+    ytd_start = report_day.replace(month=1, day=1)
 
-
-def fmt_pct(x):
-    return "" if pd.isna(x) or x is None else f"{x:.1%}"
-
-
-def make_metrics_df(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, selected_day: date) -> pd.DataFrame:
-    month_start = selected_day.replace(day=1)
-    ytd_start = selected_day.replace(month=1, day=1)
-
-    day_metrics = compute_period_metrics(price_hourly, solar_hourly, selected_day, selected_day)
-    mtd_metrics = compute_period_metrics(price_hourly, solar_hourly, month_start, selected_day)
-    ytd_metrics = compute_period_metrics(price_hourly, solar_hourly, ytd_start, selected_day)
+    day_metrics = compute_period_metrics(price_hourly, solar_hourly, report_day, report_day)
+    mtd_metrics = compute_period_metrics(price_hourly, solar_hourly, month_start, report_day)
+    ytd_metrics = compute_period_metrics(price_hourly, solar_hourly, ytd_start, report_day)
 
     return pd.DataFrame(
         [
@@ -132,6 +129,14 @@ def make_metrics_df(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, sele
             },
         ]
     )
+
+
+def fmt_num(x):
+    return "" if pd.isna(x) or x is None else f"{x:,.2f}"
+
+
+def fmt_pct(x):
+    return "" if pd.isna(x) or x is None else f"{x:.2%}"
 
 
 def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
@@ -171,7 +176,114 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
     return styles + html
 
 
-# Load data from Day Ahead history
+def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, report_day: date) -> pd.DataFrame:
+    day_price = price_hourly[price_hourly["datetime"].dt.date == report_day].copy()
+    day_solar = solar_hourly[solar_hourly["datetime"].dt.date == report_day].copy()
+
+    merged = day_price.merge(
+        day_solar[["datetime", "solar_p48_mw"]],
+        on="datetime",
+        how="left",
+    )
+    merged["solar_p48_mw"] = merged["solar_p48_mw"].fillna(0.0)
+
+    positive_solar = merged[merged["solar_p48_mw"] > 0].copy()
+    capture_price = None
+    if not positive_solar.empty:
+        capture_price = (positive_solar["price"] * positive_solar["solar_p48_mw"]).sum() / positive_solar["solar_p48_mw"].sum()
+
+    merged["Hour"] = merged["datetime"].dt.strftime("%H:%M")
+    merged = merged.rename(
+        columns={
+            "price": "Price (€/MWh)",
+            "solar_p48_mw": "Solar P48 (MW)",
+        }
+    )
+    return merged[["datetime", "Hour", "Price (€/MWh)", "Solar P48 (MW)"]], capture_price
+
+
+def build_chart_png(hourly_df: pd.DataFrame, report_day: date, capture_price: float | None) -> bytes:
+    fig, ax1 = plt.subplots(figsize=(11, 4.8))
+    ax2 = ax1.twinx()
+
+    x = hourly_df["Hour"]
+    y_price = hourly_df["Price (€/MWh)"]
+    y_solar = hourly_df["Solar P48 (MW)"]
+
+    ax1.plot(x, y_price, marker="o")
+    ax2.fill_between(range(len(x)), y_solar, alpha=0.25)
+
+    ax1.set_ylabel("Price (€/MWh)")
+    ax2.set_ylabel("Solar P48 (MW)")
+    ax1.set_xlabel("")
+    ax1.set_title(f"Day Ahead / Solar P48 Overlay - {report_day.strftime('%d-%b-%Y')}")
+
+    if capture_price is not None:
+        ax1.axhline(capture_price, linestyle="--")
+        ax1.text(
+            0.99,
+            0.92,
+            f"Capture price: {capture_price:.2f} €/MWh",
+            transform=ax1.transAxes,
+            ha="right",
+            va="center",
+            fontsize=10,
+        )
+
+    step = max(1, len(x) // 12)
+    ax1.set_xticks(range(0, len(x), step))
+    ax1.set_xticklabels([x.iloc[i] for i in range(0, len(x), step)], rotation=0)
+
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def send_email_smtp(
+    to_addresses: list[str],
+    cc_addresses: list[str],
+    subject: str,
+    html_body: str,
+    chart_png: bytes,
+):
+    smtp_host = st.secrets["smtp_host"]
+    smtp_port = int(st.secrets["smtp_port"])
+    smtp_user = st.secrets["smtp_user"]
+    smtp_password = st.secrets["smtp_password"]
+    smtp_from = st.secrets.get("smtp_from", smtp_user)
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = ", ".join(to_addresses)
+    if cc_addresses:
+        msg["Cc"] = ", ".join(cc_addresses)
+
+    alt_part = MIMEMultipart("alternative")
+    alt_part.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt_part)
+
+    image = MIMEImage(chart_png, _subtype="png")
+    image.add_header("Content-ID", "<daily_chart>")
+    image.add_header("Content-Disposition", "inline", filename="daily_chart.png")
+    msg.attach(image)
+
+    recipients = to_addresses + cc_addresses
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_from, recipients, msg.as_string())
+
+
+def parse_emails(raw: str) -> list[str]:
+    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
+# Load historical files
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
 solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
 
@@ -184,25 +296,23 @@ solar_hourly = to_hourly_mean(solar_raw, value_col_name="solar_p48_mw")
 
 latest_available_day = price_hourly["datetime"].dt.date.max()
 tomorrow = date.today() + timedelta(days=1)
-
 default_report_day = tomorrow if latest_available_day >= tomorrow else latest_available_day
 
 col1, col2 = st.columns(2)
 
 with col1:
-    to_emails = st.text_area(
+    to_emails_raw = st.text_area(
         "To",
-        value="",
+        value=st.secrets.get("default_to", ""),
         placeholder="name1@company.com; name2@company.com",
-        height=80,
+        height=90,
     )
-
 with col2:
-    cc_emails = st.text_area(
+    cc_emails_raw = st.text_area(
         "Cc",
-        value="",
+        value=st.secrets.get("default_cc", ""),
         placeholder="optional@company.com; optional2@company.com",
-        height=80,
+        height=90,
     )
 
 report_day = st.date_input(
@@ -224,65 +334,89 @@ intro_text = st.text_area(
     height=120,
 )
 
-# Data for selected day
-day_price = price_hourly[price_hourly["datetime"].dt.date == report_day].copy()
-day_solar = solar_hourly[solar_hourly["datetime"].dt.date == report_day].copy()
+hourly_table, capture_price = build_daily_dataset(price_hourly, solar_hourly, report_day)
 
-if day_price.empty:
+if hourly_table.empty:
     st.warning("No hourly price data available for the selected report day.")
-else:
-    merged_day = day_price.merge(
-        day_solar[["datetime", "solar_p48_mw"]],
-        on="datetime",
-        how="left",
+    st.stop()
+
+metrics_df = make_metrics_df(price_hourly, solar_hourly, report_day)
+
+preview_table = hourly_table[["Hour", "Price (€/MWh)", "Solar P48 (MW)"]].copy()
+
+st.subheader("Preview chart")
+chart_png = build_chart_png(hourly_table, report_day, capture_price)
+st.image(chart_png)
+
+st.subheader("Preview metrics")
+st.dataframe(metrics_df, use_container_width=True)
+
+st.subheader("Preview hourly table")
+st.dataframe(preview_table, use_container_width=True)
+
+metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
+hourly_html = df_to_html_table(preview_table)
+
+capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
+
+email_html = f"""
+<html>
+  <body style="font-family: Arial, sans-serif; font-size: 13px; color: #111111;">
+    <p>{intro_text.replace(chr(10), '<br>')}</p>
+
+    <p><strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
+       <strong>Solar capture price:</strong> {capture_text}</p>
+
+    <p><img src="cid:daily_chart" alt="Daily chart"></p>
+
+    <h3>Summary metrics</h3>
+    {metrics_html}
+
+    <br>
+
+    <h3>Hourly table</h3>
+    {hourly_html}
+
+    <br>
+    <p>Best regards,</p>
+  </body>
+</html>
+"""
+
+st.subheader("Email HTML preview")
+st.code(email_html, language="html")
+
+st.download_button(
+    label="Download email HTML",
+    data=email_html,
+    file_name=f"email_report_{report_day.isoformat()}.html",
+    mime="text/html",
+)
+
+to_emails = parse_emails(to_emails_raw)
+cc_emails = parse_emails(cc_emails_raw)
+
+send_col1, send_col2 = st.columns([1, 2])
+
+with send_col1:
+    if st.button("Send now"):
+        if not to_emails:
+            st.error("Add at least one recipient in To.")
+        else:
+            try:
+                send_email_smtp(
+                    to_addresses=to_emails,
+                    cc_addresses=cc_emails,
+                    subject=subject,
+                    html_body=email_html,
+                    chart_png=chart_png,
+                )
+                st.success("Email sent.")
+            except Exception as e:
+                st.error(f"Sending failed: {e}")
+
+with send_col2:
+    st.info(
+        "Automatic sending at 16:00 needs an external scheduler. "
+        "This page already has the report-building and send function ready."
     )
-    merged_day["solar_p48_mw"] = merged_day["solar_p48_mw"].fillna(0.0)
-    merged_day["Hour"] = merged_day["datetime"].dt.strftime("%H:%M")
-    merged_day = merged_day.rename(
-        columns={
-            "price": "Price (€/MWh)",
-            "solar_p48_mw": "Solar P48 (MW)",
-        }
-    )
-    hourly_table = merged_day[["Hour", "Price (€/MWh)", "Solar P48 (MW)"]].copy()
-
-    metrics_df = make_metrics_df(price_hourly, solar_hourly, report_day)
-
-    st.subheader("Preview")
-    st.write(f"**Report day:** {report_day.strftime('%d-%b-%Y')}")
-    st.dataframe(metrics_df, use_container_width=True)
-    st.dataframe(hourly_table, use_container_width=True)
-
-    metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
-    hourly_html = df_to_html_table(hourly_table)
-
-    email_html = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; font-size: 13px; color: #111111;">
-        <p>{intro_text.replace(chr(10), '<br>')}</p>
-
-        <h3>Summary metrics</h3>
-        {metrics_html}
-
-        <br>
-
-        <h3>Selected day: {report_day.strftime('%d-%b-%Y')}</h3>
-        {hourly_html}
-
-        <br>
-        <p>Best regards,</p>
-      </body>
-    </html>
-    """
-
-    st.subheader("Email HTML preview")
-    st.code(email_html, language="html")
-
-    st.download_button(
-        label="Download email HTML",
-        data=email_html,
-        file_name=f"email_report_{report_day.isoformat()}.html",
-        mime="text/html",
-    )
-
-    st.info("This page is ready for preview and content preparation. Sending can be added next.")
