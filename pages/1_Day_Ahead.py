@@ -2,6 +2,7 @@ import os
 from datetime import date, datetime, time, timedelta
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -46,13 +47,46 @@ ENERGY_MIX_INDICATORS = {
 }
 
 DEFAULT_START_DATE = date(2024, 1, 1)
+MADRID_TZ = ZoneInfo("Europe/Madrid")
+
+
+# =========================================================
+# DISPLAY HELPERS
+# =========================================================
+def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
+    pct_cols = pct_cols or []
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols]
+
+    fmt = {c: "{:,.2f}" for c in numeric_cols}
+    fmt.update({c: "{:.2%}" for c in pct_cols})
+
+    return (
+        df.style
+        .format(fmt)
+        .set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", "#6b7280"),
+                        ("color", "white"),
+                        ("font-weight", "bold"),
+                    ],
+                }
+            ]
+        )
+    )
+
 
 # =========================================================
 # TIME LOGIC
 # =========================================================
+def now_madrid() -> datetime:
+    return datetime.now(MADRID_TZ)
+
+
 def allow_next_day_refresh() -> bool:
-    now_madrid = datetime.now()
-    return now_madrid.time() >= time(15, 0)
+    return now_madrid().time() >= time(15, 0)
 
 
 def max_refresh_day() -> date:
@@ -198,7 +232,6 @@ def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
         .sort_values("datetime")
         .reset_index(drop=True)
     )
-
     return out
 
 
@@ -460,12 +493,12 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
     jan_rule = alt.Chart(jan_df).mark_rule(color="#111111", strokeWidth=1.2).encode(x="boundary:T")
     top_chart = (background + spot_line + captured_line + jan_rule).properties(height=320)
 
-    bottom_band_bg = alt.Chart(shaded_years_df).mark_rect(opacity=0.08, color="#9ca3af").encode(
+    bottom_bg = alt.Chart(shaded_years_df).mark_rect(opacity=0.08, color="#9ca3af").encode(
         x=alt.X("year_start:T", axis=None),
         x2="year_end:T",
     ).properties(height=34)
 
-    bottom_band_rule = alt.Chart(jan_df).mark_rule(color="#111111", strokeWidth=1.2).encode(
+    bottom_rule = alt.Chart(jan_df).mark_rule(color="#111111", strokeWidth=1.2).encode(
         x=alt.X("boundary:T", axis=None)
     ).properties(height=34)
 
@@ -474,7 +507,7 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
         text="year:N",
     ).properties(height=34)
 
-    return alt.vconcat(top_chart, bottom_band_bg + bottom_band_rule + year_text, spacing=2).resolve_scale(x="shared")
+    return alt.vconcat(top_chart, bottom_bg + bottom_rule + year_text, spacing=2).resolve_scale(x="shared")
 
 
 def build_day_overlay_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame):
@@ -551,22 +584,9 @@ def refresh_mix_indicator_energy(name: str, indicator_id: int, start_day: date, 
     hist = load_raw_history(csv_path, f"esios_{indicator_id}")
 
     if hist.empty:
-        hist = build_raw_history(
-            indicator_id=indicator_id,
-            source_name=f"esios_{indicator_id}",
-            csv_path=csv_path,
-            start_day=start_day,
-            token=token,
-        )
+        hist = build_raw_history(indicator_id, f"esios_{indicator_id}", csv_path, start_day, token)
     else:
-        hist = refresh_raw_history(
-            indicator_id=indicator_id,
-            source_name=f"esios_{indicator_id}",
-            csv_path=csv_path,
-            hist=hist,
-            token=token,
-            days_back=10,
-        )
+        hist = refresh_raw_history(indicator_id, f"esios_{indicator_id}", csv_path, hist, token, 10)
 
     return to_energy_intervals(hist, value_col_name="mw", energy_col_name="energy_mwh")
 
@@ -694,6 +714,11 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 try:
     token = require_esios_token()
 
+    st.caption(
+        f"Madrid time now: {now_madrid().strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"Tomorrow enabled after 15:00: {'Yes' if allow_next_day_refresh() else 'No'}"
+    )
+
     top_left, top_right = st.columns([1.8, 1.2])
 
     with top_left:
@@ -706,12 +731,10 @@ try:
 
     with top_right:
         btn1, btn2 = st.columns(2)
-
         with btn1:
             st.write("")
             st.write("")
             rebuild_hist = st.button("Rebuild price/solar history")
-
         with btn2:
             st.write("")
             st.write("")
@@ -765,7 +788,6 @@ try:
 
     monthly_avg = compute_monthly_avg(price_hourly)
     captured_monthly = compute_monthly_captured_price(price_hourly, solar_hourly)
-
     monthly_combo = monthly_avg.merge(captured_monthly, on="month", how="left")
 
     st.subheader("Monthly spot and solar captured price - Spain")
@@ -781,7 +803,7 @@ try:
         "capture_pct": "Solar capture rate (%)",
     })
     st.dataframe(
-        monthly_table[["Month", "Average monthly price", "Captured solar price (p48)", "Solar capture rate (%)"]],
+        styled_df(monthly_table[["Month", "Average monthly price", "Captured solar price (p48)", "Solar capture rate (%)"]], pct_cols=["Solar capture rate (%)"]),
         use_container_width=True,
     )
 
@@ -813,26 +835,11 @@ try:
 
     st.subheader("Spot / captured metrics")
     metric_rows = pd.DataFrame([
-        {
-            "Period": "Day",
-            "Average monthly price": day_metrics["avg_price"],
-            "Captured solar price (p48)": day_metrics["captured"],
-            "Solar capture rate (%)": day_metrics["capture_pct"],
-        },
-        {
-            "Period": "MTD",
-            "Average monthly price": mtd_metrics["avg_price"],
-            "Captured solar price (p48)": mtd_metrics["captured"],
-            "Solar capture rate (%)": mtd_metrics["capture_pct"],
-        },
-        {
-            "Period": "YTD",
-            "Average monthly price": ytd_metrics["avg_price"],
-            "Captured solar price (p48)": ytd_metrics["captured"],
-            "Solar capture rate (%)": ytd_metrics["capture_pct"],
-        },
+        {"Period": "Day", "Average monthly price": day_metrics["avg_price"], "Captured solar price (p48)": day_metrics["captured"], "Solar capture rate (%)": day_metrics["capture_pct"]},
+        {"Period": "MTD", "Average monthly price": mtd_metrics["avg_price"], "Captured solar price (p48)": mtd_metrics["captured"], "Solar capture rate (%)": mtd_metrics["capture_pct"]},
+        {"Period": "YTD", "Average monthly price": ytd_metrics["avg_price"], "Captured solar price (p48)": ytd_metrics["captured"], "Solar capture rate (%)": ytd_metrics["capture_pct"]},
     ])
-    st.dataframe(metric_rows, use_container_width=True)
+    st.dataframe(styled_df(metric_rows, pct_cols=["Solar capture rate (%)"]), use_container_width=True)
 
     st.subheader("Average 24h hourly profile for selected period")
     c1, c2 = st.columns(2)
@@ -844,11 +851,7 @@ try:
     if start_sel > end_sel:
         st.warning("Start date cannot be later than end date.")
     else:
-        range_df = price_hourly[
-            (price_hourly["datetime"].dt.date >= start_sel) &
-            (price_hourly["datetime"].dt.date <= end_sel)
-        ].copy()
-
+        range_df = price_hourly[(price_hourly["datetime"].dt.date >= start_sel) & (price_hourly["datetime"].dt.date <= end_sel)].copy()
         if range_df.empty:
             st.info("No data in the selected range.")
         else:
@@ -859,7 +862,7 @@ try:
                 .rename(columns={"price": "Average price (€/MWh)"})
                 .sort_values("hour")
             )
-            st.dataframe(hourly_profile, use_container_width=True)
+            st.dataframe(styled_df(hourly_profile), use_container_width=True)
 
     st.subheader("Energy mix")
 
@@ -917,7 +920,7 @@ try:
                 )
 
             mix_table = mix_table.drop(columns=["sort_key"], errors="ignore")
-            st.dataframe(mix_table, use_container_width=True)
+            st.dataframe(styled_df(mix_table), use_container_width=True)
 
             mix_workbook = build_energy_mix_workbook(mix_period, demand_period)
             st.download_button(
@@ -942,10 +945,10 @@ try:
     )
 
     st.subheader("Raw price extraction (QH when available)")
-    st.dataframe(price_raw.head(500), use_container_width=True)
+    st.dataframe(styled_df(price_raw.head(500)), use_container_width=True)
 
     st.subheader("Hourly averaged prices")
-    st.dataframe(price_hourly.head(500), use_container_width=True)
+    st.dataframe(styled_df(price_hourly.head(500)), use_container_width=True)
 
     if st.button("Force refresh"):
         with st.spinner("Refreshing..."):
