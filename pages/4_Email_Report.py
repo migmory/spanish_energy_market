@@ -1,5 +1,4 @@
 from datetime import date, timedelta
-from io import BytesIO
 from pathlib import Path
 
 import altair as alt
@@ -137,12 +136,42 @@ def parse_emails(raw: str) -> list[str]:
     return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
 
 
-def fmt_num(x):
-    return "" if pd.isna(x) or x is None else f"{x:,.2f}"
+def format_preview_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd.DataFrame:
+    pct_cols = pct_cols or []
+    out = df.copy()
+
+    for col in out.columns:
+        if col in pct_cols:
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
+        elif pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+
+    return out
 
 
-def fmt_pct(x):
-    return "" if pd.isna(x) or x is None else f"{x:.2%}"
+def style_preview_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
+    pct_cols = pct_cols or []
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols]
+
+    fmt = {c: "{:.2f}" for c in numeric_cols}
+    fmt.update({c: "{:.2%}" for c in pct_cols})
+
+    return (
+        df.style
+        .format(fmt)
+        .set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", "#d1d5db"),
+                        ("color", "#111111"),
+                        ("font-weight", "bold"),
+                    ],
+                }
+            ]
+        )
+    )
 
 
 def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, report_day: date):
@@ -172,60 +201,42 @@ def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, 
     return merged[["datetime", "Hour", "Price (€/MWh)", "Solar P48 (MW)"]].copy(), capture_price
 
 
-def build_overlay_chart(hourly_df: pd.DataFrame, capture_price: float | None):
+def build_overlay_chart(hourly_df: pd.DataFrame):
     if hourly_df.empty:
         return None
 
-    base = alt.Chart(hourly_df).encode(
-        x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0))
-    )
+    base_x = alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0))
 
-    price_line = base.mark_line(point=True).encode(
-        y=alt.Y("Price (€/MWh):Q", title="Price (€/MWh)"),
-        tooltip=[
-            alt.Tooltip("Hour:N", title="Hour"),
-            alt.Tooltip("Price (€/MWh):Q", title="Price", format=".2f"),
-            alt.Tooltip("Solar P48 (MW):Q", title="Solar P48", format=".2f"),
-        ],
-    )
-
-    solar_area = base.mark_area(opacity=0.25).encode(
-        y=alt.Y("Solar P48 (MW):Q", title="Solar P48 (MW)")
-    )
-
-    layers = [solar_area, price_line]
-
-    if capture_price is not None:
-        capture_df = pd.DataFrame(
-            {
-                "label": ["Capture price"],
-                "y": [capture_price],
-            }
+    price_line = (
+        alt.Chart(hourly_df)
+        .mark_line(point=True)
+        .encode(
+            x=base_x,
+            y=alt.Y("Price (€/MWh):Q", title="Price (€/MWh)"),
+            tooltip=[
+                alt.Tooltip("Hour:N", title="Hour"),
+                alt.Tooltip("Price (€/MWh):Q", title="Price", format=".2f"),
+                alt.Tooltip("Solar P48 (MW):Q", title="Solar P48", format=".2f"),
+            ],
         )
-        capture_rule = alt.Chart(capture_df).mark_rule(strokeDash=[6, 4]).encode(
-            y="y:Q",
-            tooltip=[alt.Tooltip("y:Q", title="Capture price", format=".2f")],
+    )
+
+    solar_area = (
+        alt.Chart(hourly_df)
+        .mark_area(opacity=0.25)
+        .encode(
+            x=base_x,
+            y=alt.Y("Solar P48 (MW):Q", title="Solar P48 (MW)"),
         )
-        layers.append(capture_rule)
+    )
 
-    return alt.layer(*layers).resolve_scale(y="independent").properties(height=360)
-
-
-def format_display_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd.DataFrame:
-    pct_cols = pct_cols or []
-    out = df.copy()
-
-    for col in out.columns:
-        if col in pct_cols:
-            out[col] = out[col].map(fmt_pct)
-        elif pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = out[col].map(fmt_num)
-
-    return out
+    return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
 
 
 def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
-    tmp = format_display_df(df, pct_cols=pct_cols)
+    pct_cols = pct_cols or []
+    tmp = format_preview_df(df, pct_cols=pct_cols)
+
     styles = """
     <style>
     table.email-table {
@@ -317,19 +328,19 @@ if hourly_df.empty:
 
 metrics_df = make_metrics_df(price_hourly, solar_hourly, report_day)
 preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar P48 (MW)"]].copy()
-overlay_chart = build_overlay_chart(hourly_df, capture_price)
+overlay_chart = build_overlay_chart(hourly_df)
 
 st.subheader("Preview chart")
 if overlay_chart is not None:
     st.altair_chart(overlay_chart, use_container_width=True)
 
 st.subheader("Preview metrics")
-st.dataframe(metrics_df, use_container_width=True)
+st.dataframe(style_preview_table(metrics_df, pct_cols=["Solar capture rate (%)"]), use_container_width=True)
 
 st.subheader("Preview hourly table")
-st.dataframe(preview_table, use_container_width=True)
+st.dataframe(style_preview_table(preview_table), use_container_width=True)
 
-capture_text = fmt_num(capture_price) + " €/MWh" if capture_price is not None else "n/a"
+capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
