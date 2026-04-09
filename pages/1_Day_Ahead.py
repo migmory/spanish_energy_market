@@ -47,6 +47,7 @@ ENERGY_MIX_INDICATORS = {
 
 DEFAULT_START_DATE = date(2024, 1, 1)
 
+
 # =========================================================
 # TOKEN / HEADERS
 # =========================================================
@@ -324,54 +325,6 @@ def refresh_raw_history(
 
     save_raw_history(updated, csv_path)
     return updated
-
-
-# =========================================================
-# TABLES
-# =========================================================
-def format_display_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd.DataFrame:
-    pct_cols = pct_cols or []
-    out = df.copy()
-
-    for col in out.columns:
-        if col in pct_cols:
-            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
-        elif pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}")
-
-    return out
-
-
-def render_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
-    display_df = format_display_df(df, pct_cols=pct_cols)
-    html = display_df.to_html(index=False, escape=False)
-    st.markdown(
-        f"""
-        <style>
-        .oai-table-wrap table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }}
-        .oai-table-wrap th {{
-            background: #d1d5db;
-            color: #111111;
-            text-align: center !important;
-            font-weight: 700;
-            padding: 8px;
-            border: 1px solid #c7ccd4;
-        }}
-        .oai-table-wrap td {{
-            text-align: center !important;
-            vertical-align: middle;
-            padding: 8px;
-            border: 1px solid #e5e7eb;
-        }}
-        </style>
-        <div class="oai-table-wrap">{html}</div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 # =========================================================
@@ -790,9 +743,9 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 try:
     token = require_esios_token()
 
-    col1, col2, col3 = st.columns([1.6, 1, 1])
+    top_left, top_right = st.columns([1.8, 1.2])
 
-    with col1:
+    with top_left:
         start_day = st.date_input(
             "Extraction start date",
             value=DEFAULT_START_DATE,
@@ -800,20 +753,25 @@ try:
             max_value=date.today(),
         )
 
-    with col2:
-        st.write("")
-        st.write("")
-        if st.button("Rebuild price/solar history"):
-            clear_file(PRICE_RAW_CSV_PATH)
-            clear_file(SOLAR_RAW_CSV_PATH)
-            clear_file(DEMAND_RAW_CSV_PATH)
-            st.success("Price, solar and demand files deleted. Reloading...")
-            st.rerun()
+    with top_right:
+        btn1, btn2 = st.columns(2)
 
-    with col3:
-        st.write("")
-        st.write("")
-        refresh_energy_mix = st.button("Refresh energy mix")
+        with btn1:
+            st.write("")
+            st.write("")
+            rebuild_hist = st.button("Rebuild price/solar history")
+
+        with btn2:
+            st.write("")
+            st.write("")
+            refresh_energy_mix = st.button("Refresh energy mix")
+
+    if rebuild_hist:
+        clear_file(PRICE_RAW_CSV_PATH)
+        clear_file(SOLAR_RAW_CSV_PATH)
+        clear_file(DEMAND_RAW_CSV_PATH)
+        st.success("Price, solar and demand files deleted. Reloading...")
+        st.rerun()
 
     price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
     solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
@@ -924,7 +882,7 @@ try:
         }
     )
     monthly_table = monthly_table[["Month", "Average monthly price", "Captured solar price (p48)", "Solar capture rate (%)"]]
-    render_table(monthly_table, pct_cols=["Solar capture rate (%)"])
+    st.dataframe(monthly_table, use_container_width=True)
 
     st.subheader("Selected day: price vs solar P48")
     min_date = price_hourly["datetime"].dt.date.min()
@@ -975,7 +933,7 @@ try:
             },
         ]
     )
-    render_table(metric_rows, pct_cols=["Solar capture rate (%)"])
+    st.dataframe(metric_rows, use_container_width=True)
 
     st.subheader("Average 24h hourly profile for selected period")
     c1, c2 = st.columns(2)
@@ -1014,7 +972,7 @@ try:
                 .rename(columns={"price": "Average price (€/MWh)"})
                 .sort_values("hour")
             )
-            render_table(hourly_profile)
+            st.dataframe(hourly_profile, use_container_width=True)
 
     st.subheader("Energy mix")
 
@@ -1101,7 +1059,7 @@ try:
                     how="left",
                 )
             mix_table = mix_table.drop(columns=[c for c in mix_table.columns if c == "sort_key"], errors="ignore")
-            render_table(mix_table)
+            st.dataframe(mix_table, use_container_width=True)
 
             mix_workbook = build_energy_mix_workbook(mix_period, demand_period)
             st.download_button(
@@ -1126,10 +1084,10 @@ try:
     )
 
     st.subheader("Raw price extraction (QH when available)")
-    render_table(price_raw)
+    st.dataframe(price_raw.head(500), use_container_width=True)
 
     st.subheader("Hourly averaged prices")
-    render_table(price_hourly)
+    st.dataframe(price_hourly.head(500), use_container_width=True)
 
     if st.button("Force refresh"):
         with st.spinner("Refreshing..."):
