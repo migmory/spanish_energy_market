@@ -24,12 +24,28 @@ DATA_DIR.mkdir(exist_ok=True)
 
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
 SOLAR_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
+DEMAND_RAW_CSV_PATH = DATA_DIR / "demand_p48_total_10027_raw.csv"
 
 PRICE_INDICATOR_ID = 600
 SOLAR_INDICATOR_ID = 84
+DEMAND_INDICATOR_ID = 10027
+
+ENERGY_MIX_INDICATORS = {
+    "Nuclear": 74,
+    "CCGT": 79,
+    "Wind": 10010,
+    "Solar PV": 84,
+    "Solar thermal": 85,
+    "Hydro UGH": 71,
+    "Hydro non-UGH": 72,
+    "Pumped hydro": 73,
+    "CHP": 10011,
+    "Biomass": 91,
+    "Biogas": 92,
+    "Other renewables": 10013,
+}
 
 DEFAULT_START_DATE = date(2024, 1, 1)
-
 
 # =========================================================
 # TOKEN / HEADERS
@@ -111,7 +127,6 @@ def parse_esios_indicator(
     if "geo_id" not in df.columns:
         df["geo_id"] = None
 
-    # Spain only
     if (df["geo_id"] == 3).any():
         df = df[df["geo_id"] == 3].copy()
     else:
@@ -291,6 +306,44 @@ def refresh_raw_history(
 
 
 # =========================================================
+# TABLE STYLE
+# =========================================================
+def style_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
+    pct_cols = pct_cols or []
+    styler = df.style
+
+    number_cols = [
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols
+    ]
+
+    fmt = {c: "{:.2f}" for c in number_cols}
+    fmt.update({c: "{:.2%}" for c in pct_cols})
+
+    styler = styler.format(fmt)
+    styler = styler.set_table_styles(
+        [
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", "#1f2937"),
+                    ("color", "white"),
+                    ("text-align", "center"),
+                    ("font-weight", "bold"),
+                ],
+            },
+            {
+                "selector": "td",
+                "props": [
+                    ("text-align", "center"),
+                ],
+            },
+        ]
+    )
+    return styler
+
+
+# =========================================================
 # ANALYTICS
 # =========================================================
 def compute_monthly_avg(hourly_price_df: pd.DataFrame) -> pd.DataFrame:
@@ -305,16 +358,6 @@ def compute_monthly_avg(hourly_price_df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"price": "avg_monthly_price"})
         .sort_values("month")
     )
-    return out
-
-
-def compute_daily_counts(hourly_price_df: pd.DataFrame) -> pd.DataFrame:
-    if hourly_price_df.empty:
-        return pd.DataFrame(columns=["day", "rows_per_day"])
-
-    out = hourly_price_df.copy()
-    out["day"] = out["datetime"].dt.date
-    out = out.groupby("day", as_index=False).size().rename(columns={"size": "rows_per_day"})
     return out
 
 
@@ -387,9 +430,6 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
 
     chart_df = monthly_df.copy()
     chart_df["year"] = chart_df["month"].dt.year
-    jan_ticks = chart_df[chart_df["month"].dt.month == 1].copy()
-    dec_ticks = chart_df[chart_df["month"].dt.month == 12].copy()
-
     years_df = (
         chart_df.assign(
             year_start=lambda x: pd.to_datetime(x["year"].astype(str) + "-01-01"),
@@ -400,73 +440,74 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
         .sort_values("year")
     )
 
-    base = alt.Chart(chart_df).encode(
+    jan_df = years_df[["year_start"]].rename(columns={"year_start": "boundary"})
+    dec_df = years_df.assign(boundary=lambda x: x["year_end"] - pd.Timedelta(days=1))[["boundary"]]
+
+    line_base = alt.Chart(chart_df).encode(
         x=alt.X(
             "month:T",
             axis=alt.Axis(title=None, format="%b", labelAngle=0, tickCount="month"),
         )
     )
 
-    spot_line = base.mark_line(point=True).encode(
+    spot_line = line_base.mark_line(point=True).encode(
         y=alt.Y("avg_monthly_price:Q", title="€/MWh"),
         tooltip=[
             alt.Tooltip("month:T", title="Month"),
-            alt.Tooltip("avg_monthly_price:Q", title="Spot avg", format=".2f"),
-            alt.Tooltip("captured_solar_price:Q", title="Solar captured", format=".2f"),
-            alt.Tooltip("capture_pct:Q", title="Capture %", format=".1%"),
+            alt.Tooltip("avg_monthly_price:Q", title="Average monthly price", format=".2f"),
+            alt.Tooltip("captured_solar_price:Q", title="Captured solar price (p48)", format=".2f"),
+            alt.Tooltip("capture_pct:Q", title="Solar capture rate (%)", format=".2%"),
         ],
     )
 
-    captured_line = base.mark_line(point=True, strokeDash=[6, 4]).encode(
+    captured_line = line_base.mark_line(point=True, strokeDash=[6, 4]).encode(
         y="captured_solar_price:Q"
     )
 
-    jan_rule = alt.Chart(jan_ticks).mark_rule(color="#9ca3af", strokeWidth=1).encode(x="month:T")
-    dec_rule = alt.Chart(dec_ticks).mark_rule(color="#9ca3af", strokeWidth=1).encode(x="month:T")
+    top_chart = (spot_line + captured_line).properties(height=320)
 
-    line_layer = (spot_line + captured_line + jan_rule + dec_rule).properties(height=320)
+    year_band = alt.Chart(years_df).mark_rect(opacity=0.08, color="#9ca3af").encode(
+        x=alt.X("year_start:T", axis=None),
+        x2="year_end:T",
+    ).properties(height=34)
 
-    year_band = (
-        alt.Chart(years_df)
-        .mark_rect(opacity=0.12, color="#94a3b8")
-        .encode(
-            x=alt.X("year_start:T", axis=None),
-            x2="year_end:T",
-        )
-        .properties(height=28)
-    )
+    jan_rule = alt.Chart(jan_df).mark_rule(color="#6b7280", strokeWidth=1.5).encode(
+        x=alt.X("boundary:T", axis=None)
+    ).properties(height=34)
 
-    year_text = (
-        alt.Chart(years_df)
-        .mark_text(baseline="middle", fontSize=12)
-        .encode(
-            x=alt.X("year_mid:T", axis=None),
-            text="year:N",
-        )
-        .properties(height=28)
-    )
+    dec_rule = alt.Chart(dec_df).mark_rule(color="#6b7280", strokeWidth=1.5).encode(
+        x=alt.X("boundary:T", axis=None)
+    ).properties(height=34)
 
-    return alt.vconcat(line_layer, year_band + year_text, spacing=4).resolve_scale(x="shared")
+    year_text = alt.Chart(years_df).mark_text(baseline="middle", fontSize=12).encode(
+        x=alt.X("year_mid:T", axis=None),
+        text="year:N",
+    ).properties(height=34)
+
+    bottom_band = year_band + jan_rule + dec_rule + year_text
+
+    return alt.vconcat(top_chart, bottom_band, spacing=2).resolve_scale(x="shared")
 
 
 def build_day_overlay_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame):
     if day_price.empty:
         return None
 
-    base = alt.Chart(day_price).encode(
-        x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0))
-    )
-
-    price_line = base.mark_line(point=True).encode(
-        y=alt.Y("price:Q", title="Price €/MWh"),
-        tooltip=[
-            alt.Tooltip("datetime:T", title="Time"),
-            alt.Tooltip("price:Q", title="Price", format=".2f"),
-        ],
+    price_line = (
+        alt.Chart(day_price)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0)),
+            y=alt.Y("price:Q", title="Price €/MWh"),
+            tooltip=[
+                alt.Tooltip("datetime:T", title="Time"),
+                alt.Tooltip("price:Q", title="Price", format=".2f"),
+            ],
+        )
     )
 
     if day_solar.empty:
-        return price_line.properties(height=320)
+        return price_line.properties(height=340)
 
     solar_area = (
         alt.Chart(day_solar)
@@ -481,7 +522,7 @@ def build_day_overlay_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame):
         )
     )
 
-    return alt.layer(solar_area, price_line).resolve_scale(y="independent").properties(height=340)
+    return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=340)
 
 
 def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) -> bytes:
@@ -499,6 +540,122 @@ def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) ->
 
     output.seek(0)
     return output.getvalue()
+
+
+# =========================================================
+# ENERGY MIX
+# =========================================================
+def load_or_build_mix_indicator(name: str, indicator_id: int, start_day: date, token: str) -> pd.DataFrame:
+    csv_path = DATA_DIR / f"mix_{indicator_id}_{name.lower().replace(' ', '_').replace('/', '_')}.csv"
+    hist = load_raw_history(csv_path, f"esios_{indicator_id}")
+
+    if hist.empty:
+        hist = build_raw_history(
+            indicator_id=indicator_id,
+            source_name=f"esios_{indicator_id}",
+            csv_path=csv_path,
+            start_day=start_day,
+            token=token,
+        )
+    else:
+        hist = refresh_raw_history(
+            indicator_id=indicator_id,
+            source_name=f"esios_{indicator_id}",
+            csv_path=csv_path,
+            hist=hist,
+            token=token,
+            days_back=10,
+        )
+
+    hourly = to_hourly_mean(hist, value_col_name="mw")
+    hourly["technology"] = name
+    return hourly
+
+
+def build_energy_mix_monthly(mix_hourly_dict: dict[str, pd.DataFrame], demand_hourly: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    mix_frames = []
+    for tech, df in mix_hourly_dict.items():
+        if not df.empty:
+            tmp = df.copy()
+            tmp["month"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+            monthly = (
+                tmp.groupby(["month", "technology"], as_index=False)["mw"]
+                .sum()
+            )
+            mix_frames.append(monthly)
+
+    mix_monthly = pd.concat(mix_frames, ignore_index=True) if mix_frames else pd.DataFrame(columns=["month", "technology", "mw"])
+
+    if not mix_monthly.empty:
+        hydro = (
+            mix_monthly[mix_monthly["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])]
+            .groupby("month", as_index=False)["mw"]
+            .sum()
+        )
+        hydro["technology"] = "Hydro"
+
+        keep = mix_monthly[~mix_monthly["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
+        mix_monthly = pd.concat([keep, hydro], ignore_index=True).groupby(["month", "technology"], as_index=False)["mw"].sum()
+
+    demand_monthly = pd.DataFrame(columns=["month", "demand_mwh"])
+    if not demand_hourly.empty:
+        tmp = demand_hourly.copy()
+        tmp["month"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+        demand_monthly = (
+            tmp.groupby("month", as_index=False)["demand_p48_mw"]
+            .sum()
+            .rename(columns={"demand_p48_mw": "demand_mwh"})
+        )
+
+    return mix_monthly, demand_monthly
+
+
+def build_energy_mix_charts(mix_monthly: pd.DataFrame, demand_monthly: pd.DataFrame, selected_month: pd.Timestamp):
+    if mix_monthly.empty:
+        return None, None
+
+    stacked = alt.Chart(mix_monthly).mark_bar().encode(
+        x=alt.X("month:T", axis=alt.Axis(title=None, format="%b %Y", labelAngle=0)),
+        y=alt.Y("mw:Q", title="Monthly generation (MWh equivalent)"),
+        color=alt.Color("technology:N", title="Technology"),
+        tooltip=[
+            alt.Tooltip("month:T", title="Month"),
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("mw:Q", title="Generation", format=".2f"),
+        ],
+    )
+
+    if not demand_monthly.empty:
+        line = alt.Chart(demand_monthly).mark_line(point=True, color="#111827").encode(
+            x="month:T",
+            y=alt.Y("demand_mwh:Q", title="Monthly demand (MWh)"),
+            tooltip=[
+                alt.Tooltip("month:T", title="Month"),
+                alt.Tooltip("demand_mwh:Q", title="Demand", format=".2f"),
+            ],
+        )
+        stacked_chart = alt.layer(stacked, line).resolve_scale(y="independent").properties(height=360)
+    else:
+        stacked_chart = stacked.properties(height=360)
+
+    pie_df = mix_monthly[mix_monthly["month"] == selected_month].copy()
+    if pie_df.empty:
+        return stacked_chart, None
+
+    total = pie_df["mw"].sum()
+    pie_df["share_pct"] = pie_df["mw"] / total
+
+    pie = alt.Chart(pie_df).mark_arc().encode(
+        theta="mw:Q",
+        color=alt.Color("technology:N", title="Technology"),
+        tooltip=[
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("mw:Q", title="Generation", format=".2f"),
+            alt.Tooltip("share_pct:Q", title="Share", format=".2%"),
+        ],
+    ).properties(height=320)
+
+    return stacked_chart, pie
 
 
 # =========================================================
@@ -523,11 +680,13 @@ try:
         if st.button("Rebuild history from selected start date"):
             clear_file(PRICE_RAW_CSV_PATH)
             clear_file(SOLAR_RAW_CSV_PATH)
+            clear_file(DEMAND_RAW_CSV_PATH)
             st.success("Historical files deleted. Reloading...")
             st.rerun()
 
     price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
     solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
+    demand_raw = load_raw_history(DEMAND_RAW_CSV_PATH, "esios_10027")
 
     if price_raw.empty:
         with st.spinner("Building price history..."):
@@ -569,11 +728,34 @@ try:
                 days_back=10,
             )
 
+    if demand_raw.empty:
+        with st.spinner("Building demand P48 history..."):
+            demand_raw = build_raw_history(
+                indicator_id=DEMAND_INDICATOR_ID,
+                source_name="esios_10027",
+                csv_path=DEMAND_RAW_CSV_PATH,
+                start_day=start_day,
+                token=token,
+            )
+    else:
+        with st.spinner("Refreshing recent demand P48 data..."):
+            demand_raw = refresh_raw_history(
+                indicator_id=DEMAND_INDICATOR_ID,
+                source_name="esios_10027",
+                csv_path=DEMAND_RAW_CSV_PATH,
+                hist=demand_raw,
+                token=token,
+                days_back=10,
+            )
+
     price_raw = price_raw[price_raw["datetime"].dt.date >= start_day].copy()
     price_raw = price_raw[price_raw["datetime"].dt.date <= date.today()].copy()
 
     solar_raw = solar_raw[solar_raw["datetime"].dt.date >= start_day].copy()
     solar_raw = solar_raw[solar_raw["datetime"].dt.date <= date.today()].copy()
+
+    demand_raw = demand_raw[demand_raw["datetime"].dt.date >= start_day].copy()
+    demand_raw = demand_raw[demand_raw["datetime"].dt.date <= date.today()].copy()
 
     if price_raw.empty:
         st.error("No price data available yet.")
@@ -581,6 +763,7 @@ try:
 
     price_hourly = to_hourly_mean(price_raw, value_col_name="price")
     solar_hourly = to_hourly_mean(solar_raw, value_col_name="solar_p48_mw")
+    demand_hourly = to_hourly_mean(demand_raw, value_col_name="demand_p48_mw")
 
     monthly_avg = compute_monthly_avg(price_hourly)
     captured_monthly = compute_monthly_captured_price(price_hourly, solar_hourly)
@@ -602,8 +785,19 @@ try:
         st.altair_chart(combo_chart, use_container_width=True)
 
     monthly_table = monthly_combo.copy()
-    monthly_table["capture_pct"] = monthly_table["capture_pct"].map(lambda x: f"{x:.1%}" if pd.notna(x) else None)
-    st.dataframe(monthly_table, use_container_width=True)
+    monthly_table["Month"] = monthly_table["month"].dt.strftime("%b - %Y")
+    monthly_table = monthly_table.rename(
+        columns={
+            "avg_monthly_price": "Average monthly price",
+            "captured_solar_price": "Captured solar price (p48)",
+            "capture_pct": "Solar capture rate (%)",
+        }
+    )
+    monthly_table = monthly_table[["Month", "Average monthly price", "Captured solar price (p48)", "Solar capture rate (%)"]]
+    st.dataframe(
+        style_table(monthly_table, pct_cols=["Solar capture rate (%)"]),
+        use_container_width=True,
+    )
 
     st.subheader("Selected day: price vs solar P48")
     min_date = price_hourly["datetime"].dt.date.min()
@@ -635,35 +829,31 @@ try:
     metric_rows = pd.DataFrame(
         [
             {
-                "period": "Day",
-                "avg_price_eur_mwh": day_metrics["avg_price"],
-                "captured_solar_eur_mwh": day_metrics["captured"],
-                "capture_pct": day_metrics["capture_pct"],
+                "Period": "Day",
+                "Average monthly price": day_metrics["avg_price"],
+                "Captured solar price (p48)": day_metrics["captured"],
+                "Solar capture rate (%)": day_metrics["capture_pct"],
             },
             {
-                "period": "MTD",
-                "avg_price_eur_mwh": mtd_metrics["avg_price"],
-                "captured_solar_eur_mwh": mtd_metrics["captured"],
-                "capture_pct": mtd_metrics["capture_pct"],
+                "Period": "MTD",
+                "Average monthly price": mtd_metrics["avg_price"],
+                "Captured solar price (p48)": mtd_metrics["captured"],
+                "Solar capture rate (%)": mtd_metrics["capture_pct"],
             },
             {
-                "period": "YTD",
-                "avg_price_eur_mwh": ytd_metrics["avg_price"],
-                "captured_solar_eur_mwh": ytd_metrics["captured"],
-                "capture_pct": ytd_metrics["capture_pct"],
+                "Period": "YTD",
+                "Average monthly price": ytd_metrics["avg_price"],
+                "Captured solar price (p48)": ytd_metrics["captured"],
+                "Solar capture rate (%)": ytd_metrics["capture_pct"],
             },
         ]
     )
-
-    metric_display = metric_rows.copy()
-    metric_display["avg_price_eur_mwh"] = metric_display["avg_price_eur_mwh"].map(lambda x: round(x, 2) if pd.notna(x) else None)
-    metric_display["captured_solar_eur_mwh"] = metric_display["captured_solar_eur_mwh"].map(lambda x: round(x, 2) if pd.notna(x) else None)
-    metric_display["capture_pct"] = metric_display["capture_pct"].map(lambda x: f"{x:.1%}" if pd.notna(x) else None)
-
-    st.dataframe(metric_display, use_container_width=True)
+    st.dataframe(
+        style_table(metric_rows, pct_cols=["Solar capture rate (%)"]),
+        use_container_width=True,
+    )
 
     st.subheader("Average 24h hourly profile for selected period")
-
     c1, c2 = st.columns(2)
     with c1:
         start_sel = st.date_input(
@@ -697,15 +887,57 @@ try:
             hourly_profile = (
                 range_df.groupby("hour", as_index=False)["price"]
                 .mean()
-                .rename(columns={"price": "avg_price"})
+                .rename(columns={"price": "Average monthly price"})
                 .sort_values("hour")
             )
-
-            st.line_chart(hourly_profile.set_index("hour")["avg_price"])
-            st.dataframe(hourly_profile, use_container_width=True)
+            st.dataframe(style_table(hourly_profile), use_container_width=True)
 
     st.subheader("Energy mix")
-    st.info("This section is left for the next step: monthly technology shares, pie chart and stacked columns with monthly accumulated demand overlay.")
+    mix_hourly = {}
+    with st.spinner("Refreshing energy mix data..."):
+        for tech_name, indicator_id in ENERGY_MIX_INDICATORS.items():
+            mix_hourly[tech_name] = load_or_build_mix_indicator(
+                name=tech_name,
+                indicator_id=indicator_id,
+                start_day=start_day,
+                token=token,
+            )
+
+    mix_monthly, demand_monthly = build_energy_mix_monthly(mix_hourly, demand_hourly)
+
+    if not mix_monthly.empty:
+        mix_min_month = mix_monthly["month"].min().date()
+        mix_max_month = mix_monthly["month"].max().date()
+
+        selected_mix_month = st.date_input(
+            "Energy mix month",
+            value=mix_max_month,
+            min_value=mix_min_month,
+            max_value=mix_max_month,
+            key="mix_month",
+        )
+        selected_mix_month_ts = pd.Timestamp(selected_mix_month).to_period("M").to_timestamp()
+
+        stacked_chart, pie_chart = build_energy_mix_charts(mix_monthly, demand_monthly, selected_mix_month_ts)
+
+        if stacked_chart is not None:
+            st.altair_chart(stacked_chart, use_container_width=True)
+
+        if pie_chart is not None:
+            st.altair_chart(pie_chart, use_container_width=False)
+
+        mix_table = (
+            mix_monthly[mix_monthly["month"] == selected_mix_month_ts]
+            .sort_values("mw", ascending=False)
+            .rename(columns={"technology": "Technology", "mw": "Monthly generation"})
+        )
+        if not mix_table.empty:
+            mix_table["Share (%)"] = mix_table["Monthly generation"] / mix_table["Monthly generation"].sum()
+            mix_table["Month"] = mix_table["month"].dt.strftime("%b - %Y")
+            mix_table = mix_table[["Month", "Technology", "Monthly generation", "Share (%)"]]
+            st.dataframe(style_table(mix_table, pct_cols=["Share (%)"]), use_container_width=True)
+    else:
+        st.info("No energy mix data available yet.")
 
     st.subheader("Extraction workbook")
     st.write("Rows in raw prices:", len(price_raw))
@@ -720,10 +952,10 @@ try:
     )
 
     st.subheader("Raw price extraction (QH when available)")
-    st.dataframe(price_raw, use_container_width=True)
+    st.dataframe(style_table(price_raw), use_container_width=True)
 
     st.subheader("Hourly averaged prices")
-    st.dataframe(price_hourly, use_container_width=True)
+    st.dataframe(style_table(price_hourly), use_container_width=True)
 
     if st.button("Force refresh"):
         with st.spinner("Refreshing..."):
@@ -740,6 +972,14 @@ try:
                 source_name="esios_84",
                 csv_path=SOLAR_RAW_CSV_PATH,
                 hist=solar_raw,
+                token=token,
+                days_back=10,
+            )
+            demand_raw = refresh_raw_history(
+                indicator_id=DEMAND_INDICATOR_ID,
+                source_name="esios_10027",
+                csv_path=DEMAND_RAW_CSV_PATH,
+                hist=demand_raw,
                 token=token,
                 days_back=10,
             )
