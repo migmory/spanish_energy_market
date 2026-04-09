@@ -161,11 +161,9 @@ def parse_esios_indicator(
 
 
 def interval_hours_from_datetime(dt_series: pd.Series) -> pd.Series:
-    # Desde oct-25 el API pasa a quarter_hour. Para generación/demanda
-    # hay que convertir MW a MWh equivalentes.
     return pd.Series(
-        0.25 if (x.date() >= date(2025, 10, 1)) else 1.0
-        for x in dt_series
+        [0.25 if x.date() >= date(2025, 10, 1) else 1.0 for x in dt_series],
+        index=dt_series.index,
     )
 
 
@@ -201,7 +199,6 @@ def to_energy_intervals(df: pd.DataFrame, value_col_name: str, energy_col_name: 
     out["interval_h"] = interval_hours_from_datetime(out["datetime"])
     out[energy_col_name] = out[value_col_name] * out["interval_h"]
 
-    out = out.rename(columns={"value": value_col_name})
     out = out[["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"]].copy()
     out = out.sort_values("datetime").reset_index(drop=True)
     return out
@@ -330,52 +327,51 @@ def refresh_raw_history(
 
 
 # =========================================================
-# TABLE STYLE
+# TABLES
 # =========================================================
-def style_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
+def format_display_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd.DataFrame:
     pct_cols = pct_cols or []
-    styler = df.style
+    out = df.copy()
 
-    number_cols = [
-        c for c in df.columns
-        if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols
-    ]
+    for col in out.columns:
+        if col in pct_cols:
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
+        elif pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}")
 
-    fmt = {c: "{:,.2f}" for c in number_cols}
-    fmt.update({c: "{:.2%}" for c in pct_cols})
+    return out
 
-    styler = styler.format(fmt)
-    styler = styler.set_properties(**{"text-align": "center", "vertical-align": "middle"})
-    styler = styler.set_table_styles(
-        [
-            {
-                "selector": "th",
-                "props": [
-                    ("background-color", "#d1d5db"),
-                    ("color", "#111111"),
-                    ("text-align", "center"),
-                    ("font-weight", "bold"),
-                    ("border", "1px solid #c7ccd4"),
-                ],
-            },
-            {
-                "selector": "td",
-                "props": [
-                    ("text-align", "center"),
-                    ("vertical-align", "middle"),
-                    ("border", "1px solid #e5e7eb"),
-                ],
-            },
-            {
-                "selector": "table",
-                "props": [
-                    ("width", "100%"),
-                    ("border-collapse", "collapse"),
-                ],
-            },
-        ]
+
+def render_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
+    display_df = format_display_df(df, pct_cols=pct_cols)
+    html = display_df.to_html(index=False, escape=False)
+    st.markdown(
+        f"""
+        <style>
+        .oai-table-wrap table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }}
+        .oai-table-wrap th {{
+            background: #d1d5db;
+            color: #111111;
+            text-align: center !important;
+            font-weight: 700;
+            padding: 8px;
+            border: 1px solid #c7ccd4;
+        }}
+        .oai-table-wrap td {{
+            text-align: center !important;
+            vertical-align: middle;
+            padding: 8px;
+            border: 1px solid #e5e7eb;
+        }}
+        </style>
+        <div class="oai-table-wrap">{html}</div>
+        """,
+        unsafe_allow_html=True,
     )
-    return styler
 
 
 # =========================================================
@@ -594,13 +590,24 @@ def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) ->
     return output.getvalue()
 
 
-def build_energy_mix_workbook(mix_monthly: pd.DataFrame, demand_monthly: pd.DataFrame) -> bytes:
+def build_energy_mix_workbook(mix_period: pd.DataFrame, demand_period: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        mix_export = mix_monthly.copy().sort_values(["month", "technology"])
-        demand_export = demand_monthly.copy().sort_values("month")
-        mix_export.to_excel(writer, index=False, sheet_name="mix_monthly")
-        demand_export.to_excel(writer, index=False, sheet_name="demand_monthly")
+        wrote_sheet = False
+
+        if not mix_period.empty:
+            mix_period.to_excel(writer, index=False, sheet_name="mix_period")
+            wrote_sheet = True
+
+        if not demand_period.empty:
+            demand_period.to_excel(writer, index=False, sheet_name="demand_period")
+            wrote_sheet = True
+
+        if not wrote_sheet:
+            pd.DataFrame({"info": ["No energy mix data available"]}).to_excel(
+                writer, index=False, sheet_name="info"
+            )
+
     output.seek(0)
     return output.getvalue()
 
@@ -661,17 +668,19 @@ def build_energy_mix_period(
         tmp["technology"] = tech
 
         if granularity == "Annual":
-            tmp["period"] = tmp["datetime"].dt.year.astype(str)
+            tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.year
 
         elif granularity == "Monthly":
             tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
-            tmp["period"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+            tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
 
         elif granularity == "Weekly":
-            tmp = tmp[
-                (tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel)
-            ].copy()
-            tmp["period"] = "W" + tmp["datetime"].dt.isocalendar().week.astype(str)
+            tmp = tmp[(tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel)].copy()
+            iso = tmp["datetime"].dt.isocalendar()
+            tmp["period_label"] = "W" + iso.week.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("W-MON").dt.start_time
 
         elif granularity == "Daily":
             week_end = week_start + timedelta(days=6)
@@ -679,40 +688,50 @@ def build_energy_mix_period(
                 (tmp["datetime"].dt.date >= week_start) &
                 (tmp["datetime"].dt.date <= week_end)
             ].copy()
-            tmp["period"] = tmp["datetime"].dt.strftime("%a %d-%b")
+            tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+            tmp["sort_key"] = tmp["datetime"].dt.normalize()
 
-        grouped = tmp.groupby(["period", "technology"], as_index=False)["energy_mwh"].sum()
+        grouped = (
+            tmp.groupby(["period_label", "technology", "sort_key"], as_index=False)["energy_mwh"]
+            .sum()
+        )
         frames.append(grouped)
 
-    mix_period = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["period", "technology", "energy_mwh"])
+    mix_period = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["period_label", "technology", "sort_key", "energy_mwh"]
+    )
 
     if not mix_period.empty:
         hydro = (
             mix_period[mix_period["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])]
-            .groupby("period", as_index=False)["energy_mwh"]
+            .groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"]
             .sum()
         )
         hydro["technology"] = "Hydro"
 
         keep = mix_period[~mix_period["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
-        mix_period = pd.concat([keep, hydro], ignore_index=True).groupby(["period", "technology"], as_index=False)["energy_mwh"].sum()
+        mix_period = pd.concat([keep, hydro], ignore_index=True).groupby(
+            ["period_label", "technology", "sort_key"], as_index=False
+        )["energy_mwh"].sum()
 
-    demand_period = pd.DataFrame(columns=["period", "demand_mwh"])
+    demand_period = pd.DataFrame(columns=["period_label", "sort_key", "demand_mwh"])
     if not demand_energy.empty:
         tmp = demand_energy.copy()
 
         if granularity == "Annual":
-            tmp["period"] = tmp["datetime"].dt.year.astype(str)
+            tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.year
 
         elif granularity == "Monthly":
             tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
-            tmp["period"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+            tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
 
         elif granularity == "Weekly":
-            tmp = tmp[
-                (tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel)
-            ].copy()
-            tmp["period"] = "W" + tmp["datetime"].dt.isocalendar().week.astype(str)
+            tmp = tmp[(tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel)].copy()
+            iso = tmp["datetime"].dt.isocalendar()
+            tmp["period_label"] = "W" + iso.week.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("W-MON").dt.start_time
 
         elif granularity == "Daily":
             week_end = week_start + timedelta(days=6)
@@ -720,9 +739,11 @@ def build_energy_mix_period(
                 (tmp["datetime"].dt.date >= week_start) &
                 (tmp["datetime"].dt.date <= week_end)
             ].copy()
-            tmp["period"] = tmp["datetime"].dt.strftime("%a %d-%b")
+            tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+            tmp["sort_key"] = tmp["datetime"].dt.normalize()
 
-        demand_period = tmp.groupby("period", as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "demand_mwh"})
+        demand_period = tmp.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"].sum()
+        demand_period = demand_period.rename(columns={"energy_mwh": "demand_mwh"})
 
     return mix_period, demand_period
 
@@ -731,12 +752,19 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
     if mix_period.empty:
         return None
 
+    period_order = (
+        mix_period[["period_label", "sort_key"]]
+        .drop_duplicates()
+        .sort_values("sort_key")
+    )
+    order_list = period_order["period_label"].tolist()
+
     stacked = alt.Chart(mix_period).mark_bar().encode(
-        x=alt.X("period:N", axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("energy_mwh:Q", title="Monthly generation / demand (MWh)"),
+        x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
+        y=alt.Y("energy_mwh:Q", title="Generation / demand (MWh)"),
         color=alt.Color("technology:N", title="Technology"),
         tooltip=[
-            alt.Tooltip("period:N", title="Period"),
+            alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("technology:N", title="Technology"),
             alt.Tooltip("energy_mwh:Q", title="Generation (MWh)", format=",.2f"),
         ],
@@ -744,10 +772,10 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 
     if not demand_period.empty:
         line = alt.Chart(demand_period).mark_line(point=True, color="#111827").encode(
-            x=alt.X("period:N", axis=alt.Axis(title=None, labelAngle=0)),
-            y=alt.Y("demand_mwh:Q", title="Monthly generation / demand (MWh)"),
+            x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
+            y=alt.Y("demand_mwh:Q", title="Generation / demand (MWh)"),
             tooltip=[
-                alt.Tooltip("period:N", title="Period"),
+                alt.Tooltip("period_label:N", title="Period"),
                 alt.Tooltip("demand_mwh:Q", title="Demand (MWh)", format=",.2f"),
             ],
         )
@@ -853,10 +881,8 @@ try:
 
     price_raw = price_raw[price_raw["datetime"].dt.date >= start_day].copy()
     price_raw = price_raw[price_raw["datetime"].dt.date <= date.today()].copy()
-
     solar_raw = solar_raw[solar_raw["datetime"].dt.date >= start_day].copy()
     solar_raw = solar_raw[solar_raw["datetime"].dt.date <= date.today()].copy()
-
     demand_raw = demand_raw[demand_raw["datetime"].dt.date >= start_day].copy()
     demand_raw = demand_raw[demand_raw["datetime"].dt.date <= date.today()].copy()
 
@@ -898,10 +924,7 @@ try:
         }
     )
     monthly_table = monthly_table[["Month", "Average monthly price", "Captured solar price (p48)", "Solar capture rate (%)"]]
-    st.dataframe(
-        style_table(monthly_table, pct_cols=["Solar capture rate (%)"]),
-        use_container_width=True,
-    )
+    render_table(monthly_table, pct_cols=["Solar capture rate (%)"])
 
     st.subheader("Selected day: price vs solar P48")
     min_date = price_hourly["datetime"].dt.date.min()
@@ -952,10 +975,7 @@ try:
             },
         ]
     )
-    st.dataframe(
-        style_table(metric_rows, pct_cols=["Solar capture rate (%)"]),
-        use_container_width=True,
-    )
+    render_table(metric_rows, pct_cols=["Solar capture rate (%)"])
 
     st.subheader("Average 24h hourly profile for selected period")
     c1, c2 = st.columns(2)
@@ -991,10 +1011,10 @@ try:
             hourly_profile = (
                 range_df.groupby("hour", as_index=False)["price"]
                 .mean()
-                .rename(columns={"price": "Average monthly price"})
+                .rename(columns={"price": "Average price (€/MWh)"})
                 .sort_values("hour")
             )
-            st.dataframe(style_table(hourly_profile), use_container_width=True)
+            render_table(hourly_profile)
 
     st.subheader("Energy mix")
 
@@ -1033,7 +1053,7 @@ try:
 
         elif granularity == "Weekly":
             monthly_options = sorted(
-                price_hourly["datetime"].dt.to_period("M").dt.to_timestamp().unique().tolist()
+                price_hourly["datetime"].dt.to_period("M").dt.to_timestamp().drop_duplicates().tolist()
             )
             month_sel = st.selectbox(
                 "Month",
@@ -1043,13 +1063,13 @@ try:
             )
 
         elif granularity == "Daily":
-            weekly_options = sorted(
-                pd.Series(price_hourly["datetime"].dt.date).drop_duplicates().tolist()
+            week_options = sorted(
+                price_hourly["datetime"].dt.to_period("W-MON").dt.start_time.dt.date.drop_duplicates().tolist()
             )
             week_start = st.selectbox(
                 "Week start",
-                options=weekly_options,
-                index=max(0, len(weekly_options) - 7),
+                options=week_options,
+                index=max(0, len(week_options) - 1),
             )
 
         mix_period, demand_period = build_energy_mix_period(
@@ -1065,96 +1085,25 @@ try:
         if chart is not None:
             st.altair_chart(chart, use_container_width=True)
 
-        if granularity in ["Annual", "Monthly"]:
-            if granularity == "Annual":
-                pie_month_candidates = sorted(
-                    pd.concat(
-                        [df["datetime"] for df in mix_energy.values() if not df.empty],
-                        ignore_index=True
-                    ).dt.to_period("M").dt.to_timestamp().unique().tolist()
-                )
-                selected_mix_month_ts = pd.Timestamp(pie_month_candidates[-1]) if pie_month_candidates else None
-            else:
-                selected_mix_month_ts = pd.Timestamp(f"{year_sel}-12-01").to_period("M").to_timestamp()
-
-            # monthly pie uses available monthly data from the selected year/month context
-            all_monthly_frames = []
-            for tech, df in mix_energy.items():
-                if df.empty:
-                    continue
-                tmp = df.copy()
-                tmp["technology"] = tech
-                tmp["month"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-                tmp = tmp.groupby(["month", "technology"], as_index=False)["energy_mwh"].sum()
-                all_monthly_frames.append(tmp)
-
-            if all_monthly_frames:
-                mix_monthly_all = pd.concat(all_monthly_frames, ignore_index=True)
-                hydro = (
-                    mix_monthly_all[mix_monthly_all["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])]
-                    .groupby(["month"], as_index=False)["energy_mwh"]
-                    .sum()
-                )
-                hydro["technology"] = "Hydro"
-                keep = mix_monthly_all[~mix_monthly_all["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
-                mix_monthly_all = pd.concat([keep, hydro], ignore_index=True).groupby(["month", "technology"], as_index=False)["energy_mwh"].sum()
-
-                if granularity == "Monthly":
-                    year_months = sorted(mix_monthly_all[mix_monthly_all["month"].dt.year == year_sel]["month"].unique().tolist())
-                    if year_months:
-                        month_for_pie = st.selectbox(
-                            "Pie chart month",
-                            options=year_months,
-                            format_func=lambda x: pd.Timestamp(x).strftime("%b - %Y"),
-                            index=len(year_months) - 1,
-                        )
-                    else:
-                        month_for_pie = None
-                else:
-                    all_months = sorted(mix_monthly_all["month"].unique().tolist())
-                    month_for_pie = st.selectbox(
-                        "Pie chart month",
-                        options=all_months,
-                        format_func=lambda x: pd.Timestamp(x).strftime("%b - %Y"),
-                        index=len(all_months) - 1,
-                    ) if all_months else None
-
-                if month_for_pie is not None:
-                    pie_df = mix_monthly_all[mix_monthly_all["month"] == month_for_pie].copy()
-                    pie_total = pie_df["energy_mwh"].sum()
-                    pie_df["Share (%)"] = pie_df["energy_mwh"] / pie_total
-                    pie = alt.Chart(pie_df).mark_arc().encode(
-                        theta="energy_mwh:Q",
-                        color=alt.Color("technology:N", title="Technology"),
-                        tooltip=[
-                            alt.Tooltip("technology:N", title="Technology"),
-                            alt.Tooltip("energy_mwh:Q", title="Generation (MWh)", format=",.2f"),
-                            alt.Tooltip("Share (%):Q", title="Share", format=".2%"),
-                        ],
-                    ).properties(height=320)
-                    st.altair_chart(pie, use_container_width=False)
-
         if not mix_period.empty:
             mix_table = (
                 mix_period.rename(columns={
-                    "period": "Period",
+                    "period_label": "Period",
                     "technology": "Technology",
                     "energy_mwh": "Generation (MWh)",
                 })
-                .sort_values(["Period", "Technology"])
+                .sort_values(["sort_key", "Technology"])
             )
             if not demand_period.empty:
                 mix_table = mix_table.merge(
-                    demand_period.rename(columns={"period": "Period", "demand_mwh": "Demand (MWh)"}),
+                    demand_period.rename(columns={"period_label": "Period", "demand_mwh": "Demand (MWh)"}),
                     on="Period",
                     how="left",
                 )
-            st.dataframe(style_table(mix_table), use_container_width=True)
+            mix_table = mix_table.drop(columns=[c for c in mix_table.columns if c == "sort_key"], errors="ignore")
+            render_table(mix_table)
 
-            mix_workbook = build_energy_mix_workbook(
-                mix_period.rename(columns={"period": "period", "technology": "technology", "energy_mwh": "energy_mwh"}),
-                demand_period.rename(columns={"period": "month"})
-            )
+            mix_workbook = build_energy_mix_workbook(mix_period, demand_period)
             st.download_button(
                 label="Download energy mix Excel",
                 data=mix_workbook,
@@ -1177,10 +1126,10 @@ try:
     )
 
     st.subheader("Raw price extraction (QH when available)")
-    st.dataframe(style_table(price_raw), use_container_width=True)
+    render_table(price_raw)
 
     st.subheader("Hourly averaged prices")
-    st.dataframe(style_table(price_hourly), use_container_width=True)
+    render_table(price_hourly)
 
     if st.button("Force refresh"):
         with st.spinner("Refreshing..."):
