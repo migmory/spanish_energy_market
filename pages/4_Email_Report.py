@@ -3,6 +3,7 @@ from pathlib import Path
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Email Report", layout="wide")
@@ -149,31 +150,6 @@ def format_preview_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd
     return out
 
 
-def style_preview_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
-    pct_cols = pct_cols or []
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols]
-
-    fmt = {c: "{:.2f}" for c in numeric_cols}
-    fmt.update({c: "{:.2%}" for c in pct_cols})
-
-    return (
-        df.style
-        .format(fmt)
-        .set_table_styles(
-            [
-                {
-                    "selector": "th",
-                    "props": [
-                        ("background-color", "#d1d5db"),
-                        ("color", "#111111"),
-                        ("font-weight", "bold"),
-                    ],
-                }
-            ]
-        )
-    )
-
-
 def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, report_day: date):
     day_price = price_hourly[price_hourly["datetime"].dt.date == report_day].copy()
     day_solar = solar_hourly[solar_hourly["datetime"].dt.date == report_day].copy()
@@ -264,10 +240,6 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
     return styles + html
 
 
-def chart_to_html(chart) -> str:
-    return chart.to_html()
-
-
 # Load data
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
 solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
@@ -335,16 +307,15 @@ if overlay_chart is not None:
     st.altair_chart(overlay_chart, use_container_width=True)
 
 st.subheader("Preview metrics")
-st.dataframe(style_preview_table(metrics_df, pct_cols=["Solar capture rate (%)"]), use_container_width=True)
+st.dataframe(metrics_df, use_container_width=True)
 
 st.subheader("Preview hourly table")
-st.dataframe(style_preview_table(preview_table), use_container_width=True)
+st.dataframe(preview_table, use_container_width=True)
 
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
-chart_html = chart_to_html(overlay_chart) if overlay_chart is not None else "<p>No chart available.</p>"
 
 email_html = f"""
 <html>
@@ -353,11 +324,6 @@ email_html = f"""
 
     <p><strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
        <strong>Captured solar price:</strong> {capture_text}</p>
-
-    <h3>Hourly price / Solar P48 chart</h3>
-    {chart_html}
-
-    <br>
 
     <h3>Summary metrics</h3>
     {metrics_html}
@@ -393,7 +359,38 @@ recipients_preview = pd.DataFrame(
 )
 st.dataframe(recipients_preview, use_container_width=True)
 
-st.info(
-    "This page is now in preview mode. "
-    "Daily automatic sending at 16:00 needs a separate scheduled script or service."
-)
+send_enabled = "mail_webhook_url" in st.secrets and "mail_webhook_token" in st.secrets
+
+if not send_enabled:
+    st.warning("Manual send button is not enabled yet. Add mail_webhook_url and mail_webhook_token to Secrets.")
+else:
+    if st.button("Send now"):
+        to_list = parse_emails(to_emails_raw)
+        cc_list = parse_emails(cc_emails_raw)
+
+        if not to_list:
+            st.error("Add at least one recipient in To.")
+        else:
+            payload = {
+                "token": st.secrets["mail_webhook_token"],
+                "to": to_list,
+                "cc": cc_list,
+                "subject": subject,
+                "html_body": email_html,
+                "report_day": report_day.isoformat(),
+            }
+
+            try:
+                resp = requests.post(
+                    st.secrets["mail_webhook_url"],
+                    json=payload,
+                    timeout=30,
+                )
+                if 200 <= resp.status_code < 300:
+                    st.success("Email request sent successfully.")
+                else:
+                    st.error(f"Webhook returned status {resp.status_code}: {resp.text}")
+            except Exception as e:
+                st.error(f"Send failed: {e}")
+
+st.info("For automatic daily sending at 16:00, use the same webhook from a scheduled Power Automate flow.")
