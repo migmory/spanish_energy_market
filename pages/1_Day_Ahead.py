@@ -127,6 +127,7 @@ def parse_esios_indicator(
     if "geo_id" not in df.columns:
         df["geo_id"] = None
 
+    # Spain only
     if (df["geo_id"] == 3).any():
         df = df[df["geo_id"] == 3].copy()
     else:
@@ -321,21 +322,32 @@ def style_table(df: pd.DataFrame, pct_cols: list[str] | None = None):
     fmt.update({c: "{:.2%}" for c in pct_cols})
 
     styler = styler.format(fmt)
+    styler = styler.set_properties(**{"text-align": "center", "vertical-align": "middle"})
     styler = styler.set_table_styles(
         [
             {
                 "selector": "th",
                 "props": [
-                    ("background-color", "#1f2937"),
-                    ("color", "white"),
+                    ("background-color", "#d1d5db"),
+                    ("color", "#111111"),
                     ("text-align", "center"),
                     ("font-weight", "bold"),
+                    ("border", "1px solid #c7ccd4"),
                 ],
             },
             {
                 "selector": "td",
                 "props": [
                     ("text-align", "center"),
+                    ("vertical-align", "middle"),
+                    ("border", "1px solid #e5e7eb"),
+                ],
+            },
+            {
+                "selector": "table",
+                "props": [
+                    ("width", "100%"),
+                    ("border-collapse", "collapse"),
                 ],
             },
         ]
@@ -430,6 +442,7 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
 
     chart_df = monthly_df.copy()
     chart_df["year"] = chart_df["month"].dt.year
+
     years_df = (
         chart_df.assign(
             year_start=lambda x: pd.to_datetime(x["year"].astype(str) + "-01-01"),
@@ -440,8 +453,10 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
         .sort_values("year")
     )
 
+    last_year = years_df["year"].max()
+    shaded_years_df = years_df[(years_df["year"] < last_year) & (((last_year - years_df["year"]) % 2) == 1)].copy()
+
     jan_df = years_df[["year_start"]].rename(columns={"year_start": "boundary"})
-    dec_df = years_df.assign(boundary=lambda x: x["year_end"] - pd.Timedelta(days=1))[["boundary"]]
 
     line_base = alt.Chart(chart_df).encode(
         x=alt.X(
@@ -466,25 +481,30 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
 
     top_chart = (spot_line + captured_line).properties(height=320)
 
-    year_band = alt.Chart(years_df).mark_rect(opacity=0.08, color="#9ca3af").encode(
+    year_band = alt.Chart(shaded_years_df).mark_rect(
+        opacity=0.08,
+        color="#9ca3af"
+    ).encode(
         x=alt.X("year_start:T", axis=None),
         x2="year_end:T",
     ).properties(height=34)
 
-    jan_rule = alt.Chart(jan_df).mark_rule(color="#6b7280", strokeWidth=1.5).encode(
+    jan_rule = alt.Chart(jan_df).mark_rule(
+        color="#6b7280",
+        strokeWidth=1.5
+    ).encode(
         x=alt.X("boundary:T", axis=None)
     ).properties(height=34)
 
-    dec_rule = alt.Chart(dec_df).mark_rule(color="#6b7280", strokeWidth=1.5).encode(
-        x=alt.X("boundary:T", axis=None)
-    ).properties(height=34)
-
-    year_text = alt.Chart(years_df).mark_text(baseline="middle", fontSize=12).encode(
+    year_text = alt.Chart(years_df).mark_text(
+        baseline="middle",
+        fontSize=12
+    ).encode(
         x=alt.X("year_mid:T", axis=None),
         text="year:N",
     ).properties(height=34)
 
-    bottom_band = year_band + jan_rule + dec_rule + year_text
+    bottom_band = year_band + jan_rule + year_text
 
     return alt.vconcat(top_chart, bottom_band, spacing=2).resolve_scale(x="shared")
 
@@ -545,8 +565,21 @@ def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) ->
 # =========================================================
 # ENERGY MIX
 # =========================================================
-def load_or_build_mix_indicator(name: str, indicator_id: int, start_day: date, token: str) -> pd.DataFrame:
-    csv_path = DATA_DIR / f"mix_{indicator_id}_{name.lower().replace(' ', '_').replace('/', '_')}.csv"
+def get_mix_indicator_csv_path(name: str, indicator_id: int) -> Path:
+    return DATA_DIR / f"mix_{indicator_id}_{name.lower().replace(' ', '_').replace('/', '_')}.csv"
+
+
+def load_mix_indicator_hourly(name: str, indicator_id: int) -> pd.DataFrame:
+    csv_path = get_mix_indicator_csv_path(name, indicator_id)
+    hist = load_raw_history(csv_path, f"esios_{indicator_id}")
+    hourly = to_hourly_mean(hist, value_col_name="mw")
+    if not hourly.empty:
+        hourly["technology"] = name
+    return hourly
+
+
+def refresh_mix_indicator_hourly(name: str, indicator_id: int, start_day: date, token: str) -> pd.DataFrame:
+    csv_path = get_mix_indicator_csv_path(name, indicator_id)
     hist = load_raw_history(csv_path, f"esios_{indicator_id}")
 
     if hist.empty:
@@ -568,7 +601,8 @@ def load_or_build_mix_indicator(name: str, indicator_id: int, start_day: date, t
         )
 
     hourly = to_hourly_mean(hist, value_col_name="mw")
-    hourly["technology"] = name
+    if not hourly.empty:
+        hourly["technology"] = name
     return hourly
 
 
@@ -578,10 +612,7 @@ def build_energy_mix_monthly(mix_hourly_dict: dict[str, pd.DataFrame], demand_ho
         if not df.empty:
             tmp = df.copy()
             tmp["month"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-            monthly = (
-                tmp.groupby(["month", "technology"], as_index=False)["mw"]
-                .sum()
-            )
+            monthly = tmp.groupby(["month", "technology"], as_index=False)["mw"].sum()
             mix_frames.append(monthly)
 
     mix_monthly = pd.concat(mix_frames, ignore_index=True) if mix_frames else pd.DataFrame(columns=["month", "technology", "mw"])
@@ -664,7 +695,7 @@ def build_energy_mix_charts(mix_monthly: pd.DataFrame, demand_monthly: pd.DataFr
 try:
     token = require_esios_token()
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1])
 
     with col1:
         start_day = st.date_input(
@@ -677,12 +708,17 @@ try:
     with col2:
         st.write("")
         st.write("")
-        if st.button("Rebuild history from selected start date"):
+        if st.button("Rebuild price/solar history"):
             clear_file(PRICE_RAW_CSV_PATH)
             clear_file(SOLAR_RAW_CSV_PATH)
             clear_file(DEMAND_RAW_CSV_PATH)
-            st.success("Historical files deleted. Reloading...")
+            st.success("Price, solar and demand files deleted. Reloading...")
             st.rerun()
+
+    with col3:
+        st.write("")
+        st.write("")
+        refresh_energy_mix = st.button("Refresh energy mix")
 
     price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
     solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
@@ -893,14 +929,22 @@ try:
             st.dataframe(style_table(hourly_profile), use_container_width=True)
 
     st.subheader("Energy mix")
+
     mix_hourly = {}
-    with st.spinner("Refreshing energy mix data..."):
+    if refresh_energy_mix:
+        with st.spinner("Refreshing energy mix data..."):
+            for tech_name, indicator_id in ENERGY_MIX_INDICATORS.items():
+                mix_hourly[tech_name] = refresh_mix_indicator_hourly(
+                    name=tech_name,
+                    indicator_id=indicator_id,
+                    start_day=start_day,
+                    token=token,
+                )
+    else:
         for tech_name, indicator_id in ENERGY_MIX_INDICATORS.items():
-            mix_hourly[tech_name] = load_or_build_mix_indicator(
+            mix_hourly[tech_name] = load_mix_indicator_hourly(
                 name=tech_name,
                 indicator_id=indicator_id,
-                start_day=start_day,
-                token=token,
             )
 
     mix_monthly, demand_monthly = build_energy_mix_monthly(mix_hourly, demand_hourly)
@@ -937,7 +981,7 @@ try:
             mix_table = mix_table[["Month", "Technology", "Monthly generation", "Share (%)"]]
             st.dataframe(style_table(mix_table, pct_cols=["Share (%)"]), use_container_width=True)
     else:
-        st.info("No energy mix data available yet.")
+        st.info("No energy mix data available yet. Press 'Refresh energy mix' once to build its historical cache.")
 
     st.subheader("Extraction workbook")
     st.write("Rows in raw prices:", len(price_raw))
