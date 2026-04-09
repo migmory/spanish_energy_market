@@ -11,6 +11,7 @@ pg = st.navigation([
     st.Page("pages/1_Day_Ahead.py", title="Day Ahead"),
     st.Page("pages/2_Forward_Market.py", title="Forward Market"),
     st.Page("pages/3_BESS.py", title="BESS"),
+    st.Page("pages/4_Email_Report.py", title="Email Report"),
 ])
 
 pg.run()
