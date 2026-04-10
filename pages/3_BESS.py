@@ -14,6 +14,10 @@ import streamlit as st
 st.set_page_config(page_title="BESS", layout="wide")
 st.title("BESS Optimisation")
 
+if "bess_admin_password" in st.secrets:
+    pwd = st.text_input("Password", type="password")
+    if pwd != st.secrets["bess_admin_password"]:
+        st.stop()
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "historical_data"
@@ -141,11 +145,8 @@ def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.Da
         tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
         tmp["year"] = tmp["Date"].dt.year
         tmp["hour_of_year"] = tmp.groupby("year").cumcount() + 1
-
-        # repeat first available uploaded profile across selected years
         source_year = sorted(tmp["year"].dropna().unique().tolist())[0]
         base = tmp[tmp["year"] == source_year][["hour_of_year", "generation"]].copy()
-
     else:
         tmp = df[[gen_col]].copy()
         tmp.columns = ["generation"]
@@ -172,6 +173,102 @@ def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.Da
     return pd.concat(rows, ignore_index=True)
 
 
+def normalize_private_price_upload(uploaded_file, target_years: list[int]) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file)
+    if df.empty:
+        raise ValueError("Uploaded private price file is empty.")
+
+    col_map = {c.lower().strip(): c for c in df.columns}
+    date_col = col_map.get("date")
+    hour_col = col_map.get("hour")
+
+    sell_col = None
+    buy_col = None
+    single_price_col = None
+
+    for candidate in ["omie_venta", "sell", "price_sell", "venta"]:
+        if candidate in col_map:
+            sell_col = col_map[candidate]
+            break
+
+    for candidate in ["omie_compra", "buy", "price_buy", "compra"]:
+        if candidate in col_map:
+            buy_col = col_map[candidate]
+            break
+
+    for candidate in ["price", "precio", "omie", "market_price"]:
+        if candidate in col_map:
+            single_price_col = col_map[candidate]
+            break
+
+    if single_price_col is None and (sell_col is None or buy_col is None):
+        raise ValueError("Private price file must contain either [Date, Hour, price] or [Date, Hour, omie_venta, omie_compra].")
+
+    if date_col and hour_col:
+        keep_cols = [date_col, hour_col]
+        if single_price_col:
+            keep_cols.append(single_price_col)
+        else:
+            keep_cols.extend([sell_col, buy_col])
+
+        tmp = df[keep_cols].copy()
+        rename_map = {date_col: "Date", hour_col: "Hour"}
+        if single_price_col:
+            rename_map[single_price_col] = "price"
+        else:
+            rename_map[sell_col] = "omie_venta"
+            rename_map[buy_col] = "omie_compra"
+        tmp = tmp.rename(columns=rename_map)
+
+        tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+        tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
+        tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
+        tmp["year"] = tmp["Date"].dt.year
+        tmp["hour_of_year"] = tmp.groupby("year").cumcount() + 1
+
+        source_year = sorted(tmp["year"].dropna().unique().tolist())[0]
+        if "price" in tmp.columns:
+            base = tmp[tmp["year"] == source_year][["hour_of_year", "price"]].copy()
+        else:
+            base = tmp[tmp["year"] == source_year][["hour_of_year", "omie_venta", "omie_compra"]].copy()
+    else:
+        if single_price_col:
+            base = df[[single_price_col]].copy()
+            base.columns = ["price"]
+        else:
+            base = df[[sell_col, buy_col]].copy()
+            base.columns = ["omie_venta", "omie_compra"]
+        for c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+        base = base.reset_index(drop=True)
+        base["hour_of_year"] = np.arange(1, len(base) + 1)
+
+    rows = []
+    for year in target_years:
+        h = hours_in_year(year)
+        idx = make_year_hour_index(year)
+        idx["hour_of_year"] = np.arange(1, len(idx) + 1)
+
+        year_base = base.iloc[:h].copy()
+        if len(year_base) < h:
+            year_base = year_base.reindex(range(h))
+            year_base["hour_of_year"] = np.arange(1, h + 1)
+
+        merged = idx.merge(year_base, on="hour_of_year", how="left")
+
+        if "price" in merged.columns:
+            merged["price"] = pd.to_numeric(merged["price"], errors="coerce").ffill().bfill()
+            merged["omie_venta"] = merged["price"]
+            merged["omie_compra"] = merged["price"]
+        else:
+            merged["omie_venta"] = pd.to_numeric(merged["omie_venta"], errors="coerce").ffill().bfill()
+            merged["omie_compra"] = pd.to_numeric(merged["omie_compra"], errors="coerce").ffill().bfill()
+
+        rows.append(merged[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]])
+
+    return pd.concat(rows, ignore_index=True)
+
+
 def build_template_generation_excel(template_year: int) -> bytes:
     idx = make_year_hour_index(template_year)
     out = idx[["Date", "Hour"]].copy()
@@ -184,15 +281,24 @@ def build_template_generation_excel(template_year: int) -> bytes:
     return bio.getvalue()
 
 
+def build_template_private_price_excel(template_year: int) -> bytes:
+    idx = make_year_hour_index(template_year)
+    out = idx[["Date", "Hour"]].copy()
+    out["price"] = ""
+
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="private_price_template")
+    bio.seek(0)
+    return bio.getvalue()
+
+
 def choose_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) -> pd.DataFrame:
     if price_hourly.empty:
         raise ValueError("No hourly electricity price history found. Build Day Ahead first.")
 
     available_years = sorted(price_hourly["year"].unique().tolist())
-    if target_year in available_years:
-        src_year = target_year
-    else:
-        src_year = max(available_years)
+    src_year = target_year if target_year in available_years else max(available_years)
 
     src = price_hourly[price_hourly["year"] == src_year].copy()
     src = src.sort_values("timestamp").reset_index(drop=True)
@@ -257,11 +363,17 @@ def build_dataset(
     price_hourly: pd.DataFrame,
     default_data: pd.DataFrame,
     uploaded_generation_file=None,
+    uploaded_private_price_file=None,
+    use_private_prices: bool = False,
 ) -> pd.DataFrame:
-    price_rows = []
-    for year in years:
-        price_rows.append(choose_price_profile_for_year(price_hourly, year))
-    prices = pd.concat(price_rows, ignore_index=True).rename(columns={"price": "omie_venta"})
+    if use_private_prices and uploaded_private_price_file is not None:
+        prices = normalize_private_price_upload(uploaded_private_price_file, years)
+    else:
+        price_rows = []
+        for year in years:
+            price_rows.append(choose_price_profile_for_year(price_hourly, year))
+        prices = pd.concat(price_rows, ignore_index=True).rename(columns={"price": "omie_venta"})
+        prices["omie_compra"] = prices["omie_venta"]
 
     default_gen, default_load = build_generic_vectors(default_data, years)
 
@@ -279,12 +391,14 @@ def build_dataset(
     df["consumption"] = df["consumption"].fillna(0.0)
 
     if mode == "BESS standalone":
-        df["omie_compra"] = df["omie_venta"]
+        if not use_private_prices:
+            df["omie_compra"] = df["omie_venta"]
         df["generation"] = 0.0
         df["consumption"] = 0.0
 
     elif mode == "BESS con demanda":
-        df["omie_compra"] = df["omie_venta"]
+        if not use_private_prices:
+            df["omie_compra"] = df["omie_venta"]
 
     elif mode == "BESS sin demanda":
         df["omie_compra"] = 1000.0
@@ -365,9 +479,6 @@ def optimize_day_pulp(
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     model.solve(solver)
-
-    if pulp.LpStatus[model.status] not in {"Optimal", "Not Solved", "Undefined", "Infeasible"}:
-        raise RuntimeError(f"Unexpected optimization status: {pulp.LpStatus[model.status]}")
 
     def vals(var_dict):
         return [pulp.value(var_dict[i]) if pulp.value(var_dict[i]) is not None else 0.0 for i in range(n)]
@@ -525,35 +636,52 @@ with left:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    st.markdown("### Private prices")
+    use_private_prices = st.checkbox("Use private uploaded price file", value=False)
+    private_price_password_ok = False
+    uploaded_private_prices = None
+
+    if use_private_prices:
+        private_pwd = st.text_input("Private price password", type="password")
+        secret_pwd = st.secrets.get("private_price_upload_password", "")
+
+        if private_pwd and private_pwd == secret_pwd:
+            private_price_password_ok = True
+            uploaded_private_prices = st.file_uploader(
+                "Upload private prices Excel",
+                type=["xlsx"],
+                help="Accepted columns: Date, Hour, price OR Date, Hour, omie_venta, omie_compra",
+                key="private_price_upload",
+            )
+        elif private_pwd:
+            st.error("Incorrect private price password.")
+
+        private_template = build_template_private_price_excel(template_year)
+        st.download_button(
+            "Download private price template",
+            data=private_template,
+            file_name=f"private_price_template_{template_year}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     run_button = st.button("Run optimisation", type="primary")
 
 with right:
     st.markdown("### Scenario rules")
     if mode == "BESS standalone":
-        st.info(
-            "omie_venta = OMIE, omie_compra = OMIE, generacion = 0, consumo = 0"
-        )
+        st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
     elif mode == "BESS con demanda":
-        st.info(
-            "omie_venta = OMIE, omie_compra = OMIE, generacion = uploaded/default profile, consumo = generic vector from data.xlsx"
-        )
+        st.info("omie_venta = price, omie_compra = same price, generacion = uploaded/default profile, consumo = generic vector from data.xlsx")
     else:
-        st.info(
-            "omie_venta = OMIE, omie_compra = 1000, generacion = uploaded/default profile, consumo = generic vector from data.xlsx"
-        )
+        st.info("omie_venta = price, omie_compra = 1000, generacion = uploaded/default profile, consumo = generic vector from data.xlsx")
+
+    if use_private_prices:
+        st.warning("Private uploaded prices will replace OMIE wherever applicable.")
 
     if DEFAULT_DATA_XLSX.exists():
         st.success("Default generic vectors found in data.xlsx")
     else:
         st.warning("data.xlsx not found. Generic generation/consumption vectors will default to zero.")
-
-    if DEFAULT_INPUTS_XLSX.exists():
-        try:
-            preview_inputs = pd.read_excel(DEFAULT_INPUTS_XLSX)
-            st.markdown("### inputs.xlsx preview")
-            st.dataframe(preview_inputs.head(10), use_container_width=True)
-        except Exception:
-            pass
 
 # =========================================================
 # RUN
@@ -567,6 +695,14 @@ if run_button:
         st.error("Upload a generation Excel file or untick the custom generation option.")
         st.stop()
 
+    if use_private_prices:
+        if not private_price_password_ok:
+            st.error("Private price password is required and must be correct.")
+            st.stop()
+        if uploaded_private_prices is None:
+            st.error("Upload a private prices Excel file.")
+            st.stop()
+
     try:
         with st.spinner("Building hourly dataset..."):
             data_used = build_dataset(
@@ -575,6 +711,8 @@ if run_button:
                 price_hourly=price_hourly,
                 default_data=default_data,
                 uploaded_generation_file=uploaded_generation,
+                uploaded_private_price_file=uploaded_private_prices,
+                use_private_prices=use_private_prices,
             )
 
         st.subheader("Hourly dataset used")
@@ -604,6 +742,7 @@ if run_button:
                     "eta_ch",
                     "eta_dis",
                     "uploaded_generation",
+                    "use_private_prices",
                 ],
                 "value": [
                     mode,
@@ -613,6 +752,7 @@ if run_button:
                     eta_ch,
                     eta_dis,
                     "yes" if uploaded_generation is not None else "no",
+                    "yes" if use_private_prices else "no",
                 ],
             }
         )
