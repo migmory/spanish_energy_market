@@ -4,3 +4,4 @@ requests
 python-dotenv
 openpyxl
 matplotlib
+vl-convert-python
