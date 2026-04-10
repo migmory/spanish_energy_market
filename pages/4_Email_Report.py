@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 from pathlib import Path
+import base64
 
 import altair as alt
 import pandas as pd
@@ -22,7 +23,8 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "historical_data"
 
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
-SOLAR_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
+SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
+SOLAR_FORECAST_RAW_CSV_PATH = DATA_DIR / "solar_forecast_spain_542_raw.csv"
 
 
 def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
@@ -70,6 +72,51 @@ def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
     return out
 
 
+def build_best_solar_hourly(
+    solar_p48_hourly: pd.DataFrame,
+    solar_forecast_hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    base_cols = ["datetime", "source", "geo_name", "geo_id"]
+    p48 = solar_p48_hourly.copy()
+    fc = solar_forecast_hourly.copy()
+
+    if p48.empty and fc.empty:
+        return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
+
+    if p48.empty:
+        out = fc.rename(columns={"solar_forecast_mw": "solar_best_mw"}).copy()
+        out["solar_source"] = "Forecast"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    if fc.empty:
+        out = p48.rename(columns={"solar_p48_mw": "solar_best_mw"}).copy()
+        out["solar_source"] = "P48"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    merged = p48[base_cols + ["solar_p48_mw"]].merge(
+        fc[base_cols + ["solar_forecast_mw"]],
+        on="datetime",
+        how="outer",
+        suffixes=("_p48", "_fc"),
+    )
+
+    merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
+    merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
+    merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
+
+    merged["source"] = "best_solar"
+    merged["geo_name"] = merged.get("geo_name_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
+    )
+    merged["geo_id"] = merged.get("geo_id_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
+    )
+
+    out = merged[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
 def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> dict:
     period_price = price_hourly[
         (price_hourly["datetime"].dt.date >= start_d)
@@ -83,12 +130,12 @@ def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
 
     avg_price = period_price["price"].mean() if not period_price.empty else None
 
-    merged = period_price.merge(period_solar[["datetime", "solar_p48_mw"]], on="datetime", how="left")
-    merged["solar_p48_mw"] = merged["solar_p48_mw"].fillna(0.0)
-    merged = merged[merged["solar_p48_mw"] > 0].copy()
+    merged = period_price.merge(period_solar[["datetime", "solar_best_mw"]], on="datetime", how="left")
+    merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+    merged = merged[merged["solar_best_mw"] > 0].copy()
 
     if not merged.empty:
-        captured = (merged["price"] * merged["solar_p48_mw"]).sum() / merged["solar_p48_mw"].sum()
+        captured = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
     else:
         captured = None
 
@@ -155,26 +202,28 @@ def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, 
     day_solar = solar_hourly[solar_hourly["datetime"].dt.date == report_day].copy()
 
     merged = day_price.merge(
-        day_solar[["datetime", "solar_p48_mw"]],
+        day_solar[["datetime", "solar_best_mw", "solar_source"]],
         on="datetime",
         how="left",
     )
-    merged["solar_p48_mw"] = merged["solar_p48_mw"].fillna(0.0)
+    merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+    merged["solar_source"] = merged["solar_source"].fillna("No data")
 
-    positive_solar = merged[merged["solar_p48_mw"] > 0].copy()
+    positive_solar = merged[merged["solar_best_mw"] > 0].copy()
     capture_price = None
     if not positive_solar.empty:
-        capture_price = (positive_solar["price"] * positive_solar["solar_p48_mw"]).sum() / positive_solar["solar_p48_mw"].sum()
+        capture_price = (positive_solar["price"] * positive_solar["solar_best_mw"]).sum() / positive_solar["solar_best_mw"].sum()
 
     merged["Hour"] = merged["datetime"].dt.strftime("%H:%M")
     merged = merged.rename(
         columns={
             "price": "Price (€/MWh)",
-            "solar_p48_mw": "Solar P48 (MW)",
+            "solar_best_mw": "Solar (MW)",
+            "solar_source": "Solar source",
         }
     )
 
-    return merged[["datetime", "Hour", "Price (€/MWh)", "Solar P48 (MW)"]].copy(), capture_price
+    return merged[["datetime", "Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy(), capture_price
 
 
 def build_overlay_chart(hourly_df: pd.DataFrame):
@@ -192,7 +241,8 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
             tooltip=[
                 alt.Tooltip("Hour:N", title="Hour"),
                 alt.Tooltip("Price (€/MWh):Q", title="Price", format=".2f"),
-                alt.Tooltip("Solar P48 (MW):Q", title="Solar P48", format=".2f"),
+                alt.Tooltip("Solar (MW):Q", title="Solar", format=".2f"),
+                alt.Tooltip("Solar source:N", title="Solar source"),
             ],
         )
     )
@@ -202,11 +252,21 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
         .mark_area(opacity=0.25)
         .encode(
             x=base_x,
-            y=alt.Y("Solar P48 (MW):Q", title="Solar P48 (MW)"),
+            y=alt.Y("Solar (MW):Q", title="Solar (MW)"),
         )
     )
 
     return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
+
+
+def chart_to_base64_png(chart) -> str | None:
+    if chart is None:
+        return None
+    try:
+        png_bytes = chart.to_image(format="png")
+        return base64.b64encode(png_bytes).decode("utf-8")
+    except Exception:
+        return None
 
 
 def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
@@ -242,14 +302,17 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
 
 # Load data
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
-solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
+solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
+solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
 
 if price_raw.empty:
     st.error("No price history found yet. Build Day Ahead first.")
     st.stop()
 
 price_hourly = to_hourly_mean(price_raw, value_col_name="price")
-solar_hourly = to_hourly_mean(solar_raw, value_col_name="solar_p48_mw")
+solar_p48_hourly = to_hourly_mean(solar_p48_raw, value_col_name="solar_p48_mw")
+solar_forecast_hourly = to_hourly_mean(solar_forecast_raw, value_col_name="solar_forecast_mw")
+solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
 
 latest_available_day = price_hourly["datetime"].dt.date.max()
 tomorrow = date.today() + timedelta(days=1)
@@ -299,8 +362,9 @@ if hourly_df.empty:
     st.stop()
 
 metrics_df = make_metrics_df(price_hourly, solar_hourly, report_day)
-preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar P48 (MW)"]].copy()
+preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy()
 overlay_chart = build_overlay_chart(hourly_df)
+chart_b64 = chart_to_base64_png(overlay_chart)
 
 st.subheader("Preview chart")
 if overlay_chart is not None:
@@ -313,17 +377,31 @@ st.subheader("Preview hourly table")
 st.dataframe(preview_table, use_container_width=True)
 
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
+day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
 
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
+
+chart_html = ""
+if chart_b64:
+    chart_html = f"""
+    <h3>Hourly chart</h3>
+    <img src="data:image/png;base64,{chart_b64}" alt="Hourly chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+    <br><br>
+    """
 
 email_html = f"""
 <html>
   <body style="font-family: Arial, sans-serif; font-size: 13px; color: #111111;">
     <p>{intro_text.replace(chr(10), '<br>')}</p>
 
-    <p><strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
-       <strong>Captured solar price:</strong> {capture_text}</p>
+    <p>
+      <strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
+      <strong>Captured solar price:</strong> {capture_text}<br>
+      <strong>Solar source used:</strong> {day_sources}
+    </p>
+
+    {chart_html}
 
     <h3>Summary metrics</h3>
     {metrics_html}
