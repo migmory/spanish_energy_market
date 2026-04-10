@@ -24,11 +24,13 @@ DATA_DIR = BASE_DIR / "historical_data"
 DATA_DIR.mkdir(exist_ok=True)
 
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
-SOLAR_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
+SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
+SOLAR_FORECAST_RAW_CSV_PATH = DATA_DIR / "solar_forecast_spain_542_raw.csv"
 DEMAND_RAW_CSV_PATH = DATA_DIR / "demand_p48_total_10027_raw.csv"
 
 PRICE_INDICATOR_ID = 600
-SOLAR_INDICATOR_ID = 84
+SOLAR_P48_INDICATOR_ID = 84
+SOLAR_FORECAST_INDICATOR_ID = 542
 DEMAND_INDICATOR_ID = 10027
 
 ENERGY_MIX_INDICATORS = {
@@ -372,6 +374,54 @@ def refresh_raw_history(
 
 
 # =========================================================
+# SOLAR BEST SERIES
+# =========================================================
+def build_best_solar_hourly(
+    solar_p48_hourly: pd.DataFrame,
+    solar_forecast_hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    base_cols = ["datetime", "source", "geo_name", "geo_id"]
+    p48 = solar_p48_hourly.copy()
+    fc = solar_forecast_hourly.copy()
+
+    if p48.empty and fc.empty:
+        return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
+
+    if p48.empty:
+        out = fc.rename(columns={"solar_forecast_mw": "solar_best_mw"}).copy()
+        out["solar_source"] = "Forecast"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    if fc.empty:
+        out = p48.rename(columns={"solar_p48_mw": "solar_best_mw"}).copy()
+        out["solar_source"] = "P48"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    merged = p48[base_cols + ["solar_p48_mw"]].merge(
+        fc[base_cols + ["solar_forecast_mw"]],
+        on="datetime",
+        how="outer",
+        suffixes=("_p48", "_fc"),
+    )
+
+    merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
+    merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
+    merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
+
+    merged["source"] = "best_solar"
+    merged["geo_name"] = merged.get("geo_name_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
+    )
+    merged["geo_id"] = merged.get("geo_id_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
+    )
+
+    out = merged[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+# =========================================================
 # ANALYTICS
 # =========================================================
 def compute_monthly_avg(hourly_price_df: pd.DataFrame) -> pd.DataFrame:
@@ -394,23 +444,23 @@ def compute_monthly_captured_price(price_hourly: pd.DataFrame, solar_hourly: pd.
         return pd.DataFrame(columns=["month", "captured_solar_price", "capture_pct"])
 
     merged = price_hourly.merge(
-        solar_hourly[["datetime", "solar_p48_mw"]],
+        solar_hourly[["datetime", "solar_best_mw"]],
         on="datetime",
         how="inner",
     )
 
-    merged = merged[merged["solar_p48_mw"] > 0].copy()
+    merged = merged[merged["solar_best_mw"] > 0].copy()
     if merged.empty:
         return pd.DataFrame(columns=["month", "captured_solar_price", "capture_pct"])
 
     merged["month"] = merged["datetime"].dt.to_period("M").dt.to_timestamp()
-    merged["weighted_price"] = merged["price"] * merged["solar_p48_mw"]
+    merged["weighted_price"] = merged["price"] * merged["solar_best_mw"]
 
     out = (
         merged.groupby("month", as_index=False)
         .agg(
             weighted_price_sum=("weighted_price", "sum"),
-            solar_sum=("solar_p48_mw", "sum"),
+            solar_sum=("solar_best_mw", "sum"),
             avg_monthly_price=("price", "mean"),
         )
     )
@@ -433,11 +483,11 @@ def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
 
     avg_price = period_price["price"].mean() if not period_price.empty else None
 
-    merged = period_price.merge(period_solar[["datetime", "solar_p48_mw"]], on="datetime", how="inner")
-    merged = merged[merged["solar_p48_mw"] > 0].copy()
+    merged = period_price.merge(period_solar[["datetime", "solar_best_mw"]], on="datetime", how="inner")
+    merged = merged[merged["solar_best_mw"] > 0].copy()
 
     if not merged.empty:
-        captured = (merged["price"] * merged["solar_p48_mw"]).sum() / merged["solar_p48_mw"].sum()
+        captured = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
     else:
         captured = None
 
@@ -481,7 +531,7 @@ def build_monthly_combo_chart(monthly_df: pd.DataFrame):
         tooltip=[
             alt.Tooltip("month:T", title="Month"),
             alt.Tooltip("avg_monthly_price:Q", title="Average monthly price", format=".2f"),
-            alt.Tooltip("captured_solar_price:Q", title="Captured solar price (p48)", format=".2f"),
+            alt.Tooltip("captured_solar_price:Q", title="Captured solar price", format=".2f"),
             alt.Tooltip("capture_pct:Q", title="Solar capture rate (%)", format=".2%"),
         ],
     )
@@ -531,10 +581,11 @@ def build_day_overlay_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame):
 
     solar_area = alt.Chart(day_solar).mark_area(opacity=0.25).encode(
         x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0)),
-        y=alt.Y("solar_p48_mw:Q", title="Solar P48 MW"),
+        y=alt.Y("solar_best_mw:Q", title="Solar MW"),
         tooltip=[
             alt.Tooltip("datetime:T", title="Time"),
-            alt.Tooltip("solar_p48_mw:Q", title="Solar P48", format=".2f"),
+            alt.Tooltip("solar_best_mw:Q", title="Solar", format=".2f"),
+            alt.Tooltip("solar_source:N", title="Solar source"),
         ],
     )
 
@@ -742,13 +793,15 @@ try:
 
     if rebuild_hist:
         clear_file(PRICE_RAW_CSV_PATH)
-        clear_file(SOLAR_RAW_CSV_PATH)
+        clear_file(SOLAR_P48_RAW_CSV_PATH)
+        clear_file(SOLAR_FORECAST_RAW_CSV_PATH)
         clear_file(DEMAND_RAW_CSV_PATH)
-        st.success("Price, solar and demand files deleted. Reloading...")
+        st.success("Price, solar P48, solar forecast and demand files deleted. Reloading...")
         st.rerun()
 
     price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
-    solar_raw = load_raw_history(SOLAR_RAW_CSV_PATH, "esios_84")
+    solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
+    solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
     demand_raw = load_raw_history(DEMAND_RAW_CSV_PATH, "esios_10027")
 
     if price_raw.empty:
@@ -758,12 +811,19 @@ try:
         with st.spinner("Refreshing recent price data..."):
             price_raw = refresh_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, price_raw, token, 10)
 
-    if solar_raw.empty:
+    if solar_p48_raw.empty:
         with st.spinner("Building solar P48 history..."):
-            solar_raw = build_raw_history(SOLAR_INDICATOR_ID, "esios_84", SOLAR_RAW_CSV_PATH, start_day, token)
+            solar_p48_raw = build_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, start_day, token)
     else:
         with st.spinner("Refreshing recent solar P48 data..."):
-            solar_raw = refresh_raw_history(SOLAR_INDICATOR_ID, "esios_84", SOLAR_RAW_CSV_PATH, solar_raw, token, 10)
+            solar_p48_raw = refresh_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, solar_p48_raw, token, 10)
+
+    if solar_forecast_raw.empty:
+        with st.spinner("Building solar forecast history..."):
+            solar_forecast_raw = build_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, start_day, token)
+    else:
+        with st.spinner("Refreshing recent solar forecast data..."):
+            solar_forecast_raw = refresh_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, solar_forecast_raw, token, 10)
 
     if demand_raw.empty:
         with st.spinner("Building demand P48 history..."):
@@ -775,7 +835,8 @@ try:
     max_allowed_day = max_refresh_day()
 
     price_raw = price_raw[(price_raw["datetime"].dt.date >= start_day) & (price_raw["datetime"].dt.date <= max_allowed_day)].copy()
-    solar_raw = solar_raw[(solar_raw["datetime"].dt.date >= start_day) & (solar_raw["datetime"].dt.date <= max_allowed_day)].copy()
+    solar_p48_raw = solar_p48_raw[(solar_p48_raw["datetime"].dt.date >= start_day) & (solar_p48_raw["datetime"].dt.date <= max_allowed_day)].copy()
+    solar_forecast_raw = solar_forecast_raw[(solar_forecast_raw["datetime"].dt.date >= start_day) & (solar_forecast_raw["datetime"].dt.date <= max_allowed_day)].copy()
     demand_raw = demand_raw[(demand_raw["datetime"].dt.date >= start_day) & (demand_raw["datetime"].dt.date <= max_allowed_day)].copy()
 
     if price_raw.empty:
@@ -783,7 +844,9 @@ try:
         st.stop()
 
     price_hourly = to_hourly_mean(price_raw, "price")
-    solar_hourly = to_hourly_mean(solar_raw, "solar_p48_mw")
+    solar_p48_hourly = to_hourly_mean(solar_p48_raw, "solar_p48_mw")
+    solar_forecast_hourly = to_hourly_mean(solar_forecast_raw, "solar_forecast_mw")
+    solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
     demand_energy = to_energy_intervals(demand_raw, "demand_p48_mw", "energy_mwh")
 
     monthly_avg = compute_monthly_avg(price_hourly)
@@ -799,15 +862,15 @@ try:
     monthly_table["Month"] = monthly_table["month"].dt.strftime("%b - %Y")
     monthly_table = monthly_table.rename(columns={
         "avg_monthly_price": "Average monthly price",
-        "captured_solar_price": "Captured solar price (p48)",
+        "captured_solar_price": "Captured solar price",
         "capture_pct": "Solar capture rate (%)",
     })
     st.dataframe(
-        styled_df(monthly_table[["Month", "Average monthly price", "Captured solar price (p48)", "Solar capture rate (%)"]], pct_cols=["Solar capture rate (%)"]),
+        styled_df(monthly_table[["Month", "Average monthly price", "Captured solar price", "Solar capture rate (%)"]], pct_cols=["Solar capture rate (%)"]),
         use_container_width=True,
     )
 
-    st.subheader("Selected day: price vs solar P48")
+    st.subheader("Selected day: price vs solar")
     min_date = price_hourly["datetime"].dt.date.min()
     max_date = price_hourly["datetime"].dt.date.max()
 
@@ -822,6 +885,10 @@ try:
     day_price = price_hourly[price_hourly["datetime"].dt.date == selected_day].copy()
     day_solar = solar_hourly[solar_hourly["datetime"].dt.date == selected_day].copy()
 
+    if not day_solar.empty:
+        day_source_text = ", ".join(sorted(day_solar["solar_source"].dropna().unique().tolist()))
+        st.caption(f"Solar source used for selected day: {day_source_text}")
+
     overlay_chart = build_day_overlay_chart(day_price, day_solar)
     if overlay_chart is not None:
         st.altair_chart(overlay_chart, use_container_width=True)
@@ -835,9 +902,9 @@ try:
 
     st.subheader("Spot / captured metrics")
     metric_rows = pd.DataFrame([
-        {"Period": "Day", "Average monthly price": day_metrics["avg_price"], "Captured solar price (p48)": day_metrics["captured"], "Solar capture rate (%)": day_metrics["capture_pct"]},
-        {"Period": "MTD", "Average monthly price": mtd_metrics["avg_price"], "Captured solar price (p48)": mtd_metrics["captured"], "Solar capture rate (%)": mtd_metrics["capture_pct"]},
-        {"Period": "YTD", "Average monthly price": ytd_metrics["avg_price"], "Captured solar price (p48)": ytd_metrics["captured"], "Solar capture rate (%)": ytd_metrics["capture_pct"]},
+        {"Period": "Day", "Average monthly price": day_metrics["avg_price"], "Captured solar price": day_metrics["captured"], "Solar capture rate (%)": day_metrics["capture_pct"]},
+        {"Period": "MTD", "Average monthly price": mtd_metrics["avg_price"], "Captured solar price": mtd_metrics["captured"], "Solar capture rate (%)": mtd_metrics["capture_pct"]},
+        {"Period": "YTD", "Average monthly price": ytd_metrics["avg_price"], "Captured solar price": ytd_metrics["captured"], "Solar capture rate (%)": ytd_metrics["capture_pct"]},
     ])
     st.dataframe(styled_df(metric_rows, pct_cols=["Solar capture rate (%)"]), use_container_width=True)
 
@@ -935,6 +1002,9 @@ try:
     st.subheader("Extraction workbook")
     st.write("Rows in raw prices:", len(price_raw))
     st.write("Rows in hourly prices:", len(price_hourly))
+    st.write("Rows in raw solar P48:", len(solar_p48_raw))
+    st.write("Rows in raw solar forecast:", len(solar_forecast_raw))
+    st.write("Rows in hourly solar best:", len(solar_hourly))
 
     workbook_bytes = build_price_workbook(price_raw, price_hourly)
     st.download_button(
@@ -950,10 +1020,14 @@ try:
     st.subheader("Hourly averaged prices")
     st.dataframe(styled_df(price_hourly.head(500)), use_container_width=True)
 
+    st.subheader("Solar hourly series used in analytics")
+    st.dataframe(styled_df(solar_hourly.head(500)), use_container_width=True)
+
     if st.button("Force refresh"):
         with st.spinner("Refreshing..."):
             price_raw = refresh_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, price_raw, token, 10)
-            solar_raw = refresh_raw_history(SOLAR_INDICATOR_ID, "esios_84", SOLAR_RAW_CSV_PATH, solar_raw, token, 10)
+            solar_p48_raw = refresh_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, solar_p48_raw, token, 10)
+            solar_forecast_raw = refresh_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, solar_forecast_raw, token, 10)
             demand_raw = refresh_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, demand_raw, token, 10)
         st.success("Data refreshed.")
         st.rerun()
