@@ -26,6 +26,36 @@ PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
 SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
 SOLAR_FORECAST_RAW_CSV_PATH = DATA_DIR / "solar_forecast_spain_542_raw.csv"
 
+ENERGY_MIX_INDICATORS_OFFICIAL = {
+    "Nuclear": 74,
+    "CCGT": 79,
+    "Wind": 10010,
+    "Solar PV": 84,
+    "Solar thermal": 85,
+    "Hydro UGH": 71,
+    "Hydro non-UGH": 72,
+    "Pumped hydro": 73,
+    "CHP": 10011,
+    "Biomass": 91,
+    "Biogas": 92,
+    "Other renewables": 10013,
+}
+
+ENERGY_MIX_INDICATORS_FORECAST = {
+    "Nuclear": None,
+    "CCGT": None,
+    "Wind": None,
+    "Solar PV": 542,
+    "Solar thermal": 543,
+    "Hydro UGH": None,
+    "Hydro non-UGH": None,
+    "Pumped hydro": None,
+    "CHP": None,
+    "Biomass": None,
+    "Biogas": None,
+    "Other renewables": None,
+}
+
 
 def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
     if not csv_path.exists():
@@ -72,6 +102,20 @@ def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
     return out
 
 
+def to_energy_intervals(df: pd.DataFrame, value_col_name: str, energy_col_name: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"])
+
+    out = df.copy()
+    out[value_col_name] = pd.to_numeric(out["value"], errors="coerce")
+    out["interval_h"] = 1.0
+    out[energy_col_name] = out[value_col_name] * out["interval_h"]
+
+    out = out[["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
 def build_best_solar_hourly(
     solar_p48_hourly: pd.DataFrame,
     solar_forecast_hourly: pd.DataFrame,
@@ -115,6 +159,111 @@ def build_best_solar_hourly(
     out = merged[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].copy()
     out = out.sort_values("datetime").reset_index(drop=True)
     return out
+
+
+def get_mix_indicator_csv_path_variant(name: str, indicator_id: int | None, variant: str) -> Path:
+    safe_name = name.lower().replace(" ", "_").replace("/", "_")
+    suffix = "none" if indicator_id is None else str(indicator_id)
+    return DATA_DIR / f"mix_{variant}_{suffix}_{safe_name}.csv"
+
+
+def build_best_mix_energy(
+    official_energy: pd.DataFrame,
+    forecast_energy: pd.DataFrame,
+    tech_name: str,
+) -> pd.DataFrame:
+    if official_energy.empty and forecast_energy.empty:
+        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "technology", "data_source"])
+
+    if official_energy.empty:
+        out = forecast_energy.copy()
+        out["technology"] = tech_name
+        out["data_source"] = "Forecast"
+        return out
+
+    if forecast_energy.empty:
+        out = official_energy.copy()
+        out["technology"] = tech_name
+        out["data_source"] = "Official"
+        return out
+
+    off = official_energy[["datetime", "mw", "energy_mwh"]].copy()
+    off = off.rename(columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"})
+
+    fc = forecast_energy[["datetime", "mw", "energy_mwh"]].copy()
+    fc = fc.rename(columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"})
+
+    merged = off.merge(fc, on="datetime", how="outer")
+    merged["mw"] = merged["mw_official"].combine_first(merged["mw_forecast"])
+    merged["energy_mwh"] = merged["energy_mwh_official"].combine_first(merged["energy_mwh_forecast"])
+    merged["data_source"] = merged["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
+    merged.loc[merged["data_source"].isna() & merged["mw_forecast"].notna(), "data_source"] = "Forecast"
+    merged["technology"] = tech_name
+
+    out = merged[["datetime", "mw", "energy_mwh", "technology", "data_source"]].copy()
+    return out.sort_values("datetime").reset_index(drop=True)
+
+
+def load_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: int | None) -> pd.DataFrame:
+    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    if official_id is not None:
+        official_df = load_raw_history(
+            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
+            f"esios_{official_id}",
+        )
+
+    if forecast_id is not None:
+        forecast_df = load_raw_history(
+            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
+            f"esios_{forecast_id}",
+        )
+
+    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
+    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
+
+    return build_best_mix_energy(official_energy, forecast_energy, tech_name)
+
+
+def build_day_energy_mix_table(selected_day: date) -> pd.DataFrame:
+    mix_energy = {}
+
+    for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
+        forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
+        mix_energy[tech_name] = load_mix_best_energy(
+            tech_name=tech_name,
+            official_id=official_id,
+            forecast_id=forecast_id,
+        )
+
+    rows = []
+    for tech, df in mix_energy.items():
+        if df.empty:
+            continue
+        tmp = df[df["datetime"].dt.date == selected_day].copy()
+        if tmp.empty:
+            continue
+
+        agg = (
+            tmp.groupby(["technology", "data_source"], as_index=False)["energy_mwh"]
+            .sum()
+            .sort_values(["technology", "data_source"])
+        )
+        rows.append(agg)
+
+    if not rows:
+        return pd.DataFrame(columns=["Technology", "Data source", "Generation (MWh)"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.rename(
+        columns={
+            "technology": "Technology",
+            "data_source": "Data source",
+            "energy_mwh": "Generation (MWh)",
+        }
+    )
+    return out.sort_values(["Technology", "Data source"]).reset_index(drop=True)
 
 
 def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> dict:
@@ -300,7 +449,6 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
     return styles + html
 
 
-# Load data
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
 solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
 solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
@@ -366,9 +514,13 @@ preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar sourc
 overlay_chart = build_overlay_chart(hourly_df)
 chart_b64 = chart_to_base64_png(overlay_chart)
 
+day_mix_df = build_day_energy_mix_table(report_day)
+
 st.subheader("Preview chart")
 if overlay_chart is not None:
     st.altair_chart(overlay_chart, use_container_width=True)
+else:
+    st.info("Chart could not be generated.")
 
 st.subheader("Preview metrics")
 st.dataframe(metrics_df, use_container_width=True)
@@ -376,18 +528,31 @@ st.dataframe(metrics_df, use_container_width=True)
 st.subheader("Preview hourly table")
 st.dataframe(preview_table, use_container_width=True)
 
+st.subheader("Preview day energy mix")
+if not day_mix_df.empty:
+    st.dataframe(day_mix_df, use_container_width=True)
+else:
+    st.info("No day energy mix available for the selected report day.")
+
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
 
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
+mix_html = df_to_html_table(day_mix_df) if not day_mix_df.empty else "<p>No day energy mix available.</p>"
 
 chart_html = ""
 if chart_b64:
     chart_html = f"""
     <h3>Hourly chart</h3>
+    <p><em>Note: some Outlook clients may block inline images.</em></p>
     <img src="data:image/png;base64,{chart_b64}" alt="Hourly chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
     <br><br>
+    """
+else:
+    chart_html = """
+    <h3>Hourly chart</h3>
+    <p>Chart image could not be embedded in this email client.</p>
     """
 
 email_html = f"""
@@ -410,6 +575,11 @@ email_html = f"""
 
     <h3>Hourly table</h3>
     {hourly_html}
+
+    <br>
+
+    <h3>Energy mix for selected day</h3>
+    {mix_html}
 
     <br>
     <p>Best regards,</p>
