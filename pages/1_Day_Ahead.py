@@ -871,7 +871,7 @@ try:
 
     st.caption(
         f"Madrid time now: {now_madrid().strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"Tomorrow enabled after 15:00: {'Yes' if allow_next_day_refresh() else 'No'}"
+        f"Tomorrow available: {'Yes' if allow_next_day_refresh() else 'No'}"
     )
 
     top_left, top_right = st.columns([1.8, 1.2])
