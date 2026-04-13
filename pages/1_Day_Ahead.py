@@ -134,12 +134,8 @@ def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
                         ("background-color", "#6b7280"),
                         ("color", "white"),
                         ("font-weight", "bold"),
-                        ("font-size", "125%"),
+                        ("font-size", "140%"),
                     ],
-                },
-                {
-                    "selector": "td",
-                    "props": [("font-size", "125%")],
                 },
             ]
         )
@@ -538,7 +534,7 @@ def load_or_refresh_mix_raw(indicator_id: int | None, source_name: str, csv_path
     if hist.empty:
         hist = build_raw_history(indicator_id, source_name, csv_path, start_day, token)
     else:
-        hist = refresh_raw_history(indicator_id, source_name, csv_path, hist, token, 10)
+        hist = refresh_raw_history(indicator_id, source_name, csv_path, hist, token, 3)
 
     return hist
 
@@ -894,6 +890,11 @@ try:
             st.write("")
             st.write("")
             refresh_energy_mix = st.button("Refresh energy mix")
+        auto_refresh_p48 = st.checkbox(
+            "Auto-refresh P48 (solar+demand)",
+            value=False,
+            help="Disabled by default to avoid heavy API refresh on each rerun.",
+        )
 
     if rebuild_hist:
         clear_file(PRICE_RAW_CSV_PATH)
@@ -919,26 +920,26 @@ try:
             price_raw = build_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, start_day, token)
     else:
         with st.spinner("Refreshing recent price data..."):
-            price_raw = refresh_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, price_raw, token, 10)
+            price_raw = refresh_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, price_raw, token, 7)
 
     if solar_p48_raw.empty:
         with st.spinner("Building solar P48 history..."):
             solar_p48_raw = build_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, start_day, token)
-    else:
+    elif auto_refresh_p48:
         with st.spinner("Refreshing recent solar P48 data..."):
             solar_p48_raw = refresh_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, solar_p48_raw, token, 10)
 
     if solar_forecast_raw.empty:
         with st.spinner("Building solar forecast history..."):
             solar_forecast_raw = build_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, start_day, token)
-    else:
+    elif auto_refresh_p48:
         with st.spinner("Refreshing recent solar forecast data..."):
             solar_forecast_raw = refresh_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, solar_forecast_raw, token, 10)
 
     if demand_raw.empty:
         with st.spinner("Building demand P48 history..."):
             demand_raw = build_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, start_day, token)
-    else:
+    elif auto_refresh_p48:
         with st.spinner("Refreshing recent demand P48 data..."):
             demand_raw = refresh_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, demand_raw, token, 10)
 
@@ -990,11 +991,37 @@ try:
 
     st.subheader("Monthly spot and solar captured price - Spain")
     if not monthly_combo.empty:
-        monthly_chart = alt.Chart(monthly_combo).encode(
-            x=alt.X("month:T", axis=alt.Axis(title=None, format="%b-%Y", labelAngle=0, labelFontSize=14, titleFontSize=16))
+        latest_year = int(monthly_combo["month"].dt.year.max())
+        previous_year = latest_year - 1
+
+        prev_year_df = pd.DataFrame(
+            {
+                "start": [pd.Timestamp(previous_year, 1, 1)],
+                "end": [pd.Timestamp(latest_year, 1, 1)],
+            }
         )
-        chart = alt.layer(
-            monthly_chart.mark_line(point=True).encode(
+
+        base = alt.Chart(monthly_combo).encode(
+            x=alt.X(
+                "month:T",
+                axis=alt.Axis(
+                    title=None,
+                    labelAngle=0,
+                    labelFontSize=13,
+                    tickCount="month",
+                    labelPadding=8,
+                    labelExpr="timeFormat(datum.value, '%b') + '\\n' + (timeFormat(datum.value, '%m') == '01' ? timeFormat(datum.value, '%Y') : '')",
+                ),
+            )
+        )
+
+        year_background = alt.Chart(prev_year_df).mark_rect(opacity=0.22, color="#e5e7eb").encode(
+            x="start:T",
+            x2="end:T",
+        )
+
+        lines = alt.layer(
+            base.mark_line(point=True, color="#0f766e", strokeWidth=2.8).encode(
                 y=alt.Y("avg_monthly_price:Q", title="€/MWh", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
                 tooltip=[
                     alt.Tooltip("month:T", title="Month"),
@@ -1003,10 +1030,16 @@ try:
                     alt.Tooltip("capture_pct:Q", title="Solar capture rate", format=".2%"),
                 ],
             ),
-            monthly_chart.mark_line(point=True, strokeDash=[6, 4]).encode(
+            base.mark_line(point=True, color="#1d4ed8", strokeDash=[6, 4], strokeWidth=2.8).encode(
                 y="captured_solar_price:Q"
             ),
-        ).properties(height=360)
+        )
+
+        chart = alt.layer(year_background, lines).properties(height=360).configure_view(
+            fill="#f3f4f6",
+            stroke="#d1d5db",
+            cornerRadius=6,
+        )
         st.altair_chart(chart, use_container_width=True)
 
     monthly_table = monthly_combo.copy()
@@ -1273,7 +1306,7 @@ try:
 
     if st.button("Force refresh"):
         with st.spinner("Refreshing..."):
-            price_raw = refresh_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, price_raw, token, 10)
+            price_raw = refresh_raw_history(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, price_raw, token, 7)
             solar_p48_raw = refresh_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, solar_p48_raw, token, 10)
             solar_forecast_raw = refresh_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, solar_forecast_raw, token, 10)
             demand_raw = refresh_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, demand_raw, token, 10)
