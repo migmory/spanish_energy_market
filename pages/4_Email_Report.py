@@ -5,6 +5,7 @@ from io import BytesIO
 import base64
 
 import altair as alt
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
@@ -172,6 +173,14 @@ def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
 
     out = df.copy()
+    if "datetime" not in out.columns:
+        return pd.DataFrame(columns=df.columns)
+
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
+
     out["datetime_hour"] = out["datetime"].dt.floor("h")
 
     agg_dict = {"energy_mwh": "sum"}
@@ -328,6 +337,12 @@ def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: 
 
         best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
         best = to_hourly_energy(best)
+
+        if "datetime" not in best.columns:
+            continue
+
+        best["datetime"] = pd.to_datetime(best["datetime"], errors="coerce")
+        best = best.dropna(subset=["datetime"]).copy()
         best = best[best["datetime"].dt.date == report_day].copy()
 
         if not best.empty:
@@ -337,6 +352,8 @@ def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: 
         return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "technology", "data_source"])
 
     out = pd.concat(rows, ignore_index=True)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
     out["Hour"] = out["datetime"].dt.strftime("%H:%M")
     return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
 
@@ -519,6 +536,63 @@ def chart_to_base64_png(chart) -> str | None:
         return None
 
 
+
+
+def line_area_png_base64(hourly_df: pd.DataFrame) -> str | None:
+    if hourly_df.empty:
+        return None
+    try:
+        fig, ax1 = plt.subplots(figsize=(10, 4.2), dpi=140)
+        ax2 = ax1.twinx()
+
+        ax1.plot(hourly_df["datetime"], hourly_df["Price (€/MWh)"], color="#0f766e", linewidth=2.2, marker="o", markersize=3)
+        ax2.fill_between(hourly_df["datetime"], hourly_df["Solar (MW)"], color="#facc15", alpha=0.28)
+
+        ax1.set_ylabel("Price (€/MWh)")
+        ax2.set_ylabel("Solar (MW)")
+        ax1.set_xlabel("")
+        ax1.set_facecolor("#f8fafc")
+        fig.patch.set_facecolor("white")
+        ax1.grid(alpha=0.25)
+        fig.autofmt_xdate(rotation=0)
+
+        buffer = BytesIO()
+        fig.tight_layout()
+        fig.savefig(buffer, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buffer.seek(0)
+        return base64.b64encode(buffer.read()).decode("utf-8")
+    except Exception:
+        return None
+
+
+def mix_donut_png_base64(day_mix_hourly: pd.DataFrame) -> str | None:
+    if day_mix_hourly.empty:
+        return None
+    try:
+        donut_df = day_mix_hourly.groupby("technology", as_index=False)["energy_mwh"].sum()
+        fig, ax = plt.subplots(figsize=(6.5, 5), dpi=140)
+        wedges, _, _ = ax.pie(
+            donut_df["energy_mwh"],
+            labels=donut_df["technology"],
+            autopct="%1.1f%%",
+            startangle=90,
+            pctdistance=0.82,
+            textprops={"fontsize": 8},
+        )
+        centre_circle = plt.Circle((0, 0), 0.55, fc="white")
+        fig.gca().add_artist(centre_circle)
+        ax.axis("equal")
+
+        buffer = BytesIO()
+        fig.tight_layout()
+        fig.savefig(buffer, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buffer.seek(0)
+        return base64.b64encode(buffer.read()).decode("utf-8")
+    except Exception:
+        return None
+
 def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
     pct_cols = pct_cols or []
     tmp = format_preview_df(df, pct_cols=pct_cols)
@@ -620,7 +694,7 @@ if hourly_df.empty:
 
 preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy()
 overlay_chart = build_overlay_chart(hourly_df)
-overlay_chart_b64 = chart_to_base64_png(overlay_chart)
+overlay_chart_b64 = line_area_png_base64(hourly_df) or chart_to_base64_png(overlay_chart)
 
 mix_preview = day_mix_hourly[["Hour", "technology", "energy_mwh", "data_source"]].copy() if not day_mix_hourly.empty else pd.DataFrame()
 if not mix_preview.empty:
@@ -633,7 +707,7 @@ if not mix_preview.empty:
     )
 
 mix_donut_chart = build_mix_donut_chart(day_mix_hourly)
-mix_donut_b64 = chart_to_base64_png(mix_donut_chart)
+mix_donut_b64 = mix_donut_png_base64(day_mix_hourly) or chart_to_base64_png(mix_donut_chart)
 
 st.subheader("Preview chart")
 if overlay_chart is not None:
