@@ -1,5 +1,7 @@
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
+from io import BytesIO
 import base64
 
 import altair as alt
@@ -8,6 +10,25 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Email Report", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    html, body, [class*="css"] {
+        font-size: 105% !important;
+    }
+    .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
+    .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
+        font-size: 105% !important;
+    }
+    h1, h2, h3 {
+        font-size: 105% !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Email Report")
 
 if "email_admin_password" not in st.secrets:
@@ -25,6 +46,8 @@ DATA_DIR = BASE_DIR / "historical_data"
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
 SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
 SOLAR_FORECAST_RAW_CSV_PATH = DATA_DIR / "solar_forecast_spain_542_raw.csv"
+
+MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 ENERGY_MIX_INDICATORS_OFFICIAL = {
     "Nuclear": 74,
@@ -57,6 +80,18 @@ ENERGY_MIX_INDICATORS_FORECAST = {
 }
 
 
+def now_madrid() -> datetime:
+    return datetime.now(MADRID_TZ)
+
+
+def allow_next_day_refresh() -> bool:
+    return now_madrid().time() >= time(15, 0)
+
+
+def max_refresh_day_from_clock() -> date:
+    return date.today() + timedelta(days=1) if allow_next_day_refresh() else date.today()
+
+
 def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
     if not csv_path.exists():
         return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
@@ -78,6 +113,22 @@ def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
     df = df.dropna(subset=["datetime", "value"]).copy()
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
     return df
+
+
+def infer_interval_hours(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "datetime" not in df.columns:
+        return pd.Series(dtype=float)
+
+    out = df.sort_values("datetime").copy()
+    diffs = out["datetime"].diff().dt.total_seconds().div(3600)
+
+    if diffs.dropna().empty:
+        interval = 1.0
+    else:
+        median_diff = diffs.dropna().median()
+        interval = 0.25 if median_diff <= 0.30 else 1.0
+
+    return pd.Series(interval, index=df.index)
 
 
 def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
@@ -108,11 +159,35 @@ def to_energy_intervals(df: pd.DataFrame, value_col_name: str, energy_col_name: 
 
     out = df.copy()
     out[value_col_name] = pd.to_numeric(out["value"], errors="coerce")
-    out["interval_h"] = 1.0
+    out["interval_h"] = infer_interval_hours(out)
     out[energy_col_name] = out[value_col_name] * out["interval_h"]
 
     out = out[["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"]].copy()
     out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    out["datetime_hour"] = out["datetime"].dt.floor("h")
+
+    agg_dict = {"energy_mwh": "sum"}
+    if "mw" in out.columns:
+        agg_dict["mw"] = "mean"
+    for c in ["source", "geo_name", "geo_id", "technology", "data_source"]:
+        if c in out.columns:
+            agg_dict[c] = "first"
+
+    out = (
+        out.groupby("datetime_hour", as_index=False)
+        .agg(agg_dict)
+        .rename(columns={"datetime_hour": "datetime"})
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
     return out
 
 
@@ -223,47 +298,47 @@ def load_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: i
     official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
     forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
 
-    return build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    return to_hourly_energy(best)
 
 
-def build_day_energy_mix_table(selected_day: date) -> pd.DataFrame:
-    mix_energy = {}
+def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: bool) -> pd.DataFrame:
+    rows = []
 
     for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
         forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
-        mix_energy[tech_name] = load_mix_best_energy(
-            tech_name=tech_name,
-            official_id=official_id,
-            forecast_id=forecast_id,
-        )
 
-    rows = []
-    for tech, df in mix_energy.items():
-        if df.empty:
-            continue
-        tmp = df[df["datetime"].dt.date == selected_day].copy()
-        if tmp.empty:
-            continue
+        official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+        forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-        agg = (
-            tmp.groupby(["technology", "data_source"], as_index=False)["energy_mwh"]
-            .sum()
-            .sort_values(["technology", "data_source"])
-        )
-        rows.append(agg)
+        if official_id is not None and not force_forecast_for_tomorrow:
+            official_df = load_raw_history(
+                get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
+                f"esios_{official_id}",
+            )
+
+        if forecast_id is not None:
+            forecast_df = load_raw_history(
+                get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
+                f"esios_{forecast_id}",
+            )
+
+        official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
+        forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
+
+        best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+        best = to_hourly_energy(best)
+        best = best[best["datetime"].dt.date == report_day].copy()
+
+        if not best.empty:
+            rows.append(best)
 
     if not rows:
-        return pd.DataFrame(columns=["Technology", "Data source", "Generation (MWh)"])
+        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "technology", "data_source"])
 
     out = pd.concat(rows, ignore_index=True)
-    out = out.rename(
-        columns={
-            "technology": "Technology",
-            "data_source": "Data source",
-            "energy_mwh": "Generation (MWh)",
-        }
-    )
-    return out.sort_values(["Technology", "Data source"]).reset_index(drop=True)
+    out["Hour"] = out["datetime"].dt.strftime("%H:%M")
+    return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
 
 
 def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> dict:
@@ -408,6 +483,32 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
     return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
 
 
+def build_mix_donut_chart(day_mix_hourly: pd.DataFrame):
+    if day_mix_hourly.empty:
+        return None
+
+    donut_df = (
+        day_mix_hourly.groupby("technology", as_index=False)["energy_mwh"]
+        .sum()
+        .rename(columns={"technology": "Technology", "energy_mwh": "Energy (MWh)"})
+    )
+
+    chart = (
+        alt.Chart(donut_df)
+        .mark_arc(innerRadius=70)
+        .encode(
+            theta=alt.Theta("Energy (MWh):Q"),
+            color=alt.Color("Technology:N"),
+            tooltip=[
+                alt.Tooltip("Technology:N"),
+                alt.Tooltip("Energy (MWh):Q", format=",.2f"),
+            ],
+        )
+        .properties(height=380)
+    )
+    return chart
+
+
 def chart_to_base64_png(chart) -> str | None:
     if chart is None:
         return None
@@ -449,6 +550,9 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
     return styles + html
 
 
+# =========================================================
+# LOAD DATA
+# =========================================================
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
 solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
 solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
@@ -463,8 +567,8 @@ solar_forecast_hourly = to_hourly_mean(solar_forecast_raw, value_col_name="solar
 solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
 
 latest_available_day = price_hourly["datetime"].dt.date.max()
-tomorrow = date.today() + timedelta(days=1)
-default_report_day = tomorrow if latest_available_day >= tomorrow else latest_available_day
+tomorrow_allowed = max_refresh_day_from_clock()
+default_report_day = min(tomorrow_allowed, max(latest_available_day, date.today()))
 
 col1, col2 = st.columns(2)
 
@@ -488,7 +592,7 @@ report_day = st.date_input(
     "Report day",
     value=default_report_day,
     min_value=price_hourly["datetime"].dt.date.min(),
-    max_value=latest_available_day,
+    max_value=tomorrow_allowed,
 )
 
 default_subject = f"Day Ahead report - {report_day.strftime('%d-%b-%Y')}"
@@ -504,23 +608,36 @@ intro_text = st.text_area(
 )
 
 hourly_df, capture_price = build_daily_dataset(price_hourly, solar_hourly, report_day)
+metrics_df = make_metrics_df(price_hourly, solar_hourly, min(report_day, latest_available_day))
+
+is_tomorrow = report_day == date.today() + timedelta(days=1)
+force_mix_forecast = is_tomorrow
+day_mix_hourly = build_all_mix_hourly_for_day(report_day, force_forecast_for_tomorrow=force_mix_forecast)
 
 if hourly_df.empty:
     st.warning("No hourly price data available for the selected report day.")
     st.stop()
 
-metrics_df = make_metrics_df(price_hourly, solar_hourly, report_day)
 preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy()
 overlay_chart = build_overlay_chart(hourly_df)
-chart_b64 = chart_to_base64_png(overlay_chart)
+overlay_chart_b64 = chart_to_base64_png(overlay_chart)
 
-day_mix_df = build_day_energy_mix_table(report_day)
+mix_preview = day_mix_hourly[["Hour", "technology", "energy_mwh", "data_source"]].copy() if not day_mix_hourly.empty else pd.DataFrame()
+if not mix_preview.empty:
+    mix_preview = mix_preview.rename(
+        columns={
+            "technology": "Technology",
+            "energy_mwh": "Energy (MWh)",
+            "data_source": "Data source",
+        }
+    )
+
+mix_donut_chart = build_mix_donut_chart(day_mix_hourly)
+mix_donut_b64 = chart_to_base64_png(mix_donut_chart)
 
 st.subheader("Preview chart")
 if overlay_chart is not None:
     st.altair_chart(overlay_chart, use_container_width=True)
-else:
-    st.info("Chart could not be generated.")
 
 st.subheader("Preview metrics")
 st.dataframe(metrics_df, use_container_width=True)
@@ -528,32 +645,42 @@ st.dataframe(metrics_df, use_container_width=True)
 st.subheader("Preview hourly table")
 st.dataframe(preview_table, use_container_width=True)
 
-st.subheader("Preview day energy mix")
-if not day_mix_df.empty:
-    st.dataframe(day_mix_df, use_container_width=True)
+st.subheader("Preview hourly energy mix")
+if not mix_preview.empty:
+    st.dataframe(mix_preview, use_container_width=True)
 else:
-    st.info("No day energy mix available for the selected report day.")
+    st.info("No hourly energy mix available for selected day.")
+
+st.subheader("Preview daily energy mix donut")
+if mix_donut_chart is not None:
+    st.altair_chart(mix_donut_chart, use_container_width=True)
+else:
+    st.info("No daily energy mix donut available.")
 
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
 
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
-mix_html = df_to_html_table(day_mix_df) if not day_mix_df.empty else "<p>No day energy mix available.</p>"
+mix_hourly_html = df_to_html_table(mix_preview) if not mix_preview.empty else "<p>No hourly energy mix available.</p>"
 
-chart_html = ""
-if chart_b64:
-    chart_html = f"""
-    <h3>Hourly chart</h3>
-    <p><em>Note: some Outlook clients may block inline images.</em></p>
-    <img src="data:image/png;base64,{chart_b64}" alt="Hourly chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+overlay_chart_html = ""
+if overlay_chart_b64:
+    overlay_chart_html = f"""
+    <h3>Hourly price and solar chart</h3>
+    <img src="data:image/png;base64,{overlay_chart_b64}" alt="Hourly chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
     <br><br>
     """
-else:
-    chart_html = """
-    <h3>Hourly chart</h3>
-    <p>Chart image could not be embedded in this email client.</p>
+
+mix_donut_html = ""
+if mix_donut_b64:
+    mix_donut_html = f"""
+    <h3>Daily energy mix donut</h3>
+    <img src="data:image/png;base64,{mix_donut_b64}" alt="Energy mix donut" style="max-width:600px; height:auto; border:1px solid #ddd;" />
+    <br><br>
     """
+
+mix_source_note = "Forecast forced for tomorrow where available." if force_mix_forecast else "Official data used where available, forecast fallback where configured."
 
 email_html = f"""
 <html>
@@ -563,23 +690,26 @@ email_html = f"""
     <p>
       <strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
       <strong>Captured solar price:</strong> {capture_text}<br>
-      <strong>Solar source used:</strong> {day_sources}
+      <strong>Solar source used:</strong> {day_sources}<br>
+      <strong>Energy mix source rule:</strong> {mix_source_note}
     </p>
 
-    {chart_html}
+    {overlay_chart_html}
 
     <h3>Summary metrics</h3>
     {metrics_html}
 
     <br>
 
-    <h3>Hourly table</h3>
+    <h3>Hourly price / solar table</h3>
     {hourly_html}
 
     <br>
 
-    <h3>Energy mix for selected day</h3>
-    {mix_html}
+    {mix_donut_html}
+
+    <h3>Hourly energy mix</h3>
+    {mix_hourly_html}
 
     <br>
     <p>Best regards,</p>
@@ -641,4 +771,4 @@ else:
             except Exception as e:
                 st.error(f"Send failed: {e}")
 
-st.info("For automatic daily sending at 16:00, use the same webhook from a scheduled Power Automate flow.")
+st.info("If report day is tomorrow, the email tries to use forecast-based mix where available.")
