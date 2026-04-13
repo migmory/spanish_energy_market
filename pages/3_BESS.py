@@ -12,6 +12,25 @@ import streamlit as st
 
 
 st.set_page_config(page_title="BESS", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    html, body, [class*="css"] {
+        font-size: 125% !important;
+    }
+    .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
+    .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
+        font-size: 125% !important;
+    }
+    h1, h2, h3 {
+        font-size: 125% !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("BESS Optimisation")
 
 if "bess_admin_password" in st.secrets:
@@ -42,22 +61,13 @@ def make_year_hour_index(year: int) -> pd.DataFrame:
     idx = pd.date_range(
         start=f"{year}-01-01 00:00:00",
         end=f"{year}-12-31 23:00:00",
-        freq="H",
+        freq="h",
     )
     df = pd.DataFrame({"timestamp": idx})
     df["Date"] = df["timestamp"].dt.date
     df["Hour"] = df["timestamp"].dt.hour + 1
     df["year"] = year
     return df
-
-
-def safe_float(x, default=0.0) -> float:
-    try:
-        if pd.isna(x):
-            return default
-        return float(str(x).replace(",", "."))
-    except Exception:
-        return default
 
 
 def standardize_price_history(raw_csv_path: Path) -> pd.DataFrame:
@@ -72,7 +82,7 @@ def standardize_price_history(raw_csv_path: Path) -> pd.DataFrame:
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["datetime", "value"]).copy()
 
-    df["timestamp"] = df["datetime"].dt.floor("H")
+    df["timestamp"] = df["datetime"].dt.floor("h")
     hourly = (
         df.groupby("timestamp", as_index=False)["value"]
         .mean()
@@ -790,7 +800,7 @@ if run_button:
             )
 
         soc_preview = dispatch.copy()
-        soc_preview["timestamp"] = pd.to_datetime(soc_preview["Date"]) + pd.to_timedelta(soc_preview["Hour"] - 1, unit="H")
+        soc_preview["timestamp"] = pd.to_datetime(soc_preview["Date"]) + pd.to_timedelta(soc_preview["Hour"] - 1, unit="h")
 
         st.subheader("SOC preview")
         st.line_chart(
