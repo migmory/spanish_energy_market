@@ -890,6 +890,11 @@ try:
             st.write("")
             st.write("")
             refresh_energy_mix = st.button("Refresh energy mix")
+        auto_refresh_p48 = st.checkbox(
+            "Auto-refresh P48 (solar+demand)",
+            value=False,
+            help="Disabled by default to avoid heavy API refresh on each rerun.",
+        )
 
     if rebuild_hist:
         clear_file(PRICE_RAW_CSV_PATH)
@@ -920,21 +925,21 @@ try:
     if solar_p48_raw.empty:
         with st.spinner("Building solar P48 history..."):
             solar_p48_raw = build_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, start_day, token)
-    else:
+    elif auto_refresh_p48:
         with st.spinner("Refreshing recent solar P48 data..."):
             solar_p48_raw = refresh_raw_history(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, solar_p48_raw, token, 10)
 
     if solar_forecast_raw.empty:
         with st.spinner("Building solar forecast history..."):
             solar_forecast_raw = build_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, start_day, token)
-    else:
+    elif auto_refresh_p48:
         with st.spinner("Refreshing recent solar forecast data..."):
             solar_forecast_raw = refresh_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, solar_forecast_raw, token, 10)
 
     if demand_raw.empty:
         with st.spinner("Building demand P48 history..."):
             demand_raw = build_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, start_day, token)
-    else:
+    elif auto_refresh_p48:
         with st.spinner("Refreshing recent demand P48 data..."):
             demand_raw = refresh_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, demand_raw, token, 10)
 
