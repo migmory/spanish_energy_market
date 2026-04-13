@@ -23,14 +23,14 @@ st.markdown(
     """
     <style>
     html, body, [class*="css"] {
-        font-size: 125% !important;
+        font-size: 105% !important;
     }
     .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
     .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
-        font-size: 125% !important;
+        font-size: 105% !important;
     }
     h1, h2, h3 {
-        font-size: 125% !important;
+        font-size: 105% !important;
     }
     </style>
     """,
