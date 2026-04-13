@@ -17,14 +17,14 @@ st.markdown(
     """
     <style>
     html, body, [class*="css"] {
-        font-size: 103% !important;
+        font-size: 105% !important;
     }
     .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
     .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
-        font-size: 103% !important;
+        font-size: 105% !important;
     }
     h1, h2, h3 {
-        font-size: 103% !important;
+        font-size: 105% !important;
     }
     </style>
     """,
@@ -42,7 +42,6 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "historical_data"
 
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
-DEFAULT_INPUTS_XLSX = BASE_DIR / "inputs.xlsx"
 DEFAULT_DATA_XLSX = BASE_DIR / "data.xlsx"
 
 
@@ -67,16 +66,17 @@ def make_year_hour_index(year: int) -> pd.DataFrame:
     df["Date"] = df["timestamp"].dt.date
     df["Hour"] = df["timestamp"].dt.hour + 1
     df["year"] = year
+    df["hour_of_year"] = np.arange(1, len(df) + 1)
     return df
 
 
-def standardize_price_history(raw_csv_path: Path) -> pd.DataFrame:
+def standardize_price_history_from_day_ahead(raw_csv_path: Path) -> pd.DataFrame:
     if not raw_csv_path.exists():
-        return pd.DataFrame(columns=["timestamp", "price"])
+        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
 
     df = pd.read_csv(raw_csv_path)
     if df.empty:
-        return pd.DataFrame(columns=["timestamp", "price"])
+        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
 
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
@@ -90,6 +90,9 @@ def standardize_price_history(raw_csv_path: Path) -> pd.DataFrame:
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
+
+    hourly["Date"] = hourly["timestamp"].dt.date
+    hourly["Hour"] = hourly["timestamp"].dt.hour + 1
     hourly["year"] = hourly["timestamp"].dt.year
     hourly["hour_of_year"] = hourly.groupby("year").cumcount() + 1
     return hourly
@@ -174,107 +177,9 @@ def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.Da
             year_base = year_base.reindex(range(h)).fillna(0.0)
             year_base["hour_of_year"] = np.arange(1, h + 1)
 
-        merged = year_idx.copy()
-        merged["hour_of_year"] = np.arange(1, len(merged) + 1)
-        merged = merged.merge(year_base[["hour_of_year", "generation"]], on="hour_of_year", how="left")
+        merged = year_idx.merge(year_base[["hour_of_year", "generation"]], on="hour_of_year", how="left")
         merged["generation"] = merged["generation"].fillna(0.0)
         rows.append(merged[["timestamp", "Date", "Hour", "year", "generation"]])
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def normalize_private_price_upload(uploaded_file, target_years: list[int]) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_file)
-    if df.empty:
-        raise ValueError("Uploaded private price file is empty.")
-
-    col_map = {c.lower().strip(): c for c in df.columns}
-    date_col = col_map.get("date")
-    hour_col = col_map.get("hour")
-
-    sell_col = None
-    buy_col = None
-    single_price_col = None
-
-    for candidate in ["omie_venta", "sell", "price_sell", "venta"]:
-        if candidate in col_map:
-            sell_col = col_map[candidate]
-            break
-
-    for candidate in ["omie_compra", "buy", "price_buy", "compra"]:
-        if candidate in col_map:
-            buy_col = col_map[candidate]
-            break
-
-    for candidate in ["price", "precio", "omie", "market_price"]:
-        if candidate in col_map:
-            single_price_col = col_map[candidate]
-            break
-
-    if single_price_col is None and (sell_col is None or buy_col is None):
-        raise ValueError("Private price file must contain either [Date, Hour, price] or [Date, Hour, omie_venta, omie_compra].")
-
-    if date_col and hour_col:
-        keep_cols = [date_col, hour_col]
-        if single_price_col:
-            keep_cols.append(single_price_col)
-        else:
-            keep_cols.extend([sell_col, buy_col])
-
-        tmp = df[keep_cols].copy()
-        rename_map = {date_col: "Date", hour_col: "Hour"}
-        if single_price_col:
-            rename_map[single_price_col] = "price"
-        else:
-            rename_map[sell_col] = "omie_venta"
-            rename_map[buy_col] = "omie_compra"
-        tmp = tmp.rename(columns=rename_map)
-
-        tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
-        tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
-        tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
-        tmp["year"] = tmp["Date"].dt.year
-        tmp["hour_of_year"] = tmp.groupby("year").cumcount() + 1
-
-        source_year = sorted(tmp["year"].dropna().unique().tolist())[0]
-        if "price" in tmp.columns:
-            base = tmp[tmp["year"] == source_year][["hour_of_year", "price"]].copy()
-        else:
-            base = tmp[tmp["year"] == source_year][["hour_of_year", "omie_venta", "omie_compra"]].copy()
-    else:
-        if single_price_col:
-            base = df[[single_price_col]].copy()
-            base.columns = ["price"]
-        else:
-            base = df[[sell_col, buy_col]].copy()
-            base.columns = ["omie_venta", "omie_compra"]
-        for c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce")
-        base = base.reset_index(drop=True)
-        base["hour_of_year"] = np.arange(1, len(base) + 1)
-
-    rows = []
-    for year in target_years:
-        h = hours_in_year(year)
-        idx = make_year_hour_index(year)
-        idx["hour_of_year"] = np.arange(1, len(idx) + 1)
-
-        year_base = base.iloc[:h].copy()
-        if len(year_base) < h:
-            year_base = year_base.reindex(range(h))
-            year_base["hour_of_year"] = np.arange(1, h + 1)
-
-        merged = idx.merge(year_base, on="hour_of_year", how="left")
-
-        if "price" in merged.columns:
-            merged["price"] = pd.to_numeric(merged["price"], errors="coerce").ffill().bfill()
-            merged["omie_venta"] = merged["price"]
-            merged["omie_compra"] = merged["price"]
-        else:
-            merged["omie_venta"] = pd.to_numeric(merged["omie_venta"], errors="coerce").ffill().bfill()
-            merged["omie_compra"] = pd.to_numeric(merged["omie_compra"], errors="coerce").ffill().bfill()
-
-        rows.append(merged[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]])
 
     return pd.concat(rows, ignore_index=True)
 
@@ -291,21 +196,97 @@ def build_template_generation_excel(template_year: int) -> bytes:
     return bio.getvalue()
 
 
-def build_template_private_price_excel(template_year: int) -> bytes:
-    idx = make_year_hour_index(template_year)
-    out = idx[["Date", "Hour"]].copy()
-    out["price"] = ""
+def build_template_forward_price_excel(start_year: int, end_year: int) -> bytes:
+    rows = []
+    for year in range(start_year, end_year + 1):
+        idx = make_year_hour_index(year)
+        tmp = idx[["Date", "Hour"]].copy()
+        tmp["price"] = ""
+        rows.append(tmp)
+
+    out = pd.concat(rows, ignore_index=True)
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        out.to_excel(writer, index=False, sheet_name="private_price_template")
+        out.to_excel(writer, index=False, sheet_name="forward_prices")
     bio.seek(0)
     return bio.getvalue()
 
 
-def choose_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) -> pd.DataFrame:
+def normalize_forward_price_upload(uploaded_file) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file)
+    if df.empty:
+        raise ValueError("Uploaded forward price file is empty.")
+
+    col_map = {c.lower().strip(): c for c in df.columns}
+    date_col = col_map.get("date")
+    hour_col = col_map.get("hour")
+
+    price_col = None
+    sell_col = None
+    buy_col = None
+
+    for candidate in ["price", "precio", "market_price"]:
+        if candidate in col_map:
+            price_col = col_map[candidate]
+            break
+
+    for candidate in ["omie_venta", "sell", "venta"]:
+        if candidate in col_map:
+            sell_col = col_map[candidate]
+            break
+
+    for candidate in ["omie_compra", "buy", "compra"]:
+        if candidate in col_map:
+            buy_col = col_map[candidate]
+            break
+
+    if date_col is None or hour_col is None:
+        raise ValueError("Forward price file must contain Date and Hour columns.")
+
+    if price_col is None and (sell_col is None or buy_col is None):
+        raise ValueError("Forward price file must contain either [Date, Hour, price] or [Date, Hour, omie_venta, omie_compra].")
+
+    keep = [date_col, hour_col]
+    if price_col is not None:
+        keep.append(price_col)
+    else:
+        keep.extend([sell_col, buy_col])
+
+    tmp = df[keep].copy()
+    rename_map = {date_col: "Date", hour_col: "Hour"}
+    if price_col is not None:
+        rename_map[price_col] = "price"
+    else:
+        rename_map[sell_col] = "omie_venta"
+        rename_map[buy_col] = "omie_compra"
+
+    tmp = tmp.rename(columns=rename_map)
+    tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+    tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
+    tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
+    tmp["year"] = tmp["Date"].dt.year
+
+    if tmp["year"].max() > 2047:
+        raise ValueError("Forward price file cannot include years beyond 2047.")
+
+    if "price" in tmp.columns:
+        tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
+        tmp["omie_venta"] = tmp["price"]
+        tmp["omie_compra"] = tmp["price"]
+        tmp = tmp.drop(columns=["price"])
+
+    tmp["omie_venta"] = pd.to_numeric(tmp["omie_venta"], errors="coerce")
+    tmp["omie_compra"] = pd.to_numeric(tmp["omie_compra"], errors="coerce")
+
+    tmp["timestamp"] = pd.to_datetime(tmp["Date"]) + pd.to_timedelta(tmp["Hour"] - 1, unit="h")
+    tmp = tmp.sort_values(["timestamp"]).reset_index(drop=True)
+    return tmp[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]]
+
+
+def choose_historical_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) -> pd.DataFrame:
     if price_hourly.empty:
-        raise ValueError("No hourly electricity price history found. Build Day Ahead first.")
+        raise ValueError("No hourly electricity price history found from Day Ahead.")
 
     available_years = sorted(price_hourly["year"].unique().tolist())
     src_year = target_year if target_year in available_years else max(available_years)
@@ -315,11 +296,9 @@ def choose_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) 
     src["hour_of_year"] = np.arange(1, len(src) + 1)
 
     target_idx = make_year_hour_index(target_year)
-    target_idx["hour_of_year"] = np.arange(1, len(target_idx) + 1)
-
     src_needed = src[["hour_of_year", "price"]].copy()
-    max_h = len(target_idx)
 
+    max_h = len(target_idx)
     if len(src_needed) < max_h:
         src_needed = src_needed.reindex(range(max_h))
         src_needed["hour_of_year"] = np.arange(1, max_h + 1)
@@ -327,7 +306,9 @@ def choose_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) 
 
     merged = target_idx.merge(src_needed[["hour_of_year", "price"]], on="hour_of_year", how="left")
     merged["price"] = merged["price"].ffill().bfill()
-    return merged[["timestamp", "Date", "Hour", "year", "price"]]
+    merged["omie_venta"] = merged["price"]
+    merged["omie_compra"] = merged["price"]
+    return merged[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]]
 
 
 def build_generic_vectors(default_data: pd.DataFrame, target_years: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -353,8 +334,6 @@ def build_generic_vectors(default_data: pd.DataFrame, target_years: list[int]) -
 
     for year in target_years:
         idx = make_year_hour_index(year)
-        idx["hour_of_year"] = np.arange(1, len(idx) + 1)
-
         tmp = idx.merge(base, on="hour_of_year", how="left")
         tmp["generacion"] = tmp["generacion"].fillna(0.0)
         tmp["consumo"] = tmp["consumo"].fillna(0.0)
@@ -367,23 +346,46 @@ def build_generic_vectors(default_data: pd.DataFrame, target_years: list[int]) -
     return pd.concat(gen_rows, ignore_index=True), pd.concat(load_rows, ignore_index=True)
 
 
+def build_price_dataset_for_years(
+    years: list[int],
+    historical_prices: pd.DataFrame,
+    forward_prices: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    hist_years = sorted(historical_prices["year"].unique().tolist()) if not historical_prices.empty else []
+    max_hist_year = max(hist_years) if hist_years else None
+
+    rows = []
+    for year in years:
+        if max_hist_year is not None and year <= max_hist_year:
+            rows.append(choose_historical_price_profile_for_year(historical_prices, year))
+        else:
+            if forward_prices is None or forward_prices.empty:
+                raise ValueError(f"Year {year} requires a forward hourly price file.")
+            year_df = forward_prices[forward_prices["year"] == year].copy()
+            if year_df.empty:
+                raise ValueError(f"Forward price file does not contain year {year}.")
+            expected_h = hours_in_year(year)
+            if len(year_df) < expected_h:
+                raise ValueError(f"Forward price file for year {year} has {len(year_df)} rows; expected at least {expected_h}.")
+            year_df = year_df.sort_values("timestamp").head(expected_h).copy()
+            rows.append(year_df[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]])
+
+    return pd.concat(rows, ignore_index=True)
+
+
 def build_dataset(
     years: list[int],
     mode: str,
-    price_hourly: pd.DataFrame,
+    historical_prices: pd.DataFrame,
     default_data: pd.DataFrame,
     uploaded_generation_file=None,
-    uploaded_private_price_file=None,
-    use_private_prices: bool = False,
+    forward_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    if use_private_prices and uploaded_private_price_file is not None:
-        prices = normalize_private_price_upload(uploaded_private_price_file, years)
-    else:
-        price_rows = []
-        for year in years:
-            price_rows.append(choose_price_profile_for_year(price_hourly, year))
-        prices = pd.concat(price_rows, ignore_index=True).rename(columns={"price": "omie_venta"})
-        prices["omie_compra"] = prices["omie_venta"]
+    prices = build_price_dataset_for_years(
+        years=years,
+        historical_prices=historical_prices,
+        forward_prices=forward_prices,
+    )
 
     default_gen, default_load = build_generic_vectors(default_data, years)
 
@@ -401,14 +403,12 @@ def build_dataset(
     df["consumption"] = df["consumption"].fillna(0.0)
 
     if mode == "BESS standalone":
-        if not use_private_prices:
-            df["omie_compra"] = df["omie_venta"]
+        df["omie_compra"] = df["omie_venta"]
         df["generation"] = 0.0
         df["consumption"] = 0.0
 
     elif mode == "BESS con demanda":
-        if not use_private_prices:
-            df["omie_compra"] = df["omie_venta"]
+        df["omie_compra"] = df["omie_venta"]
 
     elif mode == "BESS sin demanda":
         df["omie_compra"] = 1000.0
@@ -592,16 +592,16 @@ def make_results_excel(dispatch: pd.DataFrame, stats: pd.DataFrame, data_used: p
 # LOAD BASE DATA
 # =========================================================
 try:
-    price_hourly = standardize_price_history(PRICE_RAW_CSV_PATH)
+    historical_prices = standardize_price_history_from_day_ahead(PRICE_RAW_CSV_PATH)
     default_data = load_default_data_xlsx(DEFAULT_DATA_XLSX)
 except Exception as e:
     st.error(f"Error loading base data: {e}")
     st.stop()
 
-available_price_years = sorted(price_hourly["year"].unique().tolist()) if not price_hourly.empty else []
+available_hist_years = sorted(historical_prices["year"].unique().tolist()) if not historical_prices.empty else []
 
-if not available_price_years:
-    st.error("No hourly electricity history found. Build Day Ahead first so the price history CSV exists.")
+if not available_hist_years:
+    st.error("No historical prices found from Day Ahead. Build Day Ahead first so the historical price CSV exists.")
     st.stop()
 
 # =========================================================
@@ -616,11 +616,40 @@ with left:
         index=0,
     )
 
-    years = st.multiselect(
-        "Years to include in the analysis",
-        options=available_price_years,
-        default=available_price_years[-1:] if available_price_years else [],
+    use_hist_years = st.multiselect(
+        "Historical years from Day Ahead",
+        options=available_hist_years,
+        default=available_hist_years[-1:] if available_hist_years else [],
     )
+
+    use_forward_prices = st.checkbox("Add forward hourly prices from Excel", value=False)
+    forward_price_file = None
+    forward_years_selected = []
+
+    if use_forward_prices:
+        possible_forward_years = list(range(max(available_hist_years) + 1, 2048))
+        forward_years_selected = st.multiselect(
+            "Forward years to include",
+            options=possible_forward_years,
+            default=[],
+        )
+        forward_price_file = st.file_uploader(
+            "Upload forward hourly prices Excel",
+            type=["xlsx"],
+            help="Accepted columns: Date, Hour, price OR Date, Hour, omie_venta, omie_compra. Max year: 2047.",
+        )
+
+        template_start = min(forward_years_selected) if forward_years_selected else max(available_hist_years) + 1
+        template_end = max(forward_years_selected) if forward_years_selected else min(max(available_hist_years) + 1, 2047)
+        template_bytes = build_template_forward_price_excel(template_start, template_end)
+        st.download_button(
+            "Download forward price template",
+            data=template_bytes,
+            file_name=f"forward_price_template_{template_start}_{template_end}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    years = sorted(set(use_hist_years + forward_years_selected))
 
     capacity_mwh = st.number_input("BESS size (MWh)", min_value=0.1, value=6.0, step=0.1)
     c_rate = st.number_input("C-rate", min_value=0.01, value=1 / 6, step=0.01, format="%.4f")
@@ -635,9 +664,10 @@ with left:
             "Upload generation Excel",
             type=["xlsx"],
             help="Use a file with columns Date, Hour, generation, or just one generation column.",
+            key="generation_upload",
         )
 
-    template_year = years[0] if years else available_price_years[-1]
+    template_year = years[0] if years else available_hist_years[-1]
     template_bytes = build_template_generation_excel(template_year)
     st.download_button(
         "Download generation template",
@@ -646,37 +676,13 @@ with left:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    st.markdown("### Private prices")
-    use_private_prices = st.checkbox("Use private uploaded price file", value=False)
-    private_price_password_ok = False
-    uploaded_private_prices = None
-
-    if use_private_prices:
-        private_pwd = st.text_input("Private price password", type="password")
-        secret_pwd = st.secrets.get("private_price_upload_password", "")
-
-        if private_pwd and private_pwd == secret_pwd:
-            private_price_password_ok = True
-            uploaded_private_prices = st.file_uploader(
-                "Upload private prices Excel",
-                type=["xlsx"],
-                help="Accepted columns: Date, Hour, price OR Date, Hour, omie_venta, omie_compra",
-                key="private_price_upload",
-            )
-        elif private_pwd:
-            st.error("Incorrect private price password.")
-
-        private_template = build_template_private_price_excel(template_year)
-        st.download_button(
-            "Download private price template",
-            data=private_template,
-            file_name=f"private_price_template_{template_year}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
     run_button = st.button("Run optimisation", type="primary")
 
 with right:
+    st.markdown("### Price sourcing")
+    st.info("Historical years use the hourly prices built in Day Ahead.")
+    st.info("Future years use the uploaded forward hourly price Excel, up to year 2047.")
+
     st.markdown("### Scenario rules")
     if mode == "BESS standalone":
         st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
@@ -684,9 +690,6 @@ with right:
         st.info("omie_venta = price, omie_compra = same price, generacion = uploaded/default profile, consumo = generic vector from data.xlsx")
     else:
         st.info("omie_venta = price, omie_compra = 1000, generacion = uploaded/default profile, consumo = generic vector from data.xlsx")
-
-    if use_private_prices:
-        st.warning("Private uploaded prices will replace OMIE wherever applicable.")
 
     if DEFAULT_DATA_XLSX.exists():
         st.success("Default generic vectors found in data.xlsx")
@@ -698,31 +701,34 @@ with right:
 # =========================================================
 if run_button:
     if not years:
-        st.error("Select at least one year.")
+        st.error("Select at least one historical and/or forward year.")
         st.stop()
+
+    if use_forward_prices:
+        if not forward_years_selected:
+            st.error("Select at least one forward year.")
+            st.stop()
+        if forward_price_file is None:
+            st.error("Upload a forward hourly price Excel file.")
+            st.stop()
 
     if use_uploaded_generation and uploaded_generation is None:
         st.error("Upload a generation Excel file or untick the custom generation option.")
         st.stop()
 
-    if use_private_prices:
-        if not private_price_password_ok:
-            st.error("Private price password is required and must be correct.")
-            st.stop()
-        if uploaded_private_prices is None:
-            st.error("Upload a private prices Excel file.")
-            st.stop()
-
     try:
+        forward_prices = None
+        if use_forward_prices:
+            forward_prices = normalize_forward_price_upload(forward_price_file)
+
         with st.spinner("Building hourly dataset..."):
             data_used = build_dataset(
                 years=years,
                 mode=mode,
-                price_hourly=price_hourly,
+                historical_prices=historical_prices,
                 default_data=default_data,
                 uploaded_generation_file=uploaded_generation,
-                uploaded_private_price_file=uploaded_private_prices,
-                use_private_prices=use_private_prices,
+                forward_prices=forward_prices,
             )
 
         st.subheader("Hourly dataset used")
@@ -746,23 +752,25 @@ if run_button:
             {
                 "parameter": [
                     "mode",
-                    "years",
+                    "historical_years",
+                    "forward_years",
                     "capacity_mwh",
                     "c_rate",
                     "eta_ch",
                     "eta_dis",
                     "uploaded_generation",
-                    "use_private_prices",
+                    "forward_price_file",
                 ],
                 "value": [
                     mode,
-                    ", ".join(map(str, years)),
+                    ", ".join(map(str, use_hist_years)),
+                    ", ".join(map(str, forward_years_selected)),
                     capacity_mwh,
                     c_rate,
                     eta_ch,
                     eta_dis,
                     "yes" if uploaded_generation is not None else "no",
-                    "yes" if use_private_prices else "no",
+                    "yes" if forward_price_file is not None else "no",
                 ],
             }
         )
