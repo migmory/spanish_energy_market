@@ -18,6 +18,25 @@ ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 st.set_page_config(page_title="Day Ahead", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    html, body, [class*="css"] {
+        font-size: 125% !important;
+    }
+    .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
+    .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
+        font-size: 125% !important;
+    }
+    h1, h2, h3 {
+        font-size: 125% !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Day Ahead - Spain Spot Prices")
 
 DATA_DIR = BASE_DIR / "historical_data"
@@ -115,8 +134,13 @@ def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
                         ("background-color", "#6b7280"),
                         ("color", "white"),
                         ("font-weight", "bold"),
+                        ("font-size", "125%"),
                     ],
-                }
+                },
+                {
+                    "selector": "td",
+                    "props": [("font-size", "125%")],
+                },
             ]
         )
     )
@@ -250,11 +274,20 @@ def parse_esios_indicator(
     return df
 
 
-def interval_hours_from_datetime(dt_series: pd.Series) -> pd.Series:
-    return pd.Series(
-        [0.25 if x.date() >= date(2025, 10, 1) else 1.0 for x in dt_series],
-        index=dt_series.index,
-    )
+def infer_interval_hours(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "datetime" not in df.columns:
+        return pd.Series(dtype=float)
+
+    out = df.sort_values("datetime").copy()
+    diffs = out["datetime"].diff().dt.total_seconds().div(3600)
+
+    if diffs.dropna().empty:
+        interval = 1.0
+    else:
+        median_diff = diffs.dropna().median()
+        interval = 0.25 if median_diff <= 0.30 else 1.0
+
+    return pd.Series(interval, index=df.index)
 
 
 def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
@@ -285,11 +318,35 @@ def to_energy_intervals(df: pd.DataFrame, value_col_name: str, energy_col_name: 
 
     out = df.copy()
     out[value_col_name] = pd.to_numeric(out["value"], errors="coerce")
-    out["interval_h"] = interval_hours_from_datetime(out["datetime"])
+    out["interval_h"] = infer_interval_hours(out)
     out[energy_col_name] = out[value_col_name] * out["interval_h"]
 
     out = out[["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"]].copy()
     out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    out["datetime_hour"] = out["datetime"].dt.floor("h")
+
+    agg_dict = {"energy_mwh": "sum"}
+    if "mw" in out.columns:
+        agg_dict["mw"] = "mean"
+    for c in ["source", "geo_name", "geo_id", "technology", "data_source"]:
+        if c in out.columns:
+            agg_dict[c] = "first"
+
+    out = (
+        out.groupby("datetime_hour", as_index=False)
+        .agg(agg_dict)
+        .rename(columns={"datetime_hour": "datetime"})
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
     return out
 
 
@@ -558,7 +615,8 @@ def load_mix_best_energy(
     official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
     forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
 
-    return build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    return to_hourly_energy(best)
 
 
 def refresh_mix_best_energy(
@@ -592,7 +650,8 @@ def refresh_mix_best_energy(
     official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
     forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
 
-    return build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    return to_hourly_energy(best)
 
 
 def build_energy_mix_period(
@@ -704,9 +763,9 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
     forecast_df = mix_period[mix_period["data_source"] == "Forecast"].copy()
 
     official_bars = alt.Chart(official_df).mark_bar().encode(
-        x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("energy_mwh:Q", title="Generation / demand (MWh)"),
-        color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
+        x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16)),
+        y=alt.Y("energy_mwh:Q", title="Generation / demand (MWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
+        color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE, legend=alt.Legend(labelFontSize=14, titleFontSize=16)),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("technology:N", title="Technology"),
@@ -721,9 +780,9 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
         strokeDash=[3, 3],
         strokeWidth=0.7,
     ).encode(
-        x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("energy_mwh:Q", title="Generation / demand (MWh)"),
-        color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
+        x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16)),
+        y=alt.Y("energy_mwh:Q", title="Generation / demand (MWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
+        color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE, legend=alt.Legend(labelFontSize=14, titleFontSize=16)),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("technology:N", title="Technology"),
@@ -736,8 +795,8 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 
     if not demand_period.empty:
         line = alt.Chart(demand_period).mark_line(point=True, color="#111827").encode(
-            x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-            y=alt.Y("demand_mwh:Q", title="Generation / demand (MWh)"),
+            x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16)),
+            y=alt.Y("demand_mwh:Q", title="Generation / demand (MWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
             tooltip=[
                 alt.Tooltip("period_label:N", title="Period"),
                 alt.Tooltip("demand_mwh:Q", title="Demand (MWh)", format=",.2f"),
@@ -745,7 +804,7 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
         )
         layers.append(line)
 
-    return alt.layer(*layers).properties(height=380)
+    return alt.layer(*layers).properties(height=420)
 
 
 def build_day_energy_mix_table(mix_energy_dict: dict[str, pd.DataFrame], selected_day: date) -> pd.DataFrame:
@@ -899,6 +958,7 @@ try:
     solar_forecast_hourly = to_hourly_mean(solar_forecast_raw, "solar_forecast_mw")
     solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
     demand_energy = to_energy_intervals(demand_raw, "demand_p48_mw", "energy_mwh")
+    demand_energy = to_hourly_energy(demand_energy)
 
     monthly_avg = (
         price_hourly.assign(month=price_hourly["datetime"].dt.to_period("M").dt.to_timestamp())
@@ -931,11 +991,11 @@ try:
     st.subheader("Monthly spot and solar captured price - Spain")
     if not monthly_combo.empty:
         monthly_chart = alt.Chart(monthly_combo).encode(
-            x=alt.X("month:T", axis=alt.Axis(title=None, format="%b-%Y", labelAngle=0))
+            x=alt.X("month:T", axis=alt.Axis(title=None, format="%b-%Y", labelAngle=0, labelFontSize=14, titleFontSize=16))
         )
         chart = alt.layer(
             monthly_chart.mark_line(point=True).encode(
-                y=alt.Y("avg_monthly_price:Q", title="€/MWh"),
+                y=alt.Y("avg_monthly_price:Q", title="€/MWh", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
                 tooltip=[
                     alt.Tooltip("month:T", title="Month"),
                     alt.Tooltip("avg_monthly_price:Q", title="Average monthly price", format=".2f"),
@@ -946,7 +1006,7 @@ try:
             monthly_chart.mark_line(point=True, strokeDash=[6, 4]).encode(
                 y="captured_solar_price:Q"
             ),
-        ).properties(height=320)
+        ).properties(height=360)
         st.altair_chart(chart, use_container_width=True)
 
     monthly_table = monthly_combo.copy()
@@ -983,8 +1043,8 @@ try:
 
     if not day_price.empty:
         price_line = alt.Chart(day_price).mark_line(point=True).encode(
-            x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0)),
-            y=alt.Y("price:Q", title="Price €/MWh"),
+            x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelFontSize=14, titleFontSize=16)),
+            y=alt.Y("price:Q", title="Price €/MWh", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
             tooltip=[
                 alt.Tooltip("datetime:T", title="Time"),
                 alt.Tooltip("price:Q", title="Price", format=".2f"),
@@ -992,17 +1052,17 @@ try:
         )
         if not day_solar.empty:
             solar_area = alt.Chart(day_solar).mark_area(opacity=0.25).encode(
-                x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0)),
-                y=alt.Y("solar_best_mw:Q", title="Solar MW"),
+                x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelFontSize=14, titleFontSize=16)),
+                y=alt.Y("solar_best_mw:Q", title="Solar MW", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
                 tooltip=[
                     alt.Tooltip("datetime:T", title="Time"),
                     alt.Tooltip("solar_best_mw:Q", title="Solar", format=".2f"),
                     alt.Tooltip("solar_source:N", title="Solar source"),
                 ],
             )
-            st.altair_chart(alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=340), use_container_width=True)
+            st.altair_chart(alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360), use_container_width=True)
         else:
-            st.altair_chart(price_line.properties(height=340), use_container_width=True)
+            st.altair_chart(price_line.properties(height=360), use_container_width=True)
 
     def compute_period_metrics(price_df: pd.DataFrame, solar_df: pd.DataFrame, start_d: date, end_d: date) -> dict:
         period_price = price_df[(price_df["datetime"].dt.date >= start_d) & (price_df["datetime"].dt.date <= end_d)].copy()
@@ -1061,10 +1121,19 @@ try:
     st.subheader("Energy mix")
 
     mix_energy = {}
-    if refresh_energy_mix:
-        with st.spinner("Refreshing energy mix data..."):
-            for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
-                forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
+    with st.spinner("Loading energy mix data..."):
+        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
+            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
+
+            official_path = get_mix_indicator_csv_path_variant(tech_name, official_id, "official")
+            forecast_path = get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast")
+
+            official_exists = official_id is not None and official_path.exists()
+            forecast_exists = forecast_id is not None and forecast_path.exists()
+
+            should_build = refresh_energy_mix or (not official_exists and not forecast_exists)
+
+            if should_build:
                 mix_energy[tech_name] = refresh_mix_best_energy(
                     tech_name=tech_name,
                     official_id=official_id,
@@ -1072,14 +1141,12 @@ try:
                     start_day=start_day,
                     token=token,
                 )
-    else:
-        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
-            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
-            mix_energy[tech_name] = load_mix_best_energy(
-                tech_name=tech_name,
-                official_id=official_id,
-                forecast_id=forecast_id,
-            )
+            else:
+                mix_energy[tech_name] = load_mix_best_energy(
+                    tech_name=tech_name,
+                    official_id=official_id,
+                    forecast_id=forecast_id,
+                )
 
     if any(not df.empty for df in mix_energy.values()):
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
@@ -1105,8 +1172,31 @@ try:
         elif granularity == "Daily":
             daily_min = price_hourly["datetime"].dt.date.min()
             daily_max = price_hourly["datetime"].dt.date.max()
-            day_range = (daily_min, daily_max)
-            st.caption(f"Showing all daily periods with available price data: {daily_min} to {daily_max}")
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                daily_start = st.date_input(
+                    "Daily range start",
+                    value=max(daily_min, daily_max - timedelta(days=14)),
+                    min_value=daily_min,
+                    max_value=daily_max,
+                    key="mix_daily_start",
+                )
+            with cc2:
+                daily_end = st.date_input(
+                    "Daily range end",
+                    value=daily_max,
+                    min_value=daily_min,
+                    max_value=daily_max,
+                    key="mix_daily_end",
+                )
+
+            if daily_start > daily_end:
+                st.warning("Daily range start cannot be later than daily range end.")
+                st.stop()
+
+            day_range = (daily_start, daily_end)
+            st.caption(f"Showing daily periods from {daily_start} to {daily_end}")
 
         mix_period, demand_period = build_energy_mix_period(
             mix_energy,
