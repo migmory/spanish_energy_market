@@ -864,6 +864,38 @@ def add_proxy_forecast_for_day(df: pd.DataFrame, target_day: date) -> pd.DataFra
     return out.sort_values("datetime").reset_index(drop=True)
 
 
+def cap_forecast_spike_vs_previous_day(df: pd.DataFrame, target_day: date, max_ratio: float = 2.0) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns or "energy_mwh" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
+
+    prev_day = target_day - timedelta(days=1)
+    prev_total = pd.to_numeric(
+        out.loc[out["datetime"].dt.date == prev_day, "energy_mwh"],
+        errors="coerce",
+    ).sum()
+    tgt_mask = out["datetime"].dt.date == target_day
+    tgt_total = pd.to_numeric(out.loc[tgt_mask, "energy_mwh"], errors="coerce").sum()
+
+    if prev_total <= 0 or tgt_total <= 0:
+        return out
+
+    allowed_total = prev_total * max_ratio
+    if tgt_total <= allowed_total:
+        return out
+
+    scale = allowed_total / tgt_total
+    out.loc[tgt_mask, "energy_mwh"] = pd.to_numeric(out.loc[tgt_mask, "energy_mwh"], errors="coerce").fillna(0.0) * scale
+    if "mw" in out.columns:
+        out.loc[tgt_mask, "mw"] = pd.to_numeric(out.loc[tgt_mask, "mw"], errors="coerce").fillna(0.0) * scale
+    return out
+
+
 def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1237,6 +1269,7 @@ try:
         tomorrow_day = date.today() + timedelta(days=1)
         for tech_name in list(mix_energy.keys()):
             mix_energy[tech_name] = add_proxy_forecast_for_day(mix_energy[tech_name], tomorrow_day)
+            mix_energy[tech_name] = cap_forecast_spike_vs_previous_day(mix_energy[tech_name], tomorrow_day, max_ratio=2.0)
 
     if any(not df.empty for df in mix_energy.values()):
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
