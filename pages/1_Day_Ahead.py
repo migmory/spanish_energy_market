@@ -834,6 +834,36 @@ def build_day_energy_mix_table(mix_energy_dict: dict[str, pd.DataFrame], selecte
     return out.sort_values(["Technology", "Data source"]).reset_index(drop=True)
 
 
+def add_proxy_forecast_for_day(df: pd.DataFrame, target_day: date) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
+
+    if (out["datetime"].dt.date == target_day).any():
+        return out
+
+    last_day = out["datetime"].dt.date.max()
+    last_day_rows = out[out["datetime"].dt.date == last_day].copy()
+    if last_day_rows.empty:
+        return out
+
+    day_delta = (target_day - last_day).days
+    if day_delta <= 0:
+        return out
+
+    last_day_rows["datetime"] = last_day_rows["datetime"] + pd.Timedelta(days=day_delta)
+    if "data_source" in last_day_rows.columns:
+        last_day_rows["data_source"] = "Forecast"
+
+    out = pd.concat([out, last_day_rows], ignore_index=True)
+    return out.sort_values("datetime").reset_index(drop=True)
+
+
 def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1034,7 +1064,7 @@ try:
         )
 
         lines = alt.layer(
-            base.mark_line(point=True, color="#0f766e", strokeWidth=2.8).encode(
+            base.mark_line(point=True, color="#2563eb", strokeWidth=2.8).encode(
                 y=alt.Y("avg_monthly_price:Q", title="€/MWh", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
                 tooltip=[
                     alt.Tooltip("month:T", title="Month"),
@@ -1043,7 +1073,7 @@ try:
                     alt.Tooltip("capture_pct:Q", title="Solar capture rate", format=".2%"),
                 ],
             ),
-            base.mark_line(point=True, color="#1d4ed8", strokeWidth=2.8).encode(
+            base.mark_line(point=True, color="#1d4ed8", strokeDash=[6, 4], strokeWidth=2.8).encode(
                 y="captured_solar_price:Q"
             ),
         )
@@ -1202,6 +1232,11 @@ try:
                     official_id=official_id,
                     forecast_id=forecast_id,
                 )
+
+    if allow_next_day_refresh():
+        tomorrow_day = date.today() + timedelta(days=1)
+        for tech_name in list(mix_energy.keys()):
+            mix_energy[tech_name] = add_proxy_forecast_for_day(mix_energy[tech_name], tomorrow_day)
 
     if any(not df.empty for df in mix_energy.values()):
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)

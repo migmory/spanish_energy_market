@@ -311,6 +311,36 @@ def load_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: i
     return to_hourly_energy(best)
 
 
+def add_proxy_forecast_for_day(df: pd.DataFrame, target_day: date) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
+
+    if (out["datetime"].dt.date == target_day).any():
+        return out
+
+    last_day = out["datetime"].dt.date.max()
+    last_day_rows = out[out["datetime"].dt.date == last_day].copy()
+    if last_day_rows.empty:
+        return out
+
+    day_delta = (target_day - last_day).days
+    if day_delta <= 0:
+        return out
+
+    last_day_rows["datetime"] = last_day_rows["datetime"] + pd.Timedelta(days=day_delta)
+    if "data_source" in last_day_rows.columns:
+        last_day_rows["data_source"] = "Forecast"
+
+    out = pd.concat([out, last_day_rows], ignore_index=True)
+    return out.sort_values("datetime").reset_index(drop=True)
+
+
 def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: bool) -> pd.DataFrame:
     rows = []
 
@@ -337,6 +367,8 @@ def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: 
 
         best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
         best = to_hourly_energy(best)
+        if force_forecast_for_tomorrow:
+            best = add_proxy_forecast_for_day(best, report_day)
 
         if "datetime" not in best.columns:
             continue
@@ -500,25 +532,25 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
     return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
 
 
-def build_mix_donut_chart(day_mix_hourly: pd.DataFrame):
+def build_mix_hourly_chart(day_mix_hourly: pd.DataFrame):
     if day_mix_hourly.empty:
         return None
 
-    donut_df = (
-        day_mix_hourly.groupby("technology", as_index=False)["energy_mwh"]
-        .sum()
-        .rename(columns={"technology": "Technology", "energy_mwh": "Energy (MWh)"})
-    )
+    chart_df = day_mix_hourly.copy()
+    chart_df["Hour"] = pd.to_datetime(chart_df["datetime"]).dt.strftime("%H:%M")
 
     chart = (
-        alt.Chart(donut_df)
-        .mark_arc(innerRadius=70)
+        alt.Chart(chart_df)
+        .mark_bar()
         .encode(
-            theta=alt.Theta("Energy (MWh):Q"),
-            color=alt.Color("Technology:N"),
+            x=alt.X("Hour:N", sort=list(chart_df["Hour"].drop_duplicates())),
+            y=alt.Y("energy_mwh:Q", title="Energy (MWh)", stack=True),
+            color=alt.Color("technology:N", title="Technology"),
             tooltip=[
-                alt.Tooltip("Technology:N"),
-                alt.Tooltip("Energy (MWh):Q", format=",.2f"),
+                alt.Tooltip("Hour:N"),
+                alt.Tooltip("technology:N", title="Technology"),
+                alt.Tooltip("energy_mwh:Q", title="Energy (MWh)", format=",.2f"),
+                alt.Tooltip("data_source:N", title="Data source"),
             ],
         )
         .properties(height=380)
@@ -566,23 +598,29 @@ def line_area_png_base64(hourly_df: pd.DataFrame) -> str | None:
         return None
 
 
-def mix_donut_png_base64(day_mix_hourly: pd.DataFrame) -> str | None:
+def mix_hourly_png_base64(day_mix_hourly: pd.DataFrame) -> str | None:
     if day_mix_hourly.empty:
         return None
     try:
-        donut_df = day_mix_hourly.groupby("technology", as_index=False)["energy_mwh"].sum()
-        fig, ax = plt.subplots(figsize=(6.5, 5), dpi=140)
-        wedges, _, _ = ax.pie(
-            donut_df["energy_mwh"],
-            labels=donut_df["technology"],
-            autopct="%1.1f%%",
-            startangle=90,
-            pctdistance=0.82,
-            textprops={"fontsize": 8},
+        chart_df = day_mix_hourly.copy()
+        chart_df["Hour"] = pd.to_datetime(chart_df["datetime"]).dt.strftime("%H:%M")
+        pivot = (
+            chart_df.pivot_table(index="Hour", columns="technology", values="energy_mwh", aggfunc="sum", fill_value=0.0)
+            .sort_index()
         )
-        centre_circle = plt.Circle((0, 0), 0.55, fc="white")
-        fig.gca().add_artist(centre_circle)
-        ax.axis("equal")
+
+        fig, ax = plt.subplots(figsize=(10, 4.8), dpi=140)
+        bottom = None
+        for tech in pivot.columns:
+            values = pivot[tech].values
+            ax.bar(pivot.index, values, bottom=bottom, label=tech)
+            bottom = values if bottom is None else bottom + values
+
+        ax.set_ylabel("Energy (MWh)")
+        ax.set_xlabel("Hour")
+        ax.grid(axis="y", alpha=0.22)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+        ax.set_facecolor("#f8fafc")
 
         buffer = BytesIO()
         fig.tight_layout()
@@ -706,8 +744,8 @@ if not mix_preview.empty:
         }
     )
 
-mix_donut_chart = build_mix_donut_chart(day_mix_hourly)
-mix_donut_b64 = mix_donut_png_base64(day_mix_hourly) or chart_to_base64_png(mix_donut_chart)
+mix_hourly_chart = build_mix_hourly_chart(day_mix_hourly)
+mix_hourly_b64 = mix_hourly_png_base64(day_mix_hourly) or chart_to_base64_png(mix_hourly_chart)
 
 st.subheader("Preview chart")
 if overlay_chart is not None:
@@ -725,11 +763,11 @@ if not mix_preview.empty:
 else:
     st.info("No hourly energy mix available for selected day.")
 
-st.subheader("Preview daily energy mix donut")
-if mix_donut_chart is not None:
-    st.altair_chart(mix_donut_chart, use_container_width=True)
+st.subheader("Preview hourly energy mix chart")
+if mix_hourly_chart is not None:
+    st.altair_chart(mix_hourly_chart, use_container_width=True)
 else:
-    st.info("No daily energy mix donut available.")
+    st.info("No hourly energy mix chart available.")
 
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
@@ -746,11 +784,11 @@ if overlay_chart_b64:
     <br><br>
     """
 
-mix_donut_html = ""
-if mix_donut_b64:
-    mix_donut_html = f"""
-    <h3>Daily energy mix donut</h3>
-    <img src="data:image/png;base64,{mix_donut_b64}" alt="Energy mix donut" style="max-width:600px; height:auto; border:1px solid #ddd;" />
+mix_hourly_chart_html = ""
+if mix_hourly_b64:
+    mix_hourly_chart_html = f"""
+    <h3>Hourly energy mix chart</h3>
+    <img src="data:image/png;base64,{mix_hourly_b64}" alt="Hourly energy mix chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
     <br><br>
     """
 
@@ -780,7 +818,7 @@ email_html = f"""
 
     <br>
 
-    {mix_donut_html}
+    {mix_hourly_chart_html}
 
     <h3>Hourly energy mix</h3>
     {mix_hourly_html}
