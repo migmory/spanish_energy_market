@@ -7,6 +7,7 @@ import base64
 import altair as alt
 import matplotlib.pyplot as plt
 import pandas as pd
+import pulp
 import requests
 import streamlit as st
 
@@ -78,6 +79,50 @@ ENERGY_MIX_INDICATORS_FORECAST = {
     "Biomass": None,
     "Biogas": None,
     "Other renewables": None,
+}
+
+TECH_COLOR_SCALE = alt.Scale(
+    domain=[
+        "CCGT",
+        "Hydro",
+        "Nuclear",
+        "Solar PV",
+        "Solar thermal",
+        "Wind",
+        "CHP",
+        "Biomass",
+        "Biogas",
+        "Other renewables",
+        "Hydro UGH",
+        "Hydro non-UGH",
+        "Pumped hydro",
+    ],
+    range=[
+        "#9CA3AF",
+        "#60A5FA",
+        "#C084FC",
+        "#FACC15",
+        "#FCA5A5",
+        "#2563EB",
+        "#F97316",
+        "#16A34A",
+        "#22C55E",
+        "#14B8A6",
+        "#60A5FA",
+        "#3B82F6",
+        "#93C5FD",
+    ],
+)
+
+RENEWABLE_TECHS = {
+    "Wind",
+    "Solar PV",
+    "Solar thermal",
+    "Hydro UGH",
+    "Hydro non-UGH",
+    "Biomass",
+    "Biogas",
+    "Other renewables",
 }
 
 
@@ -545,7 +590,7 @@ def build_mix_hourly_chart(day_mix_hourly: pd.DataFrame):
         .encode(
             x=alt.X("Hour:N", sort=list(chart_df["Hour"].drop_duplicates())),
             y=alt.Y("energy_mwh:Q", title="Energy (MWh)", stack=True),
-            color=alt.Color("technology:N", title="Technology"),
+            color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
             tooltip=[
                 alt.Tooltip("Hour:N"),
                 alt.Tooltip("technology:N", title="Technology"),
@@ -556,6 +601,61 @@ def build_mix_hourly_chart(day_mix_hourly: pd.DataFrame):
         .properties(height=380)
     )
     return chart
+
+
+def compute_energy_mix_kpis(day_mix_hourly: pd.DataFrame, hourly_df: pd.DataFrame) -> tuple[float | None, int]:
+    negative_hours = int((hourly_df["Price (€/MWh)"] < 0).sum()) if not hourly_df.empty else 0
+    if day_mix_hourly.empty:
+        return None, negative_hours
+
+    total = float(day_mix_hourly["energy_mwh"].sum())
+    if total <= 0:
+        return None, negative_hours
+
+    renew = float(day_mix_hourly[day_mix_hourly["technology"].isin(RENEWABLE_TECHS)]["energy_mwh"].sum())
+    return renew / total, negative_hours
+
+
+def compute_bess_spread_eur_per_mwh(
+    hourly_df: pd.DataFrame,
+    capacity_mwh: float = 1.0,
+    c_rate: float = 0.25,
+    eta_ch: float = 1.0,
+    eta_dis: float = 1.0,
+) -> float | None:
+    if hourly_df.empty:
+        return None
+
+    prices = pd.to_numeric(hourly_df["Price (€/MWh)"], errors="coerce").dropna().tolist()
+    n = len(prices)
+    if n == 0:
+        return None
+
+    max_power = capacity_mwh * c_rate
+    model = pulp.LpProblem("bess_spread_daily", pulp.LpMaximize)
+    charge = pulp.LpVariable.dicts("charge", range(n), lowBound=0, upBound=max_power)
+    discharge = pulp.LpVariable.dicts("discharge", range(n), lowBound=0, upBound=max_power)
+    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0, upBound=capacity_mwh)
+
+    model += soc[0] == 0
+    for t in range(n):
+        model += soc[t + 1] == soc[t] + eta_ch * charge[t] - discharge[t] / max(eta_dis, 1e-9)
+
+    model += soc[n] == 0
+    model += pulp.lpSum(discharge[t] * prices[t] - charge[t] * prices[t] for t in range(n))
+
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    model.solve(solver)
+    if pulp.LpStatus[model.status] != "Optimal":
+        return None
+
+    total_charge = sum((pulp.value(charge[t]) or 0.0) for t in range(n))
+    total_discharge = sum((pulp.value(discharge[t]) or 0.0) for t in range(n))
+    revenue = sum(((pulp.value(discharge[t]) or 0.0) - (pulp.value(charge[t]) or 0.0)) * prices[t] for t in range(n))
+
+    if total_charge <= 1e-9 or total_discharge <= 1e-9:
+        return 0.0
+    return revenue / total_discharge
 
 
 def chart_to_base64_png(chart) -> str | None:
@@ -771,6 +871,10 @@ else:
 
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
+renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
+bess_spread = compute_bess_spread_eur_per_mwh(hourly_df, capacity_mwh=1.0, c_rate=0.25, eta_ch=1.0, eta_dis=1.0)
+renewable_text = f"{renewable_pct:.1%}" if renewable_pct is not None else "n/a"
+bess_spread_text = f"{bess_spread:.2f} €/MWh" if bess_spread is not None else "n/a"
 
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
@@ -803,7 +907,10 @@ email_html = f"""
       <strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
       <strong>Captured solar price:</strong> {capture_text}<br>
       <strong>Solar source used:</strong> {day_sources}<br>
-      <strong>Energy mix source rule:</strong> {mix_source_note}
+      <strong>Energy mix source rule:</strong> {mix_source_note}<br>
+      <strong>Renewables share (energy mix):</strong> {renewable_text}<br>
+      <strong>Negative-price hours:</strong> {negative_hours}<br>
+      <strong>BESS spread (1 MWh, 4h, 0.25C, 100%/100%):</strong> {bess_spread_text}
     </p>
 
     {overlay_chart_html}
