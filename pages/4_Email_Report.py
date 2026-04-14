@@ -464,7 +464,7 @@ def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: 
     out = pd.concat(rows, ignore_index=True)
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
     out = out.dropna(subset=["datetime"]).copy()
-    out["Hour"] = out["datetime"].dt.strftime("%H:%M")
+    out["Hour"] = out["datetime"].dt.hour + 1
     return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
 
 
@@ -565,7 +565,8 @@ def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, 
     if not positive_solar.empty:
         capture_price = (positive_solar["price"] * positive_solar["solar_best_mw"]).sum() / positive_solar["solar_best_mw"].sum()
 
-    merged["Hour"] = merged["datetime"].dt.strftime("%H:%M")
+    merged["Hour"] = merged["datetime"].dt.hour + 1
+
     merged = merged.rename(
         columns={
             "price": "Price (€/MWh)",
@@ -581,16 +582,16 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
     if hourly_df.empty:
         return None
 
-    base_x = alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0))
+    hour_order = sorted(hourly_df["Hour"].dropna().unique().tolist())
 
     price_line = (
         alt.Chart(hourly_df)
         .mark_line(point=True)
         .encode(
-            x=base_x,
+            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
             y=alt.Y("Price (€/MWh):Q", title="Price (€/MWh)"),
             tooltip=[
-                alt.Tooltip("Hour:N", title="Hour"),
+                alt.Tooltip("Hour:O", title="Hour"),
                 alt.Tooltip("Price (€/MWh):Q", title="Price", format=".2f"),
                 alt.Tooltip("Solar (MW):Q", title="Solar", format=".2f"),
                 alt.Tooltip("Solar source:N", title="Solar source"),
@@ -602,7 +603,7 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
         alt.Chart(hourly_df)
         .mark_area(opacity=0.25)
         .encode(
-            x=base_x,
+            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
             y=alt.Y("Solar (MW):Q", title="Solar (MW)"),
         )
     )
@@ -615,17 +616,17 @@ def build_mix_hourly_chart(day_mix_hourly: pd.DataFrame):
         return None
 
     chart_df = day_mix_hourly.copy()
-    chart_df["Hour"] = pd.to_datetime(chart_df["datetime"]).dt.strftime("%H:%M")
+    hour_order = sorted(chart_df["Hour"].dropna().unique().tolist())
 
     chart = (
         alt.Chart(chart_df)
         .mark_bar()
         .encode(
-            x=alt.X("Hour:N", sort=list(chart_df["Hour"].drop_duplicates())),
+            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
             y=alt.Y("energy_mwh:Q", title="Energy (MWh)", stack=True),
             color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
             tooltip=[
-                alt.Tooltip("Hour:N"),
+                alt.Tooltip("Hour:O", title="Hour"),
                 alt.Tooltip("technology:N", title="Technology"),
                 alt.Tooltip("energy_mwh:Q", title="Energy (MWh)", format=",.2f"),
                 alt.Tooltip("data_source:N", title="Data source"),
@@ -701,8 +702,6 @@ def chart_to_base64_png(chart) -> str | None:
         return None
 
 
-
-
 def line_area_png_base64(hourly_df: pd.DataFrame) -> str | None:
     if hourly_df.empty:
         return None
@@ -710,16 +709,20 @@ def line_area_png_base64(hourly_df: pd.DataFrame) -> str | None:
         fig, ax1 = plt.subplots(figsize=(10, 4.2), dpi=140)
         ax2 = ax1.twinx()
 
-        ax1.plot(hourly_df["datetime"], hourly_df["Price (€/MWh)"], color="#0f766e", linewidth=2.2, marker="o", markersize=3)
-        ax2.fill_between(hourly_df["datetime"], hourly_df["Solar (MW)"], color="#facc15", alpha=0.28)
+        x = hourly_df["Hour"]
+
+        ax1.plot(x, hourly_df["Price (€/MWh)"], color="#0f766e", linewidth=2.2, marker="o", markersize=3)
+        ax2.fill_between(x, hourly_df["Solar (MW)"], color="#facc15", alpha=0.28)
 
         ax1.set_ylabel("Price (€/MWh)")
         ax2.set_ylabel("Solar (MW)")
-        ax1.set_xlabel("")
+        ax1.set_xlabel("Hour")
         ax1.set_facecolor("#f8fafc")
         fig.patch.set_facecolor("white")
         ax1.grid(alpha=0.25)
-        fig.autofmt_xdate(rotation=0)
+
+        ax1.set_xticks(list(x))
+        ax1.set_xticklabels([str(int(v)) for v in x], rotation=0)
 
         buffer = BytesIO()
         fig.tight_layout()
@@ -736,7 +739,6 @@ def mix_hourly_png_base64(day_mix_hourly: pd.DataFrame) -> str | None:
         return None
     try:
         chart_df = day_mix_hourly.copy()
-        chart_df["Hour"] = pd.to_datetime(chart_df["datetime"]).dt.strftime("%H:%M")
         pivot = (
             chart_df.pivot_table(index="Hour", columns="technology", values="energy_mwh", aggfunc="sum", fill_value=0.0)
             .sort_index()
@@ -746,7 +748,7 @@ def mix_hourly_png_base64(day_mix_hourly: pd.DataFrame) -> str | None:
         bottom = None
         for tech in pivot.columns:
             values = pivot[tech].values
-            ax.bar(pivot.index, values, bottom=bottom, label=tech)
+            ax.bar(pivot.index.astype(str), values, bottom=bottom, label=tech)
             bottom = values if bottom is None else bottom + values
 
         ax.set_ylabel("Energy (MWh)")
@@ -763,6 +765,7 @@ def mix_hourly_png_base64(day_mix_hourly: pd.DataFrame) -> str | None:
         return base64.b64encode(buffer.read()).decode("utf-8")
     except Exception:
         return None
+
 
 def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
     pct_cols = pct_cols or []
@@ -793,6 +796,27 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
     """
     html = tmp.to_html(index=False, classes="email-table", border=0, escape=False)
     return styles + html
+
+
+def build_mix_matrix_table(day_mix_hourly: pd.DataFrame) -> pd.DataFrame:
+    if day_mix_hourly.empty:
+        return pd.DataFrame()
+
+    pivot = (
+        day_mix_hourly.pivot_table(
+            index="technology",
+            columns="Hour",
+            values="energy_mwh",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .sort_index()
+    )
+
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+    pivot.columns = [str(int(c)) for c in pivot.columns]
+    pivot = pivot.reset_index().rename(columns={"technology": "Technology"})
+    return pivot
 
 
 # =========================================================
@@ -867,15 +891,7 @@ preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar sourc
 overlay_chart = build_overlay_chart(hourly_df)
 overlay_chart_b64 = line_area_png_base64(hourly_df) or chart_to_base64_png(overlay_chart)
 
-mix_preview = day_mix_hourly[["Hour", "technology", "energy_mwh", "data_source"]].copy() if not day_mix_hourly.empty else pd.DataFrame()
-if not mix_preview.empty:
-    mix_preview = mix_preview.rename(
-        columns={
-            "technology": "Technology",
-            "energy_mwh": "Energy (MWh)",
-            "data_source": "Data source",
-        }
-    )
+mix_preview = build_mix_matrix_table(day_mix_hourly)
 
 mix_hourly_chart = build_mix_hourly_chart(day_mix_hourly)
 mix_hourly_b64 = mix_hourly_png_base64(day_mix_hourly) or chart_to_base64_png(mix_hourly_chart)
