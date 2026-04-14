@@ -350,7 +350,7 @@ def build_all_mix_hourly_for_day(report_day: date, force_forecast_for_tomorrow: 
         official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
         forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-        if official_id is not None and not force_forecast_for_tomorrow:
+        if official_id is not None:
             official_df = load_raw_history(
                 get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
                 f"esios_{official_id}",
