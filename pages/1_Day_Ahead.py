@@ -134,7 +134,7 @@ def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
                         ("background-color", "#6b7280"),
                         ("color", "white"),
                         ("font-weight", "bold"),
-                        ("font-size", "140%"),
+                        ("font-size", "155%"),
                     ],
                 },
             ]
@@ -993,6 +993,8 @@ try:
     if not monthly_combo.empty:
         latest_year = int(monthly_combo["month"].dt.year.max())
         previous_year = latest_year - 1
+        x_domain_min = monthly_combo["month"].min()
+        x_domain_max = monthly_combo["month"].max()
 
         prev_year_df = pd.DataFrame(
             {
@@ -1001,16 +1003,27 @@ try:
             }
         )
 
+        years_df = (
+            monthly_combo.assign(year=monthly_combo["month"].dt.year)
+            .groupby("year", as_index=False)
+            .agg(
+                year_start=("month", "min"),
+                year_end=("month", "max"),
+            )
+        )
+        years_df["year_mid"] = years_df["year_start"] + (years_df["year_end"] - years_df["year_start"]) / 2
+
         base = alt.Chart(monthly_combo).encode(
             x=alt.X(
                 "month:T",
+                scale=alt.Scale(domain=[x_domain_min, x_domain_max]),
                 axis=alt.Axis(
                     title=None,
                     labelAngle=0,
                     labelFontSize=13,
                     tickCount="month",
                     labelPadding=8,
-                    labelExpr="timeFormat(datum.value, '%b') + '\\n' + (timeFormat(datum.value, '%m') == '01' ? timeFormat(datum.value, '%Y') : '')",
+                    format="%b",
                 ),
             )
         )
@@ -1030,13 +1043,22 @@ try:
                     alt.Tooltip("capture_pct:Q", title="Solar capture rate", format=".2%"),
                 ],
             ),
-            base.mark_line(point=True, color="#1d4ed8", strokeDash=[6, 4], strokeWidth=2.8).encode(
+            base.mark_line(point=True, color="#1d4ed8", strokeWidth=2.8).encode(
                 y="captured_solar_price:Q"
             ),
         )
 
-        chart = alt.layer(year_background, lines).properties(height=360).configure_view(
-            fill="#f3f4f6",
+        year_axis = alt.Chart(years_df).mark_text(color="#334155", fontSize=13, fontWeight="bold").encode(
+            x=alt.X("year_mid:T", scale=alt.Scale(domain=[x_domain_min, x_domain_max]), axis=None),
+            text=alt.Text("year:O"),
+        ).properties(height=28)
+
+        chart = alt.vconcat(
+            alt.layer(year_background, lines).properties(height=360),
+            year_axis,
+            spacing=2,
+        ).configure_view(
+            fill="#ffffff",
             stroke="#d1d5db",
             cornerRadius=6,
         )
