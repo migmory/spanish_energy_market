@@ -81,6 +81,9 @@ ENERGY_MIX_INDICATORS_FORECAST = {
     "Other renewables": None,
 }
 
+# Backward-compatible alias for legacy typo ("OFICIAL")
+ENERGY_MIX_INDICATORS_OFICIAL = ENERGY_MIX_INDICATORS_OFFICIAL
+
 TECH_COLOR_SCALE = alt.Scale(
     domain=[
         "CCGT",

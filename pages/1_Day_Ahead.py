@@ -68,6 +68,9 @@ TECH_COLOR_DOMAIN = [
     "Other renewables",
 ]
 
+# Backward-compatible alias for legacy typo ("OFICIAL")
+ENERGY_MIX_INDICATORS_OFICIAL = ENERGY_MIX_INDICATORS_OFFICIAL
+
 TECH_COLOR_SCALE = alt.Scale(
     domain=TECH_COLOR_DOMAIN,
     range=[
