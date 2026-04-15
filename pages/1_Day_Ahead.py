@@ -324,10 +324,18 @@ def parse_esios_indicator(
     if "geo_id" not in df.columns:
         df["geo_id"] = None
 
-    if (df["geo_id"] == 3).any():
+    geo_series = df["geo_name"].astype(str).str.strip().str.lower()
+
+    if source_name == "esios_10027":
+        if (df["geo_id"] == 8741).any():
+            df = df[df["geo_id"] == 8741].copy()
+        elif geo_series.str.contains("penins", na=False).any():
+            df = df[geo_series.str.contains("penins", na=False)].copy()
+        elif (df["geo_id"] == 3).any():
+            df = df[df["geo_id"] == 3].copy()
+    elif (df["geo_id"] == 3).any():
         df = df[df["geo_id"] == 3].copy()
     else:
-        geo_series = df["geo_name"].astype(str).str.strip().str.lower()
         if (geo_series == "españa").any():
             df = df[geo_series == "españa"].copy()
         elif (geo_series == "espana").any():
@@ -606,17 +614,22 @@ def build_best_solar_hourly(
 # =========================================================
 # REE MIX HELPERS
 # =========================================================
-def build_or_refresh_ree_mix_cache(
-    csv_path: Path,
-    start_date: date,
-    end_date: date,
-    time_trunc: str,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    if csv_path.exists() and not force_refresh:
-        df = load_raw_history(csv_path)
-        if not df.empty:
-            return df
+def get_mix_indicator_csv_path_variant(name: str, indicator_id: int | None, variant: str) -> Path:
+    safe_name = name.lower().replace(" ", "_").replace("/", "_")
+    suffix = "none" if indicator_id is None else str(indicator_id)
+    return DATA_DIR / f"mix_{variant}_{suffix}_{safe_name}.csv"
+
+
+def load_or_refresh_mix_raw(indicator_id: int | None, source_name: str, csv_path: Path, start_day: date, token: str) -> pd.DataFrame:
+    if indicator_id is None:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    hist = load_raw_history(csv_path, source_name)
+
+    if hist.empty:
+        hist = build_raw_history(indicator_id, source_name, csv_path, start_day, token)
+    else:
+        hist = refresh_raw_history(indicator_id, source_name, csv_path, hist, token, 3)
 
     df = build_ree_mix_history(start_date, end_date, time_trunc=time_trunc)
     save_raw_history(df, csv_path)
@@ -728,15 +741,20 @@ def build_energy_mix_period_chart_gwh(mix_period: pd.DataFrame, demand_period: p
     official_df = mix_period[mix_period["data_source"] == "Official"].copy()
     forecast_df = mix_period[mix_period["data_source"] == "Forecast"].copy()
 
+    official_df = official_df.copy()
+    forecast_df = forecast_df.copy()
+    official_df["energy_gwh"] = official_df["energy_mwh"] / 1000.0
+    forecast_df["energy_gwh"] = forecast_df["energy_mwh"] / 1000.0
+
     official_bars = alt.Chart(official_df).mark_bar().encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16)),
-        y=alt.Y("value_gwh:Q", title="Generation / demand (GWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
+        y=alt.Y("energy_gwh:Q", title="Generation & Demand (GWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE, legend=alt.Legend(labelFontSize=14, titleFontSize=16)),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("technology:N", title="Technology"),
             alt.Tooltip("data_source:N", title="Source"),
-            alt.Tooltip("value_gwh:Q", title="Generation (GWh)", format=",.2f"),
+            alt.Tooltip("energy_gwh:Q", title="Generation (GWh)", format=",.2f"),
         ],
     )
 
@@ -747,25 +765,35 @@ def build_energy_mix_period_chart_gwh(mix_period: pd.DataFrame, demand_period: p
         strokeWidth=0.7,
     ).encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16)),
-        y=alt.Y("value_gwh:Q", title="Generation / demand (GWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
+        y=alt.Y("energy_gwh:Q", title="Generation & Demand (GWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE, legend=alt.Legend(labelFontSize=14, titleFontSize=16)),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("technology:N", title="Technology"),
             alt.Tooltip("data_source:N", title="Source"),
-            alt.Tooltip("value_gwh:Q", title="Generation (GWh)", format=",.2f"),
+            alt.Tooltip("energy_gwh:Q", title="Generation (GWh)", format=",.2f"),
         ],
     )
 
     layers = [official_bars, forecast_bars]
 
     if not demand_period.empty:
-        line = alt.Chart(demand_period).mark_line(point=True, color="#111827").encode(
+        demand_plot = demand_period.copy()
+        demand_plot["demand_gwh"] = demand_plot["demand_mwh"] / 1000.0
+        demand_plot["series"] = "Demand (Iberian Peninsula)"
+
+        line = alt.Chart(demand_plot).mark_line(point=True).encode(
             x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16)),
-            y=alt.Y("demand_gwh:Q", title="Generation / demand (GWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
+            y=alt.Y("demand_gwh:Q", title="Generation & Demand (GWh)", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
+            color=alt.Color(
+                "series:N",
+                title="",
+                scale=alt.Scale(domain=["Demand (Iberian Peninsula)"], range=["#111827"]),
+                legend=alt.Legend(labelFontSize=14),
+            ),
             tooltip=[
                 alt.Tooltip("period_label:N", title="Period"),
-                alt.Tooltip("demand_gwh:Q", title="Demand (GWh)", format=",.2f"),
+                alt.Tooltip("demand_gwh:Q", title="Demand (Iberian Peninsula, GWh)", format=",.2f"),
             ],
         )
         layers.append(line)
@@ -785,7 +813,78 @@ def build_mix_detail_for_day_gwh(mix_daily_df: pd.DataFrame, selected_day: date)
         .sort_values(["Technology", "Data source"])
         .reset_index(drop=True)
     )
+    return out.sort_values(["Technology", "Data source"]).reset_index(drop=True)
+
+
+def add_proxy_forecast_for_day(df: pd.DataFrame, target_day: date) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
+
+    if (out["datetime"].dt.date == target_day).any():
+        return out
+
+    last_day = out["datetime"].dt.date.max()
+    last_day_rows = out[out["datetime"].dt.date == last_day].copy()
+    if last_day_rows.empty:
+        return out
+
+    day_delta = (target_day - last_day).days
+    if day_delta <= 0:
+        return out
+
+    last_day_rows["datetime"] = last_day_rows["datetime"] + pd.Timedelta(days=day_delta)
+    if "data_source" in last_day_rows.columns:
+        last_day_rows["data_source"] = "Forecast"
+
+    out = pd.concat([out, last_day_rows], ignore_index=True)
+    return out.sort_values("datetime").reset_index(drop=True)
+
+
+def cap_forecast_spike_vs_previous_day(df: pd.DataFrame, target_day: date, max_ratio: float = 2.0) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns or "energy_mwh" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
+
+    prev_day = target_day - timedelta(days=1)
+    prev_total = pd.to_numeric(
+        out.loc[out["datetime"].dt.date == prev_day, "energy_mwh"],
+        errors="coerce",
+    ).sum()
+    tgt_mask = out["datetime"].dt.date == target_day
+    tgt_total = pd.to_numeric(out.loc[tgt_mask, "energy_mwh"], errors="coerce").sum()
+
+    if prev_total <= 0 or tgt_total <= 0:
+        return out
+
+    allowed_total = prev_total * max_ratio
+    if tgt_total <= allowed_total:
+        return out
+
+    scale = allowed_total / tgt_total
+    out.loc[tgt_mask, "energy_mwh"] = pd.to_numeric(out.loc[tgt_mask, "energy_mwh"], errors="coerce").fillna(0.0) * scale
+    if "mw" in out.columns:
+        out.loc[tgt_mask, "mw"] = pd.to_numeric(out.loc[tgt_mask, "mw"], errors="coerce").fillna(0.0) * scale
     return out
+
+
+def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        price_raw.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_raw_qh")
+        price_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_hourly_avg")
+    output.seek(0)
+    return output.getvalue()
 
 
 def build_energy_mix_workbook_gwh(mix_period: pd.DataFrame, demand_period: pd.DataFrame) -> bytes:
@@ -949,11 +1048,20 @@ try:
         x_domain_min = monthly_combo["month"].min()
         x_domain_max = monthly_combo["month"].max()
 
-        prev_year_df = pd.DataFrame({"start": [pd.Timestamp(previous_year, 1, 1)], "end": [pd.Timestamp(latest_year, 1, 1)]})
+        prev_year_df = pd.DataFrame(
+            {
+                "start": [pd.Timestamp(previous_year, 1, 1)],
+                "end": [pd.Timestamp(latest_year, 1, 1)],
+            }
+        )
+
         years_df = (
             monthly_combo.assign(year=monthly_combo["month"].dt.year)
             .groupby("year", as_index=False)
-            .agg(year_start=("month", "min"), year_end=("month", "max"))
+            .agg(
+                year_start=("month", "min"),
+                year_end=("month", "max"),
+            )
         )
         years_df["year_mid"] = years_df["year_start"] + (years_df["year_end"] - years_df["year_start"]) / 2
 
@@ -961,11 +1069,21 @@ try:
             x=alt.X(
                 "month:T",
                 scale=alt.Scale(domain=[x_domain_min, x_domain_max]),
-                axis=alt.Axis(title=None, labelAngle=0, labelFontSize=13, tickCount="month", labelPadding=8, format="%b"),
+                axis=alt.Axis(
+                    title=None,
+                    labelAngle=0,
+                    labelFontSize=13,
+                    tickCount="month",
+                    labelPadding=8,
+                    format="%b",
+                ),
             )
         )
 
-        year_background = alt.Chart(prev_year_df).mark_rect(opacity=0.22, color="#e5e7eb").encode(x="start:T", x2="end:T")
+        year_background = alt.Chart(prev_year_df).mark_rect(opacity=0.22, color="#e5e7eb").encode(
+            x="start:T",
+            x2="end:T",
+        )
 
         lines = alt.layer(
             base.mark_line(point=True, color="#2563eb", strokeWidth=2.8).encode(
@@ -977,7 +1095,9 @@ try:
                     alt.Tooltip("capture_pct:Q", title="Solar capture rate", format=".2%"),
                 ],
             ),
-            base.mark_line(point=True, color="#1d4ed8", strokeDash=[6, 4], strokeWidth=2.8).encode(y="captured_solar_price:Q"),
+            base.mark_line(point=True, color="#1d4ed8", strokeDash=[6, 4], strokeWidth=2.8).encode(
+                y="captured_solar_price:Q"
+            ),
         )
 
         year_axis = alt.Chart(years_df).mark_text(color="#334155", fontSize=13, fontWeight="bold").encode(
@@ -989,8 +1109,11 @@ try:
             alt.layer(year_background, lines).properties(height=360),
             year_axis,
             spacing=2,
-        ).configure_view(fill="#ffffff", stroke="#d1d5db", cornerRadius=6)
-
+        ).configure_view(
+            fill="#ffffff",
+            stroke="#d1d5db",
+            cornerRadius=6,
+        )
         st.altair_chart(chart, use_container_width=True)
 
     monthly_table = monthly_combo.copy()
@@ -1108,83 +1231,59 @@ try:
     # =========================================================
     st.subheader("Energy mix")
 
-    with st.spinner("Loading REE energy mix data..."):
-        current_year = max_allowed_day.year
-        monthly_start = date(current_year, 1, 1)
-        monthly_end = date(current_year, 12, 31)
+    mix_energy = {}
+    with st.spinner("Loading energy mix data..."):
+        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
+            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
 
-        daily_start = max(start_day, max_allowed_day - timedelta(days=60))
-        daily_end = max_allowed_day
+            official_path = get_mix_indicator_csv_path_variant(tech_name, official_id, "official")
+            forecast_path = get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast")
 
-        yearly_start = date(max(2020, start_day.year), 1, 1)
-        yearly_end = date(current_year, 12, 31)
+            official_exists = official_id is not None and official_path.exists()
+            forecast_exists = forecast_id is not None and forecast_path.exists()
 
-        mix_monthly = build_or_refresh_ree_mix_cache(
-            REE_MIX_MONTHLY_CSV_PATH,
-            start_date=monthly_start,
-            end_date=monthly_end,
-            time_trunc="month",
-            force_refresh=refresh_energy_mix,
-        )
-        mix_daily = build_or_refresh_ree_mix_cache(
-            REE_MIX_DAILY_CSV_PATH,
-            start_date=daily_start,
-            end_date=daily_end if not allow_next_day_refresh() else date.today(),
-            time_trunc="day",
-            force_refresh=refresh_energy_mix,
-        )
-        mix_yearly = build_or_refresh_ree_mix_cache(
-            REE_MIX_YEARLY_CSV_PATH,
-            start_date=yearly_start,
-            end_date=yearly_end,
-            time_trunc="year",
-            force_refresh=refresh_energy_mix,
-        )
+            should_build = refresh_energy_mix or (not official_exists and not forecast_exists)
+
+            if should_build:
+                mix_energy[tech_name] = refresh_mix_best_energy(
+                    tech_name=tech_name,
+                    official_id=official_id,
+                    forecast_id=forecast_id,
+                    start_day=start_day,
+                    token=token,
+                )
+            else:
+                mix_energy[tech_name] = load_mix_best_energy(
+                    tech_name=tech_name,
+                    official_id=official_id,
+                    forecast_id=forecast_id,
+                )
 
     if allow_next_day_refresh():
         tomorrow_day = date.today() + timedelta(days=1)
-        mix_daily = replace_target_day_with_previous_day_proxy_gwh(mix_daily, tomorrow_day, proxy_label="Forecast")
+        for tech_name in list(mix_energy.keys()):
+            mix_energy[tech_name] = add_proxy_forecast_for_day(mix_energy[tech_name], tomorrow_day)
+            mix_energy[tech_name] = cap_forecast_spike_vs_previous_day(mix_energy[tech_name], tomorrow_day, max_ratio=2.0)
 
-    granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Daily"], index=1)
+    if any(not df.empty for df in mix_energy.values()):
+        granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
 
-    mix_period = pd.DataFrame()
-    demand_period = pd.DataFrame()
+        available_years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
+        year_sel = None
+        month_sel = None
+        week_start = None
+        day_range = None
 
-    if granularity == "Annual":
-        year_options = sorted(mix_yearly["datetime"].dt.year.unique().tolist()) if not mix_yearly.empty else [current_year]
-        year_sel = st.selectbox("Year", year_options, index=len(year_options) - 1)
-        mix_yearly_sel = mix_yearly[mix_yearly["datetime"].dt.year <= year_sel].copy()
-        mix_period, demand_period = build_energy_mix_period_from_ree(
-            mix_yearly_sel, demand_energy, granularity="Annual"
-        )
+        if granularity == "Monthly":
+            year_sel = st.selectbox("Year", available_years, index=len(available_years) - 1)
 
-    elif granularity == "Monthly":
-        year_options = sorted(mix_monthly["datetime"].dt.year.unique().tolist()) if not mix_monthly.empty else [current_year]
-        year_sel = st.selectbox("Year", year_options, index=len(year_options) - 1)
-        mix_period, demand_period = build_energy_mix_period_from_ree(
-            mix_monthly, demand_energy, granularity="Monthly", year_sel=year_sel
-        )
-
-    elif granularity == "Daily":
-        daily_min = mix_daily["datetime"].dt.date.min() if not mix_daily.empty else min_date
-        daily_max = mix_daily["datetime"].dt.date.max() if not mix_daily.empty else max_date
-
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            daily_start_sel = st.date_input(
-                "Daily range start",
-                value=max(daily_min, daily_max - timedelta(days=14)),
-                min_value=daily_min,
-                max_value=daily_max,
-                key="mix_daily_start",
-            )
-        with cc2:
-            daily_end_sel = st.date_input(
-                "Daily range end",
-                value=daily_max,
-                min_value=daily_min,
-                max_value=daily_max,
-                key="mix_daily_end",
+        elif granularity == "Weekly":
+            monthly_options = sorted(price_hourly["datetime"].dt.to_period("M").dt.to_timestamp().drop_duplicates().tolist())
+            month_sel = st.selectbox(
+                "Month",
+                monthly_options,
+                format_func=lambda x: pd.Timestamp(x).strftime("%b - %Y"),
+                index=len(monthly_options) - 1,
             )
 
         if daily_start_sel > daily_end_sel:
