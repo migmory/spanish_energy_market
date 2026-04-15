@@ -46,55 +46,30 @@ PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
 SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
 SOLAR_FORECAST_RAW_CSV_PATH = DATA_DIR / "solar_forecast_spain_542_raw.csv"
 DEMAND_RAW_CSV_PATH = DATA_DIR / "demand_p48_total_10027_raw.csv"
+REE_MIX_MONTHLY_CSV_PATH = DATA_DIR / "ree_generation_structure_monthly_peninsular.csv"
+REE_MIX_DAILY_CSV_PATH = DATA_DIR / "ree_generation_structure_daily_peninsular.csv"
+REE_MIX_YEARLY_CSV_PATH = DATA_DIR / "ree_generation_structure_yearly_peninsular.csv"
 
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
 SOLAR_FORECAST_INDICATOR_ID = 542
 DEMAND_INDICATOR_ID = 10027
 
-ENERGY_MIX_INDICATORS_OFFICIAL = {
-    "Nuclear": 74,
-    "CCGT": 79,
-    "Wind": 10010,
-    "Solar PV": 84,
-    "Solar thermal": 85,
-    "Hydro UGH": 71,
-    "Hydro non-UGH": 72,
-    "Pumped hydro": 73,
-    "CHP": 10011,
-    "Biomass": 91,
-    "Biogas": 92,
-    "Other renewables": 10013,
-}
-
-ENERGY_MIX_INDICATORS_FORECAST = {
-    "Nuclear": None,
-    "CCGT": None,
-    "Wind": None,
-    "Solar PV": 542,
-    "Solar thermal": 543,
-    "Hydro UGH": None,
-    "Hydro non-UGH": None,
-    "Pumped hydro": None,
-    "CHP": None,
-    "Biomass": None,
-    "Biogas": None,
-    "Other renewables": None,
-}
+TECH_COLOR_DOMAIN = [
+    "CCGT",
+    "Hydro",
+    "Nuclear",
+    "Solar PV",
+    "Solar thermal",
+    "Wind",
+    "CHP",
+    "Biomass",
+    "Biogas",
+    "Other renewables",
+]
 
 TECH_COLOR_SCALE = alt.Scale(
-    domain=[
-        "CCGT",
-        "Hydro",
-        "Nuclear",
-        "Solar PV",
-        "Solar thermal",
-        "Wind",
-        "CHP",
-        "Biomass",
-        "Biogas",
-        "Other renewables",
-    ],
+    domain=TECH_COLOR_DOMAIN,
     range=[
         "#9CA3AF",  # CCGT
         "#60A5FA",  # Hydro
@@ -112,6 +87,31 @@ TECH_COLOR_SCALE = alt.Scale(
 DEFAULT_START_DATE = date(2024, 1, 1)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
+# REE apidatos: peninsular electric system geo id
+REE_GEO_LIMIT = "peninsular"
+REE_GEO_ID = 8741
+
+REE_TECH_MAP = {
+    "Ciclo combinado": "CCGT",
+    "Hidráulica": "Hydro",
+    "Nuclear": "Nuclear",
+    "Solar fotovoltaica": "Solar PV",
+    "Solar térmica": "Solar thermal",
+    "Eólica": "Wind",
+    "Cogeneración": "CHP",
+    "Biomasa": "Biomass",
+    "Biogás": "Biogas",
+    "Otras renovables": "Other renewables",
+    # agrupaciones extra por si aparecen
+    "Turbinación bombeo": "Hydro",
+    "Hidroeólica": "Other renewables",
+    "Residuos renovables": "Other renewables",
+    "Residuos no renovables": "Other renewables",
+    "Carbón": "Other renewables",
+    "Motores diésel": "Other renewables",
+    "Turbina de gas": "Other renewables",
+    "Turbina de vapor": "Other renewables",
+}
 
 # =========================================================
 # DISPLAY HELPERS
@@ -180,7 +180,7 @@ def resolve_time_trunc(day: date) -> str:
 
 
 # =========================================================
-# FETCH
+# FETCH ESIOS
 # =========================================================
 def fetch_esios_day(indicator_id: int, day: date, token: str) -> dict:
     start_local = pd.Timestamp(day, tz="Europe/Madrid")
@@ -207,7 +207,94 @@ def fetch_esios_day(indicator_id: int, day: date, token: str) -> dict:
 
 
 # =========================================================
-# PARSE
+# FETCH REE APIDATOS - ENERGY MIX
+# =========================================================
+def fetch_ree_generation_structure(
+    start_dt: str,
+    end_dt: str,
+    time_trunc: str,
+    geo_limit: str = REE_GEO_LIMIT,
+    geo_id: int = REE_GEO_ID,
+    lang: str = "es",
+) -> dict:
+    url = f"https://apidatos.ree.es/{lang}/datos/generacion/estructura-generacion"
+    params = {
+        "start_date": start_dt,
+        "end_date": end_dt,
+        "time_trunc": time_trunc,
+        "geo_trunc": "electric_system",
+        "geo_limit": geo_limit,
+        "geo_ids": geo_id,
+    }
+    resp = requests.get(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        params=params,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def parse_ree_generation_structure(raw_json: dict, time_trunc: str) -> pd.DataFrame:
+    included = raw_json.get("included", [])
+    rows = []
+
+    for item in included:
+        attrs = item.get("attributes", {})
+        title = attrs.get("title")
+        values = attrs.get("values", [])
+
+        tech = REE_TECH_MAP.get(title)
+        if tech is None:
+            continue
+
+        for v in values:
+            dt = pd.to_datetime(v.get("datetime"), errors="coerce")
+            val = pd.to_numeric(v.get("value"), errors="coerce")
+            pct = pd.to_numeric(v.get("percentage"), errors="coerce")
+
+            if pd.isna(dt) or pd.isna(val):
+                continue
+
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None) if dt.tzinfo is not None else dt
+
+            rows.append(
+                {
+                    "datetime": dt,
+                    "technology": tech,
+                    "value_gwh": float(val),
+                    "percentage": float(pct) if pd.notna(pct) else None,
+                    "data_source": "Official",
+                    "time_trunc": time_trunc,
+                }
+            )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "percentage", "data_source", "time_trunc"])
+
+    df = (
+        df.groupby(["datetime", "technology", "data_source", "time_trunc"], as_index=False)
+        .agg(value_gwh=("value_gwh", "sum"), percentage=("percentage", "sum"))
+        .sort_values(["datetime", "technology"])
+        .reset_index(drop=True)
+    )
+    return df
+
+
+def build_ree_mix_history(start_date: date, end_date: date, time_trunc: str) -> pd.DataFrame:
+    start_dt = f"{start_date.isoformat()}T00:00"
+    end_dt = f"{end_date.isoformat()}T23:59"
+    raw = fetch_ree_generation_structure(start_dt, end_dt, time_trunc=time_trunc)
+    return parse_ree_generation_structure(raw, time_trunc=time_trunc)
+
+
+# =========================================================
+# PARSE ESIOS
 # =========================================================
 def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
     if "datetime_utc" in df.columns:
@@ -357,31 +444,31 @@ def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
 # =========================================================
 # STORAGE
 # =========================================================
-def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
+def load_raw_history(csv_path: Path, source_name: str | None = None) -> pd.DataFrame:
     if not csv_path.exists():
-        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+        return pd.DataFrame()
 
     df = pd.read_csv(csv_path)
     if df.empty:
-        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+        return pd.DataFrame()
 
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 
-    if "source" not in df.columns:
-        df["source"] = source_name
-    if "geo_name" not in df.columns:
-        df["geo_name"] = None
-    if "geo_id" not in df.columns:
-        df["geo_id"] = None
+    if source_name is not None:
+        if "value" in df.columns:
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        if "source" not in df.columns:
+            df["source"] = source_name
+        if "geo_name" not in df.columns:
+            df["geo_name"] = None
+        if "geo_id" not in df.columns:
+            df["geo_id"] = None
 
-    df = df.dropna(subset=["datetime", "value"]).copy()
-    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
     return df
 
 
 def save_raw_history(df: pd.DataFrame, csv_path: Path) -> None:
-    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
     df.to_csv(csv_path, index=False)
 
 
@@ -525,7 +612,7 @@ def build_best_solar_hourly(
 
 
 # =========================================================
-# ENERGY MIX BEST SERIES
+# REE MIX HELPERS
 # =========================================================
 def get_mix_indicator_csv_path_variant(name: str, indicator_id: int | None, variant: str) -> Path:
     safe_name = name.lower().replace(" ", "_").replace("/", "_")
@@ -544,219 +631,107 @@ def load_or_refresh_mix_raw(indicator_id: int | None, source_name: str, csv_path
     else:
         hist = refresh_raw_history(indicator_id, source_name, csv_path, hist, token, 3)
 
-    return hist
+    df = build_ree_mix_history(start_date, end_date, time_trunc=time_trunc)
+    save_raw_history(df, csv_path)
+    return df
 
 
-def build_best_mix_energy(
-    official_energy: pd.DataFrame,
-    forecast_energy: pd.DataFrame,
-    tech_name: str,
+def replace_target_day_with_previous_day_proxy_gwh(
+    df: pd.DataFrame,
+    target_day: date,
+    proxy_label: str = "Forecast",
 ) -> pd.DataFrame:
-    if official_energy.empty and forecast_energy.empty:
-        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id", "technology", "data_source"])
+    if df.empty or "datetime" not in df.columns:
+        return df
 
-    if official_energy.empty:
-        out = forecast_energy.copy()
-        out["technology"] = tech_name
-        out["data_source"] = "Forecast"
+    out = df.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+
+    prev_day = target_day - timedelta(days=1)
+    prev_rows = out[out["datetime"].dt.date == prev_day].copy()
+    if prev_rows.empty:
         return out
 
-    if forecast_energy.empty:
-        out = official_energy.copy()
-        out["technology"] = tech_name
-        out["data_source"] = "Official"
-        return out
+    out = out[out["datetime"].dt.date != target_day].copy()
+    prev_rows["datetime"] = prev_rows["datetime"] + pd.Timedelta(days=1)
+    prev_rows["data_source"] = proxy_label
 
-    off = official_energy[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id"]].copy()
-    off = off.rename(columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"})
-
-    fc = forecast_energy[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id"]].copy()
-    fc = fc.rename(columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"})
-
-    merged = off.merge(fc, on="datetime", how="outer", suffixes=("_off", "_fc"))
-
-    merged["mw"] = merged["mw_official"].combine_first(merged["mw_forecast"])
-    merged["energy_mwh"] = merged["energy_mwh_official"].combine_first(merged["energy_mwh_forecast"])
-    merged["data_source"] = merged["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
-    merged.loc[merged["data_source"].isna() & merged["mw_forecast"].notna(), "data_source"] = "Forecast"
-
-    merged["source"] = merged.get("source_off", pd.Series([None] * len(merged))).combine_first(
-        merged.get("source_fc", pd.Series([None] * len(merged)))
-    )
-    merged["geo_name"] = merged.get("geo_name_off", pd.Series([None] * len(merged))).combine_first(
-        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
-    )
-    merged["geo_id"] = merged.get("geo_id_off", pd.Series([None] * len(merged))).combine_first(
-        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
-    )
-    merged["technology"] = tech_name
-
-    out = merged[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id", "technology", "data_source"]].copy()
-    out = out.sort_values("datetime").reset_index(drop=True)
+    out = pd.concat([out, prev_rows], ignore_index=True)
+    out = out.sort_values(["datetime", "technology"]).reset_index(drop=True)
     return out
 
 
-def load_mix_best_energy(
-    tech_name: str,
-    official_id: int | None,
-    forecast_id: int | None,
-) -> pd.DataFrame:
-    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-
-    if official_id is not None:
-        official_df = load_raw_history(
-            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
-            f"esios_{official_id}",
-        )
-
-    if forecast_id is not None:
-        forecast_df = load_raw_history(
-            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
-            f"esios_{forecast_id}",
-        )
-
-    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
-    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
-
-    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
-    return to_hourly_energy(best)
-
-
-def refresh_mix_best_energy(
-    tech_name: str,
-    official_id: int | None,
-    forecast_id: int | None,
-    start_day: date,
-    token: str,
-) -> pd.DataFrame:
-    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-
-    if official_id is not None:
-        official_df = load_or_refresh_mix_raw(
-            official_id,
-            f"esios_{official_id}",
-            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
-            start_day,
-            token,
-        )
-
-    if forecast_id is not None:
-        forecast_df = load_or_refresh_mix_raw(
-            forecast_id,
-            f"esios_{forecast_id}",
-            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
-            start_day,
-            token,
-        )
-
-    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
-    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
-
-    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
-    return to_hourly_energy(best)
-
-
-def build_energy_mix_period(
-    mix_energy_dict: dict[str, pd.DataFrame],
+def build_energy_mix_period_from_ree(
+    mix_df: pd.DataFrame,
     demand_energy: pd.DataFrame,
     granularity: str,
     year_sel: int | None = None,
     month_sel: pd.Timestamp | None = None,
-    week_start: date | None = None,
     day_range: tuple[date, date] | None = None,
 ):
-    frames = []
-
-    for tech, df in mix_energy_dict.items():
-        if df.empty:
-            continue
-
-        tmp = df.copy()
-
-        if granularity == "Annual":
-            tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
-            tmp["sort_key"] = tmp["datetime"].dt.year
-
-        elif granularity == "Monthly":
-            tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
-            tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
-            tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-
-        elif granularity == "Weekly":
-            tmp = tmp[tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel].copy()
-            iso = tmp["datetime"].dt.isocalendar()
-            tmp["period_label"] = "W" + iso.week.astype(str)
-            tmp["sort_key"] = tmp["datetime"].dt.to_period("W-MON").dt.start_time
-
-        else:
-            if day_range is not None:
-                d0, d1 = day_range
-                tmp = tmp[(tmp["datetime"].dt.date >= d0) & (tmp["datetime"].dt.date <= d1)].copy()
-            elif week_start is not None:
-                week_end = week_start + timedelta(days=6)
-                tmp = tmp[(tmp["datetime"].dt.date >= week_start) & (tmp["datetime"].dt.date <= week_end)].copy()
-
-            tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
-            tmp["sort_key"] = tmp["datetime"].dt.normalize()
-
-        grouped = (
-            tmp.groupby(["period_label", "technology", "sort_key", "data_source"], as_index=False)["energy_mwh"]
-            .sum()
+    if mix_df.empty:
+        return (
+            pd.DataFrame(columns=["period_label", "technology", "sort_key", "data_source", "value_gwh"]),
+            pd.DataFrame(columns=["period_label", "sort_key", "demand_gwh"]),
         )
-        frames.append(grouped)
 
-    mix_period = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["period_label", "technology", "sort_key", "data_source", "energy_mwh"]
+    tmp = mix_df.copy()
+
+    if granularity == "Annual":
+        tmp = tmp[tmp["datetime"].dt.year >= 1900].copy()
+        tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+        tmp["sort_key"] = tmp["datetime"].dt.year
+
+    elif granularity == "Monthly":
+        tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
+        tmp["period_label"] = tmp["datetime"].dt.strftime("%b - %Y")
+        tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+
+    elif granularity == "Daily":
+        d0, d1 = day_range
+        tmp = tmp[(tmp["datetime"].dt.date >= d0) & (tmp["datetime"].dt.date <= d1)].copy()
+        tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+        tmp["sort_key"] = tmp["datetime"].dt.normalize()
+
+    else:
+        raise ValueError("Supported granularities for REE mix: Annual, Monthly, Daily")
+
+    mix_period = (
+        tmp.groupby(["period_label", "technology", "sort_key", "data_source"], as_index=False)["value_gwh"]
+        .sum()
+        .sort_values(["sort_key", "technology"])
+        .reset_index(drop=True)
     )
 
-    if not mix_period.empty:
-        hydro = (
-            mix_period[mix_period["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])]
-            .groupby(["period_label", "sort_key", "data_source"], as_index=False)["energy_mwh"].sum()
-        )
-        hydro["technology"] = "Hydro"
-
-        keep = mix_period[~mix_period["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
-        mix_period = pd.concat([keep, hydro], ignore_index=True).groupby(
-            ["period_label", "technology", "sort_key", "data_source"], as_index=False
-        )["energy_mwh"].sum()
-
-    demand_period = pd.DataFrame(columns=["period_label", "sort_key", "demand_mwh"])
+    demand_period = pd.DataFrame(columns=["period_label", "sort_key", "demand_gwh"])
     if not demand_energy.empty:
-        tmp = demand_energy.copy()
+        dem = demand_energy.copy()
+        dem["value_gwh"] = dem["energy_mwh"] / 1000.0
 
         if granularity == "Annual":
-            tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
-            tmp["sort_key"] = tmp["datetime"].dt.year
+            dem["period_label"] = dem["datetime"].dt.year.astype(str)
+            dem["sort_key"] = dem["datetime"].dt.year
         elif granularity == "Monthly":
-            tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
-            tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
-            tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-        elif granularity == "Weekly":
-            tmp = tmp[tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel].copy()
-            iso = tmp["datetime"].dt.isocalendar()
-            tmp["period_label"] = "W" + iso.week.astype(str)
-            tmp["sort_key"] = tmp["datetime"].dt.to_period("W-MON").dt.start_time
-        else:
-            if day_range is not None:
-                d0, d1 = day_range
-                tmp = tmp[(tmp["datetime"].dt.date >= d0) & (tmp["datetime"].dt.date <= d1)].copy()
-            elif week_start is not None:
-                week_end = week_start + timedelta(days=6)
-                tmp = tmp[(tmp["datetime"].dt.date >= week_start) & (tmp["datetime"].dt.date <= week_end)].copy()
+            dem = dem[dem["datetime"].dt.year == year_sel].copy()
+            dem["period_label"] = dem["datetime"].dt.strftime("%b - %Y")
+            dem["sort_key"] = dem["datetime"].dt.to_period("M").dt.to_timestamp()
+        elif granularity == "Daily":
+            d0, d1 = day_range
+            dem = dem[(dem["datetime"].dt.date >= d0) & (dem["datetime"].dt.date <= d1)].copy()
+            dem["period_label"] = dem["datetime"].dt.strftime("%a %d-%b")
+            dem["sort_key"] = dem["datetime"].dt.normalize()
 
-            tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
-            tmp["sort_key"] = tmp["datetime"].dt.normalize()
-
-        demand_period = tmp.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"].sum()
-        demand_period = demand_period.rename(columns={"energy_mwh": "demand_mwh"})
+        demand_period = (
+            dem.groupby(["period_label", "sort_key"], as_index=False)["value_gwh"]
+            .sum()
+            .rename(columns={"value_gwh": "demand_gwh"})
+        )
 
     return mix_period, demand_period
 
 
-def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.DataFrame):
+def build_energy_mix_period_chart_gwh(mix_period: pd.DataFrame, demand_period: pd.DataFrame):
     if mix_period.empty:
         return None
 
@@ -826,33 +801,17 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
     return alt.layer(*layers).properties(height=420)
 
 
-def build_day_energy_mix_table(mix_energy_dict: dict[str, pd.DataFrame], selected_day: date) -> pd.DataFrame:
-    rows = []
-    for tech, df in mix_energy_dict.items():
-        if df.empty:
-            continue
+def build_mix_detail_for_day_gwh(mix_daily_df: pd.DataFrame, selected_day: date) -> pd.DataFrame:
+    tmp = mix_daily_df[mix_daily_df["datetime"].dt.date == selected_day].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["Technology", "Data source", "Generation (GWh)"])
 
-        tmp = df[df["datetime"].dt.date == selected_day].copy()
-        if tmp.empty:
-            continue
-
-        agg = (
-            tmp.groupby(["technology", "data_source"], as_index=False)["energy_mwh"]
-            .sum()
-            .sort_values(["technology", "data_source"])
-        )
-        rows.append(agg)
-
-    if not rows:
-        return pd.DataFrame(columns=["Technology", "Data source", "Generation (MWh)"])
-
-    out = pd.concat(rows, ignore_index=True)
-    out = out.rename(
-        columns={
-            "technology": "Technology",
-            "data_source": "Data source",
-            "energy_mwh": "Generation (MWh)",
-        }
+    out = (
+        tmp.groupby(["technology", "data_source"], as_index=False)["value_gwh"]
+        .sum()
+        .rename(columns={"technology": "Technology", "data_source": "Data source", "value_gwh": "Generation (GWh)"})
+        .sort_values(["Technology", "Data source"])
+        .reset_index(drop=True)
     )
     return out.sort_values(["Technology", "Data source"]).reset_index(drop=True)
 
@@ -928,18 +887,27 @@ def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) ->
     return output.getvalue()
 
 
-def build_energy_mix_workbook(mix_period: pd.DataFrame, demand_period: pd.DataFrame) -> bytes:
+def build_energy_mix_workbook_gwh(mix_period: pd.DataFrame, demand_period: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         wrote_sheet = False
         if not mix_period.empty:
-            mix_period.to_excel(writer, index=False, sheet_name="mix_period")
+            mix_period.to_excel(writer, index=False, sheet_name="mix_period_gwh")
             wrote_sheet = True
         if not demand_period.empty:
-            demand_period.to_excel(writer, index=False, sheet_name="demand_period")
+            demand_period.to_excel(writer, index=False, sheet_name="demand_period_gwh")
             wrote_sheet = True
         if not wrote_sheet:
             pd.DataFrame({"info": ["No energy mix data available"]}).to_excel(writer, index=False, sheet_name="info")
+    output.seek(0)
+    return output.getvalue()
+
+
+def build_price_workbook(price_raw: pd.DataFrame, price_hourly: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        price_raw.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_raw_qh")
+        price_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_hourly_avg")
     output.seek(0)
     return output.getvalue()
 
@@ -986,15 +954,13 @@ try:
         clear_file(SOLAR_P48_RAW_CSV_PATH)
         clear_file(SOLAR_FORECAST_RAW_CSV_PATH)
         clear_file(DEMAND_RAW_CSV_PATH)
-
-        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
-            clear_file(get_mix_indicator_csv_path_variant(tech_name, official_id, "official"))
-            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
-            clear_file(get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"))
-
-        st.success("Price, solar and demand files deleted. Reloading...")
+        clear_file(REE_MIX_MONTHLY_CSV_PATH)
+        clear_file(REE_MIX_DAILY_CSV_PATH)
+        clear_file(REE_MIX_YEARLY_CSV_PATH)
+        st.success("Caches deleted. Reloading...")
         st.rerun()
 
+    # ----- ESIOS historical series -----
     price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
     solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
     solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
@@ -1046,6 +1012,7 @@ try:
     demand_energy = to_energy_intervals(demand_raw, "demand_p48_mw", "energy_mwh")
     demand_energy = to_hourly_energy(demand_energy)
 
+    # ----- Monthly spot / captured -----
     monthly_avg = (
         price_hourly.assign(month=price_hourly["datetime"].dt.to_period("M").dt.to_timestamp())
         .groupby("month", as_index=False)["price"]
@@ -1158,10 +1125,14 @@ try:
             "capture_pct": "Solar capture rate (%)",
         })
         st.dataframe(
-            styled_df(monthly_table[["Month", "Average monthly price", "Captured solar price", "Solar capture rate (%)"]], pct_cols=["Solar capture rate (%)"]),
+            styled_df(
+                monthly_table[["Month", "Average monthly price", "Captured solar price", "Solar capture rate (%)"]],
+                pct_cols=["Solar capture rate (%)"],
+            ),
             use_container_width=True,
         )
 
+    # ----- Selected day overlay -----
     st.subheader("Selected day: price vs solar")
     min_date = price_hourly["datetime"].dt.date.min()
     max_date = price_hourly["datetime"].dt.date.max()
@@ -1185,10 +1156,7 @@ try:
         price_line = alt.Chart(day_price).mark_line(point=True).encode(
             x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelFontSize=14, titleFontSize=16)),
             y=alt.Y("price:Q", title="Price €/MWh", axis=alt.Axis(labelFontSize=14, titleFontSize=16)),
-            tooltip=[
-                alt.Tooltip("datetime:T", title="Time"),
-                alt.Tooltip("price:Q", title="Price", format=".2f"),
-            ],
+            tooltip=[alt.Tooltip("datetime:T", title="Time"), alt.Tooltip("price:Q", title="Price", format=".2f")],
         )
         if not day_solar.empty:
             solar_area = alt.Chart(day_solar).mark_area(opacity=0.25).encode(
@@ -1258,6 +1226,9 @@ try:
             )
             st.dataframe(styled_df(hourly_profile), use_container_width=True)
 
+    # =========================================================
+    # ENERGY MIX - REE APIDATOS
+    # =========================================================
     st.subheader("Energy mix")
 
     mix_energy = {}
@@ -1315,83 +1286,52 @@ try:
                 index=len(monthly_options) - 1,
             )
 
-        elif granularity == "Daily":
-            daily_min = price_hourly["datetime"].dt.date.min()
-            daily_max = price_hourly["datetime"].dt.date.max()
+        if daily_start_sel > daily_end_sel:
+            st.warning("Daily range start cannot be later than daily range end.")
+            st.stop()
 
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                daily_start = st.date_input(
-                    "Daily range start",
-                    value=max(daily_min, daily_max - timedelta(days=14)),
-                    min_value=daily_min,
-                    max_value=daily_max,
-                    key="mix_daily_start",
-                )
-            with cc2:
-                daily_end = st.date_input(
-                    "Daily range end",
-                    value=daily_max,
-                    min_value=daily_min,
-                    max_value=daily_max,
-                    key="mix_daily_end",
-                )
-
-            if daily_start > daily_end:
-                st.warning("Daily range start cannot be later than daily range end.")
-                st.stop()
-
-            day_range = (daily_start, daily_end)
-            st.caption(f"Showing daily periods from {daily_start} to {daily_end}")
-
-        mix_period, demand_period = build_energy_mix_period(
-            mix_energy,
-            demand_energy,
-            granularity=granularity,
-            year_sel=year_sel,
-            month_sel=month_sel,
-            week_start=week_start,
-            day_range=day_range,
+        mix_period, demand_period = build_energy_mix_period_from_ree(
+            mix_daily, demand_energy, granularity="Daily", day_range=(daily_start_sel, daily_end_sel)
         )
+        st.caption(f"Showing daily periods from {daily_start_sel} to {daily_end_sel}")
 
-        chart = build_energy_mix_period_chart(mix_period, demand_period)
-        if chart is not None:
-            st.altair_chart(chart, use_container_width=True)
+    chart = build_energy_mix_period_chart_gwh(mix_period, demand_period)
+    if chart is not None:
+        st.altair_chart(chart, use_container_width=True)
 
-        day_mix_table = build_day_energy_mix_table(mix_energy, selected_day)
+    if granularity == "Daily":
+        day_mix_table = build_mix_detail_for_day_gwh(mix_daily, selected_day)
         st.subheader(f"Energy mix detail for {selected_day}")
         if not day_mix_table.empty:
             st.dataframe(styled_df(day_mix_table), use_container_width=True)
         else:
             st.info("No energy mix detail available for selected day.")
 
-        if not mix_period.empty:
-            mix_table = mix_period.rename(columns={
-                "period_label": "Period",
-                "technology": "Technology",
-                "data_source": "Data source",
-                "energy_mwh": "Generation (MWh)",
-            }).sort_values(["sort_key", "Technology", "Data source"])
+    if not mix_period.empty:
+        mix_table = mix_period.rename(columns={
+            "period_label": "Period",
+            "technology": "Technology",
+            "data_source": "Data source",
+            "value_gwh": "Generation (GWh)",
+        }).sort_values(["sort_key", "Technology", "Data source"])
 
-            if not demand_period.empty:
-                mix_table = mix_table.merge(
-                    demand_period.rename(columns={"period_label": "Period", "demand_mwh": "Demand (MWh)"}),
-                    on="Period",
-                    how="left",
-                )
-
-            mix_table = mix_table.drop(columns=["sort_key"], errors="ignore")
-            st.dataframe(styled_df(mix_table), use_container_width=True)
-
-            mix_workbook = build_energy_mix_workbook(mix_period, demand_period)
-            st.download_button(
-                label="Download energy mix Excel",
-                data=mix_workbook,
-                file_name="energy_mix_extraction.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        if not demand_period.empty:
+            mix_table = mix_table.merge(
+                demand_period.rename(columns={"period_label": "Period", "demand_gwh": "Demand (GWh)"}),
+                on="Period",
+                how="left",
             )
-    else:
-        st.info("No energy mix data available yet. Press 'Refresh energy mix' once to build its historical cache.")
+
+        mix_table = mix_table.drop(columns=["sort_key"], errors="ignore")
+        st.dataframe(styled_df(mix_table), use_container_width=True)
+
+        mix_workbook = build_energy_mix_workbook_gwh(mix_period, demand_period)
+        st.download_button(
+            label="Download energy mix Excel",
+            data=mix_workbook,
+            file_name="energy_mix_extraction_gwh.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     st.subheader("Extraction workbook")
     st.write("Rows in raw prices:", len(price_raw))
@@ -1424,15 +1364,9 @@ try:
             solar_forecast_raw = refresh_raw_history(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, solar_forecast_raw, token, 10)
             demand_raw = refresh_raw_history(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, demand_raw, token, 10)
 
-            for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
-                forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
-                refresh_mix_best_energy(
-                    tech_name=tech_name,
-                    official_id=official_id,
-                    forecast_id=forecast_id,
-                    start_day=start_day,
-                    token=token,
-                )
+            clear_file(REE_MIX_MONTHLY_CSV_PATH)
+            clear_file(REE_MIX_DAILY_CSV_PATH)
+            clear_file(REE_MIX_YEARLY_CSV_PATH)
 
         st.success("Data refreshed.")
         st.rerun()
