@@ -92,9 +92,10 @@ RENEWABLE_TECHS = {
     "Other renewables",
 }
 
-# -----------------------------
+
+# =========================================================
 # TIME
-# -----------------------------
+# =========================================================
 def now_madrid() -> datetime:
     return datetime.now(MADRID_TZ)
 
@@ -111,9 +112,9 @@ def max_refresh_day_from_clock() -> date:
     return today_madrid() + timedelta(days=1) if allow_next_day_refresh() else today_madrid()
 
 
-# -----------------------------
+# =========================================================
 # LOADERS / HELPERS
-# -----------------------------
+# =========================================================
 def load_raw_history(csv_path: Path, source_name: str | None = None) -> pd.DataFrame:
     if not csv_path.exists():
         return pd.DataFrame()
@@ -230,51 +231,6 @@ def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_best_solar_hourly(
-    solar_p48_hourly: pd.DataFrame,
-    solar_forecast_hourly: pd.DataFrame,
-) -> pd.DataFrame:
-    base_cols = ["datetime", "source", "geo_name", "geo_id"]
-    p48 = solar_p48_hourly.copy()
-    fc = solar_forecast_hourly.copy()
-
-    if p48.empty and fc.empty:
-        return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
-
-    if p48.empty:
-        out = fc.rename(columns={"solar_forecast_mw": "solar_best_mw"}).copy()
-        out["solar_source"] = "Forecast"
-        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
-
-    if fc.empty:
-        out = p48.rename(columns={"solar_p48_mw": "solar_best_mw"}).copy()
-        out["solar_source"] = "P48"
-        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
-
-    merged = p48[base_cols + ["solar_p48_mw"]].merge(
-        fc[base_cols + ["solar_forecast_mw"]],
-        on="datetime",
-        how="outer",
-        suffixes=("_p48", "_fc"),
-    )
-
-    merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
-    merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
-    merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
-
-    merged["source"] = "best_solar"
-    merged["geo_name"] = merged.get("geo_name_p48", pd.Series([None] * len(merged))).combine_first(
-        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
-    )
-    merged["geo_id"] = merged.get("geo_id_p48", pd.Series([None] * len(merged))).combine_first(
-        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
-    )
-
-    out = merged[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].copy()
-    out = out.sort_values("datetime").reset_index(drop=True)
-    return out
-
-
 def parse_emails(raw: str) -> list[str]:
     return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
 
@@ -323,9 +279,121 @@ def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str
     return styles + html
 
 
-# -----------------------------
+# =========================================================
+# SOLAR SERIES
+# =========================================================
+def build_best_solar_hourly(
+    solar_p48_hourly: pd.DataFrame,
+    solar_forecast_hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    base_cols = ["datetime", "source", "geo_name", "geo_id"]
+    p48 = solar_p48_hourly.copy()
+    fc = solar_forecast_hourly.copy()
+
+    if p48.empty and fc.empty:
+        return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
+
+    if p48.empty:
+        out = fc.rename(columns={"solar_forecast_mw": "solar_best_mw"}).copy()
+        out["solar_source"] = "Forecast"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    if fc.empty:
+        out = p48.rename(columns={"solar_p48_mw": "solar_best_mw"}).copy()
+        out["solar_source"] = "P48"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    merged = p48[base_cols + ["solar_p48_mw"]].merge(
+        fc[base_cols + ["solar_forecast_mw"]],
+        on="datetime",
+        how="outer",
+        suffixes=("_p48", "_fc"),
+    )
+
+    merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
+    merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
+    merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
+
+    merged["source"] = "best_solar"
+    merged["geo_name"] = merged.get("geo_name_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
+    )
+    merged["geo_id"] = merged.get("geo_id_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
+    )
+
+    out = merged[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+def build_solar_profile_for_report_day(
+    solar_p48_hourly: pd.DataFrame,
+    solar_forecast_hourly: pd.DataFrame,
+    report_day: date,
+) -> pd.DataFrame:
+    """
+    For historical/today: use best available (P48 first, forecast fallback).
+    For tomorrow: force forecast by copying yesterday's available solar profile to tomorrow.
+    """
+    tomorrow = today_madrid() + timedelta(days=1)
+
+    if report_day == tomorrow:
+        prev_day = report_day - timedelta(days=1)
+
+        prev_p48 = solar_p48_hourly[solar_p48_hourly["datetime"].dt.date == prev_day].copy()
+        prev_fc = solar_forecast_hourly[solar_forecast_hourly["datetime"].dt.date == prev_day].copy()
+
+        if not prev_p48.empty:
+            src = prev_p48.rename(columns={"solar_p48_mw": "solar_best_mw"}).copy()
+            src["solar_source"] = "Forecast"
+        elif not prev_fc.empty:
+            src = prev_fc.rename(columns={"solar_forecast_mw": "solar_best_mw"}).copy()
+            src["solar_source"] = "Forecast"
+        else:
+            return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
+
+        src["datetime"] = src["datetime"] + pd.Timedelta(days=1)
+        return src[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+
+    best = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+    out = best[best["datetime"].dt.date == report_day].copy()
+    return out[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+
+
+def build_hourly_solar_weights(solar_day_df: pd.DataFrame, report_day: date) -> pd.DataFrame:
+    hours = pd.date_range(
+        start=pd.Timestamp(report_day),
+        end=pd.Timestamp(report_day) + pd.Timedelta(hours=23),
+        freq="h",
+    )
+    base = pd.DataFrame({"datetime": hours})
+    base["Hour"] = base["datetime"].dt.strftime("%H:%M")
+
+    if solar_day_df.empty:
+        base["weight"] = 0.0
+        return base
+
+    tmp = solar_day_df.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime"]).copy()
+    tmp = tmp.groupby("datetime", as_index=False)["solar_best_mw"].mean()
+
+    base = base.merge(tmp, on="datetime", how="left")
+    base["solar_best_mw"] = base["solar_best_mw"].fillna(0.0)
+
+    total = base["solar_best_mw"].sum()
+    if total > 0:
+        base["weight"] = base["solar_best_mw"] / total
+    else:
+        base["weight"] = 0.0
+
+    return base[["datetime", "Hour", "weight"]]
+
+
+# =========================================================
 # REE MIX
-# -----------------------------
+# =========================================================
 def load_ree_mix_daily() -> pd.DataFrame:
     df = load_raw_history(REE_MIX_DAILY_CSV_PATH)
     if df.empty:
@@ -369,9 +437,15 @@ def add_proxy_forecast_mix_for_day(mix_daily_df: pd.DataFrame, target_day: date)
 
 def build_hourly_mix_from_daily_gwh(
     mix_daily_df: pd.DataFrame,
+    solar_profile_day: pd.DataFrame,
     report_day: date,
     force_forecast_for_tomorrow: bool = False,
 ) -> pd.DataFrame:
+    """
+    Build hourly mix from REE daily totals.
+    Solar PV and Solar thermal are shaped with the solar hourly profile.
+    All other technologies are flat across 24h.
+    """
     if mix_daily_df.empty:
         return pd.DataFrame(columns=["datetime", "Hour", "technology", "energy_mwh", "data_source"])
 
@@ -387,28 +461,51 @@ def build_hourly_mix_from_daily_gwh(
     if df.empty:
         return pd.DataFrame(columns=["datetime", "Hour", "technology", "energy_mwh", "data_source"])
 
-    # REE daily values are daily totals in GWh by technology.
-    # To build an hourly stacked chart in this email, we distribute each daily total
-    # evenly across the 24 hours of the day.
     hours = pd.date_range(
         start=pd.Timestamp(report_day),
         end=pd.Timestamp(report_day) + pd.Timedelta(hours=23),
         freq="h",
     )
+    hours_df = pd.DataFrame({"datetime": hours})
+    hours_df["Hour"] = hours_df["datetime"].dt.strftime("%H:%M")
+
+    solar_weights = build_hourly_solar_weights(solar_profile_day, report_day)
 
     rows = []
     for _, r in df.iterrows():
-        hourly_mwh = (float(r["value_gwh"]) * 1000.0) / 24.0
-        for dt in hours:
-            rows.append(
-                {
-                    "datetime": dt,
-                    "Hour": dt.strftime("%H:%M"),
-                    "technology": r["technology"],
-                    "energy_mwh": hourly_mwh,
-                    "data_source": r.get("data_source", "Official"),
-                }
-            )
+        tech = r["technology"]
+        total_mwh = float(r["value_gwh"]) * 1000.0
+        data_source = r.get("data_source", "Official")
+
+        if tech in {"Solar PV", "Solar thermal"}:
+            shaped = solar_weights.copy()
+            if shaped["weight"].sum() > 0:
+                shaped["energy_mwh"] = total_mwh * shaped["weight"]
+            else:
+                shaped["energy_mwh"] = 0.0
+
+            for _, h in shaped.iterrows():
+                rows.append(
+                    {
+                        "datetime": h["datetime"],
+                        "Hour": h["Hour"],
+                        "technology": tech,
+                        "energy_mwh": h["energy_mwh"],
+                        "data_source": data_source,
+                    }
+                )
+        else:
+            hourly_mwh = total_mwh / 24.0
+            for _, h in hours_df.iterrows():
+                rows.append(
+                    {
+                        "datetime": h["datetime"],
+                        "Hour": h["Hour"],
+                        "technology": tech,
+                        "energy_mwh": hourly_mwh,
+                        "data_source": data_source,
+                    }
+                )
 
     out = pd.DataFrame(rows)
     return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
@@ -430,7 +527,7 @@ def build_hourly_demand_for_day(demand_raw: pd.DataFrame, report_day: date) -> p
 
     day_df = demand_hourly[demand_hourly["datetime"].dt.date == report_day].copy()
 
-    # If tomorrow is selected and there is no demand yet, copy previous day as proxy
+    # For tomorrow, proxy with yesterday if missing
     if day_df.empty and report_day == today_madrid() + timedelta(days=1):
         prev_day = report_day - timedelta(days=1)
         prev_df = demand_hourly[demand_hourly["datetime"].dt.date == prev_day].copy()
@@ -511,8 +608,7 @@ def build_mix_matrix_table(day_mix_hourly: pd.DataFrame, demand_hourly_day: pd.D
 
     demand_row = pd.DataFrame()
     if not demand_hourly_day.empty:
-        tmp = demand_hourly_day.copy()
-        tmp = tmp.sort_values("Hour")
+        tmp = demand_hourly_day.copy().sort_values("Hour")
         demand_row = pd.DataFrame([{"Technology": "Demand", **{str(r["Hour"]): r["demand_mwh"] for _, r in tmp.iterrows()}}])
 
     if mix_pivot.empty:
@@ -523,9 +619,9 @@ def build_mix_matrix_table(day_mix_hourly: pd.DataFrame, demand_hourly_day: pd.D
     return pd.concat([mix_pivot, demand_row], ignore_index=True)
 
 
-# -----------------------------
-# METRICS
-# -----------------------------
+# =========================================================
+# METRICS / CAPTURE
+# =========================================================
 def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> dict:
     period_price = price_hourly[
         (price_hourly["datetime"].dt.date >= start_d)
@@ -557,13 +653,13 @@ def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
     }
 
 
-def make_metrics_df(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, metric_day: date) -> pd.DataFrame:
+def make_metrics_df(price_hourly: pd.DataFrame, solar_hourly_for_metrics: pd.DataFrame, metric_day: date) -> pd.DataFrame:
     month_start = metric_day.replace(day=1)
     ytd_start = metric_day.replace(month=1, day=1)
 
-    day_metrics = compute_period_metrics(price_hourly, solar_hourly, metric_day, metric_day)
-    mtd_metrics = compute_period_metrics(price_hourly, solar_hourly, month_start, metric_day)
-    ytd_metrics = compute_period_metrics(price_hourly, solar_hourly, ytd_start, metric_day)
+    day_metrics = compute_period_metrics(price_hourly, solar_hourly_for_metrics, metric_day, metric_day)
+    mtd_metrics = compute_period_metrics(price_hourly, solar_hourly_for_metrics, month_start, metric_day)
+    ytd_metrics = compute_period_metrics(price_hourly, solar_hourly_for_metrics, ytd_start, metric_day)
 
     return pd.DataFrame(
         [
@@ -602,9 +698,72 @@ def compute_energy_mix_kpis(day_mix_hourly: pd.DataFrame, hourly_df: pd.DataFram
     return renew / total, negative_hours
 
 
-# -----------------------------
-# BESS OPTIMIZATION
-# -----------------------------
+def build_daily_dataset(price_hourly: pd.DataFrame, solar_profile_day: pd.DataFrame, report_day: date):
+    day_price = price_hourly[price_hourly["datetime"].dt.date == report_day].copy()
+    day_solar = solar_profile_day.copy()
+
+    merged = day_price.merge(
+        day_solar[["datetime", "solar_best_mw", "solar_source"]],
+        on="datetime",
+        how="left",
+    )
+    merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+    merged["solar_source"] = merged["solar_source"].fillna("No data")
+
+    positive_solar = merged[merged["solar_best_mw"] > 0].copy()
+    capture_price = None
+    if not positive_solar.empty:
+        capture_price = (positive_solar["price"] * positive_solar["solar_best_mw"]).sum() / positive_solar["solar_best_mw"].sum()
+
+    merged["Hour"] = merged["datetime"].dt.hour + 1
+
+    merged = merged.rename(
+        columns={
+            "price": "Price (€/MWh)",
+            "solar_best_mw": "Solar (MW)",
+            "solar_source": "Solar source",
+        }
+    )
+
+    return merged[["datetime", "Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy(), capture_price
+
+
+def build_overlay_chart(hourly_df: pd.DataFrame):
+    if hourly_df.empty:
+        return None
+
+    hour_order = sorted(hourly_df["Hour"].dropna().unique().tolist())
+
+    price_line = (
+        alt.Chart(hourly_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
+            y=alt.Y("Price (€/MWh):Q", title="Price (€/MWh)"),
+            tooltip=[
+                alt.Tooltip("Hour:O", title="Hour"),
+                alt.Tooltip("Price (€/MWh):Q", title="Price", format=".2f"),
+                alt.Tooltip("Solar (MW):Q", title="Solar", format=".2f"),
+                alt.Tooltip("Solar source:N", title="Solar source"),
+            ],
+        )
+    )
+
+    solar_area = (
+        alt.Chart(hourly_df)
+        .mark_area(opacity=0.25)
+        .encode(
+            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
+            y=alt.Y("Solar (MW):Q", title="Solar (MW)"),
+        )
+    )
+
+    return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
+
+
+# =========================================================
+# BESS SPREAD
+# =========================================================
 def compute_bess_spread_eur_per_mwh(
     hourly_df: pd.DataFrame,
     capacity_mwh: float = 1.0,
@@ -633,7 +792,6 @@ def compute_bess_spread_eur_per_mwh(
         model += soc[t + 1] == soc[t] + eta_ch * charge[t] - discharge[t] / max(eta_dis, 1e-9)
 
     model += soc[n] == 0
-
     model += pulp.lpSum(discharge[t] * prices[t] - charge[t] * prices[t] for t in range(n))
 
     solver = pulp.PULP_CBC_CMD(msg=False)
@@ -654,9 +812,9 @@ def compute_bess_spread_eur_per_mwh(
     return revenue / total_discharge
 
 
-# -----------------------------
+# =========================================================
 # CHART EXPORT
-# -----------------------------
+# =========================================================
 def chart_to_base64_png(chart) -> str | None:
     if chart is None:
         return None
@@ -750,75 +908,9 @@ def mix_with_demand_png_base64(day_mix_hourly: pd.DataFrame, demand_hourly_day: 
         return None
 
 
-# -----------------------------
-# DAILY DATASET
-# -----------------------------
-def build_daily_dataset(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, report_day: date):
-    day_price = price_hourly[price_hourly["datetime"].dt.date == report_day].copy()
-    day_solar = solar_hourly[solar_hourly["datetime"].dt.date == report_day].copy()
-
-    merged = day_price.merge(
-        day_solar[["datetime", "solar_best_mw", "solar_source"]],
-        on="datetime",
-        how="left",
-    )
-    merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
-    merged["solar_source"] = merged["solar_source"].fillna("No data")
-
-    positive_solar = merged[merged["solar_best_mw"] > 0].copy()
-    capture_price = None
-    if not positive_solar.empty:
-        capture_price = (positive_solar["price"] * positive_solar["solar_best_mw"]).sum() / positive_solar["solar_best_mw"].sum()
-
-    merged["Hour"] = merged["datetime"].dt.hour + 1
-
-    merged = merged.rename(
-        columns={
-            "price": "Price (€/MWh)",
-            "solar_best_mw": "Solar (MW)",
-            "solar_source": "Solar source",
-        }
-    )
-
-    return merged[["datetime", "Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy(), capture_price
-
-
-def build_overlay_chart(hourly_df: pd.DataFrame):
-    if hourly_df.empty:
-        return None
-
-    hour_order = sorted(hourly_df["Hour"].dropna().unique().tolist())
-
-    price_line = (
-        alt.Chart(hourly_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
-            y=alt.Y("Price (€/MWh):Q", title="Price (€/MWh)"),
-            tooltip=[
-                alt.Tooltip("Hour:O", title="Hour"),
-                alt.Tooltip("Price (€/MWh):Q", title="Price", format=".2f"),
-                alt.Tooltip("Solar (MW):Q", title="Solar", format=".2f"),
-                alt.Tooltip("Solar source:N", title="Solar source"),
-            ],
-        )
-    )
-
-    solar_area = (
-        alt.Chart(hourly_df)
-        .mark_area(opacity=0.25)
-        .encode(
-            x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
-            y=alt.Y("Solar (MW):Q", title="Solar (MW)"),
-        )
-    )
-
-    return alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
-
-
-# -----------------------------
+# =========================================================
 # LOAD DATA
-# -----------------------------
+# =========================================================
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
 solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
 solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
@@ -832,7 +924,6 @@ if price_raw.empty:
 price_hourly = to_hourly_mean(price_raw, value_col_name="price")
 solar_p48_hourly = to_hourly_mean(solar_p48_raw, value_col_name="solar_p48_mw")
 solar_forecast_hourly = to_hourly_mean(solar_forecast_raw, value_col_name="solar_forecast_mw")
-solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
 
 latest_available_day = price_hourly["datetime"].dt.date.max()
 tomorrow_allowed = max_refresh_day_from_clock()
@@ -875,15 +966,28 @@ intro_text = st.text_area(
     height=120,
 )
 
-hourly_df, capture_price = build_daily_dataset(price_hourly, solar_hourly, report_day)
-metrics_df = make_metrics_df(price_hourly, solar_hourly, min(report_day, latest_available_day))
+solar_profile_day = build_solar_profile_for_report_day(
+    solar_p48_hourly=solar_p48_hourly,
+    solar_forecast_hourly=solar_forecast_hourly,
+    report_day=report_day,
+)
+
+hourly_df, capture_price = build_daily_dataset(price_hourly, solar_profile_day, report_day)
+
+# For metrics table, if report day is tomorrow use latest available day for MTD/YTD cut-off,
+# but use solar profile of the selected report day for Day metrics through build_daily_dataset.
+metrics_day = min(report_day, latest_available_day)
+
+historical_best_solar = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+metrics_df = make_metrics_df(price_hourly, historical_best_solar, metrics_day)
 
 is_tomorrow = report_day == today_madrid() + timedelta(days=1)
 force_mix_forecast = is_tomorrow and allow_next_day_refresh()
 
 day_mix_hourly = build_hourly_mix_from_daily_gwh(
-    mix_daily_raw,
-    report_day,
+    mix_daily_df=mix_daily_raw,
+    solar_profile_day=solar_profile_day,
+    report_day=report_day,
     force_forecast_for_tomorrow=force_mix_forecast,
 )
 
@@ -975,9 +1079,9 @@ if mix_with_demand_b64:
     """
 
 mix_source_note = (
-    "Tomorrow proxy forecast applied from previous day for REE daily mix and demand."
-    if force_mix_forecast
-    else "REE daily mix cache used when available; demand taken from hourly demand history."
+    "Tomorrow: solar capture uses yesterday's hourly solar profile shifted to tomorrow; REE daily mix is also proxied from previous day when needed, with solar technologies shaped by the solar hourly profile."
+    if force_mix_forecast or is_tomorrow
+    else "Historical day: prices use selected day spot prices; solar capture uses best hourly solar series; REE daily mix is shaped hourly with solar restricted to solar-profile hours."
 )
 
 email_html = f"""
@@ -1074,4 +1178,4 @@ else:
             except Exception as e:
                 st.error(f"Send failed: {e}")
 
-st.info("If report day is tomorrow and it is after 15:00 Madrid time, the app uses previous-day proxy for REE daily mix and demand.")
+st.info("Tomorrow logic: captured solar uses yesterday's hourly solar profile shifted to tomorrow; solar in energy mix is shaped with that profile, so there is no solar generation at night.")
