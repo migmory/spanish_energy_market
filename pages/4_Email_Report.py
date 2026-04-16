@@ -1,8 +1,11 @@
+from __future__ import annotations
+
+import os
+import base64
 from datetime import date, datetime, time, timedelta
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from io import BytesIO
-import base64
 
 import altair as alt
 import matplotlib.pyplot as plt
@@ -10,43 +13,17 @@ import pandas as pd
 import pulp
 import requests
 import streamlit as st
+from dotenv import load_dotenv
 
-st.set_page_config(page_title="Email Report", layout="wide")
-
-st.markdown(
-    """
-    <style>
-    html, body, [class*="css"] {
-        font-size: 100% !important;
-    }
-    .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
-    .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
-        font-size: 100% !important;
-    }
-    h1 {
-        font-size: 2.0rem !important;
-    }
-    h2, h3 {
-        font-size: 1.2rem !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("Email Report")
-
-if "email_admin_password" not in st.secrets:
-    st.error("Missing secret: email_admin_password")
-    st.info("Add it in the app Secrets settings.")
-    st.stop()
-
-pwd = st.text_input("Password", type="password")
-if pwd != st.secrets["email_admin_password"]:
-    st.stop()
-
+# =========================================================
+# CONFIG
+# =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+
 DATA_DIR = BASE_DIR / "historical_data"
+DATA_DIR.mkdir(exist_ok=True)
 
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
 SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
@@ -55,6 +32,11 @@ DEMAND_RAW_CSV_PATH = DATA_DIR / "demand_p48_total_10027_raw.csv"
 REE_MIX_DAILY_CSV_PATH = DATA_DIR / "ree_generation_structure_daily_peninsular.csv"
 
 MADRID_TZ = ZoneInfo("Europe/Madrid")
+
+PRICE_INDICATOR_ID = 600
+SOLAR_P48_INDICATOR_ID = 84
+SOLAR_FORECAST_INDICATOR_ID = 542
+DEMAND_INDICATOR_ID = 10027
 
 ENERGY_MIX_INDICATORS_OFFICIAL = {
     "Nuclear": 74,
@@ -122,20 +104,23 @@ TECH_ORDER = [
     "Other renewables",
 ]
 
+TECH_COLORS = {
+    "CCGT": "#9CA3AF",
+    "Hydro": "#60A5FA",
+    "Nuclear": "#C084FC",
+    "Solar PV": "#FACC15",
+    "Solar thermal": "#FCA5A5",
+    "Wind": "#2563EB",
+    "CHP": "#F97316",
+    "Biomass": "#16A34A",
+    "Biogas": "#22C55E",
+    "Other renewables": "#14B8A6",
+    "Demand": "#111827",
+}
+
 TECH_COLOR_SCALE = alt.Scale(
     domain=TECH_ORDER,
-    range=[
-        "#9CA3AF",
-        "#60A5FA",
-        "#C084FC",
-        "#FACC15",
-        "#FCA5A5",
-        "#2563EB",
-        "#F97316",
-        "#16A34A",
-        "#22C55E",
-        "#14B8A6",
-    ],
+    range=[TECH_COLORS[t] for t in TECH_ORDER],
 )
 
 RENEWABLE_TECHS = {
@@ -148,9 +133,42 @@ RENEWABLE_TECHS = {
     "Other renewables",
 }
 
+st.set_page_config(page_title="Email Report", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    html, body, [class*="css"] {
+        font-size: 100% !important;
+    }
+    .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
+    .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
+        font-size: 100% !important;
+    }
+    h1 {
+        font-size: 1.9rem !important;
+    }
+    h2, h3 {
+        font-size: 1.15rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Email Report")
+
+if "email_admin_password" not in st.secrets:
+    st.error("Missing secret: email_admin_password")
+    st.stop()
+
+pwd = st.text_input("Password", type="password")
+if pwd != st.secrets["email_admin_password"]:
+    st.stop()
+
 
 # =========================================================
-# TIME
+# TIME / TOKEN
 # =========================================================
 def now_madrid() -> datetime:
     return datetime.now(MADRID_TZ)
@@ -168,8 +186,25 @@ def max_refresh_day_from_clock() -> date:
     return today_madrid() + timedelta(days=1) if allow_next_day_refresh() else today_madrid()
 
 
+def require_esios_token() -> str | None:
+    token = (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip()
+    return token or None
+
+
+def build_headers(token: str) -> dict:
+    return {
+        "Accept": "application/json; application/vnd.esios-api-v1+json",
+        "Content-Type": "application/json",
+        "x-api-key": token,
+    }
+
+
+def resolve_time_trunc(day: date) -> str:
+    return "hour" if day < date(2025, 10, 1) else "quarter_hour"
+
+
 # =========================================================
-# GENERIC HELPERS
+# HELPERS
 # =========================================================
 def ensure_datetime_col(df: pd.DataFrame, col: str = "datetime") -> pd.DataFrame:
     out = df.copy()
@@ -179,6 +214,78 @@ def ensure_datetime_col(df: pd.DataFrame, col: str = "datetime") -> pd.DataFrame
     return out
 
 
+def parse_emails(raw: str) -> list[str]:
+    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
+def format_preview_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd.DataFrame:
+    pct_cols = pct_cols or []
+    out = df.copy()
+
+    for col in out.columns:
+        if col in pct_cols:
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
+        elif pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:,.2f}")
+
+    return out
+
+
+def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None, small: bool = False) -> str:
+    pct_cols = pct_cols or []
+    tmp = format_preview_df(df, pct_cols=pct_cols)
+
+    font_size = "12px" if small else "13px"
+    styles = f"""
+    <style>
+    table.email-table {{
+        border-collapse: collapse;
+        width: 100%;
+        font-family: Arial, sans-serif;
+        font-size: {font_size};
+    }}
+    table.email-table th {{
+        background: #d1d5db;
+        color: #111111;
+        border: 1px solid #c7ccd4;
+        padding: 8px;
+        text-align: center;
+        font-weight: 700;
+    }}
+    table.email-table td {{
+        border: 1px solid #e5e7eb;
+        padding: 8px;
+        text-align: center;
+    }}
+    </style>
+    """
+    html = tmp.to_html(index=False, classes="email-table", border=0, escape=False)
+    return styles + html
+
+
+def make_kpi_cards_html(items: list[tuple[str, str]]) -> str:
+    cards = []
+    for title, value in items:
+        cards.append(
+            f"""
+            <div style="
+                flex: 1 1 180px;
+                min-width: 180px;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                padding: 10px 12px;
+                background: #f8fafc;">
+                <div style="font-size:12px; color:#475569; margin-bottom:4px;">{title}</div>
+                <div style="font-size:18px; font-weight:700; color:#111827;">{value}</div>
+            </div>
+            """
+        )
+    return f'<div style="display:flex; gap:10px; flex-wrap:wrap;">{"".join(cards)}</div>'
+
+
+# =========================================================
+# LOAD / PARSE LOCAL DATA
+# =========================================================
 def load_raw_history(csv_path: Path, source_name: str | None = None) -> pd.DataFrame:
     if not csv_path.exists():
         return pd.DataFrame()
@@ -213,7 +320,6 @@ def infer_interval_hours(df: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype=float)
 
     diffs = out["datetime"].diff().dt.total_seconds().div(3600)
-
     if diffs.dropna().empty:
         interval = 1.0
     else:
@@ -292,52 +398,93 @@ def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def parse_emails(raw: str) -> list[str]:
-    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+# =========================================================
+# ESIOS FETCH
+# =========================================================
+def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+    raise ValueError("No datetime column found")
 
 
-def format_preview_df(df: pd.DataFrame, pct_cols: list[str] | None = None) -> pd.DataFrame:
-    pct_cols = pct_cols or []
-    out = df.copy()
+def parse_esios_indicator(
+    raw_json: dict,
+    source_name: str,
+    filter_date: date | None = None,
+) -> pd.DataFrame:
+    values = raw_json.get("indicator", {}).get("values", [])
+    if not values:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-    for col in out.columns:
-        if col in pct_cols:
-            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
-        elif pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+    df = pd.DataFrame(values)
 
-    return out
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+
+    if (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
+    else:
+        geo_series = df["geo_name"].astype(str).str.strip().str.lower()
+        if (geo_series == "españa").any():
+            df = df[geo_series == "españa"].copy()
+        elif (geo_series == "espana").any():
+            df = df[geo_series == "espana"].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    df["datetime"] = parse_datetime_label(df)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"]).copy()
+
+    if filter_date is not None:
+        df = df[df["datetime"].dt.date == filter_date].copy()
+
+    df["source"] = source_name
+    df = df[["datetime", "value", "source", "geo_name", "geo_id"]].copy()
+    return df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
 
 
-def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
-    pct_cols = pct_cols or []
-    tmp = format_preview_df(df, pct_cols=pct_cols)
+def fetch_esios_day(indicator_id: int, day: date, token: str) -> dict:
+    start_local = pd.Timestamp(day, tz="Europe/Madrid")
+    end_local = start_local + pd.Timedelta(days=1)
 
-    styles = """
-    <style>
-    table.email-table {
-        border-collapse: collapse;
-        width: 100%;
-        font-family: Arial, sans-serif;
-        font-size: 13px;
+    start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "start_date": start_utc,
+        "end_date": end_utc,
+        "time_trunc": resolve_time_trunc(day),
     }
-    table.email-table th {
-        background: #d1d5db;
-        color: #111111;
-        border: 1px solid #c7ccd4;
-        padding: 8px;
-        text-align: center;
-        font-weight: 700;
-    }
-    table.email-table td {
-        border: 1px solid #e5e7eb;
-        padding: 8px;
-        text-align: center;
-    }
-    </style>
-    """
-    html = tmp.to_html(index=False, classes="email-table", border=0, escape=False)
-    return styles + html
+
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    resp = requests.get(url, headers=build_headers(token), params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_hourly_energy_for_indicator(indicator_id: int | None, day: date, token: str | None) -> pd.DataFrame:
+    if indicator_id is None or not token:
+        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
+
+    try:
+        raw = fetch_esios_day(indicator_id, day, token)
+        df = parse_esios_indicator(raw, source_name=f"esios_{indicator_id}", filter_date=day)
+        if df.empty:
+            return pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
+        energy = to_energy_intervals(df, value_col_name="mw", energy_col_name="energy_mwh")
+        return to_hourly_energy(energy)
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
 
 
 # =========================================================
@@ -392,11 +539,20 @@ def build_solar_profile_for_report_day(
     solar_p48_hourly: pd.DataFrame,
     solar_forecast_hourly: pd.DataFrame,
     report_day: date,
+    token: str | None,
 ) -> pd.DataFrame:
     tomorrow = today_madrid() + timedelta(days=1)
 
     solar_p48_hourly = ensure_datetime_col(solar_p48_hourly, "datetime")
     solar_forecast_hourly = ensure_datetime_col(solar_forecast_hourly, "datetime")
+
+    # Intento 1: forecast horario real del propio día
+    if token:
+        fc_live = fetch_hourly_energy_for_indicator(SOLAR_FORECAST_INDICATOR_ID, report_day, token)
+        if not fc_live.empty:
+            out = fc_live.rename(columns={"mw": "solar_best_mw"}).copy()
+            out["solar_source"] = "Forecast"
+            return out[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
 
     if report_day == tomorrow:
         prev_day = report_day - timedelta(days=1)
@@ -440,89 +596,17 @@ def build_hourly_weights_from_energy(df_hourly: pd.DataFrame, report_day: date, 
         return base
 
     tmp = tmp.groupby("datetime", as_index=False)[value_col].sum()
-
     base = base.merge(tmp, on="datetime", how="left")
     base[value_col] = base[value_col].fillna(0.0)
 
     total = base[value_col].sum()
-    if total > 0:
-        base["weight"] = base[value_col] / total
-    else:
-        base["weight"] = 0.0
-
+    base["weight"] = base[value_col] / total if total > 0 else 0.0
     return base[["datetime", "Hour", "weight"]]
 
 
 # =========================================================
 # MIX
 # =========================================================
-def get_mix_indicator_csv_path_variant(name: str, indicator_id: int | None, variant: str) -> Path:
-    safe_name = name.lower().replace(" ", "_").replace("/", "_")
-    suffix = "none" if indicator_id is None else str(indicator_id)
-    return DATA_DIR / f"mix_{variant}_{suffix}_{safe_name}.csv"
-
-
-def build_best_mix_energy(
-    official_energy: pd.DataFrame,
-    forecast_energy: pd.DataFrame,
-    tech_name: str,
-) -> pd.DataFrame:
-    if official_energy.empty and forecast_energy.empty:
-        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "technology", "data_source"])
-
-    if official_energy.empty:
-        out = forecast_energy.copy()
-        out["technology"] = tech_name
-        out["data_source"] = "Forecast"
-        return out
-
-    if forecast_energy.empty:
-        out = official_energy.copy()
-        out["technology"] = tech_name
-        out["data_source"] = "Official"
-        return out
-
-    off = official_energy[["datetime", "mw", "energy_mwh"]].copy()
-    off = off.rename(columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"})
-
-    fc = forecast_energy[["datetime", "mw", "energy_mwh"]].copy()
-    fc = fc.rename(columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"})
-
-    merged = off.merge(fc, on="datetime", how="outer")
-    merged["mw"] = merged["mw_official"].combine_first(merged["mw_forecast"])
-    merged["energy_mwh"] = merged["energy_mwh_official"].combine_first(merged["energy_mwh_forecast"])
-    merged["data_source"] = merged["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
-    merged.loc[merged["data_source"].isna() & merged["mw_forecast"].notna(), "data_source"] = "Forecast"
-    merged["technology"] = tech_name
-
-    out = merged[["datetime", "mw", "energy_mwh", "technology", "data_source"]].copy()
-    out = ensure_datetime_col(out, "datetime")
-    return out.sort_values("datetime").reset_index(drop=True)
-
-
-def load_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: int | None) -> pd.DataFrame:
-    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-
-    if official_id is not None:
-        official_df = load_raw_history(
-            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
-            f"esios_{official_id}",
-        )
-
-    if forecast_id is not None:
-        forecast_df = load_raw_history(
-            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
-            f"esios_{forecast_id}",
-        )
-
-    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
-    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
-
-    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
-    return to_hourly_energy(best)
-
-
 def load_ree_mix_daily() -> pd.DataFrame:
     df = load_raw_history(REE_MIX_DAILY_CSV_PATH)
     if df.empty:
@@ -542,10 +626,7 @@ def load_ree_mix_daily() -> pd.DataFrame:
 
     df = (
         df.groupby(["datetime", "technology"], as_index=False)
-        .agg(
-            value_gwh=("value_gwh", "sum"),
-            data_source=("data_source", "first"),
-        )
+        .agg(value_gwh=("value_gwh", "sum"), data_source=("data_source", "first"))
         .sort_values(["datetime", "technology"])
         .reset_index(drop=True)
     )
@@ -592,35 +673,123 @@ def shift_previous_day_to_target(best_hourly: pd.DataFrame, target_day: date) ->
     return prev_df
 
 
+def fetch_best_mix_shape_for_original_tech(original_tech: str, report_day: date, token: str | None) -> pd.DataFrame:
+    official_id = ENERGY_MIX_INDICATORS_OFFICIAL.get(original_tech)
+    forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(original_tech)
+    tomorrow = today_madrid() + timedelta(days=1)
+
+    # Intento 1: si mañana y existe forecast horario real, usarlo
+    if report_day == tomorrow and token and forecast_id is not None:
+        fc = fetch_hourly_energy_for_indicator(forecast_id, report_day, token)
+        if not fc.empty:
+            fc["technology"] = original_tech
+            fc["data_source"] = "Forecast"
+            return fc
+
+    # Intento 2: oficial del día
+    if token and official_id is not None and report_day != tomorrow:
+        off = fetch_hourly_energy_for_indicator(official_id, report_day, token)
+        if not off.empty:
+            off["technology"] = original_tech
+            off["data_source"] = "Official"
+            return off
+
+    # Intento 3: mañana -> oficial del día anterior desplazado
+    if token and official_id is not None and report_day == tomorrow:
+        off_prev = fetch_hourly_energy_for_indicator(official_id, report_day - timedelta(days=1), token)
+        if not off_prev.empty:
+            off_prev["datetime"] = pd.to_datetime(off_prev["datetime"], errors="coerce") + pd.Timedelta(days=1)
+            off_prev["technology"] = original_tech
+            off_prev["data_source"] = "Forecast"
+            return off_prev
+
+    # Fallback a histórico local cacheado
+    local = load_mix_best_energy(original_tech, official_id, forecast_id)
+    local = ensure_datetime_col(local, "datetime")
+    if local.empty:
+        return pd.DataFrame(columns=["datetime", "energy_mwh"])
+
+    if report_day == tomorrow:
+        local = shift_previous_day_to_target(local, report_day)
+    else:
+        local = local[local["datetime"].dt.date == report_day].copy()
+
+    return local
+
+
+def load_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: int | None) -> pd.DataFrame:
+    def get_mix_indicator_csv_path_variant(name: str, indicator_id: int | None, variant: str) -> Path:
+        safe_name = name.lower().replace(" ", "_").replace("/", "_")
+        suffix = "none" if indicator_id is None else str(indicator_id)
+        return DATA_DIR / f"mix_{variant}_{suffix}_{safe_name}.csv"
+
+    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    if official_id is not None:
+        official_df = load_raw_history(
+            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
+            f"esios_{official_id}",
+        )
+
+    if forecast_id is not None:
+        forecast_df = load_raw_history(
+            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
+            f"esios_{forecast_id}",
+        )
+
+    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
+    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
+
+    if official_energy.empty and forecast_energy.empty:
+        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "technology", "data_source"])
+
+    if official_energy.empty:
+        out = forecast_energy.copy()
+        out["technology"] = tech_name
+        out["data_source"] = "Forecast"
+        return to_hourly_energy(out)
+
+    if forecast_energy.empty:
+        out = official_energy.copy()
+        out["technology"] = tech_name
+        out["data_source"] = "Official"
+        return to_hourly_energy(out)
+
+    off = official_energy[["datetime", "mw", "energy_mwh"]].copy().rename(
+        columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"}
+    )
+    fc = forecast_energy[["datetime", "mw", "energy_mwh"]].copy().rename(
+        columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"}
+    )
+
+    merged = off.merge(fc, on="datetime", how="outer")
+    merged["mw"] = merged["mw_official"].combine_first(merged["mw_forecast"])
+    merged["energy_mwh"] = merged["energy_mwh_official"].combine_first(merged["energy_mwh_forecast"])
+    merged["data_source"] = merged["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
+    merged.loc[merged["data_source"].isna() & merged["mw_forecast"].notna(), "data_source"] = "Forecast"
+    merged["technology"] = tech_name
+
+    out = merged[["datetime", "mw", "energy_mwh", "technology", "data_source"]].copy()
+    return to_hourly_energy(out)
+
+
 def get_hourly_shape_for_tech(
     tech_name: str,
     best_hourly: pd.DataFrame,
     report_day: date,
     solar_profile_day: pd.DataFrame,
 ) -> pd.DataFrame:
-    tomorrow = today_madrid() + timedelta(days=1)
-
     best_hourly = ensure_datetime_col(best_hourly, "datetime")
     solar_profile_day = ensure_datetime_col(solar_profile_day, "datetime")
 
-    if report_day == tomorrow:
-        hourly = shift_previous_day_to_target(best_hourly, report_day)
-    else:
-        if best_hourly.empty or "datetime" not in best_hourly.columns:
-            hourly = pd.DataFrame(columns=["datetime", "energy_mwh"])
-        else:
-            hourly = best_hourly[best_hourly["datetime"].dt.date == report_day].copy()
+    if not best_hourly.empty:
+        return build_hourly_weights_from_energy(best_hourly, report_day, value_col="energy_mwh")
 
-    if not hourly.empty:
-        return build_hourly_weights_from_energy(hourly, report_day, value_col="energy_mwh")
-
-    # fallback for solar technologies using shifted previous-day forecast/p48 profile
     if tech_name in {"Solar PV", "Solar thermal"} and not solar_profile_day.empty:
-        proxy = solar_profile_day.copy()
-        proxy = proxy.rename(columns={"solar_best_mw": "energy_mwh"})
+        proxy = solar_profile_day.copy().rename(columns={"solar_best_mw": "energy_mwh"})
         return build_hourly_weights_from_energy(proxy, report_day, value_col="energy_mwh")
 
-    # flat fallback
     hours = pd.date_range(
         start=pd.Timestamp(report_day),
         end=pd.Timestamp(report_day) + pd.Timedelta(hours=23),
@@ -632,7 +801,7 @@ def get_hourly_shape_for_tech(
     return flat[["datetime", "Hour", "weight"]]
 
 
-def build_all_mix_hourly_for_day(report_day: date, ree_daily_df: pd.DataFrame, solar_profile_day: pd.DataFrame) -> pd.DataFrame:
+def build_all_mix_hourly_for_day(report_day: date, ree_daily_df: pd.DataFrame, solar_profile_day: pd.DataFrame, token: str | None) -> pd.DataFrame:
     daily_totals = get_daily_mix_totals(report_day, ree_daily_df)
     if daily_totals.empty:
         return pd.DataFrame(columns=["datetime", "Hour", "technology", "energy_mwh", "data_source"])
@@ -647,25 +816,22 @@ def build_all_mix_hourly_for_day(report_day: date, ree_daily_df: pd.DataFrame, s
         daily_total_mwh = float(tech_daily["value_gwh"].sum()) * 1000.0
         data_source = tech_daily["data_source"].iloc[0] if not tech_daily.empty else "Official"
 
-        original_techs = [k for k, v in DISPLAY_TECH_MAP.items() if v == tech_name]
-        if tech_name != "Hydro":
-            original_techs = [tech_name]
-        elif not original_techs:
+        if tech_name == "Hydro":
             original_techs = ["Hydro UGH", "Hydro non-UGH", "Pumped hydro"]
+        else:
+            original_techs = [tech_name]
 
         hourly_candidates = []
         for original_tech in original_techs:
-            official_id = ENERGY_MIX_INDICATORS_OFFICIAL.get(original_tech)
-            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(original_tech)
-            best = load_mix_best_energy(original_tech, official_id, forecast_id)
+            best = fetch_best_mix_shape_for_original_tech(original_tech, report_day, token)
             best = ensure_datetime_col(best, "datetime")
-            if not best.empty:
-                hourly_candidates.append(best)
+            if not best.empty and "energy_mwh" in best.columns:
+                hourly_candidates.append(best[["datetime", "energy_mwh"]].copy())
 
         if hourly_candidates:
-            tech_hourly = pd.concat(hourly_candidates, ignore_index=True)
             tech_hourly = (
-                tech_hourly.groupby("datetime", as_index=False)
+                pd.concat(hourly_candidates, ignore_index=True)
+                .groupby("datetime", as_index=False)
                 .agg(energy_mwh=("energy_mwh", "sum"))
                 .sort_values("datetime")
                 .reset_index(drop=True)
@@ -680,7 +846,6 @@ def build_all_mix_hourly_for_day(report_day: date, ree_daily_df: pd.DataFrame, s
             solar_profile_day=solar_profile_day,
         )
 
-        weights = weights.copy()
         if weights["weight"].sum() <= 0:
             weights["weight"] = 1 / 24
 
@@ -706,16 +871,12 @@ def build_hourly_demand_for_day(demand_raw: pd.DataFrame, report_day: date) -> p
     if demand_raw.empty:
         return pd.DataFrame(columns=["datetime", "Hour", "demand_mwh"])
 
-    demand_energy = to_energy_intervals(demand_raw, "demand_p48_mw", "energy_mwh")
-    demand_hourly = to_hourly_energy(demand_energy)
-
+    demand_hourly = to_hourly_mean(demand_raw, "demand_mw")
     if demand_hourly.empty:
         return pd.DataFrame(columns=["datetime", "Hour", "demand_mwh"])
 
     demand_hourly = ensure_datetime_col(demand_hourly, "datetime")
-    if demand_hourly.empty:
-        return pd.DataFrame(columns=["datetime", "Hour", "demand_mwh"])
-
+    demand_hourly["energy_mwh"] = pd.to_numeric(demand_hourly["demand_mw"], errors="coerce")
     tomorrow = today_madrid() + timedelta(days=1)
 
     if report_day == tomorrow:
@@ -757,18 +918,12 @@ def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
     merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
     merged = merged[merged["solar_best_mw"] > 0].copy()
 
+    captured = None
     if not merged.empty:
         captured = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
-    else:
-        captured = None
 
     capture_pct = (captured / avg_price) if (captured is not None and avg_price not in [None, 0]) else None
-
-    return {
-        "avg_price": avg_price,
-        "captured": captured,
-        "capture_pct": capture_pct,
-    }
+    return {"avg_price": avg_price, "captured": captured, "capture_pct": capture_pct}
 
 
 def make_metrics_df(
@@ -831,7 +986,6 @@ def build_daily_dataset(price_hourly: pd.DataFrame, solar_profile_day: pd.DataFr
         capture_price = (positive_solar["price"] * positive_solar["solar_best_mw"]).sum() / positive_solar["solar_best_mw"].sum()
 
     merged["Hour"] = merged["datetime"].dt.hour + 1
-
     merged = merged.rename(
         columns={
             "price": "Price (€/MWh)",
@@ -857,37 +1011,89 @@ def compute_energy_mix_kpis(day_mix_hourly: pd.DataFrame, hourly_df: pd.DataFram
 
 
 # =========================================================
-# BESS SPREAD
+# BESS TB SPREADS
 # =========================================================
-def compute_bess_spread_eur_per_mwh(
+def compute_bess_tb_spread(
     hourly_df: pd.DataFrame,
     capacity_mwh: float = 1.0,
     c_rate: float = 0.25,
     eta_ch: float = 1.0,
     eta_dis: float = 1.0,
 ) -> float | None:
+    """
+    Devuelve valor diario de arbitrage por MWh nominal de batería.
+    Está alineado con la lógica de la pestaña BESS standalone:
+    - generacion = 0
+    - consumo = 0
+    - omie_compra = omie_venta
+    - spread = beneficio neto / capacidad nominal
+    """
     if hourly_df.empty or "Price (€/MWh)" not in hourly_df.columns:
         return None
 
-    prices = pd.to_numeric(hourly_df["Price (€/MWh)"], errors="coerce").dropna().tolist()
+    prices = pd.to_numeric(hourly_df["Price (€/MWh)"], errors="coerce").tolist()
+    prices = [p for p in prices if pd.notna(p)]
     n = len(prices)
     if n == 0:
         return None
 
+    omie_sell = prices
+    omie_buy = prices
+    gen = [0.0] * n
+    load = [0.0] * n
+
     max_power = capacity_mwh * c_rate
+    max_grid_flow = max([0.0] + gen + load) + max_power
+    max_grid_flow = max(max_grid_flow, 1.0)
 
-    model = pulp.LpProblem("bess_spread_daily", pulp.LpMaximize)
+    model = pulp.LpProblem("email_report_bess_tb", pulp.LpMaximize)
 
-    charge = pulp.LpVariable.dicts("charge", range(n), lowBound=0, upBound=max_power)
-    discharge = pulp.LpVariable.dicts("discharge", range(n), lowBound=0, upBound=max_power)
-    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0, upBound=capacity_mwh)
+    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
+    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
+    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
+    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
+    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
+    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
+    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
+    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
+    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
+    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
 
-    model += soc[0] == 0
+    model += soc[0] == 0.0
+    model += soc[n] == 0.0
+
     for t in range(n):
-        model += soc[t + 1] == soc[t] + eta_ch * charge[t] - discharge[t] / max(eta_dis, 1e-9)
+        model += g_to_batt[t] + grid_charge[t] <= max_power * is_charging[t]
+        model += batt_for_load[t] + batt_for_sell[t] <= max_power * (1 - is_charging[t])
 
-    model += soc[n] == 0
-    model += pulp.lpSum(discharge[t] * prices[t] - charge[t] * prices[t] for t in range(n))
+        model += g_to_grid[t] + batt_for_sell[t] <= max_power
+        model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
+        model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
+
+        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == gen[t]
+        model += load[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
+
+        model += soc[t + 1] == (
+            soc[t]
+            + eta_ch * (g_to_batt[t] + grid_charge[t])
+            - (1 / max(eta_dis, 1e-9)) * (batt_for_load[t] + batt_for_sell[t])
+        )
+        model += soc[t] <= capacity_mwh
+
+    model += soc[n] <= capacity_mwh
+    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= capacity_mwh / max(eta_ch, 1e-9)
+    model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(
+        g_to_batt[t] + grid_charge[t] for t in range(n)
+    )
+
+    # Igual que la pestaña BESS: beneficio neto
+    model += pulp.lpSum(
+        g_to_grid[t] * omie_sell[t]
+        + batt_for_sell[t] * omie_sell[t]
+        - grid_purchase[t] * omie_buy[t]
+        - grid_charge[t] * omie_buy[t]
+        for t in range(n)
+    )
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     model.solve(solver)
@@ -895,20 +1101,44 @@ def compute_bess_spread_eur_per_mwh(
     if pulp.LpStatus[model.status] != "Optimal":
         return None
 
-    total_discharge = sum((pulp.value(discharge[t]) or 0.0) for t in range(n))
     revenue = sum(
-        ((pulp.value(discharge[t]) or 0.0) * prices[t]) - ((pulp.value(charge[t]) or 0.0) * prices[t])
+        ((pulp.value(g_to_grid[t]) or 0.0) * omie_sell[t])
+        + ((pulp.value(batt_for_sell[t]) or 0.0) * omie_sell[t])
+        - ((pulp.value(grid_purchase[t]) or 0.0) * omie_buy[t])
+        - ((pulp.value(grid_charge[t]) or 0.0) * omie_buy[t])
         for t in range(n)
     )
 
-    if total_discharge <= 1e-9:
-        return 0.0
+    if capacity_mwh <= 0:
+        return None
 
-    return revenue / total_discharge
+    return revenue / capacity_mwh
+
+
+def make_tb_spreads_table(hourly_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for label, c_rate in [("TB4", 0.25), ("TB2", 0.50), ("TB1", 1.00)]:
+        spread = compute_bess_tb_spread(
+            hourly_df=hourly_df,
+            capacity_mwh=1.0,
+            c_rate=c_rate,
+            eta_ch=1.0,
+            eta_dis=1.0,
+        )
+        rows.append(
+            {
+                "Product": label,
+                "Battery size (MWh)": 1.0,
+                "C-rate": c_rate,
+                "Efficiency": "100% / 100%",
+                "Spread (€/MWh)": spread,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # =========================================================
-# CHARTS / TABLES
+# CHARTS
 # =========================================================
 def build_overlay_chart(hourly_df: pd.DataFrame):
     if hourly_df.empty:
@@ -918,7 +1148,7 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
 
     price_line = (
         alt.Chart(hourly_df)
-        .mark_line(point=True)
+        .mark_line(point=True, color="#0f766e", strokeWidth=3)
         .encode(
             x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
             y=alt.Y("Price (€/MWh):Q", title="Price (€/MWh)"),
@@ -933,7 +1163,7 @@ def build_overlay_chart(hourly_df: pd.DataFrame):
 
     solar_area = (
         alt.Chart(hourly_df)
-        .mark_area(opacity=0.25)
+        .mark_area(opacity=0.25, color="#FACC15")
         .encode(
             x=alt.X("Hour:O", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
             y=alt.Y("Solar (MW):Q", title="Solar (MW)"),
@@ -956,8 +1186,9 @@ def build_mix_with_demand_chart(day_mix_hourly: pd.DataFrame, demand_hourly_day:
             .mark_bar()
             .encode(
                 x=alt.X("Hour:N", sort=order_list, axis=alt.Axis(title="Hour", labelAngle=0)),
-                y=alt.Y("energy_mwh:Q", title="Energy / demand (MWh)", stack=True),
+                y=alt.Y("energy_mwh:Q", title="Generation & demand (MWh)", stack=True),
                 color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
+                order=alt.Order("technology:N", sort="ascending"),
                 tooltip=[
                     alt.Tooltip("Hour:N", title="Hour"),
                     alt.Tooltip("technology:N", title="Technology"),
@@ -971,10 +1202,10 @@ def build_mix_with_demand_chart(day_mix_hourly: pd.DataFrame, demand_hourly_day:
     if not demand_hourly_day.empty:
         demand_line = (
             alt.Chart(demand_hourly_day)
-            .mark_line(point=True, color="#111827", strokeWidth=2.5)
+            .mark_line(point=True, color=TECH_COLORS["Demand"], strokeWidth=2.5)
             .encode(
                 x=alt.X("Hour:N", sort=demand_hourly_day["Hour"].drop_duplicates().tolist(), axis=alt.Axis(title="Hour", labelAngle=0)),
-                y=alt.Y("demand_mwh:Q", title="Energy / demand (MWh)"),
+                y=alt.Y("demand_mwh:Q", title="Generation & demand (MWh)"),
                 tooltip=[
                     alt.Tooltip("Hour:N", title="Hour"),
                     alt.Tooltip("demand_mwh:Q", title="Demand (MWh)", format=",.2f"),
@@ -1038,7 +1269,7 @@ def line_area_png_base64(hourly_df: pd.DataFrame) -> str | None:
         ax2 = ax1.twinx()
 
         ax1.plot(hourly_df["datetime"], hourly_df["Price (€/MWh)"], color="#0f766e", linewidth=2.2, marker="o", markersize=3)
-        ax2.fill_between(hourly_df["datetime"], hourly_df["Solar (MW)"], color="#facc15", alpha=0.28)
+        ax2.fill_between(hourly_df["datetime"], hourly_df["Solar (MW)"], color="#FACC15", alpha=0.28)
 
         ax1.set_ylabel("Price (€/MWh)")
         ax2.set_ylabel("Solar (MW)")
@@ -1072,6 +1303,7 @@ def mix_with_demand_png_base64(day_mix_hourly: pd.DataFrame, demand_hourly_day: 
                     aggfunc="sum",
                     fill_value=0.0,
                 )
+                .reindex(columns=[c for c in TECH_ORDER if c in day_mix_hourly["technology"].unique()])
                 .sort_index()
             )
 
@@ -1081,7 +1313,13 @@ def mix_with_demand_png_base64(day_mix_hourly: pd.DataFrame, demand_hourly_day: 
             bottom = None
             for tech in mix_pivot.columns:
                 vals = mix_pivot[tech].values
-                ax.bar(mix_pivot.index, vals, bottom=bottom, label=tech)
+                ax.bar(
+                    mix_pivot.index,
+                    vals,
+                    bottom=bottom,
+                    label=tech,
+                    color=TECH_COLORS.get(tech, "#9CA3AF"),
+                )
                 bottom = vals if bottom is None else bottom + vals
 
         if not demand_hourly_day.empty:
@@ -1089,14 +1327,14 @@ def mix_with_demand_png_base64(day_mix_hourly: pd.DataFrame, demand_hourly_day: 
             ax.plot(
                 demand_plot["Hour"],
                 demand_plot["demand_mwh"],
-                color="#111827",
+                color=TECH_COLORS["Demand"],
                 linewidth=2.5,
                 marker="o",
                 markersize=3,
                 label="Demand",
             )
 
-        ax.set_ylabel("Energy / demand (MWh)")
+        ax.set_ylabel("Generation & demand (MWh)")
         ax.set_xlabel("Hour")
         ax.grid(axis="y", alpha=0.22)
         ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
@@ -1115,6 +1353,8 @@ def mix_with_demand_png_base64(day_mix_hourly: pd.DataFrame, demand_hourly_day: 
 # =========================================================
 # LOAD DATA
 # =========================================================
+token = require_esios_token()
+
 price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
 solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
 solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
@@ -1174,6 +1414,7 @@ solar_profile_day = build_solar_profile_for_report_day(
     solar_p48_hourly=solar_p48_hourly,
     solar_forecast_hourly=solar_forecast_hourly,
     report_day=report_day,
+    token=token,
 )
 
 hourly_df, capture_price = build_daily_dataset(price_hourly, solar_profile_day, report_day)
@@ -1190,6 +1431,7 @@ day_mix_hourly = build_all_mix_hourly_for_day(
     report_day=report_day,
     ree_daily_df=ree_daily_raw,
     solar_profile_day=solar_profile_day,
+    token=token,
 )
 
 demand_hourly_day = build_hourly_demand_for_day(demand_raw, report_day)
@@ -1206,12 +1448,18 @@ mix_preview = build_mix_matrix_table(day_mix_hourly, demand_hourly_day)
 mix_with_demand_chart = build_mix_with_demand_chart(day_mix_hourly, demand_hourly_day)
 mix_with_demand_b64 = mix_with_demand_png_base64(day_mix_hourly, demand_hourly_day) or chart_to_base64_png(mix_with_demand_chart)
 
+renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
+tb_df = make_tb_spreads_table(hourly_df)
+
 st.subheader("Preview chart")
 if overlay_chart is not None:
     st.altair_chart(overlay_chart, use_container_width=True)
 
 st.subheader("Preview metrics")
 st.dataframe(metrics_df, use_container_width=True)
+
+st.subheader("Preview TB spreads")
+st.dataframe(tb_df, use_container_width=True)
 
 st.subheader("Preview hourly table")
 st.dataframe(preview_table, use_container_width=True)
@@ -1230,26 +1478,28 @@ else:
 
 st.caption(
     f"Debug | mix rows: {len(day_mix_hourly)} | "
-    f"mix techs: {', '.join(sorted(day_mix_hourly['technology'].unique().tolist())) if not day_mix_hourly.empty else 'none'}"
+    f"mix techs: {', '.join(sorted(day_mix_hourly['technology'].unique().tolist())) if not day_mix_hourly.empty else 'none'} | "
+    f"demand rows: {len(demand_hourly_day)} | "
+    f"solar source(s): {', '.join(sorted(hourly_df['Solar source'].dropna().unique().tolist()))}"
 )
 
 capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
 day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
-
-renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
-
-tb4_spread = compute_bess_spread_eur_per_mwh(hourly_df, capacity_mwh=1.0, c_rate=0.25, eta_ch=1.0, eta_dis=1.0)
-tb2_spread = compute_bess_spread_eur_per_mwh(hourly_df, capacity_mwh=1.0, c_rate=0.5, eta_ch=1.0, eta_dis=1.0)
-tb1_spread = compute_bess_spread_eur_per_mwh(hourly_df, capacity_mwh=1.0, c_rate=1.0, eta_ch=1.0, eta_dis=1.0)
-
 renewable_text = f"{renewable_pct:.1%}" if renewable_pct is not None else "n/a"
-tb4_text = f"{tb4_spread:.2f} €/MWh" if tb4_spread is not None else "n/a"
-tb2_text = f"{tb2_spread:.2f} €/MWh" if tb2_spread is not None else "n/a"
-tb1_text = f"{tb1_spread:.2f} €/MWh" if tb1_spread is not None else "n/a"
 
+tb_html = df_to_html_table(tb_df, small=True)
 metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
 hourly_html = df_to_html_table(preview_table)
 mix_hourly_html = df_to_html_table(mix_preview) if not mix_preview.empty else "<p>No hourly energy mix / demand available.</p>"
+
+kpi_cards_html = make_kpi_cards_html(
+    [
+        ("Captured solar price", capture_text),
+        ("Renewables share", renewable_text),
+        ("Zero / negative price hours", str(negative_hours)),
+        ("Solar source used", day_sources if day_sources else "n/a"),
+    ]
+)
 
 overlay_chart_html = ""
 if overlay_chart_b64:
@@ -1269,9 +1519,10 @@ if mix_with_demand_b64:
 
 tomorrow = today_madrid() + timedelta(days=1)
 mix_source_note = (
-    "Tomorrow: captured solar uses yesterday's hourly solar profile shifted to tomorrow; demand and technology-level mix also use previous-day hourly shapes, scaled to REE daily totals when needed."
+    "Tomorrow: solar uses next-day forecast when available; otherwise it uses the previous day's reliable profile shifted to tomorrow. "
+    "Demand and technology-level mix also use previous-day hourly shapes when next-day hourly data is not reliably available, while REE daily totals are used to preserve daily technology totals."
     if report_day == tomorrow
-    else "Selected day: captured solar uses the selected day's best hourly solar series; technology-level mix uses hourly data when available and REE daily totals with hourly shaping as fallback."
+    else "Selected day: solar uses the best available hourly series for the selected day. Technology-level mix uses ESIOS hourly shapes when available and REE daily totals with hourly shaping as fallback."
 )
 
 email_html = f"""
@@ -1281,20 +1532,22 @@ email_html = f"""
 
     <p>
       <strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
-      <strong>Captured solar price:</strong> {capture_text}<br>
-      <strong>Solar source used:</strong> {day_sources}<br>
-      <strong>Energy mix source rule:</strong> {mix_source_note}<br>
-      <strong>Renewables share (energy mix):</strong> {renewable_text}<br>
-      <strong>Zero/negative price hours:</strong> {negative_hours}<br>
-      <strong>BESS TB4 spread (1 MWh, 0.25C, 100%/100%):</strong> {tb4_text}<br>
-      <strong>BESS TB2 spread (1 MWh, 0.5C, 100%/100%):</strong> {tb2_text}<br>
-      <strong>BESS TB1 spread (1 MWh, 1.0C, 100%/100%):</strong> {tb1_text}
+      <strong>Energy mix source rule:</strong> {mix_source_note}
     </p>
+
+    {kpi_cards_html}
+
+    <br><br>
 
     {overlay_chart_html}
 
     <h3>Summary metrics</h3>
     {metrics_html}
+
+    <br>
+
+    <h3>BESS daily spreads</h3>
+    {tb_html}
 
     <br>
 
@@ -1369,6 +1622,6 @@ else:
                 st.error(f"Send failed: {e}")
 
 st.info(
-    "Tomorrow logic: if there is no reliable next-day hourly source, solar uses the previous day's forecast/profile shifted to tomorrow; "
-    "demand and hourly technology mix also use previous-day hourly shapes shifted to tomorrow, with REE daily totals used as fallback for mix completeness."
+    "TB spreads now use a standalone battery arbitrage LP aligned with the BESS tab logic and are reported as daily arbitrage value per 1 MWh nominal battery. "
+    "Hourly mix tries to use ESIOS hourly shapes first; for tomorrow, if no reliable hourly source exists, it shifts yesterday's shape."
 )
