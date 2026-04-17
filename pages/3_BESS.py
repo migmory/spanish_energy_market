@@ -651,6 +651,8 @@ def optimize_day_pulp(
         +res["batt_for_sell"] * res["omie_venta"]
     )
     res["hybrid profile (MWh)"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
+    res["charge_mwh"] = res["g_to_batt"] + res["grid_charge"]
+    res["discharge_mwh"] = res["batt_for_sell"]
 
     total_cost = (
         (res["grid_purchase"] * res["omie_compra"]).sum()
@@ -664,7 +666,7 @@ def optimize_day_pulp(
         "total_cost": float(total_cost),
         "total_sold": float(res["g_to_grid"].sum() + res["batt_for_sell"].sum()),
         "total_bought": float(res["grid_purchase"].sum()),
-        "total_charged": float((res["g_to_batt"] + res["grid_charge"]).sum()),
+        "total_charged": float(res["charge_mwh"].sum()),
         "total_discharged": float((res["batt_for_load"] + res["batt_for_sell"]).sum()),
         "revenue_bess": float(res["Revenue BESS (€)"].sum()),
         "hybrid_profile_mwh": float(res["hybrid profile (MWh)"].sum()),
@@ -796,6 +798,8 @@ def add_derived_dispatch_columns(dispatch: pd.DataFrame, bess_mw: float) -> pd.D
 
     out["solar_revenue"] = out["generacion"] * out["omie_venta"]
     out["hybrid_revenue"] = out["hybrid profile (MWh)"] * out["omie_venta"]
+    out["charge_mwh"] = out["g_to_batt"] + out["grid_charge"]
+    out["discharge_mwh"] = out["batt_for_sell"]
     return out
 
 
@@ -867,52 +871,92 @@ def compute_period_capture_metrics(df_period: pd.DataFrame) -> tuple[float, floa
     return captured_solar, captured_hybrid
 
 
-def build_avg_profile_chart(df_period: pd.DataFrame) -> alt.Chart:
+
+def build_avg_24h_dispatch_chart(df_period: pd.DataFrame) -> alt.Chart:
     chart_df = (
         df_period.groupby("Hour", as_index=False)
         .agg(
-            avg_solar_generation=("generacion", "mean"),
-            avg_hybrid_profile=("hybrid profile (MWh)", "mean"),
-            avg_spot_price=("omie_venta", "mean"),
+            charge=("charge_mwh", "mean"),
+            discharge=("discharge_mwh", "mean"),
+            omie_venta=("omie_venta", "mean"),
         )
     )
 
-    area = (
-        alt.Chart(chart_df)
-        .mark_area(opacity=0.45, color="#f4d03f")
+    bars = pd.concat(
+        [
+            chart_df[["Hour", "charge"]].rename(columns={"charge": "mwh"}).assign(series="Charge"),
+            chart_df[["Hour", "discharge"]].rename(columns={"discharge": "mwh"}).assign(series="Discharge"),
+        ],
+        ignore_index=True,
+    )
+
+    bars_chart = (
+        alt.Chart(bars)
+        .mark_bar(opacity=0.85)
         .encode(
-            x=alt.X("Hour:Q", scale=alt.Scale(domain=[1, 24])),
-            y=alt.Y("avg_solar_generation:Q", title="Generation / Hybrid profile (MWh)"),
-            tooltip=["Hour", "avg_solar_generation", "avg_hybrid_profile", "avg_spot_price"],
+            x=alt.X("Hour:O", title="Hour"),
+            y=alt.Y("mwh:Q", title="Charge / Discharge (MWh)"),
+            xOffset="series:N",
+            color=alt.Color(
+                "series:N",
+                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#2e8b57", "#c0392b"]),
+                legend=alt.Legend(title=None),
+            ),
+            tooltip=["Hour", "series", alt.Tooltip("mwh:Q", format=",.3f")],
         )
     )
 
-    hybrid_line = (
+    price_chart = (
         alt.Chart(chart_df)
-        .mark_line(strokeWidth=3, color="#1f4e79")
+        .mark_line(strokeWidth=2, strokeDash=[6, 4], color="#1f4e79")
         .encode(
-            x=alt.X("Hour:Q", scale=alt.Scale(domain=[1, 24])),
-            y=alt.Y("avg_hybrid_profile:Q", title="Generation / Hybrid profile (MWh)"),
-            tooltip=["Hour", "avg_solar_generation", "avg_hybrid_profile", "avg_spot_price"],
+            x=alt.X("Hour:O"),
+            y=alt.Y("omie_venta:Q", title="OMIE sell price (€/MWh)"),
+            tooltip=["Hour", alt.Tooltip("omie_venta:Q", format=",.2f")],
         )
     )
 
-    price_line = (
+    return alt.layer(bars_chart, price_chart).resolve_scale(y="independent").properties(height=380)
+
+
+def build_daily_dispatch_chart(df_day: pd.DataFrame) -> alt.Chart:
+    chart_df = df_day.sort_values("Hour").copy()
+
+    bars = pd.concat(
+        [
+            chart_df[["Hour", "charge_mwh"]].rename(columns={"charge_mwh": "mwh"}).assign(series="Charge"),
+            chart_df[["Hour", "discharge_mwh"]].rename(columns={"discharge_mwh": "mwh"}).assign(series="Discharge"),
+        ],
+        ignore_index=True,
+    )
+
+    bars_chart = (
+        alt.Chart(bars)
+        .mark_bar(opacity=0.85)
+        .encode(
+            x=alt.X("Hour:O", title="Hour"),
+            y=alt.Y("mwh:Q", title="Charge / Discharge (MWh)"),
+            xOffset="series:N",
+            color=alt.Color(
+                "series:N",
+                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#2e8b57", "#c0392b"]),
+                legend=alt.Legend(title=None),
+            ),
+            tooltip=["Hour", "series", alt.Tooltip("mwh:Q", format=",.3f")],
+        )
+    )
+
+    price_chart = (
         alt.Chart(chart_df)
-        .mark_line(strokeWidth=2, color="#c0392b", strokeDash=[6, 4])
+        .mark_line(strokeWidth=2, strokeDash=[6, 4], color="#1f4e79")
         .encode(
-            x=alt.X("Hour:Q", scale=alt.Scale(domain=[1, 24])),
-            y=alt.Y("avg_spot_price:Q", title="Average spot price (€/MWh)"),
-            tooltip=["Hour", "avg_solar_generation", "avg_hybrid_profile", "avg_spot_price"],
+            x=alt.X("Hour:O"),
+            y=alt.Y("omie_venta:Q", title="OMIE sell price (€/MWh)"),
+            tooltip=["Hour", alt.Tooltip("omie_venta:Q", format=",.2f")],
         )
     )
 
-    return (
-        alt.layer(area, hybrid_line, price_line)
-        .resolve_scale(y="independent")
-        .properties(height=360)
-    )
-
+    return alt.layer(bars_chart, price_chart).resolve_scale(y="independent").properties(height=380)
 
 def build_capacity_chart(capacity_table: pd.DataFrame) -> alt.Chart:
     df = capacity_table.copy()
@@ -973,17 +1017,12 @@ with left:
         index=0,
     )
 
-    use_hist_years = st.multiselect(
-        "Historical years from Day Ahead",
-        options=available_hist_years,
-        default=available_hist_years[-1:] if available_hist_years else [],
-    )
-
     use_forward_prices = st.checkbox("Add forward prices (nominal)", value=False)
     forward_provider = None
     forward_prices = None
-    forward_years_selected = []
     provider_available_years = []
+    valid_forward_pwd = False
+    provider_pwd = ""
 
     if use_forward_prices:
         provider_pwd = st.text_input("Forward prices password", type="password")
@@ -998,18 +1037,26 @@ with left:
                 provider_path = FORWARD_PROVIDER_FILES[forward_provider]
                 forward_prices = normalize_provider_forward_price_file(provider_path)
                 provider_available_years = sorted(forward_prices["year"].unique().tolist())
-                forward_years_selected = st.multiselect(
-                    "Forward years to include",
-                    options=provider_available_years,
-                    default=provider_available_years[:1] if provider_available_years else [],
-                )
         else:
             st.warning("Enter the correct password to unlock forward nominal prices from the repo.")
 
-    years = sorted(set(use_hist_years + forward_years_selected))
+    all_available_years = sorted(set(available_hist_years + provider_available_years))
+    if not all_available_years:
+        all_available_years = available_hist_years
 
-    base_capacity_mwh = st.number_input("BESS size (MWh)", min_value=0.1, value=6.0, step=0.1)
-    c_rate = st.number_input("C-rate", min_value=0.01, value=1 / 6, step=0.01, format="%.4f")
+    if len(all_available_years) == 1:
+        year_start = year_end = all_available_years[0]
+    else:
+        year_start, year_end = st.select_slider(
+            "Analysis years",
+            options=all_available_years,
+            value=(all_available_years[0], all_available_years[-1]),
+        )
+
+    years = [y for y in all_available_years if year_start <= y <= year_end]
+
+    base_capacity_mwh = st.number_input("BESS size (MWh)", min_value=0.1, value=4.0, step=0.1)
+    c_rate = st.number_input("C-rate", min_value=0.01, value=0.25, step=0.01, format="%.4f")
     bess_mw = base_capacity_mwh * c_rate
     st.caption(f"Equivalent BESS power: {bess_mw:,.3f} MW")
 
@@ -1069,15 +1116,17 @@ if run_button:
         st.stop()
 
     if use_forward_prices:
-        if not ("forward_prices_password" in st.secrets and provider_pwd == st.secrets["forward_prices_password"]):
+        if not valid_forward_pwd:
             st.error("Forward prices were selected but the password is missing or incorrect.")
             st.stop()
         if forward_prices is None or forward_provider is None:
             st.error("No forward provider data is available.")
             st.stop()
-        if not forward_years_selected:
-            st.error("Select at least one forward year.")
-            st.stop()
+
+    forward_years_selected = [y for y in years if max_hist_year is not None and y > max_hist_year]
+    if forward_years_selected and forward_prices is None:
+        st.error("Your selected year range includes forward years, but no forward price curve is unlocked.")
+        st.stop()
 
     if use_uploaded_generation and uploaded_generation is None:
         st.error("Upload a generation Excel file or untick the custom generation option.")
@@ -1126,8 +1175,8 @@ if run_button:
             {
                 "parameter": [
                     "mode",
-                    "historical_years",
-                    "forward_years",
+                    "analysis_year_start",
+                    "analysis_year_end",
                     "forward_provider",
                     "forward_prices_type",
                     "base_capacity_mwh",
@@ -1143,8 +1192,8 @@ if run_button:
                 ],
                 "value": [
                     mode,
-                    ", ".join(map(str, use_hist_years)),
-                    ", ".join(map(str, forward_years_selected)),
+                    year_start,
+                    year_end,
                     forward_provider if forward_provider is not None else "",
                     "nominal" if use_forward_prices else "",
                     base_capacity_mwh,
@@ -1201,8 +1250,71 @@ if st.session_state.dispatch is not None:
     c5.metric("Total discharged", f"{total_discharged:,.2f}")
     c6.metric("Revenue BESS (€)", f"{total_revenue_bess:,.2f}")
 
-    st.subheader("Hourly dataset used")
-    st.dataframe(data_used.head(200), use_container_width=True)
+    st.subheader("Monthly Revenue BESS (€/MW)")
+    monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
+    monthly_chart_df["label"] = monthly_chart_df["month"]
+    monthly_bar = alt.Chart(monthly_chart_df).mark_bar().encode(
+        x=alt.X("label:N", title="Month"),
+        y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
+        color=alt.Color("Year:N"),
+        tooltip=["Year", "month", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Avg_Effective_Capacity_MWh"],
+    ).properties(height=350)
+    st.altair_chart(monthly_bar, use_container_width=True)
+
+    yearly_total_df = monthly_summary[monthly_summary["month"] == "TOTAL"].copy()
+    if not yearly_total_df.empty:
+        yearly_total_df["label"] = yearly_total_df["Year"].astype(str) + " TOTAL"
+        yearly_bar = alt.Chart(yearly_total_df).mark_bar().encode(
+            x=alt.X("label:N", title="Year"),
+            y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
+            color=alt.Color("Year:N"),
+            tooltip=["Year", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Avg_Effective_Capacity_MWh"],
+        ).properties(height=280)
+        st.altair_chart(yearly_bar, use_container_width=True)
+
+    st.subheader("Average 24h charge / discharge profile")
+    min_date = pd.to_datetime(dispatch["Date"]).min().date()
+    max_date = pd.to_datetime(dispatch["Date"]).max().date()
+    p1, p2 = st.columns(2)
+    with p1:
+        period_start = st.date_input("Average profile start", value=min_date, min_value=min_date, max_value=max_date, key="avg_profile_start")
+    with p2:
+        period_end = st.date_input("Average profile end", value=max_date, min_value=min_date, max_value=max_date, key="avg_profile_end")
+
+    if period_start > period_end:
+        st.error("Start date cannot be after end date.")
+    else:
+        period_mask = (pd.to_datetime(dispatch["Date"]).dt.date >= period_start) & (pd.to_datetime(dispatch["Date"]).dt.date <= period_end)
+        period_df = dispatch.loc[period_mask].copy()
+        if period_df.empty:
+            st.warning("No data found for the selected period.")
+        else:
+            st.altair_chart(build_avg_24h_dispatch_chart(period_df), use_container_width=True)
+
+    st.subheader("Selected day dispatch")
+    available_days = sorted(pd.to_datetime(dispatch["Date"]).dt.date.unique().tolist())
+    selected_day = st.selectbox("Choose a day", options=available_days, index=0, format_func=lambda d: d.strftime("%Y-%m-%d"))
+    day_df = dispatch[pd.to_datetime(dispatch["Date"]).dt.date == selected_day].copy()
+    if day_df.empty:
+        st.warning("No data found for the selected day.")
+    else:
+        st.altair_chart(build_daily_dispatch_chart(day_df), use_container_width=True)
+
+    st.subheader("Capacity by year")
+    st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
+    st.dataframe(capacity_table, use_container_width=True)
+
+    st.subheader("Monthly captured prices")
+    captured_cols = [
+        "Year",
+        "month",
+        "Captured Solar (€/MWh)",
+        "Captured Hybrid (€/MWh)",
+        "Revenue BESS €/MW",
+        "Avg_Effective_Capacity_MWh",
+        "Avg_SOH",
+    ]
+    st.dataframe(monthly_summary[captured_cols], use_container_width=True)
 
     st.subheader("Daily stats")
     st.dataframe(stats, use_container_width=True)
@@ -1214,6 +1326,8 @@ if st.session_state.dispatch is not None:
         "Year",
         "Revenue BESS (€)",
         "hybrid profile (MWh)",
+        "charge_mwh",
+        "discharge_mwh",
         "effective_capacity_mwh",
         "SOH",
         "degradation_status",
@@ -1232,101 +1346,11 @@ if st.session_state.dispatch is not None:
     ]
     st.dataframe(dispatch[dispatch_cols].head(500), use_container_width=True)
 
+    st.subheader("Hourly dataset used")
+    st.dataframe(data_used.head(200), use_container_width=True)
+
     st.subheader("Variable definitions")
     st.dataframe(variable_definitions, use_container_width=True)
-
-    st.subheader("Capacity by year")
-    st.dataframe(capacity_table, use_container_width=True)
-    st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
-
-    monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
-    monthly_chart_df["label"] = monthly_chart_df["month"]
-    yearly_total_df = monthly_summary[monthly_summary["month"] == "TOTAL"].copy()
-    yearly_total_df["label"] = yearly_total_df["Year"].astype(str) + " TOTAL"
-
-    st.subheader("Monthly Revenue BESS (€/MW)")
-    monthly_bar = alt.Chart(monthly_chart_df).mark_bar().encode(
-        x=alt.X("label:N", title="Month"),
-        y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
-        color=alt.Color("Year:N"),
-        tooltip=["Year", "month", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Avg_Effective_Capacity_MWh"],
-    ).properties(height=350)
-    st.altair_chart(monthly_bar, use_container_width=True)
-
-    st.subheader("Annual Revenue BESS (€/MW)")
-    yearly_bar = alt.Chart(yearly_total_df).mark_bar().encode(
-        x=alt.X("label:N", title="Year"),
-        y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
-        color=alt.Color("Year:N"),
-        tooltip=["Year", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Avg_Effective_Capacity_MWh"],
-    ).properties(height=300)
-    st.altair_chart(yearly_bar, use_container_width=True)
-
-    st.subheader("Monthly captured prices")
-    captured_cols = [
-        "Year",
-        "month",
-        "Captured Solar (€/MWh)",
-        "Captured Hybrid (€/MWh)",
-        "Revenue BESS €/MW",
-        "Avg_Effective_Capacity_MWh",
-        "Avg_SOH",
-    ]
-    st.dataframe(monthly_summary[captured_cols], use_container_width=True)
-
-    st.subheader("Daily net cost")
-    daily_cost_chart = (
-        pd.to_datetime(stats["Date"]).to_frame(name="Date")
-        .join(stats[["total_cost"]])
-        .assign(Date=lambda x: pd.to_datetime(x["Date"]))
-    )
-    if not daily_cost_chart.empty:
-        st.line_chart(
-            daily_cost_chart.set_index("Date")["total_cost"],
-            use_container_width=True,
-        )
-
-    st.subheader("SOC preview")
-    st.line_chart(
-        dispatch.set_index("timestamp")["soc"].head(24 * 14),
-        use_container_width=True,
-    )
-
-    st.subheader("Average 24h solar generation vs hybrid profile")
-    min_date = pd.to_datetime(dispatch["Date"]).min().date()
-    max_date = pd.to_datetime(dispatch["Date"]).max().date()
-    p1, p2 = st.columns(2)
-    with p1:
-        period_start = st.date_input("Start date", value=min_date, min_value=min_date, max_value=max_date, key="avg_profile_start")
-    with p2:
-        period_end = st.date_input("End date", value=max_date, min_value=min_date, max_value=max_date, key="avg_profile_end")
-
-    if period_start > period_end:
-        st.error("Start date cannot be after end date.")
-    else:
-        period_mask = (pd.to_datetime(dispatch["Date"]).dt.date >= period_start) & (pd.to_datetime(dispatch["Date"]).dt.date <= period_end)
-        period_df = dispatch.loc[period_mask].copy()
-
-        if period_df.empty:
-            st.warning("No data found for the selected period.")
-        else:
-            captured_solar, captured_hybrid = compute_period_capture_metrics(period_df)
-            chart_col, metric_col = st.columns([4, 1.3])
-
-            with chart_col:
-                st.altair_chart(build_avg_profile_chart(period_df), use_container_width=True)
-
-            with metric_col:
-                days_selected = (period_end - period_start).days + 1
-                st.code(
-                    "\n".join(
-                        [
-                            f"Selected period: {days_selected} days",
-                            f"Captured solar: {captured_solar:,.2f} €/MWh" if pd.notna(captured_solar) else "Captured solar: n/a",
-                            f"Captured hybrid: {captured_hybrid:,.2f} €/MWh" if pd.notna(captured_hybrid) else "Captured hybrid: n/a",
-                        ]
-                    )
-                )
 
     xlsx_bytes = make_results_excel(
         dispatch=dispatch,
