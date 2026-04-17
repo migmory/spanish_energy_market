@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -5,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 import calendar
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import pulp
@@ -43,6 +45,7 @@ DATA_DIR = BASE_DIR / "historical_data"
 
 PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
 DEFAULT_DATA_XLSX = BASE_DIR / "data.xlsx"
+DEFAULT_SOLAR_PROFILE_XLSX = BASE_DIR / "profile_production_1y_hourly.xlsx"
 
 
 # =========================================================
@@ -130,7 +133,30 @@ def load_default_data_xlsx(path: Path) -> pd.DataFrame:
     return df
 
 
-def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.DataFrame:
+def load_default_solar_profile(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Default solar profile not found: {path}")
+
+    df = pd.read_excel(path)
+    if df.empty:
+        raise ValueError("Default solar profile is empty.")
+
+    col_map = {c.lower().strip(): c for c in df.columns}
+    gen_col = None
+    for candidate in ["generation", "generacion", "gen"]:
+        if candidate in col_map:
+            gen_col = col_map[candidate]
+            break
+
+    if gen_col is None:
+        raise ValueError("Default solar profile must contain generation/generacion/gen column.")
+
+    out = pd.DataFrame({"generation": pd.to_numeric(df[gen_col], errors="coerce").fillna(0.0)})
+    out["hour_of_year"] = np.arange(1, len(out) + 1)
+    return out
+
+
+def normalize_generation_upload(uploaded_file, target_years: list[int], scale_factor: float = 1.0) -> pd.DataFrame:
     df = pd.read_excel(uploaded_file)
     if df.empty:
         raise ValueError("Uploaded generation file is empty.")
@@ -154,7 +180,7 @@ def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.Da
         tmp.columns = ["Date", "Hour", "generation"]
         tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
         tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
-        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0)
+        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0) * scale_factor
         tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
         tmp["year"] = tmp["Date"].dt.year
         tmp["hour_of_year"] = tmp.groupby("year").cumcount() + 1
@@ -163,7 +189,7 @@ def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.Da
     else:
         tmp = df[[gen_col]].copy()
         tmp.columns = ["generation"]
-        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0)
+        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0) * scale_factor
         base = tmp.reset_index(drop=True).copy()
         base["hour_of_year"] = np.arange(1, len(base) + 1)
 
@@ -184,10 +210,13 @@ def normalize_generation_upload(uploaded_file, target_years: list[int]) -> pd.Da
     return pd.concat(rows, ignore_index=True)
 
 
-def build_template_generation_excel(template_year: int) -> bytes:
-    idx = make_year_hour_index(template_year)
-    out = idx[["Date", "Hour"]].copy()
-    out["generation"] = ""
+def build_template_generation_excel(example_path: Path) -> bytes:
+    if example_path.exists():
+        return example_path.read_bytes()
+
+    idx = make_year_hour_index(2025)
+    out = idx[["Hour"]].copy()
+    out["generacion"] = ""
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -346,6 +375,24 @@ def build_generic_vectors(default_data: pd.DataFrame, target_years: list[int]) -
     return pd.concat(gen_rows, ignore_index=True), pd.concat(load_rows, ignore_index=True)
 
 
+def build_default_solar_generation(target_years: list[int], bess_mw: float, default_solar_profile: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for year in target_years:
+        idx = make_year_hour_index(year)
+        h = len(idx)
+        base = default_solar_profile.iloc[:h].copy()
+
+        if len(base) < h:
+            base = base.reindex(range(h)).fillna(0.0)
+            base["hour_of_year"] = np.arange(1, h + 1)
+
+        merged = idx.merge(base[["hour_of_year", "generation"]], on="hour_of_year", how="left")
+        merged["generation"] = merged["generation"].fillna(0.0) * bess_mw
+        rows.append(merged[["timestamp", "Date", "Hour", "year", "generation"]])
+
+    return pd.concat(rows, ignore_index=True)
+
+
 def build_price_dataset_for_years(
     years: list[int],
     historical_prices: pd.DataFrame,
@@ -378,6 +425,8 @@ def build_dataset(
     mode: str,
     historical_prices: pd.DataFrame,
     default_data: pd.DataFrame,
+    default_solar_profile: pd.DataFrame,
+    bess_mw: float,
     uploaded_generation_file=None,
     forward_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
@@ -389,10 +438,14 @@ def build_dataset(
 
     default_gen, default_load = build_generic_vectors(default_data, years)
 
-    if uploaded_generation_file is not None:
-        generation_df = normalize_generation_upload(uploaded_generation_file, years)
+    if mode in ["BESS con demanda", "BESS sin demanda"]:
+        if uploaded_generation_file is not None:
+            generation_df = normalize_generation_upload(uploaded_generation_file, years, scale_factor=bess_mw)
+        else:
+            generation_df = build_default_solar_generation(years, bess_mw, default_solar_profile)
     else:
         generation_df = default_gen.copy()
+        generation_df["generation"] = 0.0
 
     load_df = default_load.copy()
 
@@ -458,7 +511,6 @@ def optimize_day_pulp(
         model += g_to_batt[t] + grid_charge[t] <= max_power * is_charging[t]
         model += batt_for_load[t] + batt_for_sell[t] <= max_power * (1 - is_charging[t])
 
-        model += g_to_grid[t] + batt_for_sell[t] <= max_power
         model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
         model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
 
@@ -474,16 +526,18 @@ def optimize_day_pulp(
 
     model += soc[n] <= capacity_mwh
 
-    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= capacity_mwh / eta_ch
+    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= capacity_mwh / max(eta_ch, 1e-9)
     model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(
         g_to_batt[t] + grid_charge[t] for t in range(n)
     )
 
+    # Economic objective WITHOUT charge/discharge efficiency adjustments
     model += pulp.lpSum(
         g_to_grid[t] * omie_sell[t]
         + batt_for_sell[t] * omie_sell[t]
         - grid_purchase[t] * omie_buy[t]
-        - (grid_charge[t] / eta_ch) * omie_buy[t]
+        - grid_charge[t] * omie_buy[t]
+        - g_to_batt[t] * omie_sell[t]
         for t in range(n)
     )
 
@@ -512,9 +566,17 @@ def optimize_day_pulp(
         }
     )
 
+    res["Revenue BESS (€)"] = (
+        -res["g_to_batt"] * res["omie_venta"]
+        -res["grid_charge"] * res["omie_venta"]
+        +res["batt_for_sell"] * res["omie_venta"]
+    )
+    res["hybrid profile (MWh)"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
+
     total_cost = (
         (res["grid_purchase"] * res["omie_compra"]).sum()
-        + (res["grid_charge"] * res["omie_compra"] / eta_ch).sum()
+        + (res["grid_charge"] * res["omie_compra"]).sum()
+        + (res["g_to_batt"] * res["omie_venta"]).sum()
         - (res["g_to_grid"] * res["omie_venta"]).sum()
         - (res["batt_for_sell"] * res["omie_venta"]).sum()
     )
@@ -525,6 +587,8 @@ def optimize_day_pulp(
         "total_bought": float(res["grid_purchase"].sum()),
         "total_charged": float((res["g_to_batt"] + res["grid_charge"]).sum()),
         "total_discharged": float((res["batt_for_load"] + res["batt_for_sell"]).sum()),
+        "revenue_bess": float(res["Revenue BESS (€)"].sum()),
+        "hybrid_profile_mwh": float(res["hybrid profile (MWh)"].sum()),
     }
 
     return res, stats
@@ -569,6 +633,8 @@ def run_optimization(
                     "total_bought": stats["total_bought"],
                     "total_charged": stats["total_charged"],
                     "total_discharged": stats["total_discharged"],
+                    "Revenue BESS (€)": stats["revenue_bess"],
+                    "hybrid profile (MWh)": stats["hybrid_profile_mwh"],
                 }
             )
 
@@ -577,15 +643,166 @@ def run_optimization(
     return dispatch, stats
 
 
-def make_results_excel(dispatch: pd.DataFrame, stats: pd.DataFrame, data_used: pd.DataFrame, inputs_used: pd.DataFrame) -> bytes:
+def build_variable_definitions() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "variable": [
+                "g_to_grid",
+                "g_to_batt",
+                "g_to_self",
+                "grid_charge",
+                "batt_for_load",
+                "batt_for_sell",
+                "grid_purchase",
+                "soc",
+                "Revenue BESS (€)",
+                "hybrid profile (MWh)",
+            ],
+            "definition_english": [
+                "PV energy injected into the grid.",
+                "PV generation sent to the BESS.",
+                "PV generation used to satisfy on-site demand, if any (BTM cases).",
+                "Battery charging energy imported from the grid.",
+                "Battery discharge used to satisfy on-site demand (BTM cases).",
+                "Battery discharge exported to the market / grid.",
+                "Spot market energy purchased to satisfy on-site demand.",
+                "State of charge.",
+                "BESS revenue calculated as -g_to_batt*omie_venta - grid_charge*omie_venta + batt_for_sell*omie_venta.",
+                "Hybrid exported profile calculated as g_to_grid - grid_charge + batt_for_sell.",
+            ],
+        }
+    )
+
+
+def make_results_excel(
+    dispatch: pd.DataFrame,
+    stats: pd.DataFrame,
+    data_used: pd.DataFrame,
+    inputs_used: pd.DataFrame,
+    variable_definitions: pd.DataFrame,
+    monthly_summary: pd.DataFrame,
+) -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         dispatch.to_excel(writer, index=False, sheet_name="dispatch")
         stats.to_excel(writer, index=False, sheet_name="stats")
+        monthly_summary.to_excel(writer, index=False, sheet_name="monthly_summary")
         data_used.to_excel(writer, index=False, sheet_name="data_used")
         inputs_used.to_excel(writer, index=False, sheet_name="inputs_used")
+        variable_definitions.to_excel(writer, index=False, sheet_name="variable_definitions")
     bio.seek(0)
     return bio.getvalue()
+
+
+def add_derived_dispatch_columns(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFrame:
+    out = dispatch.copy()
+    out["timestamp"] = pd.to_datetime(out["Date"]) + pd.to_timedelta(out["Hour"] - 1, unit="h")
+    out["month"] = pd.to_datetime(out["Date"]).dt.to_period("M").astype(str)
+    out["Revenue BESS €/MW"] = np.where(bess_mw > 0, out["Revenue BESS (€)"] / bess_mw, np.nan)
+
+    denom_solar = out["generacion"].replace(0, np.nan)
+    denom_hybrid = out["hybrid profile (MWh)"].replace(0, np.nan)
+    out["solar_revenue"] = out["generacion"] * out["omie_venta"]
+    out["hybrid_revenue"] = out["hybrid profile (MWh)"] * out["omie_venta"]
+    out["captured_solar_hourly"] = out["solar_revenue"] / denom_solar
+    out["captured_hybrid_hourly"] = out["hybrid_revenue"] / denom_hybrid
+    return out
+
+
+def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFrame:
+    df = add_derived_dispatch_columns(dispatch, bess_mw)
+    grouped = (
+        df.groupby(["Year", "month"], as_index=False)
+        .agg(
+            Revenue_BESS_EUR=("Revenue BESS (€)", "sum"),
+            Hybrid_Profile_MWh=("hybrid profile (MWh)", "sum"),
+            Solar_Generation_MWh=("generacion", "sum"),
+            Solar_Revenue_EUR=("solar_revenue", "sum"),
+            Hybrid_Revenue_EUR=("hybrid_revenue", "sum"),
+        )
+    )
+    grouped["Revenue BESS €/MW"] = np.where(bess_mw > 0, grouped["Revenue_BESS_EUR"] / bess_mw, np.nan)
+    grouped["Captured Solar (€/MWh)"] = np.where(
+        grouped["Solar_Generation_MWh"] != 0,
+        grouped["Solar_Revenue_EUR"] / grouped["Solar_Generation_MWh"],
+        np.nan,
+    )
+    grouped["Captured Hybrid (€/MWh)"] = np.where(
+        grouped["Hybrid_Profile_MWh"] != 0,
+        grouped["Hybrid_Revenue_EUR"] / grouped["Hybrid_Profile_MWh"],
+        np.nan,
+    )
+
+    yearly = (
+        grouped.groupby("Year", as_index=False)
+        .agg(
+            Revenue_BESS_EUR=("Revenue_BESS_EUR", "sum"),
+            Hybrid_Profile_MWh=("Hybrid_Profile_MWh", "sum"),
+            Solar_Generation_MWh=("Solar_Generation_MWh", "sum"),
+            Solar_Revenue_EUR=("Solar_Revenue_EUR", "sum"),
+            Hybrid_Revenue_EUR=("Hybrid_Revenue_EUR", "sum"),
+            Revenue_BESS_EUR_per_MW=("Revenue BESS €/MW", "sum"),
+        )
+    )
+    yearly["month"] = "TOTAL"
+    yearly["Revenue BESS €/MW"] = yearly["Revenue_BESS_EUR_per_MW"]
+    yearly["Captured Solar (€/MWh)"] = np.where(
+        yearly["Solar_Generation_MWh"] != 0,
+        yearly["Solar_Revenue_EUR"] / yearly["Solar_Generation_MWh"],
+        np.nan,
+    )
+    yearly["Captured Hybrid (€/MWh)"] = np.where(
+        yearly["Hybrid_Profile_MWh"] != 0,
+        yearly["Hybrid_Revenue_EUR"] / yearly["Hybrid_Profile_MWh"],
+        np.nan,
+    )
+    yearly = yearly.drop(columns=["Revenue_BESS_EUR_per_MW"])
+
+    out = pd.concat([grouped, yearly], ignore_index=True, sort=False)
+    return out
+
+
+def compute_period_capture_metrics(df_period: pd.DataFrame) -> tuple[float, float]:
+    solar_gen = df_period["generacion"].sum()
+    solar_revenue = (df_period["generacion"] * df_period["omie_venta"]).sum()
+    hybrid_mwh = df_period["hybrid profile (MWh)"].sum()
+    hybrid_revenue = (df_period["hybrid profile (MWh)"] * df_period["omie_venta"]).sum()
+
+    captured_solar = solar_revenue / solar_gen if solar_gen != 0 else np.nan
+    captured_hybrid = hybrid_revenue / hybrid_mwh if hybrid_mwh != 0 else np.nan
+    return captured_solar, captured_hybrid
+
+
+def build_avg_profile_chart(df_period: pd.DataFrame) -> alt.Chart:
+    chart_df = (
+        df_period.groupby("Hour", as_index=False)
+        .agg(
+            avg_solar_generation=("generacion", "mean"),
+            avg_hybrid_profile=("hybrid profile (MWh)", "mean"),
+        )
+    )
+
+    area = (
+        alt.Chart(chart_df)
+        .mark_area(opacity=0.5, color="#f4d03f")
+        .encode(
+            x=alt.X("Hour:Q", scale=alt.Scale(domain=[1, 24])),
+            y=alt.Y("avg_solar_generation:Q", title="MWh"),
+            tooltip=["Hour", "avg_solar_generation", "avg_hybrid_profile"],
+        )
+    )
+
+    line = (
+        alt.Chart(chart_df)
+        .mark_line(strokeWidth=3, color="#1f4e79")
+        .encode(
+            x=alt.X("Hour:Q", scale=alt.Scale(domain=[1, 24])),
+            y=alt.Y("avg_hybrid_profile:Q", title="MWh"),
+            tooltip=["Hour", "avg_solar_generation", "avg_hybrid_profile"],
+        )
+    )
+
+    return (area + line).properties(height=360)
 
 
 # =========================================================
@@ -594,6 +811,7 @@ def make_results_excel(dispatch: pd.DataFrame, stats: pd.DataFrame, data_used: p
 try:
     historical_prices = standardize_price_history_from_day_ahead(PRICE_RAW_CSV_PATH)
     default_data = load_default_data_xlsx(DEFAULT_DATA_XLSX)
+    default_solar_profile = load_default_solar_profile(DEFAULT_SOLAR_PROFILE_XLSX)
 except Exception as e:
     st.error(f"Error loading base data: {e}")
     st.stop()
@@ -653,6 +871,9 @@ with left:
 
     capacity_mwh = st.number_input("BESS size (MWh)", min_value=0.1, value=6.0, step=0.1)
     c_rate = st.number_input("C-rate", min_value=0.01, value=1 / 6, step=0.01, format="%.4f")
+    bess_mw = capacity_mwh * c_rate
+    st.caption(f"Equivalent BESS power: {bess_mw:,.3f} MW")
+
     eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=1.0, step=0.01)
     eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.855, step=0.01)
 
@@ -663,16 +884,15 @@ with left:
         uploaded_generation = st.file_uploader(
             "Upload generation Excel",
             type=["xlsx"],
-            help="Use a file with columns Date, Hour, generation, or just one generation column.",
+            help="Use the example structure from the downloaded template. Values are assumed to be for a 1 MW solar plant and are automatically scaled to the equivalent BESS MW.",
             key="generation_upload",
         )
 
-    template_year = years[0] if years else available_hist_years[-1]
-    template_bytes = build_template_generation_excel(template_year)
+    template_bytes = build_template_generation_excel(DEFAULT_SOLAR_PROFILE_XLSX)
     st.download_button(
         "Download generation template",
         data=template_bytes,
-        file_name=f"generation_template_{template_year}.xlsx",
+        file_name="profile_production_1y_hourly_template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -687,14 +907,19 @@ with right:
     if mode == "BESS standalone":
         st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
     elif mode == "BESS con demanda":
-        st.info("omie_venta = price, omie_compra = same price, generacion = uploaded/default profile, consumo = generic vector from data.xlsx")
+        st.info("omie_venta = price, omie_compra = same price, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
     else:
-        st.info("omie_venta = price, omie_compra = 1000, generacion = uploaded/default profile, consumo = generic vector from data.xlsx")
+        st.info("omie_venta = price, omie_compra = 1000, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
 
     if DEFAULT_DATA_XLSX.exists():
         st.success("Default generic vectors found in data.xlsx")
     else:
         st.warning("data.xlsx not found. Generic generation/consumption vectors will default to zero.")
+
+    if DEFAULT_SOLAR_PROFILE_XLSX.exists():
+        st.success("Default 1 MW solar profile found and will be replicated for all selected years.")
+    else:
+        st.warning("Default solar profile not found.")
 
 # =========================================================
 # RUN
@@ -727,6 +952,8 @@ if run_button:
                 mode=mode,
                 historical_prices=historical_prices,
                 default_data=default_data,
+                default_solar_profile=default_solar_profile,
+                bess_mw=bess_mw,
                 uploaded_generation_file=uploaded_generation,
                 forward_prices=forward_prices,
             )
@@ -748,6 +975,10 @@ if run_button:
             st.warning("No optimisation results were produced.")
             st.stop()
 
+        dispatch = add_derived_dispatch_columns(dispatch, bess_mw)
+        monthly_summary = build_monthly_summary(dispatch, bess_mw)
+        variable_definitions = build_variable_definitions()
+
         inputs_used = pd.DataFrame(
             {
                 "parameter": [
@@ -756,10 +987,12 @@ if run_button:
                     "forward_years",
                     "capacity_mwh",
                     "c_rate",
+                    "bess_mw",
                     "eta_ch",
                     "eta_dis",
                     "uploaded_generation",
                     "forward_price_file",
+                    "default_generation_profile",
                 ],
                 "value": [
                     mode,
@@ -767,10 +1000,12 @@ if run_button:
                     ", ".join(map(str, forward_years_selected)),
                     capacity_mwh,
                     c_rate,
+                    bess_mw,
                     eta_ch,
                     eta_dis,
                     "yes" if uploaded_generation is not None else "no",
                     "yes" if forward_price_file is not None else "no",
+                    DEFAULT_SOLAR_PROFILE_XLSX.name if DEFAULT_SOLAR_PROFILE_XLSX.exists() else "not found",
                 ],
             }
         )
@@ -780,43 +1015,133 @@ if run_button:
         total_bought = stats["total_bought"].sum() if not stats.empty else 0.0
         total_charged = stats["total_charged"].sum() if not stats.empty else 0.0
         total_discharged = stats["total_discharged"].sum() if not stats.empty else 0.0
+        total_revenue_bess = stats["Revenue BESS (€)"].sum() if not stats.empty else 0.0
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Net cost", f"{total_cost:,.2f}")
         c2.metric("Total sold", f"{total_sold:,.2f}")
         c3.metric("Total bought", f"{total_bought:,.2f}")
         c4.metric("Total charged", f"{total_charged:,.2f}")
         c5.metric("Total discharged", f"{total_discharged:,.2f}")
+        c6.metric("Revenue BESS (€)", f"{total_revenue_bess:,.2f}")
 
         st.subheader("Daily stats")
         st.dataframe(stats, use_container_width=True)
 
         st.subheader("Hourly dispatch")
-        st.dataframe(dispatch.head(500), use_container_width=True)
+        dispatch_cols = [
+            "Date",
+            "Hour",
+            "Year",
+            "Revenue BESS (€)",
+            "hybrid profile (MWh)",
+            "omie_venta",
+            "omie_compra",
+            "generacion",
+            "consumo",
+            "g_to_grid",
+            "g_to_batt",
+            "g_to_self",
+            "grid_charge",
+            "batt_for_load",
+            "batt_for_sell",
+            "grid_purchase",
+            "soc",
+        ]
+        st.dataframe(dispatch[dispatch_cols].head(500), use_container_width=True)
 
+        st.subheader("Variable definitions")
+        st.dataframe(variable_definitions, use_container_width=True)
+
+        monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
+        monthly_chart_df["label"] = monthly_chart_df["month"]
+        monthly_year_total_df = monthly_summary[monthly_summary["month"] == "TOTAL"].copy()
+        monthly_year_total_df["label"] = monthly_year_total_df["Year"].astype(str) + " TOTAL"
+
+        st.subheader("Monthly Revenue BESS (€/MW)")
+        monthly_bar = alt.Chart(monthly_chart_df).mark_bar().encode(
+            x=alt.X("label:N", title="Month"),
+            y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
+            color=alt.Color("Year:N"),
+            tooltip=["Year", "month", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)"],
+        ).properties(height=350)
+        st.altair_chart(monthly_bar, use_container_width=True)
+
+        st.subheader("Annual Revenue BESS (€/MW)")
+        yearly_bar = alt.Chart(monthly_year_total_df).mark_bar().encode(
+            x=alt.X("label:N", title="Year"),
+            y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
+            color=alt.Color("Year:N"),
+            tooltip=["Year", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)"],
+        ).properties(height=300)
+        st.altair_chart(yearly_bar, use_container_width=True)
+
+        st.subheader("Monthly captured prices")
+        captured_cols = ["Year", "month", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Revenue BESS €/MW"]
+        st.dataframe(monthly_summary[captured_cols], use_container_width=True)
+
+        st.subheader("Daily net cost")
         daily_cost_chart = (
             pd.to_datetime(stats["Date"]).to_frame(name="Date")
             .join(stats[["total_cost"]])
             .assign(Date=lambda x: pd.to_datetime(x["Date"]))
         )
-
         if not daily_cost_chart.empty:
-            st.subheader("Daily net cost")
             st.line_chart(
                 daily_cost_chart.set_index("Date")["total_cost"],
                 use_container_width=True,
             )
 
-        soc_preview = dispatch.copy()
-        soc_preview["timestamp"] = pd.to_datetime(soc_preview["Date"]) + pd.to_timedelta(soc_preview["Hour"] - 1, unit="h")
-
         st.subheader("SOC preview")
         st.line_chart(
-            soc_preview.set_index("timestamp")["soc"].head(24 * 14),
+            dispatch.set_index("timestamp")["soc"].head(24 * 14),
             use_container_width=True,
         )
 
-        xlsx_bytes = make_results_excel(dispatch, stats, data_used, inputs_used)
+        st.subheader("Average 24h solar generation vs hybrid profile")
+        min_date = pd.to_datetime(dispatch["Date"]).min().date()
+        max_date = pd.to_datetime(dispatch["Date"]).max().date()
+        p1, p2 = st.columns([1, 1])
+        with p1:
+            period_start = st.date_input("Start date", value=min_date, min_value=min_date, max_value=max_date, key="avg_profile_start")
+        with p2:
+            period_end = st.date_input("End date", value=min(max_date, min_date.replace(day=min_date.day) if hasattr(min_date, "replace") else max_date), min_value=min_date, max_value=max_date, key="avg_profile_end")
+
+        if period_start > period_end:
+            st.error("Start date cannot be after end date.")
+        else:
+            period_mask = (pd.to_datetime(dispatch["Date"]).dt.date >= period_start) & (pd.to_datetime(dispatch["Date"]).dt.date <= period_end)
+            period_df = dispatch.loc[period_mask].copy()
+
+            if period_df.empty:
+                st.warning("No data found for the selected period.")
+            else:
+                captured_solar, captured_hybrid = compute_period_capture_metrics(period_df)
+                chart_col, metric_col = st.columns([4, 1.4])
+
+                with chart_col:
+                    st.altair_chart(build_avg_profile_chart(period_df), use_container_width=True)
+
+                with metric_col:
+                    days_selected = (period_end - period_start).days + 1
+                    st.code(
+                        "\n".join(
+                            [
+                                f"Selected period: {days_selected} days",
+                                f"Captured solar: {captured_solar:,.2f} €/MWh" if pd.notna(captured_solar) else "Captured solar: n/a",
+                                f"Captured hybrid: {captured_hybrid:,.2f} €/MWh" if pd.notna(captured_hybrid) else "Captured hybrid: n/a",
+                            ]
+                        )
+                    )
+
+        xlsx_bytes = make_results_excel(
+            dispatch=dispatch,
+            stats=stats,
+            data_used=data_used,
+            inputs_used=inputs_used,
+            variable_definitions=variable_definitions,
+            monthly_summary=monthly_summary,
+        )
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.download_button(
             "Download hourly optimisation XLSX",
