@@ -702,9 +702,10 @@ def optimize_day_pulp(
         }
     )
 
-    # Revenue BESS follows the commercial battery leg only.
-    # Charging from PV is not booked as a battery cash cost here.
+    # Revenue BESS includes the opportunity cost of charging from PV
+    # and the explicit purchase cost of charging from grid.
     res["Revenue BESS (€)"] = (
+        -res["g_to_batt"] * res["omie_venta"]
         -res["grid_charge"] * res["omie_compra"]
         +res["batt_for_sell"] * res["omie_venta"]
     )
@@ -820,7 +821,7 @@ def build_variable_definitions() -> pd.DataFrame:
                 "Battery discharge exported to the market / grid.",
                 "Spot market energy purchased to satisfy on-site demand.",
                 "State of charge.",
-                "BESS revenue calculated as -g_to_batt*omie_venta - grid_charge*omie_venta + batt_for_sell*omie_venta.",
+                "BESS revenue calculated as -g_to_batt*omie_venta - grid_charge*omie_compra + batt_for_sell*omie_venta.",
                 "Hybrid exported profile calculated as g_to_grid - grid_charge + batt_for_sell.",
             ],
         }
@@ -865,7 +866,7 @@ def add_derived_dispatch_columns(dispatch: pd.DataFrame, bess_mw: float) -> pd.D
 def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float, eta_dis: float, mode: str) -> pd.DataFrame:
     df = add_derived_dispatch_columns(dispatch, bess_mw)
     df["month_days"] = pd.to_datetime(df["Date"]).dt.to_period("M").dt.days_in_month
-    df["charge_cost_eur"] = (df["g_to_batt"] + df["grid_charge"]) * df["omie_venta"]
+    df["charge_cost_eur"] = df["g_to_batt"] * df["omie_venta"] + df["grid_charge"] * df["omie_compra"]
     df["sell_revenue_eur"] = df["batt_for_sell"] * df["omie_venta"]
 
     grouped = (
