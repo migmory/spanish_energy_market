@@ -6,9 +6,12 @@ from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from plotly.subplots import make_subplots
+
 
 # =========================================================
 # ENV / CONFIG
@@ -38,12 +41,30 @@ st.markdown(
     h2, h3 {
         font-size: 1.35rem !important;
     }
+
+    .corp-header {
+        background: linear-gradient(90deg, #0F766E 0%, #10B981 45%, #D1FAE5 100%);
+        color: white;
+        font-weight: 800;
+        padding: 14px 18px;
+        border-radius: 12px;
+        margin-top: 14px;
+        margin-bottom: 12px;
+        font-size: 1.22rem;
+        box-shadow: 0 2px 8px rgba(15, 118, 110, 0.12);
+    }
+
+    .corp-subtitle {
+        font-weight: 700;
+        font-size: 1.05rem;
+        color: #065F46;
+        margin-top: 6px;
+        margin-bottom: 2px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-st.title("Day Ahead - Spain Spot Prices")
 
 DATA_DIR = BASE_DIR / "historical_data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -123,11 +144,20 @@ MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 TABLE_HEADER_FONT_PCT = "145%"
 TABLE_BODY_FONT_PCT = "112%"
+MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
 # =========================================================
 # DISPLAY HELPERS
 # =========================================================
+def section_header(title: str):
+    st.markdown(f"<div class='corp-header'>{title}</div>", unsafe_allow_html=True)
+
+
+def subsection_label(title: str):
+    st.markdown(f"<div class='corp-subtitle'>{title}</div>", unsafe_allow_html=True)
+
+
 def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
     pct_cols = pct_cols or []
     numeric_cols = [
@@ -146,7 +176,7 @@ def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
                 {
                     "selector": "th",
                     "props": [
-                        ("background-color", "#4B5563"),
+                        ("background-color", "#065F46"),
                         ("color", "white"),
                         ("font-weight", "bold"),
                         ("font-size", TABLE_HEADER_FONT_PCT),
@@ -187,6 +217,27 @@ def apply_common_chart_style(chart, height: int = 360):
             titleFontSize=14,
         )
     )
+
+
+def base_plotly_layout(fig: go.Figure, height: int = 420):
+    fig.update_layout(
+        height=height,
+        plot_bgcolor="#F8FAFC",
+        paper_bgcolor="white",
+        margin=dict(l=70, r=70, t=30, b=90),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0.0,
+            bgcolor="rgba(255,255,255,0.7)",
+        ),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(showgrid=False, linecolor="#CBD5E1", tickcolor="#CBD5E1")
+    fig.update_yaxes(gridcolor="#E5E7EB", linecolor="#CBD5E1", tickcolor="#CBD5E1", zerolinecolor="#CBD5E1")
+    return fig
 
 
 # =========================================================
@@ -973,21 +1024,256 @@ def build_energy_mix_workbook(mix_period: pd.DataFrame, demand_period: pd.DataFr
     return output.getvalue()
 
 
-def compute_period_metrics(price_df: pd.DataFrame, solar_df: pd.DataFrame, start_d: date, end_d: date) -> dict:
-    period_price = price_df[(price_df["datetime"].dt.date >= start_d) & (price_df["datetime"].dt.date <= end_d)].copy()
-    period_solar = solar_df[(solar_df["datetime"].dt.date >= start_d) & (solar_df["datetime"].dt.date <= end_d)].copy()
+# =========================================================
+# PRICE METRICS / NEGATIVE PRICES
+# =========================================================
+def compute_captured_stats(price_df: pd.DataFrame, solar_df: pd.DataFrame) -> dict:
+    period_price = price_df.copy()
+    period_solar = solar_df.copy()
 
     avg_price = period_price["price"].mean() if not period_price.empty else None
     merged = period_price.merge(period_solar[["datetime", "solar_best_mw"]], on="datetime", how="inner")
     merged = merged[merged["solar_best_mw"] > 0].copy()
 
+    uncurtailed = None
+    curtailed = None
     if not merged.empty and merged["solar_best_mw"].sum() != 0:
-        captured = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
-    else:
-        captured = None
+        uncurtailed = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
 
-    capture_pct = (captured / avg_price) if (captured is not None and avg_price not in [None, 0]) else None
-    return {"avg_price": avg_price, "captured": captured, "capture_pct": capture_pct}
+    merged_curtailed = merged[merged["price"] > 0].copy()
+    if not merged_curtailed.empty and merged_curtailed["solar_best_mw"].sum() != 0:
+        curtailed = (
+            (merged_curtailed["price"] * merged_curtailed["solar_best_mw"]).sum()
+            / merged_curtailed["solar_best_mw"].sum()
+        )
+
+    capture_unc = (uncurtailed / avg_price) if (uncurtailed is not None and avg_price not in [None, 0]) else None
+    capture_cur = (curtailed / avg_price) if (curtailed is not None and avg_price not in [None, 0]) else None
+
+    return {
+        "avg_price": avg_price,
+        "captured_uncurtailed": uncurtailed,
+        "captured_curtailed": curtailed,
+        "capture_pct_uncurtailed": capture_unc,
+        "capture_pct_curtailed": capture_cur,
+    }
+
+
+def compute_period_metrics(price_df: pd.DataFrame, solar_df: pd.DataFrame, start_d: date, end_d: date) -> dict:
+    period_price = price_df[(price_df["datetime"].dt.date >= start_d) & (price_df["datetime"].dt.date <= end_d)].copy()
+    period_solar = solar_df[(solar_df["datetime"].dt.date >= start_d) & (solar_df["datetime"].dt.date <= end_d)].copy()
+    return compute_captured_stats(period_price, period_solar)
+
+
+def build_negative_prices_summary(price_hourly: pd.DataFrame, include_zero: bool = True) -> pd.DataFrame:
+    df = price_hourly.copy()
+    if df.empty:
+        return pd.DataFrame(columns=["year", "month_num", "count", "cum_count"])
+
+    df["year"] = df["datetime"].dt.year
+    df["month_num"] = df["datetime"].dt.month
+    if include_zero:
+        df = df[df["price"] <= 0].copy()
+    else:
+        df = df[df["price"] < 0].copy()
+
+    years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
+    full_index = pd.MultiIndex.from_product([years, range(1, 13)], names=["year", "month_num"])
+
+    out = (
+        df.groupby(["year", "month_num"]).size().rename("count").reindex(full_index, fill_value=0).reset_index()
+    )
+    out["cum_count"] = out.groupby("year")["count"].cumsum()
+    out["month_label"] = out["month_num"].map(lambda x: MONTH_LABELS[x - 1])
+    return out
+
+
+# =========================================================
+# CHART BUILDERS
+# =========================================================
+def build_monthly_spot_capture_plot(monthly_combo: pd.DataFrame) -> go.Figure:
+    df = monthly_combo.copy().sort_values("month")
+    df["year"] = df["month"].dt.year
+    df["month_num"] = df["month"].dt.month
+    df["month_label"] = df["month"].dt.strftime("%b")
+    df["x_idx"] = range(len(df))
+
+    fig = go.Figure()
+
+    years = sorted(df["year"].unique().tolist())
+    if len(years) >= 2:
+        second_latest = years[-2]
+        shade = df[df["year"] == second_latest]
+        if not shade.empty:
+            fig.add_vrect(
+                x0=shade["x_idx"].min() - 0.5,
+                x1=shade["x_idx"].max() + 0.5,
+                fillcolor="rgba(148, 163, 184, 0.14)",
+                line_width=0,
+                layer="below",
+            )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df["x_idx"],
+            y=df["avg_monthly_price"],
+            mode="lines+markers",
+            name="Average spot price",
+            line=dict(color="#1D4ED8", width=3),
+            marker=dict(size=6),
+            customdata=df[["month_label", "year", "captured_uncurtailed_price", "captured_curtailed_price"]],
+            hovertemplate=(
+                "<b>%{customdata[0]}-%{customdata[1]}</b><br>"
+                "Average spot: %{y:.2f} €/MWh<br>"
+                "Solar captured (uncurtailed): %{customdata[2]:.2f} €/MWh<br>"
+                "Solar captured (curtailed): %{customdata[3]:.2f} €/MWh<extra></extra>"
+            ),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df["x_idx"],
+            y=df["captured_curtailed_price"],
+            mode="lines+markers",
+            name="Solar captured (curtailed)",
+            line=dict(color="#F59E0B", width=3, dash="dash"),
+            marker=dict(size=6),
+            customdata=df[["month_label", "year", "captured_uncurtailed_price", "capture_pct_curtailed"]],
+            hovertemplate=(
+                "<b>%{customdata[0]}-%{customdata[1]}</b><br>"
+                "Solar captured (curtailed): %{y:.2f} €/MWh<br>"
+                "Solar captured (uncurtailed): %{customdata[2]:.2f} €/MWh<br>"
+                "Capture rate curtailed: %{customdata[3]:.2%}<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=df["x_idx"].tolist(),
+        ticktext=df["month_label"].tolist(),
+        title=None,
+    )
+    fig.update_yaxes(title="€/MWh")
+    base_plotly_layout(fig, height=420)
+    fig.update_layout(margin=dict(l=70, r=40, t=25, b=105))
+
+    for year in years:
+        year_df = df[df["year"] == year]
+        mid = (year_df["x_idx"].min() + year_df["x_idx"].max()) / 2
+        fig.add_annotation(
+            x=mid,
+            y=-0.18,
+            xref="x",
+            yref="paper",
+            text=f"<b>{year}</b>",
+            showarrow=False,
+            font=dict(size=13, color="#334155"),
+        )
+        fig.add_shape(
+            type="line",
+            x0=year_df["x_idx"].min() - 0.35,
+            x1=year_df["x_idx"].max() + 0.35,
+            y0=-0.10,
+            y1=-0.10,
+            xref="x",
+            yref="paper",
+            line=dict(color="#94A3B8", width=2),
+        )
+
+    return fig
+
+
+def build_selected_day_price_solar_plot(day_price: pd.DataFrame, day_solar: pd.DataFrame) -> tuple[go.Figure, dict]:
+    stats = compute_captured_stats(day_price, day_solar)
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    if not day_solar.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=day_solar["datetime"],
+                y=day_solar["solar_best_mw"],
+                mode="lines",
+                name="Solar",
+                line=dict(color="#D4A017", width=1.5),
+                fill="tozeroy",
+                fillcolor="rgba(251, 191, 36, 0.28)",
+                hovertemplate="%{x|%H:%M}<br>Solar: %{y:.2f} MW<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=day_price["datetime"],
+            y=day_price["price"],
+            mode="lines+markers",
+            name="Price",
+            line=dict(color="#1D4ED8", width=3),
+            marker=dict(size=5),
+            hovertemplate="%{x|%H:%M}<br>Price: %{y:.2f} €/MWh<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+
+    if stats["captured_uncurtailed"] is not None:
+        fig.add_hline(
+            y=stats["captured_uncurtailed"],
+            line=dict(color="#0F766E", width=2, dash="dot"),
+            annotation_text=f"Uncurtailed capture: {stats['captured_uncurtailed']:.2f}",
+            annotation_position="top left",
+        )
+    if stats["captured_curtailed"] is not None:
+        fig.add_hline(
+            y=stats["captured_curtailed"],
+            line=dict(color="#EA580C", width=2, dash="dash"),
+            annotation_text=f"Curtailed capture: {stats['captured_curtailed']:.2f}",
+            annotation_position="bottom left",
+        )
+
+    fig.update_yaxes(title_text="Price €/MWh", secondary_y=False)
+    fig.update_yaxes(title_text="Solar MW", secondary_y=True)
+    fig.update_xaxes(title=None, tickformat="%H:%M")
+    base_plotly_layout(fig, height=390)
+    return fig, stats
+
+
+def build_negative_prices_plot(summary_df: pd.DataFrame, include_zero: bool) -> go.Figure:
+    fig = go.Figure()
+    palette = ["#2563EB", "#F59E0B", "#10B981", "#8B5CF6", "#EF4444"]
+    years = sorted(summary_df["year"].unique().tolist())
+
+    for i, year in enumerate(years):
+        tmp = summary_df[summary_df["year"] == year].copy().sort_values("month_num")
+        fig.add_trace(
+            go.Scatter(
+                x=tmp["month_num"],
+                y=tmp["cum_count"],
+                mode="lines+markers",
+                name=str(year),
+                line=dict(width=3, color=palette[i % len(palette)]),
+                marker=dict(size=6),
+                hovertemplate=(
+                    f"<b>{year}</b><br>Month: %{{text}}<br>Monthly count: %{{customdata}}<br>"
+                    "Cumulative: %{y}<extra></extra>"
+                ),
+                text=tmp["month_label"],
+                customdata=tmp["count"],
+            )
+        )
+
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=list(range(1, 13)),
+        ticktext=MONTH_LABELS,
+        title=None,
+    )
+    y_title = "Cumulative count of zero & negative prices" if include_zero else "Cumulative count of negative prices"
+    fig.update_yaxes(title=y_title)
+    base_plotly_layout(fig, height=380)
+    return fig
 
 
 # =========================================================
@@ -996,6 +1282,7 @@ def compute_period_metrics(price_df: pd.DataFrame, solar_df: pd.DataFrame, start
 try:
     token = require_esios_token()
 
+    st.title("Day Ahead - Spain Spot Prices")
     st.caption(
         f"Madrid time now: {now_madrid().strftime('%Y-%m-%d %H:%M:%S')} | "
         f"Tomorrow available: {'Yes' if allow_next_day_refresh() else 'No'} | "
@@ -1140,6 +1427,9 @@ try:
     demand_hourly["energy_mwh"] = demand_hourly["demand_mw"]
     demand_energy = demand_hourly.copy()
 
+    # =====================================================
+    # MONTHLY SPOT / CAPTURE
+    # =====================================================
     monthly_avg = (
         price_hourly.assign(month=price_hourly["datetime"].dt.to_period("M").dt.to_timestamp())
         .groupby("month", as_index=False)["price"]
@@ -1151,86 +1441,81 @@ try:
     merged_monthly = merged_monthly[merged_monthly["solar_best_mw"] > 0].copy()
 
     if merged_monthly.empty:
-        captured_monthly = pd.DataFrame(columns=["month", "captured_solar_price", "capture_pct"])
+        monthly_capture = pd.DataFrame(
+            columns=["month", "captured_uncurtailed_price", "captured_curtailed_price", "capture_pct_uncurtailed", "capture_pct_curtailed"]
+        )
     else:
         merged_monthly["month"] = merged_monthly["datetime"].dt.to_period("M").dt.to_timestamp()
         merged_monthly["weighted_price"] = merged_monthly["price"] * merged_monthly["solar_best_mw"]
 
-        captured_monthly = (
+        unc = (
             merged_monthly.groupby("month", as_index=False)
             .agg(
                 weighted_price_sum=("weighted_price", "sum"),
                 solar_sum=("solar_best_mw", "sum"),
-                avg_monthly_price=("price", "mean"),
             )
         )
+        unc["captured_uncurtailed_price"] = unc["weighted_price_sum"] / unc["solar_sum"]
+        unc = unc[["month", "captured_uncurtailed_price"]]
 
-        captured_monthly["captured_solar_price"] = captured_monthly["weighted_price_sum"] / captured_monthly["solar_sum"]
-        captured_monthly["capture_pct"] = captured_monthly["captured_solar_price"] / captured_monthly["avg_monthly_price"]
-        captured_monthly = captured_monthly[["month", "captured_solar_price", "capture_pct"]]
+        curtailed_source = merged_monthly[merged_monthly["price"] > 0].copy()
+        if curtailed_source.empty:
+            cur = pd.DataFrame(columns=["month", "captured_curtailed_price"])
+        else:
+            curtailed_source["weighted_price"] = curtailed_source["price"] * curtailed_source["solar_best_mw"]
+            cur = (
+                curtailed_source.groupby("month", as_index=False)
+                .agg(
+                    weighted_price_sum=("weighted_price", "sum"),
+                    solar_sum=("solar_best_mw", "sum"),
+                )
+            )
+            cur["captured_curtailed_price"] = cur["weighted_price_sum"] / cur["solar_sum"]
+            cur = cur[["month", "captured_curtailed_price"]]
 
-    monthly_combo = monthly_avg.merge(captured_monthly, on="month", how="left")
+        monthly_capture = monthly_avg.merge(unc, on="month", how="left").merge(cur, on="month", how="left")
+        monthly_capture["capture_pct_uncurtailed"] = monthly_capture["captured_uncurtailed_price"] / monthly_capture["avg_monthly_price"]
+        monthly_capture["capture_pct_curtailed"] = monthly_capture["captured_curtailed_price"] / monthly_capture["avg_monthly_price"]
+        monthly_capture = monthly_capture[[
+            "month", "captured_uncurtailed_price", "captured_curtailed_price", "capture_pct_uncurtailed", "capture_pct_curtailed"
+        ]]
 
-    st.subheader("Monthly spot and solar captured price - Spain")
+    monthly_combo = monthly_avg.merge(monthly_capture, on="month", how="left")
+
+    section_header("Monthly spot and solar captured price - Spain")
     if not monthly_combo.empty:
-        base = alt.Chart(monthly_combo).encode(
-            x=alt.X(
-                "month:T",
-                axis=alt.Axis(title=None, format="%b-%Y", labelAngle=0, labelFontSize=14, titleFontSize=16)
-            )
-        )
-
-        avg_line = base.mark_line(point=True, strokeWidth=3, color="#1D4ED8").encode(
-            y=alt.Y(
-                "avg_monthly_price:Q",
-                title="€/MWh",
-                axis=alt.Axis(labelFontSize=14, titleFontSize=16)
-            ),
-            tooltip=[
-                alt.Tooltip("month:T", title="Month"),
-                alt.Tooltip("avg_monthly_price:Q", title="Average monthly price", format=".2f"),
-                alt.Tooltip("captured_solar_price:Q", title="Captured solar price", format=".2f"),
-                alt.Tooltip("capture_pct:Q", title="Solar capture rate", format=".2%"),
-            ],
-        )
-
-        captured_line = base.mark_line(point=True, strokeWidth=3, strokeDash=[6, 4], color="#F59E0B").encode(
-            y=alt.Y("captured_solar_price:Q")
-        )
-
-        chart = alt.layer(avg_line, captured_line).properties(height=380)
-        chart = (
-            chart
-            .configure_view(stroke="#D1D5DB", fill="#F8FAFC")
-            .configure_axis(
-                grid=True,
-                gridColor="#E5E7EB",
-                domainColor="#CBD5E1",
-                tickColor="#CBD5E1",
-                labelColor="#111827",
-                titleColor="#111827",
-            )
-        )
-
-        st.altair_chart(chart, use_container_width=True)
+        fig = build_monthly_spot_capture_plot(monthly_combo)
+        st.plotly_chart(fig, use_container_width=True)
 
     monthly_table = monthly_combo.copy()
     if not monthly_table.empty:
         monthly_table["Month"] = monthly_table["month"].dt.strftime("%b - %Y")
         monthly_table = monthly_table.rename(columns={
             "avg_monthly_price": "Average monthly price",
-            "captured_solar_price": "Captured solar price",
-            "capture_pct": "Solar capture rate (%)",
+            "captured_uncurtailed_price": "Solar captured price (uncurtailed)",
+            "captured_curtailed_price": "Solar captured price (curtailed)",
+            "capture_pct_uncurtailed": "Solar capture rate uncurtailed (%)",
+            "capture_pct_curtailed": "Solar capture rate curtailed (%)",
         })
         st.dataframe(
             styled_df(
-                monthly_table[["Month", "Average monthly price", "Captured solar price", "Solar capture rate (%)"]],
-                pct_cols=["Solar capture rate (%)"],
+                monthly_table[[
+                    "Month",
+                    "Average monthly price",
+                    "Solar captured price (uncurtailed)",
+                    "Solar captured price (curtailed)",
+                    "Solar capture rate uncurtailed (%)",
+                    "Solar capture rate curtailed (%)",
+                ]],
+                pct_cols=["Solar capture rate uncurtailed (%)", "Solar capture rate curtailed (%)"],
             ),
             use_container_width=True,
         )
 
-    st.subheader("Selected day: price vs solar")
+    # =====================================================
+    # SELECTED DAY
+    # =====================================================
+    section_header("Selected day: price vs solar")
     min_date = price_hourly["datetime"].dt.date.min()
     max_date = price_hourly["datetime"].dt.date.max()
 
@@ -1250,78 +1535,81 @@ try:
         st.caption(f"Solar source used for selected day: {day_source_text}")
 
     if not day_price.empty:
-        price_line = alt.Chart(day_price).mark_line(point=True, strokeWidth=3, color="#1D4ED8").encode(
-            x=alt.X(
-                "datetime:T",
-                axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelFontSize=14, titleFontSize=16),
-            ),
-            y=alt.Y(
-                "price:Q",
-                title="Price €/MWh",
-                axis=alt.Axis(labelFontSize=14, titleFontSize=16),
-            ),
-            tooltip=[
-                alt.Tooltip("datetime:T", title="Time"),
-                alt.Tooltip("price:Q", title="Price", format=".2f"),
-            ],
-        )
+        day_fig, day_stats = build_selected_day_price_solar_plot(day_price, day_solar)
+        st.plotly_chart(day_fig, use_container_width=True)
+    else:
+        day_stats = {
+            "avg_price": None,
+            "captured_uncurtailed": None,
+            "captured_curtailed": None,
+            "capture_pct_uncurtailed": None,
+            "capture_pct_curtailed": None,
+        }
 
-        if not day_solar.empty:
-            solar_area = alt.Chart(day_solar).mark_area(opacity=0.28, color="#FBBF24").encode(
-                x=alt.X(
-                    "datetime:T",
-                    axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelFontSize=14, titleFontSize=16),
-                ),
-                y=alt.Y(
-                    "solar_best_mw:Q",
-                    title="Solar MW",
-                    axis=alt.Axis(labelFontSize=14, titleFontSize=16),
-                ),
-                tooltip=[
-                    alt.Tooltip("datetime:T", title="Time"),
-                    alt.Tooltip("solar_best_mw:Q", title="Solar", format=".2f"),
-                    alt.Tooltip("solar_source:N", title="Solar source"),
-                ],
-            )
-
-            overlay_chart = alt.layer(price_line, solar_area).resolve_scale(y="independent").properties(height=360)
-            overlay_chart = apply_common_chart_style(overlay_chart, height=360)
-            st.altair_chart(overlay_chart, use_container_width=True)
-        else:
-            price_line = apply_common_chart_style(price_line.properties(height=360), height=360)
-            st.altair_chart(price_line, use_container_width=True)
-
-    day_metrics = compute_period_metrics(price_hourly, solar_hourly, selected_day, selected_day)
+    # =====================================================
+    # SPOT / CAPTURE METRICS
+    # =====================================================
+    section_header("Spot / captured metrics")
     month_start = selected_day.replace(day=1)
     ytd_start = selected_day.replace(month=1, day=1)
 
+    day_metrics = compute_period_metrics(price_hourly, solar_hourly, selected_day, selected_day)
     mtd_metrics = compute_period_metrics(price_hourly, solar_hourly, month_start, selected_day)
     ytd_metrics = compute_period_metrics(price_hourly, solar_hourly, ytd_start, selected_day)
 
-    st.subheader("Spot / captured metrics")
     metric_rows = pd.DataFrame([
         {
             "Period": "Day",
-            "Average monthly price": day_metrics["avg_price"],
-            "Captured solar price": day_metrics["captured"],
-            "Solar capture rate (%)": day_metrics["capture_pct"],
+            "Average spot price": day_metrics["avg_price"],
+            "Solar captured price (uncurtailed)": day_metrics["captured_uncurtailed"],
+            "Solar captured price (curtailed)": day_metrics["captured_curtailed"],
+            "Solar capture rate uncurtailed (%)": day_metrics["capture_pct_uncurtailed"],
+            "Solar capture rate curtailed (%)": day_metrics["capture_pct_curtailed"],
         },
         {
             "Period": "MTD",
-            "Average monthly price": mtd_metrics["avg_price"],
-            "Captured solar price": mtd_metrics["captured"],
-            "Solar capture rate (%)": mtd_metrics["capture_pct"],
+            "Average spot price": mtd_metrics["avg_price"],
+            "Solar captured price (uncurtailed)": mtd_metrics["captured_uncurtailed"],
+            "Solar captured price (curtailed)": mtd_metrics["captured_curtailed"],
+            "Solar capture rate uncurtailed (%)": mtd_metrics["capture_pct_uncurtailed"],
+            "Solar capture rate curtailed (%)": mtd_metrics["capture_pct_curtailed"],
         },
         {
             "Period": "YTD",
-            "Average monthly price": ytd_metrics["avg_price"],
-            "Captured solar price": ytd_metrics["captured"],
-            "Solar capture rate (%)": ytd_metrics["capture_pct"],
+            "Average spot price": ytd_metrics["avg_price"],
+            "Solar captured price (uncurtailed)": ytd_metrics["captured_uncurtailed"],
+            "Solar captured price (curtailed)": ytd_metrics["captured_curtailed"],
+            "Solar capture rate uncurtailed (%)": ytd_metrics["capture_pct_uncurtailed"],
+            "Solar capture rate curtailed (%)": ytd_metrics["capture_pct_curtailed"],
         },
     ])
-    st.dataframe(styled_df(metric_rows, pct_cols=["Solar capture rate (%)"]), use_container_width=True)
+    st.dataframe(
+        styled_df(metric_rows, pct_cols=["Solar capture rate uncurtailed (%)", "Solar capture rate curtailed (%)"]),
+        use_container_width=True,
+    )
 
-    st.subheader("Average 24h hourly profile for selected period")
+    # =====================================================
+    # NEGATIVE PRICES
+    # =====================================================
+    section_header("Negative prices")
+    neg_mode = st.radio(
+        "Curve type",
+        ["Zero and negative prices", "Only negative prices"],
+        horizontal=True,
+    )
+    include_zero = neg_mode == "Zero and negative prices"
+    neg_summary = build_negative_prices_summary(price_hourly, include_zero=include_zero)
+    neg_fig = build_negative_prices_plot(neg_summary, include_zero=include_zero)
+    st.plotly_chart(neg_fig, use_container_width=True)
+
+    neg_table = neg_summary.pivot(index="month_label", columns="year", values="cum_count").reindex(MONTH_LABELS)
+    neg_table = neg_table.reset_index().rename(columns={"month_label": "Month"})
+    st.dataframe(styled_df(neg_table), use_container_width=True)
+
+    # =====================================================
+    # AVERAGE PROFILE
+    # =====================================================
+    section_header("Average 24h hourly profile for selected period")
     c1, c2 = st.columns(2)
     with c1:
         start_sel = st.date_input(
@@ -1360,7 +1648,10 @@ try:
             )
             st.dataframe(styled_df(hourly_profile), use_container_width=True)
 
-    st.subheader("Energy mix")
+    # =====================================================
+    # ENERGY MIX
+    # =====================================================
+    section_header("Energy mix")
 
     mix_energy = {}
     with st.spinner("Loading energy mix data..."):
@@ -1456,8 +1747,8 @@ try:
         if chart is not None:
             st.altair_chart(chart, use_container_width=True)
 
+        subsection_label(f"Energy mix detail for {selected_day}")
         day_mix_table = build_day_energy_mix_table(mix_energy, selected_day)
-        st.subheader(f"Energy mix detail for {selected_day}")
         if not day_mix_table.empty:
             st.dataframe(styled_df(day_mix_table), use_container_width=True)
         else:
@@ -1491,12 +1782,16 @@ try:
     else:
         st.info("No energy mix data available yet. Press 'Refresh energy mix' once to build its historical cache.")
 
-    st.subheader("Extraction workbook")
-    st.write("Rows in raw prices:", len(price_raw))
-    st.write("Rows in hourly prices:", len(price_hourly))
-    st.write("Rows in raw solar P48:", len(solar_p48_raw))
-    st.write("Rows in raw solar forecast:", len(solar_forecast_raw))
-    st.write("Rows in hourly solar best:", len(solar_hourly))
+    # =====================================================
+    # EXTRACTION WORKBOOK / TABLES
+    # =====================================================
+    section_header("Extraction workbook")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Raw prices", f"{len(price_raw):,}")
+    c2.metric("Hourly prices", f"{len(price_hourly):,}")
+    c3.metric("Raw solar P48", f"{len(solar_p48_raw):,}")
+    c4.metric("Raw solar forecast", f"{len(solar_forecast_raw):,}")
+    c5.metric("Hourly solar best", f"{len(solar_hourly):,}")
 
     workbook_bytes = build_price_workbook(price_raw, price_hourly)
     st.download_button(
@@ -1506,13 +1801,13 @@ try:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    st.subheader("Raw price extraction (QH when available)")
+    subsection_label("Raw price extraction (QH when available)")
     st.dataframe(styled_df(price_raw.head(500)), use_container_width=True)
 
-    st.subheader("Hourly averaged prices")
+    subsection_label("Hourly averaged prices")
     st.dataframe(styled_df(price_hourly.head(500)), use_container_width=True)
 
-    st.subheader("Solar hourly series used in analytics")
+    subsection_label("Solar hourly series used in analytics")
     st.dataframe(styled_df(solar_hourly.head(500)), use_container_width=True)
 
     if st.button("Force refresh"):
