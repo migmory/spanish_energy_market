@@ -231,8 +231,15 @@ def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
 
 
 def apply_common_chart_style(chart, height: int = 360):
+    # Concat charts do not accept a top-level height parameter.
+    chart_dict = chart.to_dict()
+    if "vconcat" in chart_dict or "hconcat" in chart_dict or "concat" in chart_dict:
+        styled = chart
+    else:
+        styled = chart.properties(height=height)
+
     return (
-        chart.properties(height=height)
+        styled
         .configure_view(
             stroke="#E5E7EB",
             fill="white",
