@@ -1486,17 +1486,20 @@ if st.session_state.dispatch is not None:
             st.warning("No data found for the selected period.")
         else:
             avg_profile = period_df.groupby("Hour", as_index=False).agg(
-                charge_mwh=("charge_mwh", "mean"),
+                g_to_batt=("g_to_batt", "mean"),
+                grid_charge=("grid_charge", "mean"),
                 discharge_mwh=("discharge_mwh", "mean"),
                 omie_venta=("omie_venta", "mean"),
                 generacion=("generacion", "mean"),
                 hybrid_profile_mwh=("hybrid profile (MWh)", "mean"),
             )
+            avg_profile["charge_mwh"] = avg_profile["g_to_batt"] + avg_profile["grid_charge"]
             import matplotlib.pyplot as plt
             fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
             ax_flow = ax_price.twinx()
             x = avg_profile["Hour"].astype(int).values
-            ax_flow.bar(x - 0.18, avg_profile["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85)
+            ax_flow.bar(x - 0.18, avg_profile["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
+            ax_flow.bar(x - 0.18, avg_profile["grid_charge"], width=0.35, bottom=avg_profile["g_to_batt"], color="#8fd19e", alpha=0.95)
             ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
             if mode_result != "BESS standalone":
                 ax_flow.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
@@ -1512,7 +1515,7 @@ if st.session_state.dispatch is not None:
             with cplot:
                 st.pyplot(fig, use_container_width=True)
             with cbox:
-                legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge", "#2e8b57", None), ("Discharge", "#c0392b", None)]
+                legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
                 if mode_result != "BESS standalone":
                     legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
                 draw_side_legend(legend_items)
@@ -1536,7 +1539,8 @@ if st.session_state.dispatch is not None:
         ax_flow = ax_price.twinx()
         x = day_df["Hour"].astype(int).values
         ax_price.plot(x, day_df["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
-        ax_flow.bar(x - 0.18, day_df["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85)
+        ax_flow.bar(x - 0.18, day_df["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
+        ax_flow.bar(x - 0.18, day_df["grid_charge"], width=0.35, bottom=day_df["g_to_batt"], color="#8fd19e", alpha=0.95)
         ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
         if mode_result != "BESS standalone":
             ax_flow.plot(x, day_df["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
@@ -1552,7 +1556,7 @@ if st.session_state.dispatch is not None:
         with dplot:
             st.pyplot(fig, use_container_width=True)
         with dside:
-            legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge", "#2e8b57", None), ("Discharge", "#c0392b", None)]
+            legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
             if mode_result != "BESS standalone":
                 legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
             draw_side_legend(legend_items)
