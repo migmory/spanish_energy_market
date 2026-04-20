@@ -70,6 +70,20 @@ def data_header(title: str) -> None:
 def metric_value_or_blank(x):
     return "" if pd.isna(x) else f"{x:,.2f}"
 
+
+def draw_side_legend(items: list[tuple[str, str, str | None]]) -> None:
+    rows = []
+    for label, color, style in items:
+        symbol = '■'
+        if style == 'line':
+            symbol = '━━'
+        elif style == 'dashed':
+            symbol = '┅┅'
+        elif style == 'area':
+            symbol = '▉'
+        rows.append(f"<div style="display:flex; align-items:center; gap:8px; margin:4px 0;"><span style="color:{color}; font-weight:700; min-width:24px;">{symbol}</span><span>{label}</span></div>")
+    st.markdown(''.join(rows), unsafe_allow_html=True)
+
 if "bess_admin_password" in st.secrets:
     pwd = st.text_input("Password", type="password")
     if pwd != st.secrets["bess_admin_password"]:
@@ -652,13 +666,14 @@ def optimize_day_pulp(
         g_to_batt[t] + grid_charge[t] for t in range(n)
     )
 
-    # Economic objective WITHOUT charge/discharge efficiency adjustments
+    # Economic objective aligned with the original Julia model:
+    # PV charged into the battery is not penalised in the objective.
+    # Only explicit grid purchases / grid charging are costs.
     model += pulp.lpSum(
         g_to_grid[t] * omie_sell[t]
         + batt_for_sell[t] * omie_sell[t]
         - grid_purchase[t] * omie_buy[t]
         - grid_charge[t] * omie_buy[t]
-        - g_to_batt[t] * omie_sell[t]
         for t in range(n)
     )
 
@@ -687,9 +702,10 @@ def optimize_day_pulp(
         }
     )
 
+    # Revenue BESS follows the commercial battery leg only.
+    # Charging from PV is not booked as a battery cash cost here.
     res["Revenue BESS (€)"] = (
-        -res["g_to_batt"] * res["omie_venta"]
-        -res["grid_charge"] * res["omie_venta"]
+        -res["grid_charge"] * res["omie_compra"]
         +res["batt_for_sell"] * res["omie_venta"]
     )
     res["hybrid profile (MWh)"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
@@ -698,8 +714,7 @@ def optimize_day_pulp(
 
     total_cost = (
         (res["grid_purchase"] * res["omie_compra"]).sum()
-        + (res["grid_charge"] * res["omie_compra"]).sum()
-        + (res["g_to_batt"] * res["omie_venta"]).sum()
+        + (res["grid_charge"] * res["omie_compra"] / max(eta_ch, 1e-9)).sum()
         - (res["g_to_grid"] * res["omie_venta"]).sum()
         - (res["batt_for_sell"] * res["omie_venta"]).sum()
     )
@@ -1135,8 +1150,8 @@ with left:
     assume_degradation = st.radio("Assume degradation", ["No", "Yes"], horizontal=True, index=0)
     use_degradation = assume_degradation == "Yes"
 
-    eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.01)
-    eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.01)
+    eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.001, format="%.3f")
+    eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.001, format="%.3f")
     st.caption(f"Round-trip-efficiency equivalent = {eta_ch:.2%} × {eta_dis:.2%} = {(eta_ch * eta_dis):.2%}")
 
     cycle_limit_option = st.radio(
@@ -1179,7 +1194,7 @@ with right:
     elif mode == "BESS con demanda":
         st.info("omie_venta = price, omie_compra = same price, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
     else:
-        st.info("omie_venta = price, omie_compra = 1000, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
+        st.info("omie_venta = price, omie_compra = 1000, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 €/MWh is intentionally unattractive.")
 
     st.markdown("### Degradation logic")
     st.info("If degradation is enabled, effective storage capacity for forward years is adjusted as: BESS size (MWh) × SOH(%). BESS power (MW) remains constant.")
@@ -1414,30 +1429,29 @@ if st.session_state.dispatch is not None:
             fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
             ax_flow = ax_price.twinx()
             x = avg_profile["Hour"].astype(int).values
-            if mode_result == "BESS standalone":
-                ax_flow.bar(x - 0.18, avg_profile["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
-                ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
-            else:
-                ax_flow.bar(x - 0.18, avg_profile["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
-                ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
-                ax_price.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b", label="Solar generation")
-                ax_price.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22, label="Hybrid profile")
-            ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79", label="OMIE sell price")
+            ax_flow.bar(x - 0.18, avg_profile["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85)
+            ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
+            if mode_result != "BESS standalone":
+                ax_flow.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
+                ax_flow.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22)
+            ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
             ax_price.set_xlabel("Hour")
-            ax_price.set_ylabel("OMIE €/MWh")
-            ax_flow.set_ylabel("Charge / Discharge / Solar / Hybrid (MWh)")
+            ax_price.set_ylabel("OMIE (€/MWh)")
+            ax_flow.set_ylabel("Charge / Discharge / Solar / Hybrid (MWh)", labelpad=16)
             ax_price.grid(axis="y", alpha=0.25)
             ax_price.set_xticks(x)
-            lines1, labels1 = ax_price.get_legend_handles_labels()
-            lines2, labels2 = ax_flow.get_legend_handles_labels()
-            ax_price.legend(lines1 + lines2, labels1 + labels2, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
-            fig.tight_layout()
-            cplot, cbox = st.columns([5, 1])
+            fig.tight_layout(rect=[0, 0, 0.9, 1])
+            cplot, cbox = st.columns([5.3, 1.2])
             with cplot:
                 st.pyplot(fig, use_container_width=True)
-            if mode_result != "BESS standalone":
-                solar_cap, hybrid_cap = compute_period_capture_metrics(period_df)
-                with cbox:
+            with cbox:
+                legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge", "#2e8b57", None), ("Discharge", "#c0392b", None)]
+                if mode_result != "BESS standalone":
+                    legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
+                draw_side_legend(legend_items)
+                if mode_result != "BESS standalone":
+                    solar_cap, hybrid_cap = compute_period_capture_metrics(period_df)
+                    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                     st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
                     st.metric("Hybrid capture (€/MWh)", metric_value_or_blank(hybrid_cap))
 
@@ -1453,19 +1467,35 @@ if st.session_state.dispatch is not None:
         fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
         ax_flow = ax_price.twinx()
         x = day_df["Hour"].astype(int).values
-        ax_price.plot(x, day_df["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79", label="OMIE sell price")
-        ax_flow.bar(x - 0.18, day_df["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
-        ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
+        ax_price.plot(x, day_df["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
+        ax_flow.bar(x - 0.18, day_df["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85)
+        ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
+        if mode_result != "BESS standalone":
+            ax_flow.plot(x, day_df["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
+            ax_flow.fill_between(x, day_df["hybrid profile (MWh)"], color="#facc15", alpha=0.22)
         ax_price.set_xlabel("Hour")
-        ax_price.set_ylabel("OMIE €/MWh")
-        ax_flow.set_ylabel("Charge / Discharge (MWh)")
+        ax_price.set_ylabel("OMIE (€/MWh)")
+        right_label = "Charge / Discharge (MWh)" if mode_result == "BESS standalone" else "Charge / Discharge / Solar / Hybrid (MWh)"
+        ax_flow.set_ylabel(right_label, labelpad=16)
         ax_price.grid(axis="y", alpha=0.25)
         ax_price.set_xticks(x)
-        lines1, labels1 = ax_price.get_legend_handles_labels()
-        lines2, labels2 = ax_flow.get_legend_handles_labels()
-        ax_price.legend(lines1 + lines2, labels1 + labels2, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
-        fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
+        fig.tight_layout(rect=[0, 0, 0.9, 1])
+        dplot, dside = st.columns([5.3, 1.2])
+        with dplot:
+            st.pyplot(fig, use_container_width=True)
+        with dside:
+            legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge", "#2e8b57", None), ("Discharge", "#c0392b", None)]
+            if mode_result != "BESS standalone":
+                legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
+            draw_side_legend(legend_items)
+        if float(day_df["charge_mwh"].sum() + day_df["discharge_mwh"].sum()) <= 1e-9:
+            if mode_result == "BESS sin demanda":
+                solar_day = float(day_df["generacion"].sum()) if "generacion" in day_df.columns else 0.0
+                st.caption(
+                    f"No battery cycling on this selected day. In 'BESS sin demanda' the model sets omie_compra = 1000 €/MWh, so the battery usually only charges from solar. Solar available on this day: {solar_day:,.2f} MWh."
+                )
+            else:
+                st.caption("No battery cycling on this selected day under the current price profile, solar profile and model constraints.")
 
     hero_header("Capacity by year")
     st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
@@ -1540,17 +1570,19 @@ if st.session_state.dispatch is not None:
 
     csv_bytes = dispatch[dispatch_cols].to_csv(index=False).encode("utf-8")
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        "Download hourly optimisation CSV",
-        data=csv_bytes,
-        file_name=f"bess_optimisation_{run_ts}.csv",
-        mime="text/csv",
-    )
-
-    if xlsx_bytes is not None:
+    dl1, dl2 = st.columns(2)
+    with dl1:
         st.download_button(
-            "Download hourly optimisation XLSX",
-            data=xlsx_bytes,
-            file_name=f"bess_optimisation_{run_ts}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "Download hourly optimisation CSV",
+            data=csv_bytes,
+            file_name=f"bess_optimisation_{run_ts}.csv",
+            mime="text/csv",
         )
+    with dl2:
+        if xlsx_bytes is not None:
+            st.download_button(
+                "Download hourly optimisation XLSX",
+                data=xlsx_bytes,
+                file_name=f"bess_optimisation_{run_ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
