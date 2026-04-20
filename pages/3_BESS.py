@@ -91,6 +91,11 @@ def standardize_price_history_from_day_ahead(raw_csv_path: Path) -> pd.DataFrame
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["datetime", "value"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
+
+    # Prevent duplicated refresh rows from distorting hourly averages
+    df = df.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").copy()
 
     df["timestamp"] = df["datetime"].dt.floor("h")
     hourly = (
@@ -558,6 +563,7 @@ def optimize_day_pulp(
     power_mw: float,
     eta_ch: float = 1.0,
     eta_dis: float = 1.0,
+    cycle_limit_factor: float = 1.0,
 ) -> tuple[pd.DataFrame, dict]:
     df_day = df_day.sort_values("hora").reset_index(drop=True).copy()
     n = len(df_day)
@@ -605,7 +611,7 @@ def optimize_day_pulp(
 
     model += soc[n] <= capacity_mwh
 
-    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= capacity_mwh / max(eta_ch, 1e-9)
+    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= cycle_limit_factor * capacity_mwh / max(eta_ch, 1e-9)
     model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(
         g_to_batt[t] + grid_charge[t] for t in range(n)
     )
@@ -682,6 +688,7 @@ def run_optimization(
     power_mw: float,
     eta_ch: float,
     eta_dis: float,
+    cycle_limit_factor: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     results_all = []
     stats_all = []
@@ -708,6 +715,7 @@ def run_optimization(
                 power_mw=power_mw,
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
+                cycle_limit_factor=cycle_limit_factor,
             )
             res["Year"] = year
             res["effective_capacity_mwh"] = year_capacity
@@ -803,8 +811,12 @@ def add_derived_dispatch_columns(dispatch: pd.DataFrame, bess_mw: float) -> pd.D
     return out
 
 
-def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFrame:
+def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float, eta_dis: float, mode: str) -> pd.DataFrame:
     df = add_derived_dispatch_columns(dispatch, bess_mw)
+    df["month_days"] = pd.to_datetime(df["Date"]).dt.to_period("M").dt.days_in_month
+    df["charge_cost_eur"] = (df["g_to_batt"] + df["grid_charge"]) * df["omie_venta"]
+    df["sell_revenue_eur"] = df["batt_for_sell"] * df["omie_venta"]
+
     grouped = (
         df.groupby(["Year", "month"], as_index=False)
         .agg(
@@ -815,6 +827,11 @@ def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFram
             Hybrid_Revenue_EUR=("hybrid_revenue", "sum"),
             Avg_Effective_Capacity_MWh=("effective_capacity_mwh", "mean"),
             Avg_SOH=("SOH", "mean"),
+            Charge_MWh=("charge_mwh", "sum"),
+            Discharge_MWh=("discharge_mwh", "sum"),
+            Avg_Buy_Price_EUR=("charge_cost_eur", "sum"),
+            Avg_Sell_Price_EUR=("sell_revenue_eur", "sum"),
+            Days=("Date", lambda s: pd.to_datetime(s).dt.date.nunique()),
         )
     )
     grouped["Revenue BESS €/MW"] = np.where(bess_mw > 0, grouped["Revenue_BESS_EUR"] / bess_mw, np.nan)
@@ -828,6 +845,14 @@ def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFram
         grouped["Hybrid_Revenue_EUR"] / grouped["Hybrid_Profile_MWh"],
         np.nan,
     )
+    grouped["Avg buy price (€/MWh)"] = np.where(grouped["Charge_MWh"] != 0, grouped["Avg_Buy_Price_EUR"] / grouped["Charge_MWh"], np.nan)
+    grouped["Avg sell price (€/MWh)"] = np.where(grouped["Discharge_MWh"] != 0, grouped["Avg_Sell_Price_EUR"] / grouped["Discharge_MWh"], np.nan)
+    grouped["Captured spread (€/MWh)"] = grouped["Avg sell price (€/MWh)"] - grouped["Avg buy price (€/MWh)"]
+    grouped["Cycles/day avg"] = np.where(
+        (grouped["Days"] > 0) & (grouped["Avg_Effective_Capacity_MWh"] > 0),
+        grouped["Discharge_MWh"] / max(eta_dis, 1e-9) / grouped["Avg_Effective_Capacity_MWh"] / grouped["Days"],
+        np.nan,
+    )
 
     yearly = (
         grouped.groupby("Year", as_index=False)
@@ -837,26 +862,33 @@ def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFram
             Solar_Generation_MWh=("Solar_Generation_MWh", "sum"),
             Solar_Revenue_EUR=("Solar_Revenue_EUR", "sum"),
             Hybrid_Revenue_EUR=("Hybrid_Revenue_EUR", "sum"),
-            Revenue_BESS_EUR_per_MW=("Revenue BESS €/MW", "sum"),
             Avg_Effective_Capacity_MWh=("Avg_Effective_Capacity_MWh", "mean"),
             Avg_SOH=("Avg_SOH", "mean"),
+            Charge_MWh=("Charge_MWh", "sum"),
+            Discharge_MWh=("Discharge_MWh", "sum"),
+            Charge_Cost_EUR=("Avg_Buy_Price_EUR", "sum"),
+            Sell_Revenue_EUR=("Avg_Sell_Price_EUR", "sum"),
+            Days=("Days", "sum"),
         )
     )
     yearly["month"] = "TOTAL"
-    yearly["Revenue BESS €/MW"] = yearly["Revenue_BESS_EUR_per_MW"]
-    yearly["Captured Solar (€/MWh)"] = np.where(
-        yearly["Solar_Generation_MWh"] != 0,
-        yearly["Solar_Revenue_EUR"] / yearly["Solar_Generation_MWh"],
+    yearly["Revenue BESS €/MW"] = np.where(bess_mw > 0, yearly["Revenue_BESS_EUR"] / bess_mw, np.nan)
+    yearly["Captured Solar (€/MWh)"] = np.where(yearly["Solar_Generation_MWh"] != 0, yearly["Solar_Revenue_EUR"] / yearly["Solar_Generation_MWh"], np.nan)
+    yearly["Captured Hybrid (€/MWh)"] = np.where(yearly["Hybrid_Profile_MWh"] != 0, yearly["Hybrid_Revenue_EUR"] / yearly["Hybrid_Profile_MWh"], np.nan)
+    yearly["Avg buy price (€/MWh)"] = np.where(yearly["Charge_MWh"] != 0, yearly["Charge_Cost_EUR"] / yearly["Charge_MWh"], np.nan)
+    yearly["Avg sell price (€/MWh)"] = np.where(yearly["Discharge_MWh"] != 0, yearly["Sell_Revenue_EUR"] / yearly["Discharge_MWh"], np.nan)
+    yearly["Captured spread (€/MWh)"] = yearly["Avg sell price (€/MWh)"] - yearly["Avg buy price (€/MWh)"]
+    yearly["Cycles/day avg"] = np.where(
+        (yearly["Days"] > 0) & (yearly["Avg_Effective_Capacity_MWh"] > 0),
+        yearly["Discharge_MWh"] / max(eta_dis, 1e-9) / yearly["Avg_Effective_Capacity_MWh"] / yearly["Days"],
         np.nan,
     )
-    yearly["Captured Hybrid (€/MWh)"] = np.where(
-        yearly["Hybrid_Profile_MWh"] != 0,
-        yearly["Hybrid_Revenue_EUR"] / yearly["Hybrid_Profile_MWh"],
-        np.nan,
-    )
-    yearly = yearly.drop(columns=["Revenue_BESS_EUR_per_MW"])
-
     out = pd.concat([grouped, yearly], ignore_index=True, sort=False)
+
+    if mode == "BESS standalone":
+        out["Captured Solar (€/MWh)"] = np.nan
+        out["Captured Hybrid (€/MWh)"] = np.nan
+
     return out
 
 
@@ -1001,6 +1033,9 @@ for key, default in {
     "variable_definitions": None,
     "bess_mw_result": None,
     "capacity_table": None,
+    "mode_result": None,
+    "eta_dis_result": None,
+    "cycle_limit_label": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1065,6 +1100,14 @@ with left:
 
     eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=1.0, step=0.01)
     eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.855, step=0.01)
+
+    cycle_limit_option = st.radio(
+        "Cycles/day setting",
+        ["Limit 1 cycle/day", "No limit cycles/day"],
+        index=0,
+        horizontal=True,
+    )
+    cycle_limit_factor = 1.0 if cycle_limit_option == "Limit 1 cycle/day" else 5.0
 
     st.markdown("### Generation profile")
     use_uploaded_generation = st.checkbox("Upload a custom yearly generation profile", value=False)
@@ -1161,6 +1204,7 @@ if run_button:
                 power_mw=bess_mw,
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
+                cycle_limit_factor=cycle_limit_factor,
             )
 
         if dispatch.empty:
@@ -1168,7 +1212,7 @@ if run_button:
             st.stop()
 
         dispatch = add_derived_dispatch_columns(dispatch, bess_mw)
-        monthly_summary = build_monthly_summary(dispatch, bess_mw)
+        monthly_summary = build_monthly_summary(dispatch, bess_mw, eta_dis, mode)
         variable_definitions = build_variable_definitions()
 
         inputs_used = pd.DataFrame(
@@ -1184,6 +1228,8 @@ if run_button:
                     "bess_mw_constant",
                     "eta_ch",
                     "eta_dis",
+                    "cycles_day_setting",
+                    "cycles_day_factor",
                     "assume_degradation",
                     "degradation_status_output",
                     "uploaded_generation",
@@ -1201,6 +1247,8 @@ if run_button:
                     bess_mw,
                     eta_ch,
                     eta_dis,
+                    cycle_limit_option,
+                    cycle_limit_factor,
                     "yes" if use_degradation else "no",
                     "degraded for forward years only" if use_degradation else "undegraded",
                     "yes" if uploaded_generation is not None else "no",
@@ -1218,6 +1266,9 @@ if run_button:
         st.session_state.variable_definitions = variable_definitions
         st.session_state.bess_mw_result = bess_mw
         st.session_state.capacity_table = capacity_table
+        st.session_state.mode_result = mode
+        st.session_state.eta_dis_result = eta_dis
+        st.session_state.cycle_limit_label = cycle_limit_option
 
     except Exception as e:
         st.error(f"Optimization failed: {e}")
@@ -1234,21 +1285,34 @@ if st.session_state.dispatch is not None:
     variable_definitions = st.session_state.variable_definitions
     bess_mw_result = st.session_state.bess_mw_result
     capacity_table = st.session_state.capacity_table
+    mode_result = st.session_state.mode_result
+    eta_dis_result = st.session_state.eta_dis_result
+    cycle_limit_label = st.session_state.cycle_limit_label
 
-    total_cost = stats["total_cost"].sum() if not stats.empty else 0.0
-    total_sold = stats["total_sold"].sum() if not stats.empty else 0.0
-    total_bought = stats["total_bought"].sum() if not stats.empty else 0.0
-    total_charged = stats["total_charged"].sum() if not stats.empty else 0.0
-    total_discharged = stats["total_discharged"].sum() if not stats.empty else 0.0
-    total_revenue_bess = stats["Revenue BESS (€)"].sum() if not stats.empty else 0.0
+    yearly_rollup = stats.groupby("Year", as_index=False).agg(
+        total_charged=("total_charged", "sum"),
+        total_discharged=("total_discharged", "sum"),
+        revenue_bess_eur=("Revenue BESS (€)", "sum"),
+    ) if not stats.empty else pd.DataFrame(columns=["Year", "total_charged", "total_discharged", "revenue_bess_eur"])
+    yearly_rollup["Revenue BESS (€/MW)"] = np.where(bess_mw_result > 0, yearly_rollup["revenue_bess_eur"] / bess_mw_result, np.nan)
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Net cost", f"{total_cost:,.2f}")
-    c2.metric("Total sold", f"{total_sold:,.2f}")
-    c3.metric("Total bought", f"{total_bought:,.2f}")
-    c4.metric("Total charged", f"{total_charged:,.2f}")
-    c5.metric("Total discharged", f"{total_discharged:,.2f}")
-    c6.metric("Revenue BESS (€)", f"{total_revenue_bess:,.2f}")
+    if len(yearly_rollup) > 1:
+        total_charged_display = yearly_rollup["total_charged"].mean()
+        total_discharged_display = yearly_rollup["total_discharged"].mean()
+        revenue_bess_display = yearly_rollup["Revenue BESS (€/MW)"].mean()
+        metrics_caption = "Average across selected years"
+    else:
+        total_charged_display = yearly_rollup["total_charged"].iloc[0] if not yearly_rollup.empty else 0.0
+        total_discharged_display = yearly_rollup["total_discharged"].iloc[0] if not yearly_rollup.empty else 0.0
+        revenue_bess_display = yearly_rollup["Revenue BESS (€/MW)"].iloc[0] if not yearly_rollup.empty else 0.0
+        metrics_caption = f"Year {int(yearly_rollup['Year'].iloc[0])}" if not yearly_rollup.empty else ""
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total charged (MWh)", f"{total_charged_display:,.2f}")
+    c2.metric("Total discharged (MWh)", f"{total_discharged_display:,.2f}")
+    c3.metric("Revenue BESS (€/MW)", f"{revenue_bess_display:,.2f}")
+    if metrics_caption:
+        st.caption(metrics_caption)
 
     st.subheader("Monthly Revenue BESS (€/MW)")
     monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
@@ -1289,7 +1353,43 @@ if st.session_state.dispatch is not None:
         if period_df.empty:
             st.warning("No data found for the selected period.")
         else:
-            st.altair_chart(build_avg_24h_dispatch_chart(period_df), use_container_width=True)
+            avg_profile = period_df.groupby("Hour", as_index=False).agg(
+                charge_mwh=("charge_mwh", "mean"),
+                discharge_mwh=("discharge_mwh", "mean"),
+                omie_venta=("omie_venta", "mean"),
+                generacion=("generacion", "mean"),
+                hybrid_profile_mwh=("hybrid profile (MWh)", "mean"),
+            )
+            import matplotlib.pyplot as plt
+            fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
+            ax_flow = ax_price.twinx()
+            x = avg_profile["Hour"].astype(int).values
+            if mode_result == "BESS standalone":
+                ax_flow.bar(x - 0.18, avg_profile["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
+                ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
+            else:
+                ax_flow.bar(x - 0.18, avg_profile["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
+                ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
+                ax_price.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b", label="Solar generation")
+                ax_price.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22, label="Hybrid profile")
+            ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79", label="OMIE sell price")
+            ax_price.set_xlabel("Hour")
+            ax_price.set_ylabel("Price / Solar / Hybrid (€/MWh or MWh)")
+            ax_flow.set_ylabel("Charge / Discharge (MWh)")
+            ax_price.grid(axis="y", alpha=0.25)
+            ax_price.set_xticks(x)
+            lines1, labels1 = ax_price.get_legend_handles_labels()
+            lines2, labels2 = ax_flow.get_legend_handles_labels()
+            ax_price.legend(lines1 + lines2, labels1 + labels2, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+            fig.tight_layout()
+            cplot, cbox = st.columns([5, 1])
+            with cplot:
+                st.pyplot(fig, use_container_width=True)
+            if mode_result != "BESS standalone":
+                solar_cap, hybrid_cap = compute_period_capture_metrics(period_df)
+                with cbox:
+                    st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
+                    st.metric("Hybrid capture (€/MWh)", metric_value_or_blank(hybrid_cap))
 
     st.subheader("Selected day dispatch")
     available_days = sorted(pd.to_datetime(dispatch["Date"]).dt.date.unique().tolist())
@@ -1298,23 +1398,56 @@ if st.session_state.dispatch is not None:
     if day_df.empty:
         st.warning("No data found for the selected day.")
     else:
-        st.altair_chart(build_daily_dispatch_chart(day_df), use_container_width=True)
+        import matplotlib.pyplot as plt
+        day_df = day_df.sort_values("Hour").copy()
+        fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
+        ax_flow = ax_price.twinx()
+        x = day_df["Hour"].astype(int).values
+        ax_price.plot(x, day_df["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79", label="OMIE sell price")
+        ax_flow.bar(x - 0.18, day_df["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
+        ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
+        ax_price.set_xlabel("Hour")
+        ax_price.set_ylabel("OMIE sell price (€/MWh)")
+        ax_flow.set_ylabel("Charge / Discharge (MWh)")
+        ax_price.grid(axis="y", alpha=0.25)
+        ax_price.set_xticks(x)
+        lines1, labels1 = ax_price.get_legend_handles_labels()
+        lines2, labels2 = ax_flow.get_legend_handles_labels()
+        ax_price.legend(lines1 + lines2, labels1 + labels2, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
 
     st.subheader("Capacity by year")
     st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
     st.dataframe(capacity_table, use_container_width=True)
 
     st.subheader("Monthly captured prices")
-    captured_cols = [
+    base_cols = [
         "Year",
         "month",
-        "Captured Solar (€/MWh)",
-        "Captured Hybrid (€/MWh)",
         "Revenue BESS €/MW",
+        "Cycles/day avg",
         "Avg_Effective_Capacity_MWh",
         "Avg_SOH",
     ]
+    if mode_result == "BESS standalone":
+        captured_cols = base_cols
+    else:
+        captured_cols = [
+            "Year",
+            "month",
+            "Captured Solar (€/MWh)",
+            "Captured Hybrid (€/MWh)",
+            "Revenue BESS €/MW",
+            "Cycles/day avg",
+            "Avg_Effective_Capacity_MWh",
+            "Avg_SOH",
+        ]
     st.dataframe(monthly_summary[captured_cols], use_container_width=True)
+
+    st.subheader("Monthly Revenue BESS (€/MW) detail")
+    revenue_detail_cols = ["Year", "month", "Revenue BESS €/MW", "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)"]
+    st.dataframe(monthly_summary[monthly_summary["month"] != "TOTAL"][revenue_detail_cols], use_container_width=True)
 
     st.subheader("Daily stats")
     st.dataframe(stats, use_container_width=True)
@@ -1325,6 +1458,7 @@ if st.session_state.dispatch is not None:
         "Hour",
         "Year",
         "Revenue BESS (€)",
+        "Revenue BESS €/MW",
         "hybrid profile (MWh)",
         "charge_mwh",
         "discharge_mwh",
@@ -1344,24 +1478,23 @@ if st.session_state.dispatch is not None:
         "grid_purchase",
         "soc",
     ]
-    st.dataframe(dispatch[dispatch_cols].head(500), use_container_width=True)
+    st.dataframe(dispatch[dispatch_cols], use_container_width=True)
 
     st.subheader("Hourly dataset used")
-    st.dataframe(data_used.head(200), use_container_width=True)
+    st.dataframe(data_used, use_container_width=True)
 
     st.subheader("Variable definitions")
     st.dataframe(variable_definitions, use_container_width=True)
 
-    xlsx_bytes = make_results_excel(
-        dispatch=dispatch,
-        stats=stats,
-        data_used=data_used,
-        inputs_used=inputs_used,
-        variable_definitions=variable_definitions,
-        monthly_summary=monthly_summary,
-        capacity_table=capacity_table,
-    )
+    csv_bytes = dispatch[dispatch_cols].to_csv(index=False).encode("utf-8")
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "Download hourly optimisation CSV",
+        data=csv_bytes,
+        file_name=f"bess_optimisation_{run_ts}.csv",
+        mime="text/csv",
+    )
+
     st.download_button(
         "Download hourly optimisation XLSX",
         data=xlsx_bytes,
