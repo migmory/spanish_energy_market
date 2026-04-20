@@ -81,7 +81,7 @@ def draw_side_legend(items: list[tuple[str, str, str | None]]) -> None:
             symbol = '┅┅'
         elif style == 'area':
             symbol = '▉'
-        rows.append(f"<div style="display:flex; align-items:center; gap:8px; margin:4px 0;"><span style="color:{color}; font-weight:700; min-width:24px;">{symbol}</span><span>{label}</span></div>")
+        rows.append(f'<div style="display:flex; align-items:center; gap:8px; margin:4px 0;"><span style="color:{color}; font-weight:700; min-width:24px;">{symbol}</span><span>{label}</span></div>')
     st.markdown(''.join(rows), unsafe_allow_html=True)
 
 if "bess_admin_password" in st.secrets:
