@@ -35,6 +35,41 @@ st.markdown(
 
 st.title("BESS Optimisation")
 
+st.markdown(
+    """
+    <style>
+    .section-hero {
+        padding: 10px 14px;
+        border-radius: 10px;
+        margin: 10px 0 6px 0;
+        font-weight: 700;
+        font-size: 1.05rem;
+        color: white;
+        background: linear-gradient(90deg, #1f4e79 0%, #2f6da5 45%, #e9f2fb 100%);
+    }
+    .section-data {
+        padding: 7px 10px;
+        border-left: 4px solid #94a3b8;
+        background: #f8fafc;
+        border-radius: 6px;
+        margin: 16px 0 6px 0;
+        font-weight: 600;
+        color: #334155;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def hero_header(title: str) -> None:
+    st.markdown(f'<div class="section-hero">{title}</div>', unsafe_allow_html=True)
+
+def data_header(title: str) -> None:
+    st.markdown(f'<div class="section-data">{title}</div>', unsafe_allow_html=True)
+
+def metric_value_or_blank(x):
+    return "" if pd.isna(x) else f"{x:,.2f}"
+
 if "bess_admin_password" in st.secrets:
     pwd = st.text_input("Password", type="password")
     if pwd != st.secrets["bess_admin_password"]:
@@ -512,6 +547,7 @@ def build_dataset(
 
     elif mode == "BESS sin demanda":
         df["omie_compra"] = 1000.0
+        df["consumption"] = 0.0
 
     else:
         raise ValueError("Unknown mode selected.")
@@ -1036,6 +1072,7 @@ for key, default in {
     "mode_result": None,
     "eta_dis_result": None,
     "cycle_limit_label": None,
+    "xlsx_bytes": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1098,8 +1135,9 @@ with left:
     assume_degradation = st.radio("Assume degradation", ["No", "Yes"], horizontal=True, index=0)
     use_degradation = assume_degradation == "Yes"
 
-    eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=1.0, step=0.01)
-    eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.855, step=0.01)
+    eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.01)
+    eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.01)
+    st.caption(f"Round-trip-efficiency equivalent = {eta_ch:.2%} × {eta_dis:.2%} = {(eta_ch * eta_dis):.2%}")
 
     cycle_limit_option = st.radio(
         "Cycles/day setting",
@@ -1263,12 +1301,23 @@ if run_button:
         st.session_state.data_used = data_used
         st.session_state.monthly_summary = monthly_summary
         st.session_state.inputs_used = inputs_used
+        xlsx_bytes = make_results_excel(
+            dispatch=dispatch,
+            stats=stats,
+            data_used=data_used,
+            inputs_used=inputs_used,
+            variable_definitions=variable_definitions,
+            monthly_summary=monthly_summary,
+            capacity_table=capacity_table,
+        )
+
         st.session_state.variable_definitions = variable_definitions
         st.session_state.bess_mw_result = bess_mw
         st.session_state.capacity_table = capacity_table
         st.session_state.mode_result = mode
         st.session_state.eta_dis_result = eta_dis
         st.session_state.cycle_limit_label = cycle_limit_option
+        st.session_state.xlsx_bytes = xlsx_bytes
 
     except Exception as e:
         st.error(f"Optimization failed: {e}")
@@ -1287,6 +1336,7 @@ if st.session_state.dispatch is not None:
     capacity_table = st.session_state.capacity_table
     mode_result = st.session_state.mode_result
     eta_dis_result = st.session_state.eta_dis_result
+    xlsx_bytes = st.session_state.xlsx_bytes
     cycle_limit_label = st.session_state.cycle_limit_label
 
     yearly_rollup = stats.groupby("Year", as_index=False).agg(
@@ -1314,7 +1364,7 @@ if st.session_state.dispatch is not None:
     if metrics_caption:
         st.caption(metrics_caption)
 
-    st.subheader("Monthly Revenue BESS (€/MW)")
+    hero_header("Monthly Revenue BESS (€/MW)")
     monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
     monthly_chart_df["label"] = monthly_chart_df["month"]
     monthly_bar = alt.Chart(monthly_chart_df).mark_bar().encode(
@@ -1336,7 +1386,7 @@ if st.session_state.dispatch is not None:
         ).properties(height=280)
         st.altair_chart(yearly_bar, use_container_width=True)
 
-    st.subheader("Average 24h charge / discharge profile")
+    hero_header("Average 24h charge / discharge profile")
     min_date = pd.to_datetime(dispatch["Date"]).min().date()
     max_date = pd.to_datetime(dispatch["Date"]).max().date()
     p1, p2 = st.columns(2)
@@ -1374,8 +1424,8 @@ if st.session_state.dispatch is not None:
                 ax_price.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22, label="Hybrid profile")
             ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79", label="OMIE sell price")
             ax_price.set_xlabel("Hour")
-            ax_price.set_ylabel("Price / Solar / Hybrid (€/MWh or MWh)")
-            ax_flow.set_ylabel("Charge / Discharge (MWh)")
+            ax_price.set_ylabel("OMIE €/MWh")
+            ax_flow.set_ylabel("Charge / Discharge / Solar / Hybrid (MWh)")
             ax_price.grid(axis="y", alpha=0.25)
             ax_price.set_xticks(x)
             lines1, labels1 = ax_price.get_legend_handles_labels()
@@ -1391,7 +1441,7 @@ if st.session_state.dispatch is not None:
                     st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
                     st.metric("Hybrid capture (€/MWh)", metric_value_or_blank(hybrid_cap))
 
-    st.subheader("Selected day dispatch")
+    hero_header("Selected day dispatch")
     available_days = sorted(pd.to_datetime(dispatch["Date"]).dt.date.unique().tolist())
     selected_day = st.selectbox("Choose a day", options=available_days, index=0, format_func=lambda d: d.strftime("%Y-%m-%d"))
     day_df = dispatch[pd.to_datetime(dispatch["Date"]).dt.date == selected_day].copy()
@@ -1407,7 +1457,7 @@ if st.session_state.dispatch is not None:
         ax_flow.bar(x - 0.18, day_df["charge_mwh"], width=0.35, color="#2e8b57", alpha=0.85, label="Charge")
         ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85, label="Discharge")
         ax_price.set_xlabel("Hour")
-        ax_price.set_ylabel("OMIE sell price (€/MWh)")
+        ax_price.set_ylabel("OMIE €/MWh")
         ax_flow.set_ylabel("Charge / Discharge (MWh)")
         ax_price.grid(axis="y", alpha=0.25)
         ax_price.set_xticks(x)
@@ -1417,11 +1467,11 @@ if st.session_state.dispatch is not None:
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
 
-    st.subheader("Capacity by year")
+    hero_header("Capacity by year")
     st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
     st.dataframe(capacity_table, use_container_width=True)
 
-    st.subheader("Monthly captured prices")
+    hero_header("Monthly captured prices")
     base_cols = [
         "Year",
         "month",
@@ -1445,10 +1495,12 @@ if st.session_state.dispatch is not None:
         ]
     st.dataframe(monthly_summary[captured_cols], use_container_width=True)
 
-    st.subheader("Monthly Revenue BESS (€/MW) detail")
+    hero_header("Monthly Revenue BESS (€/MW) detail")
     revenue_detail_cols = ["Year", "month", "Revenue BESS €/MW", "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)"]
     st.dataframe(monthly_summary[monthly_summary["month"] != "TOTAL"][revenue_detail_cols], use_container_width=True)
 
+    data_header("Download / data tables")
+    st.caption("From this point downward, this section is mainly for validation, download and detailed data inspection.")
     st.subheader("Daily stats")
     st.dataframe(stats, use_container_width=True)
 
@@ -1495,9 +1547,10 @@ if st.session_state.dispatch is not None:
         mime="text/csv",
     )
 
-    st.download_button(
-        "Download hourly optimisation XLSX",
-        data=xlsx_bytes,
-        file_name=f"bess_optimisation_{run_ts}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if xlsx_bytes is not None:
+        st.download_button(
+            "Download hourly optimisation XLSX",
+            data=xlsx_bytes,
+            file_name=f"bess_optimisation_{run_ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
