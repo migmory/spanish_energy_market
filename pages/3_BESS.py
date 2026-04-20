@@ -39,22 +39,42 @@ st.markdown(
     """
     <style>
     .section-hero {
-        padding: 10px 14px;
-        border-radius: 10px;
-        margin: 10px 0 6px 0;
-        font-weight: 700;
-        font-size: 1.05rem;
+        padding: 12px 16px;
+        border-radius: 14px;
+        margin: 14px 0 10px 0;
+        font-weight: 800;
+        font-size: 1.06rem;
         color: white;
-        background: linear-gradient(90deg, #1f4e79 0%, #2f6da5 45%, #e9f2fb 100%);
+        box-shadow: 0 8px 24px rgba(31, 78, 121, 0.12);
+        border: 1px solid rgba(255,255,255,0.18);
+        background: linear-gradient(90deg, #1f4e79 0%, #2f6da5 46%, #6fa0cc 76%, #d7e5f2 100%);
     }
     .section-data {
-        padding: 7px 10px;
+        padding: 8px 12px;
         border-left: 4px solid #94a3b8;
-        background: #f8fafc;
-        border-radius: 6px;
-        margin: 16px 0 6px 0;
-        font-weight: 600;
+        background: linear-gradient(90deg, #f8fafc 0%, #ffffff 100%);
+        border-radius: 8px;
+        margin: 18px 0 8px 0;
+        font-weight: 650;
         color: #334155;
+    }
+    div[data-testid="stMetric"] {
+        background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+        border: 1px solid #dbe7f3;
+        border-radius: 14px;
+        padding: 10px 12px;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
+    }
+    div[data-testid="stMetricLabel"] {
+        font-weight: 700;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #163a63;
+    }
+    div[data-testid="stDataFrame"] {
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.03);
     }
     </style>
     """,
@@ -66,6 +86,50 @@ def hero_header(title: str) -> None:
 
 def data_header(title: str) -> None:
     st.markdown(f'<div class="section-data">{title}</div>', unsafe_allow_html=True)
+
+def bold_label(text: str) -> None:
+    st.markdown(f"**{text}**")
+
+def style_total_rows(df: pd.DataFrame):
+    def highlight(row):
+        is_total = False
+        for col in ["month", "Month", "Year", "year"]:
+            if col in row.index and str(row[col]).strip().upper() == "TOTAL":
+                is_total = True
+        base = []
+        for _ in row.index:
+            if is_total:
+                base.append("font-weight: 700; background-color: #eef4fb;")
+            else:
+                base.append("")
+        return base
+
+    return (
+        df.style
+        .apply(highlight, axis=1)
+        .set_table_styles(
+            [
+                {
+                    "selector": "thead th",
+                    "props": [
+                        ("background", "#eaf2fb"),
+                        ("color", "#1e3a5f"),
+                        ("font-weight", "700"),
+                        ("border-bottom", "1px solid #cbd5e1"),
+                        ("padding", "8px 10px"),
+                    ],
+                },
+                {
+                    "selector": "tbody tr:nth-child(even)",
+                    "props": [("background-color", "#fbfdff")],
+                },
+                {
+                    "selector": "tbody td",
+                    "props": [("border-color", "#e5e7eb"), ("padding", "7px 10px")],
+                },
+            ]
+        )
+    )
 
 def metric_value_or_blank(x):
     return "" if pd.isna(x) else f"{x:,.2f}"
@@ -1407,9 +1471,11 @@ if st.session_state.dispatch is not None:
     max_date = pd.to_datetime(dispatch["Date"]).max().date()
     p1, p2 = st.columns(2)
     with p1:
-        period_start = st.date_input("Average profile start", value=min_date, min_value=min_date, max_value=max_date, key="avg_profile_start")
+        bold_label("Average profile start")
+        period_start = st.date_input("Average profile start", value=min_date, min_value=min_date, max_value=max_date, key="avg_profile_start", label_visibility="collapsed")
     with p2:
-        period_end = st.date_input("Average profile end", value=max_date, min_value=min_date, max_value=max_date, key="avg_profile_end")
+        bold_label("Average profile end")
+        period_end = st.date_input("Average profile end", value=max_date, min_value=min_date, max_value=max_date, key="avg_profile_end", label_visibility="collapsed")
 
     if period_start > period_end:
         st.error("Start date cannot be after end date.")
@@ -1458,7 +1524,8 @@ if st.session_state.dispatch is not None:
 
     hero_header("Selected day dispatch")
     available_days = sorted(pd.to_datetime(dispatch["Date"]).dt.date.unique().tolist())
-    selected_day = st.selectbox("Choose a day", options=available_days, index=0, format_func=lambda d: d.strftime("%Y-%m-%d"))
+    bold_label("Choose a day")
+    selected_day = st.selectbox("Choose a day", options=available_days, index=0, format_func=lambda d: d.strftime("%Y-%m-%d"), label_visibility="collapsed")
     day_df = dispatch[pd.to_datetime(dispatch["Date"]).dt.date == selected_day].copy()
     if day_df.empty:
         st.warning("No data found for the selected day.")
@@ -1500,7 +1567,7 @@ if st.session_state.dispatch is not None:
 
     hero_header("Capacity by year")
     st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
-    st.dataframe(capacity_table, use_container_width=True)
+    st.dataframe(style_total_rows(capacity_table), use_container_width=True)
 
     hero_header("Monthly captured prices")
     base_cols = [
@@ -1524,16 +1591,16 @@ if st.session_state.dispatch is not None:
             "Avg_Effective_Capacity_MWh",
             "Avg_SOH",
         ]
-    st.dataframe(monthly_summary[captured_cols], use_container_width=True)
+    st.dataframe(style_total_rows(monthly_summary[captured_cols]), use_container_width=True)
 
     hero_header("Monthly Revenue BESS (€/MW) detail")
     revenue_detail_cols = ["Year", "month", "Revenue BESS €/MW", "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)"]
-    st.dataframe(monthly_summary[monthly_summary["month"] != "TOTAL"][revenue_detail_cols], use_container_width=True)
+    st.dataframe(style_total_rows(monthly_summary[revenue_detail_cols]), use_container_width=True)
 
     data_header("Download / data tables")
     st.caption("From this point downward, this section is mainly for validation, download and detailed data inspection.")
     st.subheader("Daily stats")
-    st.dataframe(stats, use_container_width=True)
+    st.dataframe(style_total_rows(stats), use_container_width=True)
 
     st.subheader("Hourly dispatch")
     dispatch_cols = [
@@ -1561,13 +1628,13 @@ if st.session_state.dispatch is not None:
         "grid_purchase",
         "soc",
     ]
-    st.dataframe(dispatch[dispatch_cols], use_container_width=True)
+    st.dataframe(style_total_rows(dispatch[dispatch_cols]), use_container_width=True)
 
     st.subheader("Hourly dataset used")
-    st.dataframe(data_used, use_container_width=True)
+    st.dataframe(style_total_rows(data_used), use_container_width=True)
 
     st.subheader("Variable definitions")
-    st.dataframe(variable_definitions, use_container_width=True)
+    st.dataframe(style_total_rows(variable_definitions), use_container_width=True)
 
     csv_bytes = dispatch[dispatch_cols].to_csv(index=False).encode("utf-8")
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
