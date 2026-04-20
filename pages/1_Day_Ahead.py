@@ -1177,7 +1177,8 @@ def build_negative_price_curves(price_hourly: pd.DataFrame, mode: str) -> pd.Dat
     for y in years:
         temp = monthly[monthly["year"] == y].set_index("month_num")
         cum = 0
-        for m in range(1, 13):
+        max_month_for_year = int(temp.index.max()) if len(temp.index) else 0
+        for m in range(1, max_month_for_year + 1):
             if m in temp.index:
                 cum += float(temp.loc[m, "count"])
             rows.append({"year": str(y), "month_num": m, "month_name": month_names[m - 1], "cum_count": cum})
@@ -1304,88 +1305,86 @@ def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, s
     if day_price.empty:
         return None
 
-    base = alt.Chart(day_price).encode(
+    price_base = alt.Chart(day_price).encode(
         x=alt.X(
             "datetime:T",
             axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelPadding=8),
         )
     )
 
-    price_line = base.mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
+    price_line = price_base.mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
         y=alt.Y("price:Q", title="Price €/MWh"),
-        tooltip=[alt.Tooltip("datetime:T", title="Time"), alt.Tooltip("price:Q", title="Price", format=".2f")],
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Time"),
+            alt.Tooltip("price:Q", title="Price", format=".2f"),
+        ],
     )
 
-    layers = [price_line]
+    left_layers = [price_line]
+
+    rule_rows = []
+    if metrics.get("captured_curtailed") is not None:
+        rule_rows.append(
+            {
+                "series": "Curtailed captured",
+                "value": metrics["captured_curtailed"],
+                "color": YELLOW_DARK,
+                "dash": [6, 4],
+            }
+        )
+    if metrics.get("captured_uncurtailed") is not None:
+        rule_rows.append(
+            {
+                "series": "Uncurtailed captured",
+                "value": metrics["captured_uncurtailed"],
+                "color": YELLOW_LIGHT,
+                "dash": [2, 2],
+            }
+        )
+
+    if rule_rows:
+        rules = pd.DataFrame(rule_rows)
+        left_layers.append(
+            alt.Chart(rules).mark_rule(strokeWidth=2).encode(
+                y=alt.Y("value:Q"),
+                color=alt.Color(
+                    "series:N",
+                    title=None,
+                    legend=alt.Legend(orient="top", direction="horizontal"),
+                    scale=alt.Scale(domain=rules["series"].tolist(), range=rules["color"].tolist()),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "series:N",
+                    legend=None,
+                    scale=alt.Scale(domain=rules["series"].tolist(), range=rules["dash"].tolist()),
+                ),
+                tooltip=[
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+                ],
+            )
+        )
+
+    left_chart = alt.layer(*left_layers)
 
     if not day_solar.empty:
-        solar_area = alt.Chart(day_solar).mark_area(opacity=0.35, color=YELLOW_LIGHT).encode(
+        solar_chart = alt.Chart(day_solar).mark_area(opacity=0.35, color=YELLOW_LIGHT).encode(
             x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelPadding=8)),
-            y=alt.Y("solar_best_mw:Q", title="Solar MW"),
+            y=alt.Y(
+                "solar_best_mw:Q",
+                title="Solar MW",
+                axis=alt.Axis(titlePadding=14, labelPadding=6),
+            ),
             tooltip=[
                 alt.Tooltip("datetime:T", title="Time"),
                 alt.Tooltip("solar_best_mw:Q", title="Solar", format=",.2f"),
                 alt.Tooltip("solar_source:N", title="Solar source"),
             ],
         )
-        layers.append(solar_area)
+        overlay = alt.layer(left_chart, solar_chart).resolve_scale(y="independent").properties(height=360)
+    else:
+        overlay = left_chart.properties(height=360)
 
-    rule_rows = []
-    if metrics.get("captured_curtailed") is not None:
-        rule_rows.append(
-            {
-                "label": f"Curtailed captured {metrics['captured_curtailed']:.2f}",
-                "value": metrics["captured_curtailed"],
-                "color": YELLOW_DARK,
-                "dash": [6, 4],
-                "dy": -6,
-            }
-        )
-    if metrics.get("captured_uncurtailed") is not None:
-        dy = 12 if (metrics.get("captured_curtailed") is not None and abs(metrics["captured_uncurtailed"] - metrics["captured_curtailed"]) < 6) else -6
-        rule_rows.append(
-            {
-                "label": f"Uncurtailed captured {metrics['captured_uncurtailed']:.2f}",
-                "value": metrics["captured_uncurtailed"],
-                "color": YELLOW_LIGHT,
-                "dash": [2, 2],
-                "dy": dy,
-            }
-        )
-
-    if rule_rows:
-        rules = pd.DataFrame(rule_rows)
-        rule_marks = alt.Chart(rules).mark_rule(strokeWidth=2).encode(
-            y=alt.Y("value:Q"),
-            color=alt.Color("label:N", legend=alt.Legend(title=None), scale=alt.Scale(domain=rules["label"].tolist(), range=rules["color"].tolist())),
-            strokeDash=alt.StrokeDash("label:N", legend=None, scale=alt.Scale(domain=rules["label"].tolist(), range=rules["dash"].tolist())),
-            tooltip=[alt.Tooltip("label:N", title="Line"), alt.Tooltip("value:Q", title="€/MWh", format=",.2f")],
-        )
-
-        labels = rules.copy()
-        labels["datetime"] = day_price["datetime"].max() - pd.Timedelta(minutes=20)
-        label_marks = alt.Chart(labels).mark_text(align="right", dx=-4, fontSize=11).encode(
-            x=alt.X("datetime:T"),
-            y=alt.Y("value:Q"),
-            text="label:N",
-            color=alt.Color("label:N", legend=None, scale=alt.Scale(domain=rules["label"].tolist(), range=rules["color"].tolist())),
-            detail="label:N",
-        ).transform_calculate(dummy="0")
-        # apply dy manually via separate layers
-        text_layers = []
-        for _, row in labels.iterrows():
-            text_layers.append(
-                alt.Chart(pd.DataFrame([row])).mark_text(align="right", dx=-4, dy=int(row["dy"]), fontSize=11).encode(
-                    x="datetime:T",
-                    y="value:Q",
-                    text="label:N",
-                    color=alt.value(row["color"]),
-                )
-            )
-        layers.append(rule_marks)
-        layers.extend(text_layers)
-
-    overlay = alt.layer(*layers).resolve_scale(y="independent").properties(height=360)
     return apply_common_chart_style(overlay, height=360)
 
 
@@ -1397,19 +1396,7 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, price_hourl
     colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626"]
     color_map = colors[: len(years)]
 
-    latest_year = int(price_hourly["datetime"].dt.year.max()) if not price_hourly.empty else None
-    latest_month = int(price_hourly[price_hourly["datetime"].dt.year == latest_year]["datetime"].dt.month.max()) if latest_year is not None else None
-
-    plot_df = negative_df.copy()
-    plot_df["segment"] = "solid"
-
-    if latest_year is not None and latest_month is not None:
-        plot_df.loc[
-            (plot_df["year"].astype(int) == latest_year) & (plot_df["month_num"] >= latest_month),
-            "segment"
-        ] = "dotted"
-
-    chart = alt.Chart(plot_df).mark_line(point=True, strokeWidth=3).encode(
+    chart = alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X(
             "month_num:O",
             sort=list(range(1, 13)),
@@ -1424,17 +1411,11 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, price_hourl
             title=("Cumulative # hours" if mode == "Zero and negative prices" else "Cumulative # negative hours")
         ),
         color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=color_map)),
-        strokeDash=alt.StrokeDash(
-            "segment:N",
-            title=None,
-            scale=alt.Scale(domain=["solid", "dotted"], range=[[1, 0], [4, 4]])
-        ),
         detail="year:N",
         tooltip=[
             alt.Tooltip("year:N", title="Year"),
             alt.Tooltip("month_name:N", title="Month"),
             alt.Tooltip("cum_count:Q", title="Cumulative count", format=",.0f"),
-            alt.Tooltip("segment:N", title="Style"),
         ],
     )
     return apply_common_chart_style(chart.properties(height=330), height=330)
@@ -1732,7 +1713,18 @@ try:
                 .rename(columns={"price": "Average price (€/MWh)"})
                 .sort_values("hour")
             )
-            st.dataframe(styled_df(hourly_profile), use_container_width=True)
+            hourly_profile["hour_label"] = hourly_profile["hour"].map(lambda x: f"{int(x):02d}:00")
+
+            profile_chart = alt.Chart(hourly_profile).mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
+                x=alt.X("hour_label:N", sort=hourly_profile["hour_label"].tolist(), axis=alt.Axis(title="Hour", labelAngle=0)),
+                y=alt.Y("Average price (€/MWh):Q", title="Average price (€/MWh)"),
+                tooltip=[
+                    alt.Tooltip("hour_label:N", title="Hour"),
+                    alt.Tooltip("Average price (€/MWh):Q", title="Average price", format=",.2f"),
+                ],
+            )
+            st.altair_chart(apply_common_chart_style(profile_chart.properties(height=320), height=320), use_container_width=True)
+            st.dataframe(styled_df(hourly_profile[["hour", "Average price (€/MWh)"]]), use_container_width=True)
 
     section_header("Negative prices")
     neg_mode = st.radio(
