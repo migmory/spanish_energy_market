@@ -578,8 +578,12 @@ def build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel=None
         hydro["technology"]="Hydro"
         keep=mixp[~mixp["technology"].isin(["Hydro UGH","Hydro non-UGH","Pumped hydro"])].copy()
         mixp=pd.concat([keep,hydro],ignore_index=True).groupby(["Period","sort_key","technology"],as_index=False)["energy_mwh"].sum()
-    demandp=demand.copy(); demandp["energy_mwh"]=demandp["demand_mw"]
-    demandp=demandp.groupby(["Period","sort_key"],as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh":"demand_mwh"})
+    if demand.empty:
+        demandp = pd.DataFrame(columns=["Period","sort_key","demand_mwh"])
+    else:
+        demandp=demand.copy()
+        demandp["energy_mwh"]=pd.to_numeric(demandp["demand_mw"], errors="coerce")
+        demandp=demandp.groupby(["Period","sort_key"],as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh":"demand_mwh"})
     return mixp, demandp
 
 def build_energy_mix_period_chart(mixp, demandp):
@@ -592,11 +596,16 @@ def build_energy_mix_period_chart(mixp, demandp):
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE, legend=alt.Legend(labelFontSize=14,titleFontSize=16))
     )]
     if not demandp.empty:
-        d=demandp.copy(); d["demand_gwh"]=d["demand_mwh"]/1000.0
-        layers.append(alt.Chart(d).mark_line(point=True,color="#111827",strokeWidth=2.5).encode(
-            x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None,labelAngle=0,labelFontSize=14,titleFontSize=16)),
-            y=alt.Y("demand_gwh:Q", title="Generation & demand (GWh)", axis=alt.Axis(labelFontSize=14,titleFontSize=16))
-        ))
+        try:
+            d=demandp.copy()
+            d["Period"] = d["Period"].astype(str)
+            d["demand_gwh"]=pd.to_numeric(d["demand_mwh"], errors="coerce")/1000.0
+            layers.append(alt.Chart(d).mark_line(point=True,color="#111827",strokeWidth=2.5).encode(
+                x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None,labelAngle=0,labelFontSize=14,titleFontSize=16)),
+                y=alt.Y("demand_gwh:Q", title="Generation & demand (GWh)", axis=alt.Axis(labelFontSize=14,titleFontSize=16))
+            ))
+        except Exception:
+            pass
     return apply_common_chart_style(alt.layer(*layers).properties(height=420),420)
 
 def build_day_energy_mix_table(mix_daily, selected_day):
@@ -666,7 +675,8 @@ def build_price_workbook(price_hourly, solar_hourly, demand_hourly, monthly_comb
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         price_hourly.to_excel(writer, index=False, sheet_name="prices_hourly_avg")
         solar_hourly.to_excel(writer, index=False, sheet_name="solar_hourly_best")
-        demand_hourly.to_excel(writer, index=False, sheet_name="demand_hourly")
+        if demand_hourly is not None and not demand_hourly.empty:
+            demand_hourly.to_excel(writer, index=False, sheet_name="demand_hourly")
         monthly_combo.to_excel(writer, index=False, sheet_name="monthly_capture")
         negative_price_df.to_excel(writer, index=False, sheet_name="negative_prices")
     output.seek(0)
@@ -725,7 +735,11 @@ try:
     with st.spinner("Refreshing 2026 solar forecast..."):
         solar_fc_hourly, sfc_fail = update_hourly_2026(pd.DataFrame(columns=["datetime","solar_forecast_mw"]), SOLAR_FORECAST_INDICATOR_ID, SOLAR_FC_2026_CACHE, "solar_forecast_mw", token)
     with st.spinner("Refreshing 2026 demand..."):
-        demand_hourly, demand_fail = update_hourly_2026(pd.DataFrame(columns=["datetime","demand_mw"]), DEMAND_INDICATOR_ID, DEMAND_2026_CACHE, "demand_mw", token)
+        try:
+            demand_hourly, demand_fail = update_hourly_2026(pd.DataFrame(columns=["datetime","demand_mw"]), DEMAND_INDICATOR_ID, DEMAND_2026_CACHE, "demand_mw", token)
+        except Exception:
+            demand_hourly = pd.DataFrame(columns=["datetime","demand_mw"])
+            demand_fail = 1
     with st.spinner("Refreshing 2026 energy mix..."):
         mix_daily, mix_fail = update_mix_daily_2026(mix_base)
     with st.spinner("Refreshing 2026 installed capacity..."):
