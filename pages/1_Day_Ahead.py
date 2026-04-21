@@ -476,7 +476,10 @@ def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
 
-    out = df.copy()
+    out = ensure_datetime_col(df.copy(), "datetime")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return out
     out["datetime_hour"] = out["datetime"].dt.floor("h")
 
     agg_dict = {"energy_mwh": "sum"}
@@ -1559,6 +1562,8 @@ def load_installed_base_from_data() -> pd.DataFrame:
 def refresh_2026_only_raw(indicator_id: int, source_name: str, csv_path: Path, token: str, days_back: int) -> pd.DataFrame:
     hist = load_raw_history(csv_path, source_name)
     if not hist.empty:
+        hist = ensure_datetime_col(hist, "datetime")
+        hist = hist.dropna(subset=["datetime"]).copy()
         hist = hist[hist["datetime"].dt.year >= 2026].copy()
     else:
         hist = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
@@ -1598,7 +1603,7 @@ def merge_mix_base_with_2026(base_mix_df: pd.DataFrame, tech_name: str, refreshe
     base_part = base_mix_df[base_mix_df["technology"] == tech_name].copy()
     ref_part = refreshed_2026_df.copy()
     combined = pd.concat([base_part, ref_part], ignore_index=True)
-    combined["datetime"] = pd.to_datetime(combined["datetime"], errors="coerce")
+    combined = ensure_datetime_col(combined, "datetime")
     combined = combined.dropna(subset=["datetime"]).sort_values("datetime")
     combined = combined.drop_duplicates(subset=["datetime", "technology", "data_source"], keep="last")
     return combined.reset_index(drop=True)
