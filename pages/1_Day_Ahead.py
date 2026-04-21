@@ -1199,13 +1199,14 @@ def build_negative_price_curves(price_hourly: pd.DataFrame, mode: str) -> pd.Dat
 def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
     years = sorted(monthly_combo["month"].dt.year.unique().tolist()) if not monthly_combo.empty else []
     if len(years) < 2:
-        return pd.DataFrame(columns=["x_start", "x_end", "year"]) 
-    shade_year = years[-2]
+        return pd.DataFrame(columns=["x_start", "x_end", "year"])
+    max_year = max(years)
+    shade_years = list(range(max_year - 1, min(years) - 1, -2))
     return pd.DataFrame(
         {
-            "x_start": [pd.Timestamp(shade_year, 1, 1)],
-            "x_end": [pd.Timestamp(shade_year + 1, 1, 1)],
-            "year": [str(shade_year)],
+            "x_start": [pd.Timestamp(y, 1, 1) for y in shade_years],
+            "x_end": [pd.Timestamp(y + 1, 1, 1) for y in shade_years],
+            "year": [str(y) for y in shade_years],
         }
     )
 
@@ -1570,6 +1571,16 @@ def merge_solar_best_with_2026(base_best: pd.DataFrame, p48_raw_2026: pd.DataFra
     return combined.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
 
 
+
+def merge_mix_base_with_2026(base_mix_df: pd.DataFrame, tech_name: str, refreshed_2026_df: pd.DataFrame) -> pd.DataFrame:
+    base_part = base_mix_df[base_mix_df["technology"] == tech_name].copy()
+    ref_part = refreshed_2026_df.copy()
+    combined = pd.concat([base_part, ref_part], ignore_index=True)
+    combined["datetime"] = pd.to_datetime(combined["datetime"], errors="coerce")
+    combined = combined.dropna(subset=["datetime"]).sort_values("datetime")
+    combined = combined.drop_duplicates(subset=["datetime", "technology", "data_source"], keep="last")
+    return combined.reset_index(drop=True)
+
 def refresh_2026_only_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: int | None, token: str) -> pd.DataFrame:
     official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
     forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
@@ -1896,32 +1907,24 @@ try:
     section_header("Energy mix")
 
     mix_energy = {}
+    mix_base_hourly = load_mix_base_hourly_from_data()
+
     with st.spinner("Loading energy mix data..."):
         for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
             forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
 
-            official_path = get_mix_indicator_csv_path_variant(tech_name, official_id, "official")
-            forecast_path = get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast")
+            # Base 2021-2025 from /data
+            base_tech = mix_base_hourly[mix_base_hourly["technology"] == tech_name].copy()
 
-            official_exists = official_id is not None and official_path.exists()
-            forecast_exists = forecast_id is not None and forecast_path.exists()
+            # Only refresh 2026 online
+            refreshed_2026 = refresh_2026_only_mix_best_energy(
+                tech_name=tech_name,
+                official_id=official_id,
+                forecast_id=forecast_id,
+                token=token,
+            )
 
-            should_build = refresh_energy_mix or (not official_exists and not forecast_exists)
-
-            if should_build:
-                mix_energy[tech_name] = refresh_mix_best_energy(
-                    tech_name=tech_name,
-                    official_id=official_id,
-                    forecast_id=forecast_id,
-                    start_day=start_day,
-                    token=token,
-                )
-            else:
-                mix_energy[tech_name] = load_mix_best_energy(
-                    tech_name=tech_name,
-                    official_id=official_id,
-                    forecast_id=forecast_id,
-                )
+            mix_energy[tech_name] = merge_mix_base_with_2026(base_tech if not base_tech.empty else mix_base_hourly, tech_name, refreshed_2026)
 
     if any(not df.empty for df in mix_energy.values()):
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
@@ -2029,11 +2032,24 @@ try:
             if re_chart is not None:
                 st.altair_chart(re_chart, use_container_width=True)
             if not re_share.empty:
-                st.dataframe(styled_df(re_share[["Period", "Renewable generation (MWh)", "Total generation (MWh)", "% RE"]], pct_cols=["% RE"]), use_container_width=True)
+                st.dataframe(
+                    styled_df(
+                        re_share[["Period", "Renewable generation (MWh)", "Total generation (MWh)", "% RE"]],
+                        pct_cols=["% RE"],
+                    ),
+                    use_container_width=True,
+                )
 
             section_header("Installed capacity")
             installed_hist = load_installed_base_from_data()
-            inst_period = build_installed_period(installed_hist, granularity, year_sel=year_sel, month_sel=month_sel, week_start=week_start, day_range=day_range)
+            inst_period = build_installed_period(
+                installed_hist,
+                granularity,
+                year_sel=year_sel,
+                month_sel=month_sel,
+                week_start=week_start,
+                day_range=day_range,
+            )
             inst_chart = build_installed_chart(inst_period)
             if inst_chart is not None:
                 st.altair_chart(inst_chart, use_container_width=True)
