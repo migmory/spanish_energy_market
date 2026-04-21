@@ -248,6 +248,14 @@ def normalize_to_madrid_naive(series: pd.Series) -> pd.Series:
     return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
 
 
+def ensure_datetime_series(series: pd.Series) -> pd.Series:
+    # Forces a datetimelike dtype even when the source column is object/mixed/empty
+    dt = pd.to_datetime(series, errors="coerce", utc=True)
+    dt = dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    return pd.Series(dt, index=series.index)
+
+
+
 
 # =========================================================
 # FILE HELPERS
@@ -271,7 +279,13 @@ def load_cache_csv(path: Path, schema: list[str]) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=schema)
     df = pd.read_csv(path)
-    return df if not df.empty else pd.DataFrame(columns=schema)
+    if df.empty:
+        return pd.DataFrame(columns=schema)
+    if "datetime" in df.columns:
+        df["datetime"] = ensure_datetime_series(df["datetime"])
+    if "date" in df.columns:
+        df["date"] = ensure_datetime_series(df["date"])
+    return df
 
 
 def save_cache_csv(df: pd.DataFrame, path: Path) -> None:
@@ -544,7 +558,7 @@ def latest_date_for_year(df: pd.DataFrame, dt_col: str, year: int) -> date | Non
     if df.empty or dt_col not in df.columns:
         return None
     tmp = df.copy()
-    tmp[dt_col] = pd.to_datetime(tmp[dt_col], errors="coerce")
+    tmp[dt_col] = ensure_datetime_series(tmp[dt_col])
     tmp = tmp.dropna(subset=[dt_col])
     tmp = tmp[tmp[dt_col].dt.year == year]
     if tmp.empty:
@@ -560,8 +574,9 @@ def update_hourly_series_2026(base_df: pd.DataFrame, indicator_id: int, cache_pa
         cache = cache.dropna(subset=["datetime", value_name])
 
     existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["datetime"] = normalize_to_madrid_naive(existing["datetime"])
-    existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
+    existing["datetime"] = ensure_datetime_series(existing["datetime"])
+    existing = existing.dropna(subset=["datetime"]).copy()
+    existing = existing.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -581,9 +596,13 @@ def update_hourly_series_2026(base_df: pd.DataFrame, indicator_id: int, cache_pa
 
     if rows:
         new_df = pd.concat(rows, ignore_index=True)
-        existing = pd.concat([existing, new_df], ignore_index=True).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
+        new_df["datetime"] = ensure_datetime_series(new_df["datetime"])
+        existing = pd.concat([existing, new_df], ignore_index=True)
+        existing["datetime"] = ensure_datetime_series(existing["datetime"])
+        existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
 
-    cache_out = existing[existing["datetime"].dt.year == 2026][["datetime", value_name]].copy()
+    existing["datetime"] = ensure_datetime_series(existing["datetime"])
+    cache_out = existing[existing["datetime"].notna() & (existing["datetime"].dt.year == 2026)][["datetime", value_name]].copy()
     save_cache_csv(cache_out, cache_path)
     existing = force_madrid_naive_df(existing, ["datetime"])
     return existing.reset_index(drop=True), failures
@@ -646,7 +665,8 @@ def update_mix_daily_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     if not new_df.empty:
         existing = pd.concat([existing, new_df], ignore_index=True).sort_values(["date", "technology"]).drop_duplicates(subset=["date", "technology"], keep="last")
 
-    cache_out = existing[existing["date"].dt.year == 2026].copy()
+    existing["date"] = ensure_datetime_series(existing["date"])
+    cache_out = existing[existing["date"].notna() & (existing["date"].dt.year == 2026)].copy()
     save_cache_csv(cache_out, MIX_2026_CSV)
     existing = force_madrid_naive_df(existing, ["date"])
     return existing.reset_index(drop=True), failures
@@ -706,7 +726,8 @@ def update_installed_capacity_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame,
     if not new_df.empty:
         existing = pd.concat([existing, new_df], ignore_index=True).sort_values(["datetime", "technology"]).drop_duplicates(subset=["datetime", "technology"], keep="last")
 
-    cache_out = existing[existing["datetime"].dt.year == 2026].copy()
+    existing["datetime"] = ensure_datetime_series(existing["datetime"])
+    cache_out = existing[existing["datetime"].notna() & (existing["datetime"].dt.year == 2026)].copy()
     save_cache_csv(cache_out, INSTALLED_2026_CSV)
     existing = force_madrid_naive_df(existing, ["datetime"])
     return existing.reset_index(drop=True), failures
@@ -1327,6 +1348,14 @@ try:
         installed_long, installed_failures = installed_base, 0
 
     # Apply start date filter
+    price_hourly["datetime"] = ensure_datetime_series(price_hourly["datetime"])
+    solar_p48_hourly["datetime"] = ensure_datetime_series(solar_p48_hourly["datetime"])
+    solar_forecast_hourly["datetime"] = ensure_datetime_series(solar_forecast_hourly["datetime"])
+    demand_hourly["datetime"] = ensure_datetime_series(demand_hourly["datetime"])
+    if not mix_daily.empty:
+        mix_daily["date"] = ensure_datetime_series(mix_daily["date"])
+    if not installed_long.empty:
+        installed_long["datetime"] = ensure_datetime_series(installed_long["datetime"])
     max_allowed_day = max_refresh_day()
     price_hourly = price_hourly[(price_hourly["datetime"].dt.date >= start_day) & (price_hourly["datetime"].dt.date <= max_allowed_day)].copy()
     solar_p48_hourly = solar_p48_hourly[(solar_p48_hourly["datetime"].dt.date >= start_day) & (solar_p48_hourly["datetime"].dt.date <= max_allowed_day)].copy()
