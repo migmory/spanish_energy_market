@@ -86,6 +86,14 @@ def subtle_subsection(title: str):
         <div style="margin-top:14px;margin-bottom:8px;padding:8px 0 4px 0;color:#1F2937;font-size:1.05rem;font-weight:700;border-bottom:1px solid #E5E7EB;">{title}</div>
     """, unsafe_allow_html=True)
 
+
+def decat(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if str(out[c].dtype) == "category":
+            out[c] = out[c].astype(str)
+    return out
+
 def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
     pct_cols = pct_cols or []
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols]
@@ -151,6 +159,7 @@ def force_str_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 def load_price_base() -> pd.DataFrame:
     df = pd.read_excel(PRICE_FILE)
+    df = decat(df)
     out = pd.DataFrame({
         "datetime": pd.to_datetime(df["datetime"], errors="coerce"),
         "price": pd.to_numeric(df["value"], errors="coerce"),
@@ -159,6 +168,7 @@ def load_price_base() -> pd.DataFrame:
 
 def load_p48_base() -> pd.DataFrame:
     df = pd.read_csv(P48_FILE)
+    df = decat(df)
     out = pd.DataFrame({
         "datetime": pd.to_datetime(df["datetime"], errors="coerce"),
         "solar_best_mw": pd.to_numeric(df["solar_best_mw"], errors="coerce"),
@@ -183,6 +193,7 @@ def _tech_map(x: str) -> str:
 
 def load_mix_base_daily() -> pd.DataFrame:
     raw = pd.read_excel(MIX_FILE, header=None)
+    raw = decat(raw)
     header = raw.iloc[4].tolist()
     body = raw.iloc[5:].copy().reset_index(drop=True)
     body.columns = header
@@ -201,6 +212,7 @@ def load_mix_base_daily() -> pd.DataFrame:
 
 def load_installed_base_monthly() -> pd.DataFrame:
     raw = pd.read_excel(INSTALLED_FILE, header=None)
+    raw = decat(raw)
     header = raw.iloc[4].tolist()
     body = raw.iloc[5:].copy().reset_index(drop=True)
     body.columns = header
@@ -220,6 +232,7 @@ def load_cache(path: Path, dt_col: str, value_cols: list[str]) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=[dt_col]+value_cols)
     df = pd.read_csv(path)
+    df = decat(df)
     if df.empty:
         return pd.DataFrame(columns=[dt_col]+value_cols)
     df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
@@ -252,6 +265,7 @@ def fetch_esios_day(indicator_id: int, day: date, token: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame(columns=["datetime", "value"])
     df = pd.DataFrame(values)
+    df = decat(df)
     if "geo_id" in df.columns and (df["geo_id"] == 8741).any():
         df = df[df["geo_id"] == 8741]
     elif "geo_id" in df.columns and (df["geo_id"] == 3).any():
@@ -267,7 +281,7 @@ def fetch_esios_day(indicator_id: int, day: date, token: str) -> pd.DataFrame:
 
 def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str):
     cache = load_cache(cache_path, "datetime", [value_name])
-    existing = pd.concat([base_df, cache], ignore_index=True)
+    existing = decat(pd.concat([base_df, cache], ignore_index=True))
     existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
     existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime", keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
@@ -304,7 +318,7 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
     if not cache.empty:
         cache["date"] = pd.to_datetime(cache["date"], errors="coerce")
         cache["renewable"] = cache["renewable"].astype(str).str.lower().isin(["true","1","yes","y"])
-    existing = pd.concat([base_df, cache], ignore_index=True)
+    existing = decat(pd.concat([base_df, cache], ignore_index=True))
     existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
     existing["energy_mwh"] = pd.to_numeric(existing["energy_mwh"], errors="coerce")
     existing = existing.dropna(subset=["date","technology","energy_mwh"]).copy()
@@ -329,14 +343,14 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
         except Exception:
             failures = 1
     if rows:
-        new = pd.DataFrame(rows).dropna(subset=["date","technology","energy_mwh"])
+        new = decat(pd.DataFrame(rows)).dropna(subset=["date","technology","energy_mwh"])
         existing = pd.concat([existing, new], ignore_index=True).sort_values(["date","technology"]).drop_duplicates(["date","technology"], keep="last")
     save_cache(existing[existing["date"].dt.year == 2026][["date","technology","energy_mwh","renewable"]], MIX_2026_CACHE)
     return existing.reset_index(drop=True), failures
 
 def update_installed_2026(base_df: pd.DataFrame):
     cache = load_cache(INSTALLED_2026_CACHE, "datetime", ["technology","mw"])
-    existing = pd.concat([base_df, cache], ignore_index=True)
+    existing = decat(pd.concat([base_df, cache], ignore_index=True))
     existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
     existing["mw"] = pd.to_numeric(existing["mw"], errors="coerce")
     existing = existing.dropna(subset=["datetime","technology","mw"]).copy()
@@ -361,7 +375,7 @@ def update_installed_2026(base_df: pd.DataFrame):
         except Exception:
             failures = 1
     if rows:
-        new = pd.DataFrame(rows).dropna(subset=["datetime","technology","mw"])
+        new = decat(pd.DataFrame(rows)).dropna(subset=["datetime","technology","mw"])
         new = new[~new["technology"].str.contains("total", case=False, na=False)]
         existing = pd.concat([existing, new], ignore_index=True).sort_values(["datetime","technology"]).drop_duplicates(["datetime","technology"], keep="last")
     save_cache(existing[existing["datetime"].dt.year == 2026][["datetime","technology","mw"]], INSTALLED_2026_CACHE)
@@ -378,7 +392,7 @@ def build_best_solar_hourly(p48: pd.DataFrame, fc: pd.DataFrame) -> pd.DataFrame
         out = p48.rename(columns={"solar_p48_mw":"solar_best_mw"}).copy()
         out["solar_source"] = "P48"
         return out
-    merged = p48.merge(fc, on="datetime", how="outer")
+    merged = decat(p48.merge(fc, on="datetime", how="outer"))
     merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
     merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
     merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
@@ -428,7 +442,7 @@ def build_monthly_capture_table(price_hourly, solar_hourly):
     return out
 
 def build_negative_price_curves(price_hourly, mode):
-    df = price_hourly.copy()
+    df = decat(price_hourly.copy())
     if df.empty:
         return pd.DataFrame(columns=["year","month_num","month_name","cum_count"])
     df["flag"] = (df["price"] < 0).astype(int) if mode == "Only negative prices" else (df["price"] <= 0).astype(int)
@@ -458,12 +472,12 @@ def build_monthly_shading_df(monthly_combo):
 def build_monthly_main_chart(monthly_combo):
     if monthly_combo.empty:
         return None
-    plot_df = monthly_combo.copy().rename(columns={
+    plot_df = decat(monthly_combo.copy()).rename(columns={
         "avg_monthly_price":"Average spot price",
         "captured_solar_price_curtailed":"Solar captured (curtailed)",
         "captured_solar_price_uncurtailed":"Solar captured (uncurtailed)",
     })
-    long_df = plot_df.melt(id_vars=["month"], value_vars=["Average spot price","Solar captured (curtailed)","Solar captured (uncurtailed)"], var_name="series", value_name="value").dropna(subset=["value"])
+    long_df = decat(plot_df.melt(id_vars=["month"], value_vars=["Average spot price","Solar captured (curtailed)","Solar captured (uncurtailed)"], var_name="series", value_name="value").dropna(subset=["value"]))
     long_df["year"]=long_df["month"].dt.year.astype(str)
     long_df["year_mid"]=pd.to_datetime(long_df["month"].dt.year.astype(str)+"-07-01")
     shading=build_monthly_shading_df(monthly_combo)
@@ -527,7 +541,7 @@ def build_negative_price_chart(df, mode):
     return apply_common_chart_style(chart.properties(height=330),330)
 
 def build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel=None, month_sel=None, day_range=None):
-    mix=mix_daily.copy(); demand=demand_hourly.copy()
+    mix=decat(mix_daily.copy()); demand=decat(demand_hourly.copy())
     if granularity=="Annual":
         mix["Period"]=mix["date"].dt.year.astype(str); mix["sort_key"]=mix["date"].dt.year
         demand["Period"]=demand["datetime"].dt.year.astype(str); demand["sort_key"]=demand["datetime"].dt.year
@@ -578,7 +592,7 @@ def build_energy_mix_period_chart(mixp, demandp):
     return apply_common_chart_style(alt.layer(*layers).properties(height=420),420)
 
 def build_day_energy_mix_table(mix_daily, selected_day):
-    tmp=mix_daily[mix_daily["date"].dt.date==selected_day].copy()
+    tmp=decat(mix_daily[mix_daily["date"].dt.date==selected_day].copy())
     if tmp.empty:
         return pd.DataFrame(columns=["Technology","Generation (MWh)"])
     tmp["technology"] = tmp["technology"].astype(str)
@@ -588,7 +602,7 @@ def build_day_energy_mix_table(mix_daily, selected_day):
 def build_renewable_share_period(mixp):
     if mixp.empty:
         return pd.DataFrame(columns=["Period","Renewable generation (MWh)","Total generation (MWh)","renewable_pct"])
-    tmp=mixp.copy(); tmp["is_renewable"]=tmp["technology"].isin(RENEWABLE_TECHS)
+    tmp=decat(mixp.copy()); tmp["is_renewable"]=tmp["technology"].isin(RENEWABLE_TECHS)
     g=tmp.groupby(["Period","sort_key"],as_index=False).agg(
         total_mwh=("energy_mwh","sum"),
         renewable_mwh=("energy_mwh", lambda s: s[tmp.loc[s.index,"is_renewable"]].sum())
@@ -608,7 +622,7 @@ def build_renewable_share_chart(df):
 def build_installed_capacity_period(installed, granularity, year_sel=None, month_sel=None, day_range=None):
     if installed.empty:
         return pd.DataFrame(columns=["Period","Technology","Installed GW","sort_key"])
-    tmp=installed.copy()
+    tmp=decat(installed.copy())
     if granularity=="Annual":
         tmp["Period"]=tmp["datetime"].dt.year.astype(str); tmp["sort_key"]=tmp["datetime"].dt.year
         tmp=tmp.sort_values("datetime").groupby(["Period","technology"],as_index=False).tail(1)
@@ -720,6 +734,7 @@ try:
     monthly_combo = build_monthly_capture_table(price_hourly, solar_hourly)
 
     section_header("Monthly spot and solar captured price - Spain")
+    monthly_combo = decat(monthly_combo)
     chart = build_monthly_main_chart(monthly_combo)
     if chart is not None:
         st.altair_chart(chart, use_container_width=True)
@@ -793,7 +808,7 @@ try:
 
     section_header("Negative prices")
     neg_mode = st.radio("Series to display", ["Zero and negative prices","Only negative prices"], index=0, horizontal=True)
-    neg_df = build_negative_price_curves(price_hourly, neg_mode)
+    neg_df = decat(build_negative_price_curves(price_hourly, neg_mode))
     neg_chart = build_negative_price_chart(neg_df, neg_mode)
     if neg_chart is not None:
         st.altair_chart(neg_chart, use_container_width=True)
@@ -822,6 +837,8 @@ try:
         st.caption(f"Showing daily periods from {ds} to {de}")
 
     mixp, demandp = build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel, month_sel, day_range)
+    mixp = decat(mixp)
+    demandp = decat(demandp)
     em_chart = build_energy_mix_period_chart(mixp, demandp)
     if em_chart is not None:
         st.altair_chart(em_chart, use_container_width=True)
@@ -834,7 +851,7 @@ try:
         st.info("No daily energy mix data for the selected day.")
 
     section_header("% RE over total generation")
-    re_df = build_renewable_share_period(mixp)
+    re_df = decat(build_renewable_share_period(mixp))
     re_chart = build_renewable_share_chart(re_df)
     if re_chart is not None:
         st.altair_chart(re_chart, use_container_width=True)
@@ -843,7 +860,7 @@ try:
         st.dataframe(styled_df(show_re, pct_cols=["% RE"]), use_container_width=True)
 
     section_header("Installed capacity")
-    inst_period = build_installed_capacity_period(installed_long, granularity, year_sel, month_sel, day_range)
+    inst_period = decat(build_installed_capacity_period(installed_long, granularity, year_sel, month_sel, day_range))
     inst_chart = build_installed_capacity_chart(inst_period)
     if inst_chart is not None:
         st.altair_chart(inst_chart, use_container_width=True)
