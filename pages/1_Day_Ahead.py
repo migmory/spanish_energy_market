@@ -157,6 +157,11 @@ def to_naive(series) -> pd.Series:
     s = pd.to_datetime(series, errors="coerce", utc=True)
     return s.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
 
+
+def normalize_any_datetime(series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+
 def daterange(start_date: date, end_date: date):
     d = start_date
     while d <= end_date:
@@ -172,7 +177,7 @@ def format_metric(value, suffix="", decimals=2):
 def load_price_base() -> pd.DataFrame:
     df = pd.read_excel(PRICE_FILE)
     out = pd.DataFrame({
-        "datetime": pd.to_datetime(df["datetime"], errors="coerce"),
+        "datetime": normalize_any_datetime(df["datetime"]),
         "price": pd.to_numeric(df["value"], errors="coerce"),
     }).dropna()
     return out.sort_values("datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
@@ -180,7 +185,7 @@ def load_price_base() -> pd.DataFrame:
 def load_p48_base() -> pd.DataFrame:
     df = pd.read_csv(P48_FILE)
     out = pd.DataFrame({
-        "datetime": pd.to_datetime(df["datetime"], errors="coerce"),
+        "datetime": normalize_any_datetime(df["datetime"]),
         "solar_best_mw": pd.to_numeric(df["solar_best_mw"], errors="coerce"),
     }).dropna()
     out["solar_source"] = "P48"
@@ -230,7 +235,7 @@ def load_installed_base_monthly() -> pd.DataFrame:
     body = body[body["technology"].notna()].copy()
     body["technology"] = body["technology"].astype(str).str.strip()
     long = body.melt(id_vars=["technology"], var_name="datetime", value_name="mw")
-    long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce")
+    long["datetime"] = normalize_any_datetime(long["datetime"])
     long["mw"] = pd.to_numeric(long["mw"], errors="coerce")
     long = long.dropna(subset=["datetime", "mw"]).copy()
     long = long[~long["technology"].str.contains("total", case=False, na=False)].copy()
@@ -244,7 +249,7 @@ def load_cache(path: Path, dt_col: str, extra_cols: list[str]) -> pd.DataFrame:
     df = pd.read_csv(path)
     if df.empty:
         return pd.DataFrame(columns=[dt_col] + extra_cols)
-    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+    df[dt_col] = normalize_any_datetime(df[dt_col])
     return df
 
 def save_cache(df: pd.DataFrame, path: Path):
@@ -253,7 +258,7 @@ def save_cache(df: pd.DataFrame, path: Path):
 def latest_date_for_year(df: pd.DataFrame, col: str, year: int) -> date | None:
     if df.empty:
         return None
-    s = pd.to_datetime(df[col], errors="coerce")
+    s = normalize_any_datetime(df[col])
     s = s[s.dt.year == year]
     return None if s.empty else s.max().date()
 
@@ -285,11 +290,11 @@ def fetch_esios_day(indicator_id: int, day: date, token: str) -> pd.DataFrame:
 def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str):
     cache = load_cache(cache_path, "datetime", [value_name])
     if not cache.empty:
-        cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
+        cache["datetime"] = normalize_any_datetime(cache["datetime"])
         cache[value_name] = pd.to_numeric(cache[value_name], errors="coerce")
         cache = cache.dropna(subset=["datetime", value_name])
     existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
+    existing["datetime"] = normalize_any_datetime(existing["datetime"])
     existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime", keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
@@ -323,12 +328,12 @@ def ree_installed_url(start_d: date, end_d: date) -> str:
 def update_mix_daily_2026(base_df: pd.DataFrame):
     cache = load_cache(MIX_2026_CACHE, "date", ["technology", "energy_mwh", "renewable"])
     if not cache.empty:
-        cache["date"] = pd.to_datetime(cache["date"], errors="coerce")
+        cache["date"] = normalize_any_datetime(cache["date"])
         cache["energy_mwh"] = pd.to_numeric(cache["energy_mwh"], errors="coerce")
         cache["renewable"] = cache["renewable"].astype(str).str.lower().isin(["true", "1", "yes", "y"])
         cache = cache.dropna(subset=["date", "technology", "energy_mwh"])
     existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
+    existing["date"] = normalize_any_datetime(existing["date"])
     existing["energy_mwh"] = pd.to_numeric(existing["energy_mwh"], errors="coerce")
     existing = existing.dropna(subset=["date", "technology", "energy_mwh"]).sort_values(["date", "technology"]).drop_duplicates(["date", "technology"], keep="last")
     start = latest_date_for_year(existing.rename(columns={"date": "datetime"}), "datetime", 2026)
@@ -347,7 +352,7 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
                 tech = tech_map(attrs.get("title"))
                 for v in attrs.get("values", []):
                     rows.append({
-                        "date": pd.to_datetime(v.get("datetime"), errors="coerce"),
+                        "date": normalize_any_datetime(pd.Series([v.get("datetime")])).iloc[0],
                         "technology": tech,
                         "energy_mwh": pd.to_numeric(v.get("value"), errors="coerce"),
                         "renewable": renewable,
@@ -363,11 +368,11 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
 def update_installed_2026(base_df: pd.DataFrame):
     cache = load_cache(INST_2026_CACHE, "datetime", ["technology", "mw"])
     if not cache.empty:
-        cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
+        cache["datetime"] = normalize_any_datetime(cache["datetime"])
         cache["mw"] = pd.to_numeric(cache["mw"], errors="coerce")
         cache = cache.dropna(subset=["datetime", "technology", "mw"])
     existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
+    existing["datetime"] = normalize_any_datetime(existing["datetime"])
     existing["mw"] = pd.to_numeric(existing["mw"], errors="coerce")
     existing = existing.dropna(subset=["datetime", "technology", "mw"]).sort_values(["datetime", "technology"]).drop_duplicates(["datetime", "technology"], keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
@@ -385,7 +390,7 @@ def update_installed_2026(base_df: pd.DataFrame):
                 tech = tech_map(attrs.get("title"))
                 for v in attrs.get("values", []):
                     rows.append({
-                        "datetime": pd.to_datetime(v.get("datetime"), errors="coerce"),
+                        "datetime": normalize_any_datetime(pd.Series([v.get("datetime")])).iloc[0],
                         "technology": tech,
                         "mw": pd.to_numeric(v.get("value"), errors="coerce"),
                     })
