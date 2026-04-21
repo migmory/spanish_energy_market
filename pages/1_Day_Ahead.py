@@ -140,6 +140,15 @@ def daterange(start_date: date, end_date: date):
         yield d
         d += timedelta(days=1)
 
+
+def force_str_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = out[c].astype(str)
+    return out
+
+
 def load_price_base() -> pd.DataFrame:
     df = pd.read_excel(PRICE_FILE)
     out = pd.DataFrame({
@@ -187,6 +196,7 @@ def load_mix_base_daily() -> pd.DataFrame:
     long = long[~long["technology"].str.contains("total", case=False, na=False)].copy()
     long["technology"] = long["technology"].map(_tech_map)
     long["renewable"] = long["technology"].isin(RENEWABLE_TECHS)
+    long = force_str_columns(long, ["technology"])
     return long.sort_values(["date","technology"]).reset_index(drop=True)
 
 def load_installed_base_monthly() -> pd.DataFrame:
@@ -203,6 +213,7 @@ def load_installed_base_monthly() -> pd.DataFrame:
     long = long.dropna(subset=["datetime", "mw"]).copy()
     long = long[~long["technology"].str.contains("total", case=False, na=False)].copy()
     long["technology"] = long["technology"].map(_tech_map)
+    long = force_str_columns(long, ["technology"])
     return long.sort_values(["datetime","technology"]).reset_index(drop=True)
 
 def load_cache(path: Path, dt_col: str, value_cols: list[str]) -> pd.DataFrame:
@@ -296,7 +307,9 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
     existing = pd.concat([base_df, cache], ignore_index=True)
     existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
     existing["energy_mwh"] = pd.to_numeric(existing["energy_mwh"], errors="coerce")
-    existing = existing.dropna(subset=["date","technology","energy_mwh"]).sort_values(["date","technology"]).drop_duplicates(["date","technology"], keep="last")
+    existing = existing.dropna(subset=["date","technology","energy_mwh"]).copy()
+    existing["technology"] = existing["technology"].astype(str)
+    existing = existing.sort_values(["date","technology"]).drop_duplicates(["date","technology"], keep="last")
     start = latest_date_for_year(existing.rename(columns={"date":"datetime"}), "datetime", 2026)
     start = date(2026,1,1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -326,7 +339,9 @@ def update_installed_2026(base_df: pd.DataFrame):
     existing = pd.concat([base_df, cache], ignore_index=True)
     existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
     existing["mw"] = pd.to_numeric(existing["mw"], errors="coerce")
-    existing = existing.dropna(subset=["datetime","technology","mw"]).sort_values(["datetime","technology"]).drop_duplicates(["datetime","technology"], keep="last")
+    existing = existing.dropna(subset=["datetime","technology","mw"]).copy()
+    existing["technology"] = existing["technology"].astype(str)
+    existing = existing.sort_values(["datetime","technology"]).drop_duplicates(["datetime","technology"], keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026,1,1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -502,6 +517,7 @@ def build_negative_price_chart(df, mode):
         return None
     years=sorted(df["year"].unique().tolist())
     colors=[BLUE_PRICE,CORP_GREEN,YELLOW_DARK,"#7C3AED","#DC2626"][:len(years)]
+    df = df.assign(year=df["year"].astype(str), month_name=df["month_name"].astype(str))
     chart = alt.Chart(df).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("month_num:O", sort=list(range(1,13)), axis=alt.Axis(title=None,labelAngle=0,labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
         y=alt.Y("cum_count:Q", title=("Cumulative # hours" if mode=="Zero and negative prices" else "Cumulative # negative hours")),
@@ -531,6 +547,9 @@ def build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel=None
         demand=demand[(demand["datetime"].dt.date>=d0)&(demand["datetime"].dt.date<=d1)].copy()
         mix["Period"]=mix["date"].dt.strftime("%a %d-%b"); mix["sort_key"]=mix["date"].dt.normalize()
         demand["Period"]=demand["datetime"].dt.strftime("%a %d-%b"); demand["sort_key"]=demand["datetime"].dt.normalize()
+    mix["Period"] = mix["Period"].astype(str)
+    mix["technology"] = mix["technology"].astype(str)
+    demand["Period"] = demand["Period"].astype(str)
     mixp=mix.groupby(["Period","sort_key","technology"], as_index=False)["energy_mwh"].sum()
     hydro=mixp[mixp["technology"].isin(["Hydro UGH","Hydro non-UGH","Pumped hydro","Hydro"])].groupby(["Period","sort_key"], as_index=False)["energy_mwh"].sum()
     if not hydro.empty:
@@ -544,7 +563,7 @@ def build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel=None
 def build_energy_mix_period_chart(mixp, demandp):
     if mixp.empty: return None
     mix=mixp.copy(); mix["energy_gwh"]=mix["energy_mwh"]/1000.0
-    order=mix[["Period","sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].tolist()
+    order=mix[["Period","sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].astype(str).tolist()
     layers=[alt.Chart(mix).mark_bar().encode(
         x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None,labelAngle=0,labelFontSize=14,titleFontSize=16)),
         y=alt.Y("energy_gwh:Q", title="Generation & demand (GWh)", axis=alt.Axis(labelFontSize=14,titleFontSize=16)),
@@ -562,6 +581,7 @@ def build_day_energy_mix_table(mix_daily, selected_day):
     tmp=mix_daily[mix_daily["date"].dt.date==selected_day].copy()
     if tmp.empty:
         return pd.DataFrame(columns=["Technology","Generation (MWh)"])
+    tmp["technology"] = tmp["technology"].astype(str)
     out=tmp.groupby("technology",as_index=False)["energy_mwh"].sum().rename(columns={"technology":"Technology","energy_mwh":"Generation (MWh)"})
     return out.sort_values("Technology").reset_index(drop=True)
 
@@ -573,6 +593,7 @@ def build_renewable_share_period(mixp):
         total_mwh=("energy_mwh","sum"),
         renewable_mwh=("energy_mwh", lambda s: s[tmp.loc[s.index,"is_renewable"]].sum())
     )
+    g["Period"] = g["Period"].astype(str)
     g["renewable_pct"]=g["renewable_mwh"]/g["total_mwh"]
     return g.rename(columns={"renewable_mwh":"Renewable generation (MWh)","total_mwh":"Total generation (MWh)"}).sort_values("sort_key").reset_index(drop=True)
 
@@ -609,7 +630,8 @@ def build_installed_capacity_period(installed, granularity, year_sel=None, month
 
 def build_installed_capacity_chart(df):
     if df.empty: return None
-    order=df[["Period","sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].tolist()
+    order=df[["Period","sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].astype(str).tolist()
+    df = df.assign(Period=df["Period"].astype(str), Technology=df["Technology"].astype(str))
     chart=alt.Chart(df).mark_bar().encode(
         x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None,labelAngle=0,labelFontSize=14,titleFontSize=16)),
         y=alt.Y("Installed GW:Q", title="Installed capacity (GW)", axis=alt.Axis(labelFontSize=14,titleFontSize=16)),
