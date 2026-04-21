@@ -1030,7 +1030,12 @@ def build_day_energy_mix_table(mix_energy_dict: dict[str, pd.DataFrame], selecte
         if df.empty:
             continue
 
-        tmp = df[df["datetime"].dt.date == selected_day].copy()
+        tmp = ensure_datetime_col(df.copy(), "datetime")
+        tmp = tmp.dropna(subset=["datetime"]).copy()
+        if tmp.empty:
+            continue
+
+        tmp = tmp[tmp["datetime"].dt.date == selected_day].copy()
         if tmp.empty:
             continue
 
@@ -1515,6 +1520,7 @@ def load_mix_base_hourly_from_data() -> pd.DataFrame:
     body = body[~body["technology"].str.contains("total", case=False, na=False)].copy()
     body = body[~body["technology"].str.contains("generación total", case=False, na=False)].copy()
     long = body.melt(id_vars=["technology"], var_name="datetime", value_name="energy_gwh")
+    long = ensure_datetime_col(long, "datetime")
     long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce")
     long["energy_gwh"] = pd.to_numeric(long["energy_gwh"], errors="coerce")
     long = long.dropna(subset=["datetime", "energy_gwh"]).copy()
@@ -1542,6 +1548,7 @@ def load_installed_base_from_data() -> pd.DataFrame:
     body = body[~body["technology"].str.contains("total", case=False, na=False)].copy()
     long = body.melt(id_vars=["technology"], var_name="datetime", value_name="mw")
     long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce", utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    long = ensure_datetime_col(long, "datetime")
     long["mw"] = pd.to_numeric(long["mw"], errors="coerce")
     long = long.dropna(subset=["datetime", "mw"]).copy()
     tmap = {"Hidráulica":"Hydro","Hidraulica":"Hydro","Nuclear":"Nuclear","Carbón":"Coal","Carbon":"Coal","Fuel + Gas":"Fuel + Gas","Ciclo combinado":"CCGT","Eólica":"Wind","Eolica":"Wind","Solar fotovoltaica":"Solar PV","Solar térmica":"Solar thermal","Solar termica":"Solar thermal","Cogeneración":"CHP","Cogeneracion":"CHP","Biomasa":"Biomass","Biogás":"Biogas","Biogas":"Biogas","Residuos renovables":"Other renewables","Otras renovables":"Other renewables","Residuos no renovables":"Non-renewable waste"}
@@ -1625,7 +1632,10 @@ def build_re_share_table(mix_period: pd.DataFrame) -> pd.DataFrame:
 def build_installed_period(installed_df: pd.DataFrame, granularity: str, year_sel=None, month_sel=None, week_start=None, day_range=None) -> pd.DataFrame:
     if installed_df.empty:
         return pd.DataFrame(columns=["Period", "Technology", "Installed GW", "sort_key"])
-    tmp = installed_df.copy()
+    tmp = ensure_datetime_col(installed_df.copy(), "datetime")
+    tmp = tmp.dropna(subset=["datetime"]).copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["Period", "Technology", "Installed GW", "sort_key"])
     if granularity == "Annual":
         tmp["Period"] = tmp["datetime"].dt.year.astype(str)
         tmp["sort_key"] = tmp["datetime"].dt.year
