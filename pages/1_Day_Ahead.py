@@ -243,6 +243,12 @@ def resolve_time_trunc(day: date) -> str:
     return "hour" if day < date(2025, 10, 1) else "quarter_hour"
 
 
+def normalize_to_madrid_naive(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series, errors="coerce", utc=True)
+    return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+
+
 # =========================================================
 # FILE HELPERS
 # =========================================================
@@ -287,7 +293,7 @@ def load_price_base() -> pd.DataFrame:
     if "datetime" in col_map:
         dt = pd.to_datetime(df[col_map["datetime"]], errors="coerce")
     elif "date" in col_map and "hour" in col_map:
-        dt = pd.to_datetime(df[col_map["date"]], errors="coerce") + pd.to_timedelta(
+        dt = pd.to_datetime(df[col_map["date"]], errors="coerce").dt.tz_localize(None) + pd.to_timedelta(
             pd.to_numeric(df[col_map["hour"]], errors="coerce") - 1, unit="h"
         )
     else:
@@ -326,7 +332,7 @@ def load_p48_base() -> pd.DataFrame:
         return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
 
     out = pd.DataFrame({
-        "datetime": pd.to_datetime(df[dt_col], errors="coerce"),
+        "datetime": normalize_to_madrid_naive(df[dt_col]),
         "solar_best_mw": pd.to_numeric(df[val_col], errors="coerce"),
     })
     out = out.dropna(subset=["datetime", "solar_best_mw"]).copy()
@@ -420,7 +426,7 @@ def load_installed_capacity_monthly_long() -> pd.DataFrame:
         val_col = next((col_map[c] for c in ["mw", "value_mw", "installed_mw", "value"] if c in col_map), None)
         if date_col and tech_col and val_col:
             out = pd.DataFrame({
-                "datetime": pd.to_datetime(df[date_col], errors="coerce"),
+                "datetime": normalize_to_madrid_naive(df[date_col]),
                 "technology": df[tech_col].astype(str).str.strip(),
                 "mw": pd.to_numeric(df[val_col], errors="coerce"),
             })
@@ -444,7 +450,7 @@ def load_installed_capacity_monthly_long() -> pd.DataFrame:
     body["technology"] = body["technology"].astype(str).str.strip()
 
     long = body.melt(id_vars=["technology"], var_name="datetime", value_name="mw")
-    long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce")
+    long["datetime"] = normalize_to_madrid_naive(long["datetime"])
     long["mw"] = pd.to_numeric(long["mw"], errors="coerce")
     long = long.dropna(subset=["datetime", "mw"]).copy()
     long = long[~long["technology"].str.contains("total", case=False, na=False)].copy()
@@ -534,11 +540,13 @@ def latest_date_for_year(df: pd.DataFrame, dt_col: str, year: int) -> date | Non
 def update_hourly_series_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str) -> tuple[pd.DataFrame, int]:
     cache = load_cache_csv(cache_path, ["datetime", value_name])
     if not cache.empty:
-        cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
+        cache["datetime"] = normalize_to_madrid_naive(cache["datetime"])
         cache[value_name] = pd.to_numeric(cache[value_name], errors="coerce")
         cache = cache.dropna(subset=["datetime", value_name])
 
-    existing = pd.concat([base_df, cache], ignore_index=True).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
+    existing = pd.concat([base_df, cache], ignore_index=True)
+    existing["datetime"] = normalize_to_madrid_naive(existing["datetime"])
+    existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -610,7 +618,7 @@ def update_mix_daily_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
                 renewable = str(attrs.get("type", "")).strip().lower() == "renovable"
                 for val in attrs.get("values", []):
                     rows.append({
-                        "date": pd.to_datetime(val.get("datetime"), errors="coerce").normalize(),
+                        "date": normalize_to_madrid_naive(pd.Series([val.get("datetime")])).iloc[0].normalize(),
                         "technology": tech,
                         "energy_mwh": pd.to_numeric(val.get("value"), errors="coerce"),
                         "renewable": renewable,
@@ -630,11 +638,13 @@ def update_mix_daily_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 def update_installed_capacity_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     cache = load_cache_csv(INSTALLED_2026_CSV, ["datetime", "technology", "mw"])
     if not cache.empty:
-        cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
+        cache["datetime"] = normalize_to_madrid_naive(cache["datetime"])
         cache["mw"] = pd.to_numeric(cache["mw"], errors="coerce")
         cache = cache.dropna(subset=["datetime", "technology", "mw"])
 
-    existing = pd.concat([base_df, cache], ignore_index=True).sort_values(["datetime", "technology"]).drop_duplicates(subset=["datetime", "technology"], keep="last")
+    existing = pd.concat([base_df, cache], ignore_index=True)
+    existing["datetime"] = normalize_to_madrid_naive(existing["datetime"])
+    existing = existing.dropna(subset=["datetime"]).sort_values(["datetime", "technology"]).drop_duplicates(subset=["datetime", "technology"], keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -667,7 +677,7 @@ def update_installed_capacity_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame,
                 tech = tech_map.get(attrs.get("title"), attrs.get("title"))
                 for val in attrs.get("values", []):
                     rows.append({
-                        "datetime": pd.to_datetime(val.get("datetime"), errors="coerce"),
+                        "datetime": normalize_to_madrid_naive(pd.Series([val.get("datetime")])).iloc[0],
                         "technology": tech,
                         "mw": pd.to_numeric(val.get("value"), errors="coerce"),
                     })
