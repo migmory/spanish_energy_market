@@ -275,6 +275,10 @@ def apply_common_chart_style(chart, height: int = 360):
     )
 
 
+
+def ensure_dt(series):
+    return pd.to_datetime(series, errors="coerce")
+
 def format_metric(value, suffix="", decimals=2):
     if value is None or pd.isna(value):
         return "-"
@@ -1908,6 +1912,8 @@ try:
 
     mix_energy = {}
     mix_base_hourly = load_mix_base_hourly_from_data()
+    if not mix_base_hourly.empty and "datetime" in mix_base_hourly.columns:
+        mix_base_hourly["datetime"] = ensure_dt(mix_base_hourly["datetime"])
 
     with st.spinner("Loading energy mix data..."):
         for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
@@ -2042,6 +2048,8 @@ try:
 
             section_header("Installed capacity")
             installed_hist = load_installed_base_from_data()
+            if not installed_hist.empty and "datetime" in installed_hist.columns:
+                installed_hist["datetime"] = ensure_dt(installed_hist["datetime"])
             inst_period = build_installed_period(
                 installed_hist,
                 granularity,
