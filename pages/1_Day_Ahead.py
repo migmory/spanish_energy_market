@@ -252,6 +252,14 @@ def normalize_to_madrid_naive(series: pd.Series) -> pd.Series:
 # =========================================================
 # FILE HELPERS
 # =========================================================
+
+def force_madrid_naive_df(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        if col in out.columns:
+            out[col] = normalize_to_madrid_naive(out[col])
+    return out
+
 def first_existing(paths: list[Path]) -> Path | None:
     for path in paths:
         if path.exists():
@@ -314,6 +322,7 @@ def load_price_base() -> pd.DataFrame:
     out = pd.DataFrame({"datetime": dt, "price": pd.to_numeric(df[price_col], errors="coerce")})
     out = out.dropna(subset=["datetime", "price"]).copy()
     out = out.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
+    out = force_madrid_naive_df(out, ["datetime"])
     return out.reset_index(drop=True)
 
 
@@ -337,6 +346,7 @@ def load_p48_base() -> pd.DataFrame:
     })
     out = out.dropna(subset=["datetime", "solar_best_mw"]).copy()
     out["solar_source"] = "P48"
+    out = force_madrid_naive_df(out, ["datetime"])
     return out.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
 
 
@@ -407,6 +417,7 @@ def load_mix_base_daily() -> pd.DataFrame:
     }
     long["technology"] = long["technology"].map(lambda x: tech_map.get(x, x))
     long["renewable"] = long["technology"].isin(RENEWABLE_TECHS)
+    long = force_madrid_naive_df(long, ["date"])
     return long.sort_values(["date", "technology"]).reset_index(drop=True)
 
 
@@ -432,6 +443,7 @@ def load_installed_capacity_monthly_long() -> pd.DataFrame:
             })
             out = out.dropna(subset=["datetime", "technology", "mw"]).copy()
             out = out[~out["technology"].str.contains("total", case=False, na=False)].copy()
+            out = force_madrid_naive_df(out, ["datetime"])
             return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
     except Exception:
         pass
@@ -471,6 +483,7 @@ def load_installed_capacity_monthly_long() -> pd.DataFrame:
         "Biogás": "Biogas", "Biogas": "Biogas",
     }
     long["technology"] = long["technology"].map(lambda x: tech_map.get(x, x))
+    long = force_madrid_naive_df(long, ["datetime"])
     return long.sort_values(["datetime", "technology"]).reset_index(drop=True)
 
 
@@ -511,6 +524,7 @@ def parse_esios_indicator(raw_json: dict, filter_date: date | None = None) -> pd
     df = df.dropna(subset=["datetime", "value"]).copy()
     if filter_date is not None:
         df = df[df["datetime"].dt.date == filter_date].copy()
+    df = force_madrid_naive_df(df, ["datetime"])
     return df[["datetime", "value"]].sort_values("datetime").reset_index(drop=True)
 
 
@@ -522,6 +536,7 @@ def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
     out = out.groupby("datetime_hour", as_index=False)["value"].mean().rename(
         columns={"datetime_hour": "datetime", "value": value_col_name}
     )
+    out = force_madrid_naive_df(out, ["datetime"])
     return out.sort_values("datetime").reset_index(drop=True)
 
 
@@ -570,6 +585,7 @@ def update_hourly_series_2026(base_df: pd.DataFrame, indicator_id: int, cache_pa
 
     cache_out = existing[existing["datetime"].dt.year == 2026][["datetime", value_name]].copy()
     save_cache_csv(cache_out, cache_path)
+    existing = force_madrid_naive_df(existing, ["datetime"])
     return existing.reset_index(drop=True), failures
 
 
@@ -632,6 +648,7 @@ def update_mix_daily_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
     cache_out = existing[existing["date"].dt.year == 2026].copy()
     save_cache_csv(cache_out, MIX_2026_CSV)
+    existing = force_madrid_naive_df(existing, ["date"])
     return existing.reset_index(drop=True), failures
 
 
@@ -691,6 +708,7 @@ def update_installed_capacity_2026(base_df: pd.DataFrame) -> tuple[pd.DataFrame,
 
     cache_out = existing[existing["datetime"].dt.year == 2026].copy()
     save_cache_csv(cache_out, INSTALLED_2026_CSV)
+    existing = force_madrid_naive_df(existing, ["datetime"])
     return existing.reset_index(drop=True), failures
 
 
@@ -1320,7 +1338,15 @@ try:
         st.error("No price data available.")
         st.stop()
 
+    price_hourly = force_madrid_naive_df(price_hourly, ["datetime"])
+    solar_p48_hourly = force_madrid_naive_df(solar_p48_hourly, ["datetime"])
+    solar_forecast_hourly = force_madrid_naive_df(solar_forecast_hourly, ["datetime"])
+    demand_hourly = force_madrid_naive_df(demand_hourly, ["datetime"])
+    mix_daily = force_madrid_naive_df(mix_daily, ["date"])
+    installed_long = force_madrid_naive_df(installed_long, ["datetime"])
+
     solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+    solar_hourly = force_madrid_naive_df(solar_hourly, ["datetime"])
     monthly_combo = build_monthly_capture_table(price_hourly, solar_hourly)
 
     # =====================================================
