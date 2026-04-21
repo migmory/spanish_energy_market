@@ -87,6 +87,14 @@ def subtle_subsection(title: str):
     """, unsafe_allow_html=True)
 
 
+def safe_sort(df: pd.DataFrame, by):
+    out = df.copy()
+    cols = [by] if isinstance(by, str) else list(by)
+    for c in cols:
+        if c in out.columns and str(out[c].dtype) == "category":
+            out[c] = out[c].astype(str)
+    return out.sort_values(by)
+
 def decat(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
@@ -164,7 +172,7 @@ def load_price_base() -> pd.DataFrame:
         "datetime": pd.to_datetime(df["datetime"], errors="coerce"),
         "price": pd.to_numeric(df["value"], errors="coerce"),
     }).dropna()
-    return out.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
+    return out.pipe(lambda _df: safe_sort(_df, "datetime")).drop_duplicates("datetime").reset_index(drop=True)
 
 def load_p48_base() -> pd.DataFrame:
     df = pd.read_csv(P48_FILE)
@@ -174,7 +182,7 @@ def load_p48_base() -> pd.DataFrame:
         "solar_best_mw": pd.to_numeric(df["solar_best_mw"], errors="coerce"),
     }).dropna()
     out["solar_source"] = "P48"
-    return out.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
+    return out.pipe(lambda _df: safe_sort(_df, "datetime")).drop_duplicates("datetime").reset_index(drop=True)
 
 def _tech_map(x: str) -> str:
     m = {
@@ -208,7 +216,7 @@ def load_mix_base_daily() -> pd.DataFrame:
     long["technology"] = long["technology"].map(_tech_map)
     long["renewable"] = long["technology"].isin(RENEWABLE_TECHS)
     long = force_str_columns(long, ["technology"])
-    return long.sort_values(["date","technology"]).reset_index(drop=True)
+    return long.pipe(lambda _df: safe_sort(_df, ["date","technology"])).reset_index(drop=True)
 
 def load_installed_base_monthly() -> pd.DataFrame:
     raw = pd.read_excel(INSTALLED_FILE, header=None)
@@ -226,7 +234,7 @@ def load_installed_base_monthly() -> pd.DataFrame:
     long = long[~long["technology"].str.contains("total", case=False, na=False)].copy()
     long["technology"] = long["technology"].map(_tech_map)
     long = force_str_columns(long, ["technology"])
-    return long.sort_values(["datetime","technology"]).reset_index(drop=True)
+    return long.pipe(lambda _df: safe_sort(_df, ["datetime","technology"])).reset_index(drop=True)
 
 def load_cache(path: Path, dt_col: str, value_cols: list[str]) -> pd.DataFrame:
     if not path.exists():
@@ -277,13 +285,13 @@ def fetch_esios_day(indicator_id: int, day: date, token: str) -> pd.DataFrame:
     }).dropna()
     out = out[out["datetime"].dt.date == day]
     out["datetime"] = out["datetime"].dt.floor("h")
-    return out.groupby("datetime", as_index=False)["value"].mean().sort_values("datetime")
+    return out.groupby("datetime", as_index=False)["value"].mean().pipe(lambda _df: safe_sort(_df, "datetime"))
 
 def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str):
     cache = load_cache(cache_path, "datetime", [value_name])
     existing = decat(pd.concat([base_df, cache], ignore_index=True))
     existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
-    existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime", keep="last")
+    existing = existing.dropna(subset=["datetime"]).pipe(lambda _df: safe_sort(_df, "datetime")).drop_duplicates("datetime", keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026,1,1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -299,7 +307,7 @@ def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Pat
                 failures += 1
     if rows:
         new = pd.concat(rows, ignore_index=True)
-        existing = pd.concat([existing, new], ignore_index=True).sort_values("datetime").drop_duplicates("datetime", keep="last")
+        existing = pd.concat([existing, new], ignore_index=True).pipe(lambda _df: safe_sort(_df, "datetime")).drop_duplicates("datetime", keep="last")
     save_cache(existing[existing["datetime"].dt.year == 2026][["datetime", value_name]], cache_path)
     return existing.reset_index(drop=True), failures
 
@@ -323,7 +331,7 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
     existing["energy_mwh"] = pd.to_numeric(existing["energy_mwh"], errors="coerce")
     existing = existing.dropna(subset=["date","technology","energy_mwh"]).copy()
     existing["technology"] = existing["technology"].astype(str)
-    existing = existing.sort_values(["date","technology"]).drop_duplicates(["date","technology"], keep="last")
+    existing = existing.pipe(lambda _df: safe_sort(_df, ["date","technology"])).drop_duplicates(["date","technology"], keep="last")
     start = latest_date_for_year(existing.rename(columns={"date":"datetime"}), "datetime", 2026)
     start = date(2026,1,1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -344,7 +352,7 @@ def update_mix_daily_2026(base_df: pd.DataFrame):
             failures = 1
     if rows:
         new = decat(pd.DataFrame(rows)).dropna(subset=["date","technology","energy_mwh"])
-        existing = pd.concat([existing, new], ignore_index=True).sort_values(["date","technology"]).drop_duplicates(["date","technology"], keep="last")
+        existing = pd.concat([existing, new], ignore_index=True).pipe(lambda _df: safe_sort(_df, ["date","technology"])).drop_duplicates(["date","technology"], keep="last")
     save_cache(existing[existing["date"].dt.year == 2026][["date","technology","energy_mwh","renewable"]], MIX_2026_CACHE)
     return existing.reset_index(drop=True), failures
 
@@ -355,7 +363,7 @@ def update_installed_2026(base_df: pd.DataFrame):
     existing["mw"] = pd.to_numeric(existing["mw"], errors="coerce")
     existing = existing.dropna(subset=["datetime","technology","mw"]).copy()
     existing["technology"] = existing["technology"].astype(str)
-    existing = existing.sort_values(["datetime","technology"]).drop_duplicates(["datetime","technology"], keep="last")
+    existing = existing.pipe(lambda _df: safe_sort(_df, ["datetime","technology"])).drop_duplicates(["datetime","technology"], keep="last")
     start = latest_date_for_year(existing, "datetime", 2026)
     start = date(2026,1,1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
@@ -377,7 +385,7 @@ def update_installed_2026(base_df: pd.DataFrame):
     if rows:
         new = decat(pd.DataFrame(rows)).dropna(subset=["datetime","technology","mw"])
         new = new[~new["technology"].str.contains("total", case=False, na=False)]
-        existing = pd.concat([existing, new], ignore_index=True).sort_values(["datetime","technology"]).drop_duplicates(["datetime","technology"], keep="last")
+        existing = pd.concat([existing, new], ignore_index=True).pipe(lambda _df: safe_sort(_df, ["datetime","technology"])).drop_duplicates(["datetime","technology"], keep="last")
     save_cache(existing[existing["datetime"].dt.year == 2026][["datetime","technology","mw"]], INSTALLED_2026_CACHE)
     return existing.reset_index(drop=True), failures
 
@@ -396,7 +404,7 @@ def build_best_solar_hourly(p48: pd.DataFrame, fc: pd.DataFrame) -> pd.DataFrame
     merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
     merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
     merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
-    return merged[["datetime","solar_best_mw","solar_source"]].sort_values("datetime").reset_index(drop=True)
+    return merged[["datetime","solar_best_mw","solar_source"]].pipe(lambda _df: safe_sort(_df, "datetime")).reset_index(drop=True)
 
 def compute_period_metrics(price_df, solar_df, start_d, end_d):
     p = price_df[(price_df["datetime"].dt.date >= start_d) & (price_df["datetime"].dt.date <= end_d)].copy()
@@ -492,7 +500,7 @@ def build_monthly_main_chart(monthly_combo):
         tooltip=[alt.Tooltip("month:T", title="Month"), alt.Tooltip("series:N", title="Series"), alt.Tooltip("value:Q", title="€/MWh", format=",.2f")]
     ))
     main = alt.layer(*layers).properties(height=330)
-    year_df = long_df[["year","year_mid"]].drop_duplicates().sort_values("year_mid")
+    year_df = long_df[["year","year_mid"]].drop_duplicates().pipe(lambda _df: safe_sort(_df, "year_mid"))
     year_layers=[]
     if not shading.empty:
         year_layers.append(alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(x="x_start:T", x2="x_end:T"))
@@ -577,7 +585,7 @@ def build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel=None
 def build_energy_mix_period_chart(mixp, demandp):
     if mixp.empty: return None
     mix=mixp.copy(); mix["energy_gwh"]=mix["energy_mwh"]/1000.0
-    order=mix[["Period","sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].astype(str).tolist()
+    order=mix[["Period","sort_key"]].drop_duplicates().pipe(lambda _df: safe_sort(_df, "sort_key"))["Period"].astype(str).tolist()
     layers=[alt.Chart(mix).mark_bar().encode(
         x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None,labelAngle=0,labelFontSize=14,titleFontSize=16)),
         y=alt.Y("energy_gwh:Q", title="Generation & demand (GWh)", axis=alt.Axis(labelFontSize=14,titleFontSize=16)),
@@ -597,7 +605,7 @@ def build_day_energy_mix_table(mix_daily, selected_day):
         return pd.DataFrame(columns=["Technology","Generation (MWh)"])
     tmp["technology"] = tmp["technology"].astype(str)
     out=tmp.groupby("technology",as_index=False)["energy_mwh"].sum().rename(columns={"technology":"Technology","energy_mwh":"Generation (MWh)"})
-    return out.sort_values("Technology").reset_index(drop=True)
+    return out.pipe(lambda _df: safe_sort(_df, "Technology")).reset_index(drop=True)
 
 def build_renewable_share_period(mixp):
     if mixp.empty:
@@ -609,7 +617,7 @@ def build_renewable_share_period(mixp):
     )
     g["Period"] = g["Period"].astype(str)
     g["renewable_pct"]=g["renewable_mwh"]/g["total_mwh"]
-    return g.rename(columns={"renewable_mwh":"Renewable generation (MWh)","total_mwh":"Total generation (MWh)"}).sort_values("sort_key").reset_index(drop=True)
+    return g.rename(columns={"renewable_mwh":"Renewable generation (MWh)","total_mwh":"Total generation (MWh)"}).pipe(lambda _df: safe_sort(_df, "sort_key")).reset_index(drop=True)
 
 def build_renewable_share_chart(df):
     if df.empty: return None
@@ -625,11 +633,11 @@ def build_installed_capacity_period(installed, granularity, year_sel=None, month
     tmp=decat(installed.copy())
     if granularity=="Annual":
         tmp["Period"]=tmp["datetime"].dt.year.astype(str); tmp["sort_key"]=tmp["datetime"].dt.year
-        tmp=tmp.sort_values("datetime").groupby(["Period","technology"],as_index=False).tail(1)
+        tmp=tmp.pipe(lambda _df: safe_sort(_df, "datetime")).groupby(["Period","technology"],as_index=False).tail(1)
     elif granularity=="Monthly":
         tmp=tmp[tmp["datetime"].dt.year==year_sel].copy()
         tmp["Period"]=tmp["datetime"].dt.strftime("%b - %Y"); tmp["sort_key"]=tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-        tmp=tmp.sort_values("datetime").groupby(["Period","technology"],as_index=False).tail(1)
+        tmp=tmp.pipe(lambda _df: safe_sort(_df, "datetime")).groupby(["Period","technology"],as_index=False).tail(1)
     else:
         if month_sel is not None:
             m=pd.Timestamp(month_sel)
@@ -638,13 +646,13 @@ def build_installed_capacity_period(installed, granularity, year_sel=None, month
             _, d1=day_range
             tmp=tmp[tmp["datetime"].dt.date<=d1].copy()
         tmp["Period"]=tmp["datetime"].dt.strftime("%b - %Y"); tmp["sort_key"]=tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-        tmp=tmp.sort_values("datetime").groupby(["Period","technology"],as_index=False).tail(1)
+        tmp=tmp.pipe(lambda _df: safe_sort(_df, "datetime")).groupby(["Period","technology"],as_index=False).tail(1)
     tmp["Installed GW"]=tmp["mw"]/1000.0
     return tmp.rename(columns={"technology":"Technology"})[["Period","Technology","Installed GW","sort_key"]].sort_values(["sort_key","Technology"]).reset_index(drop=True)
 
 def build_installed_capacity_chart(df):
     if df.empty: return None
-    order=df[["Period","sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].astype(str).tolist()
+    order=df[["Period","sort_key"]].drop_duplicates().pipe(lambda _df: safe_sort(_df, "sort_key"))["Period"].astype(str).tolist()
     df = df.assign(Period=df["Period"].astype(str), Technology=df["Technology"].astype(str))
     chart=alt.Chart(df).mark_bar().encode(
         x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None,labelAngle=0,labelFontSize=14,titleFontSize=16)),
