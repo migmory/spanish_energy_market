@@ -267,7 +267,7 @@ def load_installed_base_monthly() -> pd.DataFrame:
 
 
 # ---------- online 2026 ----------
-def fetch_esios_day(indicator_id: int, day: date, token: str) -> pd.DataFrame:
+def fetch_esios_day(indicator_id: int, day: date, token: str) -> dict:
     start_local = pd.Timestamp(day, tz="Europe/Madrid")
     end_local = start_local + pd.Timedelta(days=1)
     params = {
@@ -277,49 +277,102 @@ def fetch_esios_day(indicator_id: int, day: date, token: str) -> pd.DataFrame:
     }
     resp = requests.get(f"https://api.esios.ree.es/indicators/{indicator_id}", headers=build_headers(token), params=params, timeout=30)
     resp.raise_for_status()
-    values = resp.json().get("indicator", {}).get("values", [])
+    return resp.json()
+
+def parse_esios_indicator(raw_json: dict, source_name: str, filter_date: date | None = None) -> pd.DataFrame:
+    values = raw_json.get("indicator", {}).get("values", [])
     if not values:
-        return pd.DataFrame(columns=["datetime", "value"])
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
     df = pd.DataFrame(values)
-    # mimic old logic: demand/prices were effectively using national or peninsular if present
-    if "geo_id" in df.columns and (df["geo_id"] == PENINSULAR_GEO_ID).any():
-        df = df[df["geo_id"] == PENINSULAR_GEO_ID]
-    elif "geo_id" in df.columns and (df["geo_id"] == 3).any():
-        df = df[df["geo_id"] == 3]
+
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+
+    if (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
+    else:
+        geo_series = df["geo_name"].astype(str).str.strip().str.lower()
+        if (geo_series == "españa").any():
+            df = df[geo_series == "españa"].copy()
+        elif (geo_series == "espana").any():
+            df = df[geo_series == "espana"].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
     dt_col = "datetime_utc" if "datetime_utc" in df.columns else "datetime"
-    out = pd.DataFrame({"datetime": normalize_remote_datetime(df[dt_col]), "value": pd.to_numeric(df["value"], errors="coerce")}).dropna()
-    out = out[out["datetime"].dt.date == day]
-    out["datetime"] = out["datetime"].dt.floor("h")
-    return out.groupby("datetime", as_index=False)["value"].mean().sort_values("datetime")
+    df["datetime"] = normalize_remote_datetime(df[dt_col])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"]).copy()
+
+    if filter_date is not None:
+        df = df[df["datetime"].dt.date == filter_date].copy()
+
+    if df["datetime"].duplicated().any():
+        dup_mask = df["datetime"].duplicated(keep="first")
+        df.loc[dup_mask, "datetime"] = df.loc[dup_mask, "datetime"] + pd.Timedelta(minutes=1)
+
+    df["source"] = source_name
+    return df[["datetime", "value", "source", "geo_name", "geo_id"]].sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last").reset_index(drop=True)
+
+def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", value_col_name, "source", "geo_name", "geo_id"])
+    out = df.copy()
+    out["datetime_hour"] = out["datetime"].dt.floor("h")
+    out = (
+        out.groupby("datetime_hour", as_index=False)
+        .agg(
+            value=("value", "mean"),
+            source=("source", "first"),
+            geo_name=("geo_name", "first"),
+            geo_id=("geo_id", "first"),
+        )
+        .rename(columns={"datetime_hour": "datetime", "value": value_col_name})
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    return out
 
 
-def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str):
-    cache = load_cache(cache_path, "datetime", [value_name])
+def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str, source_name: str):
+    cache = load_cache(cache_path, "datetime", [value_name, "source", "geo_name", "geo_id"])
     if not cache.empty:
         cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
         cache[value_name] = pd.to_numeric(cache[value_name], errors="coerce")
         cache = cache.dropna(subset=["datetime", value_name])
-    existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
-    existing = existing.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime", keep="last")
-    start = latest_date_for_year(existing, "datetime", 2026)
+
+    existing_hourly = pd.concat([base_df, cache], ignore_index=True)
+    existing_hourly["datetime"] = pd.to_datetime(existing_hourly["datetime"], errors="coerce")
+    existing_hourly = existing_hourly.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime", keep="last")
+
+    # Build raw-like 2026 rows and only then aggregate to hourly, matching old page logic
+    start = latest_date_for_year(existing_hourly, "datetime", 2026)
     start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
     end = max_refresh_day()
     failures = 0
-    rows = []
+    raw_rows = []
     if start <= end:
         for d in daterange(start, end):
             try:
-                day_df = fetch_esios_day(indicator_id, d, token).rename(columns={"value": value_name})
-                if not day_df.empty:
-                    rows.append(day_df)
+                raw = fetch_esios_day(indicator_id, d, token)
+                daily = parse_esios_indicator(raw, source_name=source_name, filter_date=d)
+                if not daily.empty:
+                    raw_rows.append(daily)
             except Exception:
                 failures += 1
-    if rows:
-        new = pd.concat(rows, ignore_index=True)
-        existing = pd.concat([existing, new], ignore_index=True).sort_values("datetime").drop_duplicates("datetime", keep="last")
-    save_cache(existing[existing["datetime"].dt.year == 2026][["datetime", value_name]], cache_path)
-    return existing.reset_index(drop=True), failures
+
+    if raw_rows:
+        new_raw = pd.concat(raw_rows, ignore_index=True)
+        new_hourly = to_hourly_mean(new_raw, value_name)
+        existing_hourly = pd.concat([existing_hourly, new_hourly], ignore_index=True).sort_values("datetime").drop_duplicates("datetime", keep="last")
+
+    out_cols = ["datetime", value_name] + [c for c in ["source", "geo_name", "geo_id"] if c in existing_hourly.columns]
+    save_cache(existing_hourly[existing_hourly["datetime"].dt.year == 2026][out_cols], cache_path)
+    return existing_hourly.reset_index(drop=True), failures
 
 
 def ree_generation_url(start_d: date, end_d: date) -> str:
@@ -728,18 +781,18 @@ try:
     installed_base = load_installed_base_monthly()
 
     with st.spinner("Refreshing 2026 price..."):
-        price_hourly, price_fail = update_hourly_2026(price_base, PRICE_INDICATOR_ID, PRICE_2026_CACHE, "price", token)
+        price_hourly, price_fail = update_hourly_2026(price_base, PRICE_INDICATOR_ID, PRICE_2026_CACHE, "price", token, "esios_600")
 
     with st.spinner("Refreshing 2026 solar P48..."):
         p48_hist = solar_base[solar_base["solar_source"].astype(str).str.contains("P48", case=False, na=False)][["datetime", "solar_best_mw"]].rename(columns={"solar_best_mw": "solar_p48_mw"})
-        solar_p48_hourly, p48_fail = update_hourly_2026(p48_hist, SOLAR_P48_INDICATOR_ID, P48_2026_CACHE, "solar_p48_mw", token)
+        solar_p48_hourly, p48_fail = update_hourly_2026(p48_hist, SOLAR_P48_INDICATOR_ID, P48_2026_CACHE, "solar_p48_mw", token, "esios_84")
 
     with st.spinner("Refreshing 2026 solar forecast..."):
         fc_hist = solar_base[solar_base["solar_source"].astype(str).str.contains("Forecast", case=False, na=False)][["datetime", "solar_best_mw"]].rename(columns={"solar_best_mw": "solar_forecast_mw"})
-        solar_fc_hourly, sfc_fail = update_hourly_2026(fc_hist, SOLAR_FORECAST_INDICATOR_ID, SOLARFC_2026_CACHE, "solar_forecast_mw", token)
+        solar_fc_hourly, sfc_fail = update_hourly_2026(fc_hist, SOLAR_FORECAST_INDICATOR_ID, SOLARFC_2026_CACHE, "solar_forecast_mw", token, "esios_542")
 
     with st.spinner("Refreshing 2026 demand..."):
-        demand_hourly, demand_fail = update_hourly_2026(demand_base[["datetime", "demand_mw"]], DEMAND_INDICATOR_ID, DEMAND_2026_CACHE, "demand_mw", token)
+        demand_hourly, demand_fail = update_hourly_2026(demand_base[["datetime", "demand_mw"]], DEMAND_INDICATOR_ID, DEMAND_2026_CACHE, "demand_mw", token, "esios_10027")
         demand_hourly["energy_mwh"] = demand_hourly["demand_mw"]
 
     with st.spinner("Refreshing 2026 energy mix..."):
