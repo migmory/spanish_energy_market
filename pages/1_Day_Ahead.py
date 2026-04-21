@@ -279,6 +279,13 @@ def apply_common_chart_style(chart, height: int = 360):
 def ensure_dt(series):
     return pd.to_datetime(series, errors="coerce")
 
+
+def ensure_datetime_col(df: pd.DataFrame, col: str = "datetime") -> pd.DataFrame:
+    out = df.copy()
+    if col in out.columns:
+        out[col] = pd.to_datetime(out[col], errors="coerce")
+    return out
+
 def format_metric(value, suffix="", decimals=2):
     if value is None or pd.isna(value):
         return "-"
@@ -829,7 +836,10 @@ def build_energy_mix_period(
         if df.empty:
             continue
 
-        tmp = df.copy()
+        tmp = ensure_datetime_col(df.copy(), "datetime")
+        tmp = tmp.dropna(subset=["datetime"]).copy()
+        if tmp.empty:
+            continue
 
         if granularity == "Annual":
             tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
@@ -881,7 +891,8 @@ def build_energy_mix_period(
 
     demand_period = pd.DataFrame(columns=["period_label", "sort_key", "demand_mwh"])
     if not demand_energy.empty:
-        tmp = demand_energy.copy()
+        tmp = ensure_datetime_col(demand_energy.copy(), "datetime")
+        tmp = tmp.dropna(subset=["datetime"]).copy()
 
         if granularity == "Annual":
             tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
