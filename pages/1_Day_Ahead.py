@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 # ENV / CONFIG
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data"
+DATA_PATH = DATA_DIR
+DATA_DIR.mkdir(exist_ok=True)
+HISTORICAL_DATA_DIR = BASE_DIR / "historical_data"
+HISTORICAL_DATA_DIR.mkdir(exist_ok=True)
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
