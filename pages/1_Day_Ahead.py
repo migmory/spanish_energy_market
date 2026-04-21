@@ -1,17 +1,18 @@
-from __future__ import annotations
-
 import os
 from datetime import date, datetime, time, timedelta
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import altair as alt
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+# =========================================================
+# ENV / CONFIG
+# =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
@@ -21,66 +22,142 @@ st.set_page_config(page_title="Day Ahead", layout="wide")
 st.markdown(
     """
     <style>
-    html, body, [class*="css"] { font-size: 101% !important; }
+    html, body, [class*="css"] {
+        font-size: 101% !important;
+    }
+
     .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
     .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
         font-size: 101% !important;
     }
-    h1 { font-size: 2.0rem !important; }
-    h2, h3 { font-size: 1.35rem !important; }
-    div[data-testid="stMetricValue"] { font-weight: 700; }
+
+    h1 {
+        font-size: 2.0rem !important;
+    }
+
+    h2, h3 {
+        font-size: 1.35rem !important;
+    }
+
+    div[data-testid="stMetricValue"] {
+        font-weight: 700;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+st.title("Day Ahead - Spain Spot Prices")
 
-HIST_BOOK = DATA_DIR / "hourly_avg_price_since2021.xlsx"
-MIX_FILE = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
-INSTALLED_FILE = DATA_DIR / "installed_capacity_monthly.xlsx"
+CACHE_DIR = BASE_DIR / "historical_data"
+CACHE_DIR.mkdir(exist_ok=True)
+DATA_BASE_DIR = BASE_DIR / "data"
+DATA_BASE_DIR.mkdir(exist_ok=True)
 
-PRICE_2026_CACHE = DATA_DIR / "_price_2026_cache.csv"
-P48_2026_CACHE = DATA_DIR / "_p48_2026_cache.csv"
-SOLARFC_2026_CACHE = DATA_DIR / "_solarfc_2026_cache.csv"
-DEMAND_2026_CACHE = DATA_DIR / "_demand_2026_cache.csv"
-MIX_2026_CACHE = DATA_DIR / "_mix_2026_cache.csv"
-INST_2026_CACHE = DATA_DIR / "_installed_2026_cache.csv"
+PRICE_RAW_CSV_PATH = CACHE_DIR / "day_ahead_spain_spot_600_raw.csv"
+SOLAR_P48_RAW_CSV_PATH = CACHE_DIR / "solar_p48_spain_84_raw.csv"
+SOLAR_FORECAST_RAW_CSV_PATH = CACHE_DIR / "solar_forecast_spain_542_raw.csv"
+DEMAND_RAW_CSV_PATH = CACHE_DIR / "demand_p48_total_10027_raw.csv"
+
+HIST_BOOK_PATH = DATA_BASE_DIR / "hourly_avg_price_since2021.xlsx"
+MIX_BASE_PATH = DATA_BASE_DIR / "generation_mix_daily_2021_2025.xlsx"
+INSTALLED_BASE_PATH = DATA_BASE_DIR / "installed_capacity_monthly.xlsx"
 
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
 SOLAR_FORECAST_INDICATOR_ID = 542
 DEMAND_INDICATOR_ID = 10027
-PENINSULAR_GEO_ID = 8741
+
+REFRESH_DAYS_PRICES = 7
+REFRESH_DAYS_ENERGY_MIX = 3
+
+ENERGY_MIX_INDICATORS_OFFICIAL = {
+    "Nuclear": 74,
+    "CCGT": 79,
+    "Wind": 10010,
+    "Solar PV": 84,
+    "Solar thermal": 85,
+    "Hydro UGH": 71,
+    "Hydro non-UGH": 72,
+    "Pumped hydro": 73,
+    "CHP": 10011,
+    "Biomass": 91,
+    "Biogas": 92,
+    "Other renewables": 10013,
+}
+
+ENERGY_MIX_INDICATORS_FORECAST = {
+    "Nuclear": None,
+    "CCGT": None,
+    "Wind": None,
+    "Solar PV": 542,
+    "Solar thermal": 543,
+    "Hydro UGH": None,
+    "Hydro non-UGH": None,
+    "Pumped hydro": None,
+    "CHP": None,
+    "Biomass": None,
+    "Biogas": None,
+    "Other renewables": None,
+}
+
+TECH_COLOR_SCALE = alt.Scale(
+    domain=[
+        "CCGT",
+        "Hydro",
+        "Nuclear",
+        "Solar PV",
+        "Solar thermal",
+        "Wind",
+        "CHP",
+        "Biomass",
+        "Biogas",
+        "Other renewables",
+    ],
+    range=[
+        "#9CA3AF",
+        "#60A5FA",
+        "#C084FC",
+        "#FACC15",
+        "#FCA5A5",
+        "#2563EB",
+        "#F97316",
+        "#16A34A",
+        "#22C55E",
+        "#14B8A6",
+    ],
+)
+
+DEFAULT_START_DATE = date(2021, 1, 1)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
+TABLE_HEADER_FONT_PCT = "145%"
+TABLE_BODY_FONT_PCT = "112%"
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
+CORP_GREEN_LIGHT = "#D1FAE5"
 GREY_SHADE = "#F3F4F6"
 YELLOW_DARK = "#D97706"
 YELLOW_LIGHT = "#FBBF24"
 BLUE_PRICE = "#1D4ED8"
-
-TECH_COLORS = {
-    "CCGT": "#9CA3AF", "Hydro": "#60A5FA", "Nuclear": "#C084FC", "Solar PV": "#FACC15",
-    "Solar thermal": "#FCA5A5", "Wind": "#2563EB", "CHP": "#F97316", "Biomass": "#16A34A",
-    "Biogas": "#22C55E", "Other renewables": "#14B8A6", "Coal": "#6B7280",
-    "Fuel + Gas": "#A16207", "Renewable waste": "#34D399", "Non-renewable waste": "#64748B",
-    "Steam turbine": "#FF2D2D",
-}
-RENEWABLE_TECHS = {"Hydro", "Wind", "Solar PV", "Solar thermal", "Biomass", "Biogas", "Other renewables", "Renewable waste"}
-TABLE_HEADER_FONT_PCT = "145%"
-TABLE_BODY_FONT_PCT = "112%"
+TEAL_ACCENT = "#0F766E"
 
 
+# =========================================================
+# DISPLAY HELPERS
+# =========================================================
 def section_header(title: str):
     st.markdown(
         f"""
         <div style="
             background: linear-gradient(90deg, {CORP_GREEN_DARK} 0%, {CORP_GREEN} 55%, #C7F0DD 100%);
-            color: white; padding: 12px 18px; border-radius: 12px; font-weight: 800;
-            font-size: 1.25rem; margin-top: 14px; margin-bottom: 14px;
+            color: white;
+            padding: 12px 18px;
+            border-radius: 12px;
+            font-weight: 800;
+            font-size: 1.25rem;
+            margin-top: 14px;
+            margin-bottom: 14px;
             box-shadow: 0 2px 8px rgba(15,118,110,0.14);
         ">{title}</div>
         """,
@@ -92,8 +169,13 @@ def subtle_subsection(title: str):
     st.markdown(
         f"""
         <div style="
-            margin-top: 14px; margin-bottom: 8px; padding: 8px 0 4px 0; color: #1F2937;
-            font-size: 1.05rem; font-weight: 700; border-bottom: 1px solid #E5E7EB;
+            margin-top: 14px;
+            margin-bottom: 8px;
+            padding: 8px 0 4px 0;
+            color: #1F2937;
+            font-size: 1.05rem;
+            font-weight: 700;
+            border-bottom: 1px solid #E5E7EB;
         ">{title}</div>
         """,
         unsafe_allow_html=True,
@@ -102,14 +184,89 @@ def subtle_subsection(title: str):
 
 def styled_df(df: pd.DataFrame, pct_cols: list[str] | None = None):
     pct_cols = pct_cols or []
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols]
+    numeric_cols = [
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and c not in pct_cols
+    ]
+
     fmt = {c: "{:,.2f}" for c in numeric_cols}
     fmt.update({c: "{:.2%}" for c in pct_cols})
-    return df.style.format(fmt).set_table_styles(
-        [
-            {"selector": "th", "props": [("background-color", "#4B5563"), ("color", "white"), ("font-weight", "bold"), ("font-size", TABLE_HEADER_FONT_PCT), ("text-align", "center"), ("padding", "10px 8px")]},
-            {"selector": "td", "props": [("font-size", TABLE_BODY_FONT_PCT), ("padding", "6px 8px")]},
-        ]
+
+    styles = [
+        {
+            "selector": "th",
+            "props": [
+                ("background-color", "#4B5563"),
+                ("color", "white"),
+                ("font-weight", "bold"),
+                ("font-size", TABLE_HEADER_FONT_PCT),
+                ("text-align", "center"),
+                ("padding", "10px 8px"),
+            ],
+        },
+        {
+            "selector": "td",
+            "props": [
+                ("font-size", TABLE_BODY_FONT_PCT),
+                ("padding", "6px 8px"),
+            ],
+        },
+    ]
+
+    total_rows = pd.DataFrame()
+    if not df.empty:
+        first_col = df.columns[0]
+        total_rows = df[df[first_col].astype(str).str.upper().eq("TOTAL")].copy()
+    if not total_rows.empty:
+        styles.append(
+            {
+                "selector": ".total-row",
+                "props": [("font-weight", "bold"), ("background-color", "#F8FAFC")],
+            }
+        )
+
+    styler = df.style.format(fmt).set_table_styles(styles)
+    if not total_rows.empty:
+        total_idx = total_rows.index.tolist()
+        styler = styler.set_td_classes(pd.DataFrame("", index=df.index, columns=df.columns))
+        def _row_style(row):
+            return ["font-weight: bold; background-color: #F8FAFC" if row.name in total_idx else "" for _ in row]
+        styler = styler.apply(_row_style, axis=1)
+
+    return styler
+
+
+def apply_common_chart_style(chart, height: int = 360):
+    # Concat charts do not accept a top-level height parameter.
+    chart_dict = chart.to_dict()
+    if "vconcat" in chart_dict or "hconcat" in chart_dict or "concat" in chart_dict:
+        styled = chart
+    else:
+        styled = chart.properties(height=height)
+
+    return (
+        styled
+        .configure_view(
+            stroke="#E5E7EB",
+            fill="white",
+        )
+        .configure_axis(
+            grid=True,
+            gridColor="#E5E7EB",
+            domainColor="#CBD5E1",
+            tickColor="#CBD5E1",
+            labelColor="#111827",
+            titleColor="#111827",
+            labelFontSize=12,
+            titleFontSize=14,
+        )
+        .configure_legend(
+            orient="top",
+            direction="horizontal",
+            labelFontSize=12,
+            titleFontSize=13,
+            symbolStrokeWidth=3,
+        )
     )
 
 
@@ -119,6 +276,9 @@ def format_metric(value, suffix="", decimals=2):
     return f"{value:,.{decimals}f}{suffix}"
 
 
+# =========================================================
+# TIME LOGIC
+# =========================================================
 def now_madrid() -> datetime:
     return datetime.now(MADRID_TZ)
 
@@ -131,6 +291,9 @@ def max_refresh_day() -> date:
     return date.today() + timedelta(days=1) if allow_next_day_refresh() else date.today()
 
 
+# =========================================================
+# TOKEN / HEADERS
+# =========================================================
 def require_esios_token() -> str:
     token = (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip()
     if not token:
@@ -146,140 +309,57 @@ def build_headers(token: str) -> dict:
     }
 
 
-def normalize_remote_datetime(series) -> pd.Series:
-    s = pd.to_datetime(series, errors="coerce", utc=True)
-    return s.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+def resolve_time_trunc(day: date) -> str:
+    return "hour" if day < date(2025, 10, 1) else "quarter_hour"
 
 
-def daterange(start_date: date, end_date: date):
-    d = start_date
-    while d <= end_date:
-        yield d
-        d += timedelta(days=1)
-
-
-def load_cache(path: Path, dt_col: str, extra_cols: list[str]) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame(columns=[dt_col] + extra_cols)
-    df = pd.read_csv(path)
-    if df.empty:
-        return pd.DataFrame(columns=[dt_col] + extra_cols)
-    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-    return df
-
-
-def save_cache(df: pd.DataFrame, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-
-
-def latest_date_for_year(df: pd.DataFrame, col: str, year: int) -> date | None:
-    if df.empty:
-        return None
-    s = pd.to_datetime(df[col], errors="coerce")
-    s = s[s.dt.year == year]
-    return None if s.empty else s.max().date()
-
-
-def tech_map(x: str) -> str:
-    x = str(x).strip()
-    mapping = {
-        "Hidráulica": "Hydro", "Hidraulica": "Hydro",
-        "Nuclear": "Nuclear", "Carbón": "Coal", "Carbon": "Coal",
-        "Fuel + Gas": "Fuel + Gas", "Ciclo combinado": "CCGT",
-        "Eólica": "Wind", "Eolica": "Wind",
-        "Solar fotovoltaica": "Solar PV", "Solar térmica": "Solar thermal", "Solar termica": "Solar thermal",
-        "Cogeneración": "CHP", "Cogeneracion": "CHP",
-        "Residuos no renovables": "Non-renewable waste", "Residuos renovables": "Renewable waste",
-        "Biomasa": "Biomass", "Biogás": "Biogas", "Biogas": "Biogas",
-        "Turbina de vapor": "Steam turbine", "Otras renovables": "Other renewables",
-    }
-    return mapping.get(x, x)
-
-
-# ---------- historical base from workbook ----------
-def load_hist_sheet(sheet: str, cols: list[str]) -> pd.DataFrame:
-    df = pd.read_excel(HIST_BOOK, sheet_name=sheet)
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df = df.dropna(subset=["datetime"]).copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce") if c not in ("solar_source", "source", "geo_name") else df[c]
-    keep = ["datetime"] + [c for c in cols if c in df.columns]
-    return df[keep].dropna(subset=[c for c in cols if c in df.columns and c not in ("solar_source", "source", "geo_name")], how="all").sort_values("datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
-
-
-def load_price_base() -> pd.DataFrame:
-    df = load_hist_sheet("prices_hourly_avg", ["price", "source", "geo_name", "geo_id"])
-    return df[["datetime", "price"]]
-
-
-def load_solar_base() -> pd.DataFrame:
-    df = load_hist_sheet("solar_hourly_best", ["solar_best_mw", "solar_source", "source", "geo_name", "geo_id"])
-    if "solar_source" not in df.columns:
-        df["solar_source"] = "P48"
-    return df[["datetime", "solar_best_mw", "solar_source"]]
-
-
-def load_demand_base() -> pd.DataFrame:
-    df = load_hist_sheet("demand_hourly", ["demand_mw", "energy_mwh", "source", "geo_name", "geo_id"])
-    if "energy_mwh" not in df.columns:
-        df["energy_mwh"] = df["demand_mw"]
-    return df[["datetime", "demand_mw", "energy_mwh"]]
-
-
-def load_mix_base_daily() -> pd.DataFrame:
-    raw = pd.read_excel(MIX_FILE, sheet_name="data", header=None)
-    header = raw.iloc[4].tolist()
-    body = raw.iloc[5:].copy().reset_index(drop=True)
-    body.columns = header
-    body = body.rename(columns={body.columns[0]: "technology"})
-    body = body[body["technology"].notna()].copy()
-    body["technology"] = body["technology"].astype(str).str.strip()
-    long = body.melt(id_vars=["technology"], var_name="date", value_name="energy_gwh")
-    long["date"] = pd.to_datetime(long["date"], errors="coerce")
-    long["energy_gwh"] = pd.to_numeric(long["energy_gwh"], errors="coerce")
-    long = long.dropna(subset=["date", "energy_gwh"]).copy()
-    mask_total = long["technology"].str.contains("total", case=False, na=False) | long["technology"].str.contains("generación total", case=False, na=False)
-    long = long[~mask_total].copy()
-    long["technology"] = long["technology"].map(tech_map)
-    long["energy_mwh"] = long["energy_gwh"] * 1000.0
-    long["renewable"] = long["technology"].isin(RENEWABLE_TECHS)
-    return long[["date", "technology", "energy_mwh", "renewable"]].sort_values(["date", "technology"]).reset_index(drop=True)
-
-
-def load_installed_base_monthly() -> pd.DataFrame:
-    raw = pd.read_excel(INSTALLED_FILE, sheet_name="data", header=None)
-    header = raw.iloc[4].tolist()
-    body = raw.iloc[5:].copy().reset_index(drop=True)
-    body.columns = header
-    body = body.rename(columns={body.columns[0]: "technology"})
-    body = body[body["technology"].notna()].copy()
-    body["technology"] = body["technology"].astype(str).str.strip()
-    long = body.melt(id_vars=["technology"], var_name="datetime", value_name="mw")
-    # handles mm/YYYY and tz strings
-    long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce", utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
-    long["mw"] = pd.to_numeric(long["mw"], errors="coerce")
-    long = long.dropna(subset=["datetime", "mw"]).copy()
-    long = long[~long["technology"].str.contains("total", case=False, na=False)].copy()
-    long["technology"] = long["technology"].map(tech_map)
-    return long.sort_values(["datetime", "technology"]).reset_index(drop=True)
-
-
-# ---------- online 2026 ----------
+# =========================================================
+# FETCH
+# =========================================================
 def fetch_esios_day(indicator_id: int, day: date, token: str) -> dict:
     start_local = pd.Timestamp(day, tz="Europe/Madrid")
     end_local = start_local + pd.Timedelta(days=1)
+
+    start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+
     params = {
-        "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "time_trunc": "hour" if day < date(2025, 10, 1) else "quarter_hour",
+        "start_date": start_utc,
+        "end_date": end_utc,
+        "time_trunc": resolve_time_trunc(day),
     }
-    resp = requests.get(f"https://api.esios.ree.es/indicators/{indicator_id}", headers=build_headers(token), params=params, timeout=30)
+
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    resp = requests.get(
+        url,
+        headers=build_headers(token),
+        params=params,
+        timeout=30,
+    )
     resp.raise_for_status()
     return resp.json()
 
-def parse_esios_indicator(raw_json: dict, source_name: str, filter_date: date | None = None) -> pd.DataFrame:
+
+# =========================================================
+# PARSE
+# =========================================================
+def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+    raise ValueError("No datetime column found")
+
+
+def parse_esios_indicator(
+    raw_json: dict,
+    source_name: str,
+    filter_date: date | None = None,
+) -> pd.DataFrame:
     values = raw_json.get("indicator", {}).get("values", [])
     if not values:
         return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
@@ -303,8 +383,10 @@ def parse_esios_indicator(raw_json: dict, source_name: str, filter_date: date | 
     if df.empty:
         return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-    dt_col = "datetime_utc" if "datetime_utc" in df.columns else "datetime"
-    df["datetime"] = normalize_remote_datetime(df[dt_col])
+    if "value" not in df.columns:
+        raise ValueError(f"No 'value' column found. Columns: {df.columns.tolist()}")
+
+    df["datetime"] = parse_datetime_label(df)
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["datetime", "value"]).copy()
 
@@ -316,13 +398,35 @@ def parse_esios_indicator(raw_json: dict, source_name: str, filter_date: date | 
         df.loc[dup_mask, "datetime"] = df.loc[dup_mask, "datetime"] + pd.Timedelta(minutes=1)
 
     df["source"] = source_name
-    return df[["datetime", "value", "source", "geo_name", "geo_id"]].sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last").reset_index(drop=True)
+    df = df[["datetime", "value", "source", "geo_name", "geo_id"]].copy()
+    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
+
+    return df
+
+
+def infer_interval_hours(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "datetime" not in df.columns:
+        return pd.Series(dtype=float)
+
+    out = df.sort_values("datetime").copy()
+    diffs = out["datetime"].diff().dt.total_seconds().div(3600)
+
+    if diffs.dropna().empty:
+        interval = 1.0
+    else:
+        median_diff = diffs.dropna().median()
+        interval = 0.25 if median_diff <= 0.30 else 1.0
+
+    return pd.Series(interval, index=df.index)
+
 
 def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["datetime", value_col_name, "source", "geo_name", "geo_id"])
+
     out = df.copy()
     out["datetime_hour"] = out["datetime"].dt.floor("h")
+
     out = (
         out.groupby("datetime_hour", as_index=False)
         .agg(
@@ -338,285 +442,1159 @@ def to_hourly_mean(df: pd.DataFrame, value_col_name: str) -> pd.DataFrame:
     return out
 
 
-def update_hourly_2026(base_df: pd.DataFrame, indicator_id: int, cache_path: Path, value_name: str, token: str, source_name: str):
-    cache = load_cache(cache_path, "datetime", [value_name, "source", "geo_name", "geo_id"])
-    if not cache.empty:
-        cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
-        cache[value_name] = pd.to_numeric(cache[value_name], errors="coerce")
-        cache = cache.dropna(subset=["datetime", value_name])
+def to_energy_intervals(df: pd.DataFrame, value_col_name: str, energy_col_name: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"])
 
-    existing_hourly = pd.concat([base_df, cache], ignore_index=True)
-    existing_hourly["datetime"] = pd.to_datetime(existing_hourly["datetime"], errors="coerce")
-    existing_hourly = existing_hourly.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime", keep="last")
+    out = df.copy()
+    out[value_col_name] = pd.to_numeric(out["value"], errors="coerce")
+    out["interval_h"] = infer_interval_hours(out)
+    out[energy_col_name] = out[value_col_name] * out["interval_h"]
 
-    # Build raw-like 2026 rows and only then aggregate to hourly, matching old page logic
-    start = latest_date_for_year(existing_hourly, "datetime", 2026)
-    start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
-    end = max_refresh_day()
-    failures = 0
-    raw_rows = []
-    if start <= end:
-        for d in daterange(start, end):
-            try:
-                raw = fetch_esios_day(indicator_id, d, token)
-                daily = parse_esios_indicator(raw, source_name=source_name, filter_date=d)
-                if not daily.empty:
-                    raw_rows.append(daily)
-            except Exception:
-                failures += 1
-
-    if raw_rows:
-        new_raw = pd.concat(raw_rows, ignore_index=True)
-        new_hourly = to_hourly_mean(new_raw, value_name)
-        existing_hourly = pd.concat([existing_hourly, new_hourly], ignore_index=True).sort_values("datetime").drop_duplicates("datetime", keep="last")
-
-    out_cols = ["datetime", value_name] + [c for c in ["source", "geo_name", "geo_id"] if c in existing_hourly.columns]
-    save_cache(existing_hourly[existing_hourly["datetime"].dt.year == 2026][out_cols], cache_path)
-    return existing_hourly.reset_index(drop=True), failures
+    out = out[["datetime", value_col_name, energy_col_name, "source", "geo_name", "geo_id"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
 
 
-def ree_generation_url(start_d: date, end_d: date) -> str:
-    return ("https://apidatos.ree.es/es/datos/generacion/estructura-generacion"
-            f"?start_date={start_d:%Y-%m-%d}T00:00&end_date={end_d:%Y-%m-%d}T23:59"
-            f"&time_trunc=day&geo_trunc=electric_system&geo_limit=peninsular&geo_ids={PENINSULAR_GEO_ID}")
+def to_hourly_energy(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    out["datetime_hour"] = out["datetime"].dt.floor("h")
+
+    agg_dict = {"energy_mwh": "sum"}
+    if "mw" in out.columns:
+        agg_dict["mw"] = "mean"
+    for c in ["source", "geo_name", "geo_id", "technology", "data_source"]:
+        if c in out.columns:
+            agg_dict[c] = "first"
+
+    out = (
+        out.groupby("datetime_hour", as_index=False)
+        .agg(agg_dict)
+        .rename(columns={"datetime_hour": "datetime"})
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    return out
 
 
-def ree_installed_url(start_d: date, end_d: date) -> str:
-    return ("https://apidatos.ree.es/es/datos/generacion/potencia-instalada"
-            f"?start_date={start_d:%Y-%m-%d}T00:00&end_date={end_d:%Y-%m-%d}T23:59"
-            f"&time_trunc=month&geo_trunc=electric_system&geo_limit=peninsular&geo_ids={PENINSULAR_GEO_ID}")
+# =========================================================
+# STORAGE
+# =========================================================
+def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
+    if not csv_path.exists():
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+
+    if "source" not in df.columns:
+        df["source"] = source_name
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+
+    df = df.dropna(subset=["datetime", "value"]).copy()
+    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
+    return df
 
 
-def update_mix_daily_2026(base_df: pd.DataFrame):
-    cache = load_cache(MIX_2026_CACHE, "date", ["technology", "energy_mwh", "renewable"])
-    if not cache.empty:
-        cache["date"] = pd.to_datetime(cache["date"], errors="coerce")
-        cache["energy_mwh"] = pd.to_numeric(cache["energy_mwh"], errors="coerce")
-        cache["renewable"] = cache["renewable"].astype(str).str.lower().isin(["true", "1", "yes", "y"])
-        cache = cache.dropna(subset=["date", "technology", "energy_mwh"])
-    existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
-    existing["energy_mwh"] = pd.to_numeric(existing["energy_mwh"], errors="coerce")
-    existing = existing.dropna(subset=["date", "technology", "energy_mwh"]).sort_values(["date", "technology"]).drop_duplicates(["date", "technology"], keep="last")
-    start = latest_date_for_year(existing.rename(columns={"date": "datetime"}), "datetime", 2026)
-    start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
-    end = max_refresh_day()
-    failures = 0
-    rows = []
-    if start <= end:
+def save_raw_history(df: pd.DataFrame, csv_path: Path) -> None:
+    df = df.sort_values("datetime").drop_duplicates(subset=["datetime", "source"], keep="last")
+    df.to_csv(csv_path, index=False)
+
+
+def clear_file(csv_path: Path) -> None:
+    if csv_path.exists():
+        csv_path.unlink()
+
+
+def upsert_raw_data(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    if new_df.empty:
+        return existing_df.copy()
+
+    combined = pd.concat([existing_df, new_df], ignore_index=True)
+    combined = (
+        combined.sort_values("datetime")
+        .drop_duplicates(subset=["datetime", "source"], keep="last")
+        .reset_index(drop=True)
+    )
+    return combined
+
+
+# =========================================================
+# EXTRACTION
+# =========================================================
+def daterange(start_date: date, end_date: date):
+    current = start_date
+    while current <= end_date:
+        yield current
+        current += timedelta(days=1)
+
+
+def build_raw_history(
+    indicator_id: int,
+    source_name: str,
+    csv_path: Path,
+    start_day: date,
+    token: str,
+) -> pd.DataFrame:
+    hist = load_raw_history(csv_path, source_name)
+    if not hist.empty:
+        return hist
+
+    end_day = max_refresh_day()
+    all_days = list(daterange(start_day, end_day))
+    collected = []
+
+    progress = st.progress(0.0)
+    total_days = max(len(all_days), 1)
+
+    for i, day in enumerate(all_days, start=1):
         try:
-            resp = requests.get(ree_generation_url(start, end), timeout=60)
-            resp.raise_for_status()
-            payload = resp.json()
-            for item in payload.get("included", []):
-                attrs = item.get("attributes", {})
-                tech = tech_map(attrs.get("title"))
-                if "total" in str(tech).lower() or "generación total" in str(tech).lower():
-                    continue
-                renewable = str(attrs.get("type", "")).strip().lower() == "renovable"
-                for v in attrs.get("values", []):
-                    rows.append({
-                        "date": normalize_remote_datetime(pd.Series([v.get("datetime")])).iloc[0],
-                        "technology": tech,
-                        "energy_mwh": pd.to_numeric(v.get("value"), errors="coerce") * 1000.0,
-                        "renewable": renewable,
-                    })
-        except Exception:
-            failures = 1
-    if rows:
-        new = pd.DataFrame(rows).dropna(subset=["date", "technology", "energy_mwh"])
-        existing = pd.concat([existing, new], ignore_index=True).sort_values(["date", "technology"]).drop_duplicates(["date", "technology"], keep="last")
-    save_cache(existing[existing["date"].dt.year == 2026][["date", "technology", "energy_mwh", "renewable"]], MIX_2026_CACHE)
-    return existing.reset_index(drop=True), failures
+            raw = fetch_esios_day(indicator_id, day, token)
+            daily = parse_esios_indicator(raw, source_name=source_name, filter_date=day)
+            if not daily.empty:
+                collected.append(daily)
+        except Exception as e:
+            st.warning(f"No se pudo descargar {source_name} {day}: {e}")
+
+        progress.progress(i / total_days)
+
+    progress.empty()
+
+    if not collected:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    hist = (
+        pd.concat(collected, ignore_index=True)
+        .sort_values("datetime")
+        .drop_duplicates(subset=["datetime", "source"], keep="last")
+        .reset_index(drop=True)
+    )
+    save_raw_history(hist, csv_path)
+    return hist
 
 
-def update_installed_2026(base_df: pd.DataFrame):
-    cache = load_cache(INST_2026_CACHE, "datetime", ["technology", "mw"])
-    if not cache.empty:
-        cache["datetime"] = pd.to_datetime(cache["datetime"], errors="coerce")
-        cache["mw"] = pd.to_numeric(cache["mw"], errors="coerce")
-        cache = cache.dropna(subset=["datetime", "technology", "mw"])
-    existing = pd.concat([base_df, cache], ignore_index=True)
-    existing["datetime"] = pd.to_datetime(existing["datetime"], errors="coerce")
-    existing["mw"] = pd.to_numeric(existing["mw"], errors="coerce")
-    existing = existing.dropna(subset=["datetime", "technology", "mw"]).sort_values(["datetime", "technology"]).drop_duplicates(["datetime", "technology"], keep="last")
-    start = latest_date_for_year(existing, "datetime", 2026)
-    start = date(2026, 1, 1) if start is None else start + timedelta(days=1)
-    end = max_refresh_day()
-    failures = 0
-    rows = []
-    if start <= end:
+def refresh_raw_history(
+    indicator_id: int,
+    source_name: str,
+    csv_path: Path,
+    hist: pd.DataFrame,
+    token: str,
+    days_back: int,
+) -> pd.DataFrame:
+    updated = hist.copy()
+    last_day = max_refresh_day()
+    start_day = date.today() - timedelta(days=days_back)
+
+    for day in daterange(start_day, last_day):
         try:
-            resp = requests.get(ree_installed_url(start, end), timeout=60)
-            resp.raise_for_status()
-            payload = resp.json()
-            for item in payload.get("included", []):
-                attrs = item.get("attributes", {})
-                tech = tech_map(attrs.get("title"))
-                if "total" in str(tech).lower():
-                    continue
-                for v in attrs.get("values", []):
-                    rows.append({
-                        "datetime": normalize_remote_datetime(pd.Series([v.get("datetime")])).iloc[0],
-                        "technology": tech,
-                        "mw": pd.to_numeric(v.get("value"), errors="coerce"),
-                    })
-        except Exception:
-            failures = 1
-    if rows:
-        new = pd.DataFrame(rows).dropna(subset=["datetime", "technology", "mw"])
-        existing = pd.concat([existing, new], ignore_index=True).sort_values(["datetime", "technology"]).drop_duplicates(["datetime", "technology"], keep="last")
-    save_cache(existing[existing["datetime"].dt.year == 2026][["datetime", "technology", "mw"]], INST_2026_CACHE)
-    return existing.reset_index(drop=True), failures
+            raw = fetch_esios_day(indicator_id, day, token)
+            daily = parse_esios_indicator(raw, source_name=source_name, filter_date=day)
+            if not daily.empty:
+                updated = upsert_raw_data(updated, daily)
+        except Exception as e:
+            st.warning(f"No se pudo actualizar {source_name} {day}: {e}")
+
+    save_raw_history(updated, csv_path)
+    return updated
 
 
-# ---------- business logic ----------
-def build_best_solar_hourly(p48: pd.DataFrame, fc: pd.DataFrame) -> pd.DataFrame:
+# =========================================================
+# SOLAR BEST SERIES
+# =========================================================
+def build_best_solar_hourly(
+    solar_p48_hourly: pd.DataFrame,
+    solar_forecast_hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    base_cols = ["datetime", "source", "geo_name", "geo_id"]
+    p48 = solar_p48_hourly.copy()
+    fc = solar_forecast_hourly.copy()
+
     if p48.empty and fc.empty:
         return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
+
     if p48.empty:
         out = fc.rename(columns={"solar_forecast_mw": "solar_best_mw"}).copy()
         out["solar_source"] = "Forecast"
-        return out[["datetime", "solar_best_mw", "solar_source"]]
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
     if fc.empty:
         out = p48.rename(columns={"solar_p48_mw": "solar_best_mw"}).copy()
-        if "solar_source" not in out.columns:
-            out["solar_source"] = "P48"
-        return out[["datetime", "solar_best_mw", "solar_source"]]
-    merged = p48.merge(fc, on="datetime", how="outer")
+        out["solar_source"] = "P48"
+        return out[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]]
+
+    merged = p48[base_cols + ["solar_p48_mw"]].merge(
+        fc[base_cols + ["solar_forecast_mw"]],
+        on="datetime",
+        how="outer",
+        suffixes=("_p48", "_fc"),
+    )
+
     merged["solar_best_mw"] = merged["solar_p48_mw"].combine_first(merged["solar_forecast_mw"])
-    merged["solar_source"] = merged.get("solar_source", pd.Series([None] * len(merged)))
-    merged.loc[merged["solar_source"].isna() & merged["solar_p48_mw"].notna(), "solar_source"] = "P48"
+    merged["solar_source"] = merged["solar_p48_mw"].apply(lambda x: "P48" if pd.notna(x) else None)
     merged.loc[merged["solar_source"].isna() & merged["solar_forecast_mw"].notna(), "solar_source"] = "Forecast"
-    return merged[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+
+    merged["source"] = "best_solar"
+    merged["geo_name"] = merged.get("geo_name_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
+    )
+    merged["geo_id"] = merged.get("geo_id_p48", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
+    )
+
+    out = merged[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+# =========================================================
+# ENERGY MIX BEST SERIES
+# =========================================================
+def get_mix_indicator_csv_path_variant(name: str, indicator_id: int | None, variant: str) -> Path:
+    safe_name = name.lower().replace(" ", "_").replace("/", "_")
+    suffix = "none" if indicator_id is None else str(indicator_id)
+    return DATA_DIR / f"mix_{variant}_{suffix}_{safe_name}.csv"
+
+
+def load_or_refresh_mix_raw(
+    indicator_id: int | None,
+    source_name: str,
+    csv_path: Path,
+    start_day: date,
+    token: str,
+) -> pd.DataFrame:
+    if indicator_id is None:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    hist = load_raw_history(csv_path, source_name)
+
+    if hist.empty:
+        hist = build_raw_history(indicator_id, source_name, csv_path, start_day, token)
+    else:
+        hist = refresh_raw_history(
+            indicator_id=indicator_id,
+            source_name=source_name,
+            csv_path=csv_path,
+            hist=hist,
+            token=token,
+            days_back=REFRESH_DAYS_ENERGY_MIX,
+        )
+
+    return hist
+
+
+def build_best_mix_energy(
+    official_energy: pd.DataFrame,
+    forecast_energy: pd.DataFrame,
+    tech_name: str,
+) -> pd.DataFrame:
+    if official_energy.empty and forecast_energy.empty:
+        return pd.DataFrame(
+            columns=["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id", "technology", "data_source"]
+        )
+
+    if official_energy.empty:
+        out = forecast_energy.copy()
+        out["technology"] = tech_name
+        out["data_source"] = "Forecast"
+        return out
+
+    if forecast_energy.empty:
+        out = official_energy.copy()
+        out["technology"] = tech_name
+        out["data_source"] = "Official"
+        return out
+
+    off = official_energy[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id"]].copy()
+    off = off.rename(columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"})
+
+    fc = forecast_energy[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id"]].copy()
+    fc = fc.rename(columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"})
+
+    merged = off.merge(fc, on="datetime", how="outer", suffixes=("_off", "_fc"))
+
+    merged["mw"] = merged["mw_official"].combine_first(merged["mw_forecast"])
+    merged["energy_mwh"] = merged["energy_mwh_official"].combine_first(merged["energy_mwh_forecast"])
+    merged["data_source"] = merged["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
+    merged.loc[merged["data_source"].isna() & merged["mw_forecast"].notna(), "data_source"] = "Forecast"
+
+    merged["source"] = merged.get("source_off", pd.Series([None] * len(merged))).combine_first(
+        merged.get("source_fc", pd.Series([None] * len(merged)))
+    )
+    merged["geo_name"] = merged.get("geo_name_off", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_name_fc", pd.Series([None] * len(merged)))
+    )
+    merged["geo_id"] = merged.get("geo_id_off", pd.Series([None] * len(merged))).combine_first(
+        merged.get("geo_id_fc", pd.Series([None] * len(merged)))
+    )
+    merged["technology"] = tech_name
+
+    out = merged[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id", "technology", "data_source"]].copy()
+    out = out.sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+def load_mix_best_energy(
+    tech_name: str,
+    official_id: int | None,
+    forecast_id: int | None,
+) -> pd.DataFrame:
+    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    if official_id is not None:
+        official_df = load_raw_history(
+            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
+            f"esios_{official_id}",
+        )
+
+    if forecast_id is not None:
+        forecast_df = load_raw_history(
+            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
+            f"esios_{forecast_id}",
+        )
+
+    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
+    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
+
+    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    return to_hourly_energy(best)
+
+
+def refresh_mix_best_energy(
+    tech_name: str,
+    official_id: int | None,
+    forecast_id: int | None,
+    start_day: date,
+    token: str,
+) -> pd.DataFrame:
+    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    if official_id is not None:
+        official_df = load_or_refresh_mix_raw(
+            official_id,
+            f"esios_{official_id}",
+            get_mix_indicator_csv_path_variant(tech_name, official_id, "official"),
+            start_day,
+            token,
+        )
+
+    if forecast_id is not None:
+        forecast_df = load_or_refresh_mix_raw(
+            forecast_id,
+            f"esios_{forecast_id}",
+            get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"),
+            start_day,
+            token,
+        )
+
+    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
+    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
+
+    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    return to_hourly_energy(best)
+
+
+def build_energy_mix_period(
+    mix_energy_dict: dict[str, pd.DataFrame],
+    demand_energy: pd.DataFrame,
+    granularity: str,
+    year_sel: int | None = None,
+    month_sel: pd.Timestamp | None = None,
+    week_start: date | None = None,
+    day_range: tuple[date, date] | None = None,
+):
+    frames = []
+
+    for tech, df in mix_energy_dict.items():
+        if df.empty:
+            continue
+
+        tmp = df.copy()
+
+        if granularity == "Annual":
+            tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.year
+
+        elif granularity == "Monthly":
+            tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
+            tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+
+        elif granularity == "Weekly":
+            tmp = tmp[tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel].copy()
+            iso = tmp["datetime"].dt.isocalendar()
+            tmp["period_label"] = "W" + iso.week.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("W-MON").dt.start_time
+
+        else:
+            if day_range is not None:
+                d0, d1 = day_range
+                tmp = tmp[(tmp["datetime"].dt.date >= d0) & (tmp["datetime"].dt.date <= d1)].copy()
+            elif week_start is not None:
+                week_end = week_start + timedelta(days=6)
+                tmp = tmp[(tmp["datetime"].dt.date >= week_start) & (tmp["datetime"].dt.date <= week_end)].copy()
+
+            tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+            tmp["sort_key"] = tmp["datetime"].dt.normalize()
+
+        grouped = (
+            tmp.groupby(["period_label", "technology", "sort_key", "data_source"], as_index=False)["energy_mwh"]
+            .sum()
+        )
+        frames.append(grouped)
+
+    mix_period = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["period_label", "technology", "sort_key", "data_source", "energy_mwh"]
+    )
+
+    if not mix_period.empty:
+        hydro = (
+            mix_period[mix_period["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])]
+            .groupby(["period_label", "sort_key", "data_source"], as_index=False)["energy_mwh"].sum()
+        )
+        hydro["technology"] = "Hydro"
+
+        keep = mix_period[~mix_period["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
+        mix_period = pd.concat([keep, hydro], ignore_index=True).groupby(
+            ["period_label", "technology", "sort_key", "data_source"], as_index=False
+        )["energy_mwh"].sum()
+
+    demand_period = pd.DataFrame(columns=["period_label", "sort_key", "demand_mwh"])
+    if not demand_energy.empty:
+        tmp = demand_energy.copy()
+
+        if granularity == "Annual":
+            tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.year
+        elif granularity == "Monthly":
+            tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
+            tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+        elif granularity == "Weekly":
+            tmp = tmp[tmp["datetime"].dt.to_period("M").dt.to_timestamp() == month_sel].copy()
+            iso = tmp["datetime"].dt.isocalendar()
+            tmp["period_label"] = "W" + iso.week.astype(str)
+            tmp["sort_key"] = tmp["datetime"].dt.to_period("W-MON").dt.start_time
+        else:
+            if day_range is not None:
+                d0, d1 = day_range
+                tmp = tmp[(tmp["datetime"].dt.date >= d0) & (tmp["datetime"].dt.date <= d1)].copy()
+            elif week_start is not None:
+                week_end = week_start + timedelta(days=6)
+                tmp = tmp[(tmp["datetime"].dt.date >= week_start) & (tmp["datetime"].dt.date <= week_end)].copy()
+
+            tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+            tmp["sort_key"] = tmp["datetime"].dt.normalize()
+
+        demand_period = tmp.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"].sum()
+        demand_period = demand_period.rename(columns={"energy_mwh": "demand_mwh"})
+
+    return mix_period, demand_period
+
+
+def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.DataFrame):
+    if mix_period.empty:
+        return None
+
+    mix_plot = mix_period.copy()
+    mix_plot["energy_gwh"] = mix_plot["energy_mwh"] / 1000.0
+
+    demand_plot = demand_period.copy()
+    if not demand_plot.empty:
+        demand_plot["demand_gwh"] = demand_plot["demand_mwh"] / 1000.0
+
+    period_order = mix_plot[["period_label", "sort_key"]].drop_duplicates().sort_values("sort_key")
+    order_list = period_order["period_label"].tolist()
+
+    official_df = mix_plot[mix_plot["data_source"] == "Official"].copy()
+    forecast_df = mix_plot[mix_plot["data_source"] == "Forecast"].copy()
+
+    official_bars = alt.Chart(official_df).mark_bar().encode(
+        x=alt.X(
+            "period_label:N",
+            sort=order_list,
+            axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16),
+        ),
+        y=alt.Y(
+            "energy_gwh:Q",
+            title="Generation & demand (GWh)",
+            axis=alt.Axis(labelFontSize=14, titleFontSize=16),
+        ),
+        color=alt.Color(
+            "technology:N",
+            title="Technology",
+            scale=TECH_COLOR_SCALE,
+            legend=alt.Legend(labelFontSize=14, titleFontSize=16),
+        ),
+        tooltip=[
+            alt.Tooltip("period_label:N", title="Period"),
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("data_source:N", title="Source"),
+            alt.Tooltip("energy_gwh:Q", title="Generation (GWh)", format=",.2f"),
+        ],
+    )
+
+    forecast_bars = alt.Chart(forecast_df).mark_bar(
+        opacity=0.42,
+        stroke="#111827",
+        strokeDash=[3, 3],
+        strokeWidth=0.7,
+    ).encode(
+        x=alt.X(
+            "period_label:N",
+            sort=order_list,
+            axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16),
+        ),
+        y=alt.Y(
+            "energy_gwh:Q",
+            title="Generation & demand (GWh)",
+            axis=alt.Axis(labelFontSize=14, titleFontSize=16),
+        ),
+        color=alt.Color(
+            "technology:N",
+            title="Technology",
+            scale=TECH_COLOR_SCALE,
+            legend=alt.Legend(labelFontSize=14, titleFontSize=16),
+        ),
+        tooltip=[
+            alt.Tooltip("period_label:N", title="Period"),
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("data_source:N", title="Source"),
+            alt.Tooltip("energy_gwh:Q", title="Generation (GWh)", format=",.2f"),
+        ],
+    )
+
+    layers = [official_bars, forecast_bars]
+
+    if not demand_plot.empty:
+        line = alt.Chart(demand_plot).mark_line(
+            point=True,
+            color="#111827",
+            strokeWidth=2.5,
+        ).encode(
+            x=alt.X(
+                "period_label:N",
+                sort=order_list,
+                axis=alt.Axis(title=None, labelAngle=0, labelFontSize=14, titleFontSize=16),
+            ),
+            y=alt.Y(
+                "demand_gwh:Q",
+                title="Generation & demand (GWh)",
+                axis=alt.Axis(labelFontSize=14, titleFontSize=16),
+            ),
+            tooltip=[
+                alt.Tooltip("period_label:N", title="Period"),
+                alt.Tooltip("demand_gwh:Q", title="Demand (GWh)", format=",.2f"),
+            ],
+        )
+        layers.append(line)
+
+    chart = alt.layer(*layers).properties(height=420)
+    return apply_common_chart_style(chart, height=420)
+
+
+def build_day_energy_mix_table(mix_energy_dict: dict[str, pd.DataFrame], selected_day: date) -> pd.DataFrame:
+    rows = []
+    for tech, df in mix_energy_dict.items():
+        if df.empty:
+            continue
+
+        tmp = df[df["datetime"].dt.date == selected_day].copy()
+        if tmp.empty:
+            continue
+
+        agg = (
+            tmp.groupby(["technology", "data_source"], as_index=False)["energy_mwh"]
+            .sum()
+            .sort_values(["technology", "data_source"])
+        )
+        rows.append(agg)
+
+    if not rows:
+        return pd.DataFrame(columns=["Technology", "Data source", "Generation (MWh)"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.rename(
+        columns={
+            "technology": "Technology",
+            "data_source": "Data source",
+            "energy_mwh": "Generation (MWh)",
+        }
+    )
+    return out.sort_values(["Technology", "Data source"]).reset_index(drop=True)
+
+
+def build_price_workbook(
+    price_raw: pd.DataFrame,
+    price_hourly: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    demand_hourly: pd.DataFrame,
+    monthly_combo: pd.DataFrame,
+    negative_price_df: pd.DataFrame,
+) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        price_raw.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_raw_qh")
+        price_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_hourly_avg")
+        solar_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="solar_hourly_best")
+        demand_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="demand_hourly")
+        monthly_combo.sort_values("month").to_excel(writer, index=False, sheet_name="monthly_capture")
+        negative_price_df.to_excel(writer, index=False, sheet_name="negative_prices")
+    output.seek(0)
+    return output.getvalue()
+
+
+def build_energy_mix_workbook(mix_period: pd.DataFrame, demand_period: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        wrote_sheet = False
+        if not mix_period.empty:
+            mix_period.to_excel(writer, index=False, sheet_name="mix_period")
+            wrote_sheet = True
+        if not demand_period.empty:
+            demand_period.to_excel(writer, index=False, sheet_name="demand_period")
+            wrote_sheet = True
+        if not wrote_sheet:
+            pd.DataFrame({"info": ["No energy mix data available"]}).to_excel(writer, index=False, sheet_name="info")
+    output.seek(0)
+    return output.getvalue()
 
 
 def compute_period_metrics(price_df: pd.DataFrame, solar_df: pd.DataFrame, start_d: date, end_d: date) -> dict:
-    p = price_df[(price_df["datetime"].dt.date >= start_d) & (price_df["datetime"].dt.date <= end_d)].copy()
-    s = solar_df[(solar_df["datetime"].dt.date >= start_d) & (solar_df["datetime"].dt.date <= end_d)].copy()
-    avg_price = p["price"].mean() if not p.empty else None
-    merged = p.merge(s[["datetime", "solar_best_mw"]], on="datetime", how="inner")
+    period_price = price_df[(price_df["datetime"].dt.date >= start_d) & (price_df["datetime"].dt.date <= end_d)].copy()
+    period_solar = solar_df[(solar_df["datetime"].dt.date >= start_d) & (solar_df["datetime"].dt.date <= end_d)].copy()
+
+    avg_price = period_price["price"].mean() if not period_price.empty else None
+    merged = period_price.merge(period_solar[["datetime", "solar_best_mw"]], on="datetime", how="inner")
     merged = merged[merged["solar_best_mw"] > 0].copy()
-    cu = cc = None
+
+    captured_uncurtailed = None
+    captured_curtailed = None
+
     if not merged.empty and merged["solar_best_mw"].sum() != 0:
-        cu = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
-        pos = merged[merged["price"] > 0].copy()
-        if not pos.empty and pos["solar_best_mw"].sum() != 0:
-            cc = (pos["price"] * pos["solar_best_mw"]).sum() / pos["solar_best_mw"].sum()
+        captured_uncurtailed = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
+
+        curtailed = merged[merged["price"] > 0].copy()
+        if not curtailed.empty and curtailed["solar_best_mw"].sum() != 0:
+            captured_curtailed = (curtailed["price"] * curtailed["solar_best_mw"]).sum() / curtailed["solar_best_mw"].sum()
+
+    capture_pct_unc = (captured_uncurtailed / avg_price) if (captured_uncurtailed is not None and avg_price not in [None, 0]) else None
+    capture_pct_cur = (captured_curtailed / avg_price) if (captured_curtailed is not None and avg_price not in [None, 0]) else None
     return {
         "avg_price": avg_price,
-        "captured_uncurtailed": cu,
-        "captured_curtailed": cc,
-        "capture_pct_uncurtailed": (cu / avg_price if cu is not None and avg_price not in [None, 0] else None),
-        "capture_pct_curtailed": (cc / avg_price if cc is not None and avg_price not in [None, 0] else None),
+        "captured_uncurtailed": captured_uncurtailed,
+        "captured_curtailed": captured_curtailed,
+        "capture_pct_uncurtailed": capture_pct_unc,
+        "capture_pct_curtailed": capture_pct_cur,
     }
 
 
 def build_monthly_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
-    monthly_avg = price_hourly.assign(month=price_hourly["datetime"].dt.to_period("M").dt.to_timestamp()).groupby("month", as_index=False)["price"].mean().rename(columns={"price": "avg_monthly_price"})
-    merged = price_hourly.merge(solar_hourly[["datetime", "solar_best_mw"]], on="datetime", how="inner")
-    merged = merged[merged["solar_best_mw"] > 0].copy()
-    if merged.empty:
-        return monthly_avg.assign(captured_solar_price_uncurtailed=pd.NA, captured_solar_price_curtailed=pd.NA, capture_pct_uncurtailed=pd.NA, capture_pct_curtailed=pd.NA)
-    merged["month"] = merged["datetime"].dt.to_period("M").dt.to_timestamp()
-    merged["weighted_price"] = merged["price"] * merged["solar_best_mw"]
-    allm = merged.groupby("month", as_index=False).agg(weighted_price_sum=("weighted_price", "sum"), solar_sum=("solar_best_mw", "sum"))
-    allm["captured_solar_price_uncurtailed"] = allm["weighted_price_sum"] / allm["solar_sum"]
-    pos = merged[merged["price"] > 0].copy()
-    if pos.empty:
-        curm = pd.DataFrame(columns=["month", "captured_solar_price_curtailed"])
+    monthly_avg = (
+        price_hourly.assign(month=price_hourly["datetime"].dt.to_period("M").dt.to_timestamp())
+        .groupby("month", as_index=False)["price"]
+        .mean()
+        .rename(columns={"price": "avg_monthly_price"})
+    )
+
+    merged_monthly = price_hourly.merge(solar_hourly[["datetime", "solar_best_mw"]], on="datetime", how="inner")
+    merged_monthly = merged_monthly[merged_monthly["solar_best_mw"] > 0].copy()
+
+    if merged_monthly.empty:
+        return monthly_avg.assign(
+            captured_solar_price_uncurtailed=pd.NA,
+            captured_solar_price_curtailed=pd.NA,
+            capture_pct_uncurtailed=pd.NA,
+            capture_pct_curtailed=pd.NA,
+        )
+
+    merged_monthly["month"] = merged_monthly["datetime"].dt.to_period("M").dt.to_timestamp()
+    merged_monthly["weighted_price"] = merged_monthly["price"] * merged_monthly["solar_best_mw"]
+
+    all_months = (
+        merged_monthly.groupby("month", as_index=False)
+        .agg(
+            weighted_price_sum=("weighted_price", "sum"),
+            solar_sum=("solar_best_mw", "sum"),
+        )
+    )
+    all_months["captured_solar_price_uncurtailed"] = all_months["weighted_price_sum"] / all_months["solar_sum"]
+
+    curtailed = merged_monthly[merged_monthly["price"] > 0].copy()
+    if curtailed.empty:
+        curtailed_months = pd.DataFrame(columns=["month", "captured_solar_price_curtailed"])
     else:
-        pos["weighted_price"] = pos["price"] * pos["solar_best_mw"]
-        curm = pos.groupby("month", as_index=False).agg(weighted_price_sum=("weighted_price", "sum"), solar_sum=("solar_best_mw", "sum"))
-        curm["captured_solar_price_curtailed"] = curm["weighted_price_sum"] / curm["solar_sum"]
-        curm = curm[["month", "captured_solar_price_curtailed"]]
-    out = monthly_avg.merge(allm[["month", "captured_solar_price_uncurtailed"]], on="month", how="left").merge(curm, on="month", how="left")
-    out["capture_pct_uncurtailed"] = out["captured_solar_price_uncurtailed"] / out["avg_monthly_price"]
-    out["capture_pct_curtailed"] = out["captured_solar_price_curtailed"] / out["avg_monthly_price"]
-    return out
+        curtailed["weighted_price"] = curtailed["price"] * curtailed["solar_best_mw"]
+        curtailed_months = (
+            curtailed.groupby("month", as_index=False)
+            .agg(
+                weighted_price_sum=("weighted_price", "sum"),
+                solar_sum=("solar_best_mw", "sum"),
+            )
+        )
+        curtailed_months["captured_solar_price_curtailed"] = curtailed_months["weighted_price_sum"] / curtailed_months["solar_sum"]
+        curtailed_months = curtailed_months[["month", "captured_solar_price_curtailed"]]
+
+    monthly_combo = monthly_avg.merge(
+        all_months[["month", "captured_solar_price_uncurtailed"]],
+        on="month",
+        how="left",
+    ).merge(
+        curtailed_months,
+        on="month",
+        how="left",
+    )
+
+    monthly_combo["capture_pct_uncurtailed"] = monthly_combo["captured_solar_price_uncurtailed"] / monthly_combo["avg_monthly_price"]
+    monthly_combo["capture_pct_curtailed"] = monthly_combo["captured_solar_price_curtailed"] / monthly_combo["avg_monthly_price"]
+    return monthly_combo
 
 
 def build_negative_price_curves(price_hourly: pd.DataFrame, mode: str) -> pd.DataFrame:
     df = price_hourly.copy()
     if df.empty:
         return pd.DataFrame(columns=["year", "month_num", "month_name", "cum_count"])
-    df["flag"] = (df["price"] < 0).astype(int) if mode == "Only negative prices" else (df["price"] <= 0).astype(int)
+
+    if mode == "Only negative prices":
+        df["flag"] = (df["price"] < 0).astype(int)
+    else:
+        df["flag"] = (df["price"] <= 0).astype(int)
+
     df["year"] = df["datetime"].dt.year
     df["month_num"] = df["datetime"].dt.month
     df["month_name"] = df["datetime"].dt.strftime("%b")
+
     monthly = df.groupby(["year", "month_num", "month_name"], as_index=False)["flag"].sum().rename(columns={"flag": "count"})
+
+    years = sorted(monthly["year"].unique().tolist())
     rows = []
-    for y in sorted(monthly["year"].unique()):
+    month_names = [datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]
+    for y in years:
         temp = monthly[monthly["year"] == y].set_index("month_num")
         cum = 0
-        maxm = int(temp.index.max()) if len(temp.index) else 0
-        for m in range(1, maxm + 1):
+        max_month_for_year = int(temp.index.max()) if len(temp.index) else 0
+        for m in range(1, max_month_for_year + 1):
             if m in temp.index:
                 cum += float(temp.loc[m, "count"])
-            rows.append({"year": str(y), "month_num": m, "month_name": datetime(2000, m, 1).strftime("%b"), "cum_count": cum})
+            rows.append({"year": str(y), "month_num": m, "month_name": month_names[m - 1], "cum_count": cum})
     return pd.DataFrame(rows)
 
 
-def build_energy_mix_period(mix_daily: pd.DataFrame, demand_hourly: pd.DataFrame, granularity: str, year_sel=None, month_sel=None, day_range=None):
-    mix = mix_daily.copy()
-    demand = demand_hourly.copy()
-    if granularity == "Annual":
-        mix["Period"] = mix["date"].dt.year.astype(str)
-        mix["sort_key"] = mix["date"].dt.year
-        demand["Period"] = demand["datetime"].dt.year.astype(str)
-        demand["sort_key"] = demand["datetime"].dt.year
-    elif granularity == "Monthly":
-        mix = mix[mix["date"].dt.year == year_sel].copy()
-        demand = demand[demand["datetime"].dt.year == year_sel].copy()
-        mix["Period"] = mix["date"].dt.strftime("%b - %Y")
-        mix["sort_key"] = mix["date"].dt.to_period("M").dt.to_timestamp()
-        demand["Period"] = demand["datetime"].dt.strftime("%b - %Y")
-        demand["sort_key"] = demand["datetime"].dt.to_period("M").dt.to_timestamp()
-    elif granularity == "Weekly":
-        month_ts = pd.Timestamp(month_sel)
-        mix = mix[mix["date"].dt.to_period("M").dt.to_timestamp() == month_ts].copy()
-        demand = demand[demand["datetime"].dt.to_period("M").dt.to_timestamp() == month_ts].copy()
-        mix["Period"] = "W" + mix["date"].dt.isocalendar().week.astype(str)
-        mix["sort_key"] = mix["date"].dt.to_period("W-MON").apply(lambda p: p.start_time)
-        demand["Period"] = "W" + demand["datetime"].dt.isocalendar().week.astype(str)
-        demand["sort_key"] = demand["datetime"].dt.to_period("W-MON").apply(lambda p: p.start_time)
+def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
+    years = sorted(monthly_combo["month"].dt.year.unique().tolist()) if not monthly_combo.empty else []
+    if len(years) < 2:
+        return pd.DataFrame(columns=["x_start", "x_end", "year"]) 
+    shade_year = years[-2]
+    return pd.DataFrame(
+        {
+            "x_start": [pd.Timestamp(shade_year, 1, 1)],
+            "x_end": [pd.Timestamp(shade_year + 1, 1, 1)],
+            "year": [str(shade_year)],
+        }
+    )
+
+
+def build_monthly_main_chart(monthly_combo: pd.DataFrame):
+    if monthly_combo.empty:
+        return None
+
+    plot_df = monthly_combo.copy()
+    plot_df = plot_df.rename(
+        columns={
+            "avg_monthly_price": "Average spot price",
+            "captured_solar_price_curtailed": "Solar captured (curtailed)",
+            "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
+        }
+    )
+
+    long_df = plot_df.melt(
+        id_vars=["month"],
+        value_vars=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        var_name="series",
+        value_name="value",
+    ).dropna(subset=["value"])
+
+    long_df["year"] = long_df["month"].dt.year.astype(str)
+    long_df["month_label"] = long_df["month"].dt.strftime("%b")
+    long_df["year_mid"] = pd.to_datetime(long_df["month"].dt.year.astype(str) + "-07-01")
+
+    shading = build_monthly_shading_df(monthly_combo)
+
+    color_scale = alt.Scale(
+        domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        range=[BLUE_PRICE, YELLOW_DARK, YELLOW_LIGHT],
+    )
+    dash_scale = alt.Scale(
+        domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        range=[[1, 0], [6, 4], [2, 2]],
+    )
+
+    base = alt.Chart(long_df).encode(
+        x=alt.X(
+            "month:T",
+            axis=alt.Axis(
+                title=None,
+                format="%b",
+                labelAngle=0,
+                labelPadding=8,
+                ticks=False,
+                domain=False,
+                grid=False,
+            ),
+        )
+    )
+
+    layers = []
+    if not shading.empty:
+        shade = alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(
+            x="x_start:T",
+            x2="x_end:T",
+        )
+        layers.append(shade)
+
+    line = base.mark_line(point=True, strokeWidth=3).encode(
+        y=alt.Y(
+            "value:Q",
+            title="€/MWh",
+        ),
+        color=alt.Color("series:N", title=None, scale=color_scale),
+        strokeDash=alt.StrokeDash("series:N", title=None, scale=dash_scale),
+        tooltip=[
+            alt.Tooltip("month:T", title="Month"),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+        ],
+    )
+    layers.append(line)
+
+    main = alt.layer(*layers).properties(height=330)
+
+    year_df = (
+        long_df[["year", "year_mid"]]
+        .drop_duplicates()
+        .sort_values("year_mid")
+        .reset_index(drop=True)
+    )
+
+    year_layers = []
+    if not shading.empty:
+        shade2 = alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(
+            x="x_start:T",
+            x2="x_end:T",
+        )
+        year_layers.append(shade2)
+
+    year_text = alt.Chart(year_df).mark_text(fontWeight="bold", dy=0, fontSize=13, color="#111827").encode(
+        x=alt.X("year_mid:T", axis=alt.Axis(title=None, labels=False, ticks=False, domain=False, grid=False)),
+        text="year:N",
+    )
+    year_layers.append(year_text)
+
+    year_band = alt.layer(*year_layers).properties(height=24)
+
+    chart = alt.vconcat(main, year_band, spacing=2).resolve_scale(x="shared")
+    return apply_common_chart_style(chart, height=330)
+
+
+def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, selected_day: date, metrics: dict):
+    if day_price.empty:
+        return None
+
+    price_base = alt.Chart(day_price).encode(
+        x=alt.X(
+            "datetime:T",
+            axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelPadding=8),
+        )
+    )
+
+    price_line = price_base.mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
+        y=alt.Y("price:Q", title="Price €/MWh"),
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Time"),
+            alt.Tooltip("price:Q", title="Price", format=".2f"),
+        ],
+    )
+
+    left_layers = [price_line]
+
+    rule_rows = []
+    if metrics.get("captured_curtailed") is not None:
+        rule_rows.append(
+            {
+                "series": "Curtailed captured",
+                "value": metrics["captured_curtailed"],
+                "color": YELLOW_DARK,
+                "dash": [6, 4],
+            }
+        )
+    if metrics.get("captured_uncurtailed") is not None:
+        rule_rows.append(
+            {
+                "series": "Uncurtailed captured",
+                "value": metrics["captured_uncurtailed"],
+                "color": YELLOW_LIGHT,
+                "dash": [2, 2],
+            }
+        )
+
+    if rule_rows:
+        rules = pd.DataFrame(rule_rows)
+        left_layers.append(
+            alt.Chart(rules).mark_rule(strokeWidth=2).encode(
+                y=alt.Y("value:Q"),
+                color=alt.Color(
+                    "series:N",
+                    title=None,
+                    legend=alt.Legend(orient="top", direction="horizontal"),
+                    scale=alt.Scale(domain=rules["series"].tolist(), range=rules["color"].tolist()),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "series:N",
+                    legend=None,
+                    scale=alt.Scale(domain=rules["series"].tolist(), range=rules["dash"].tolist()),
+                ),
+                tooltip=[
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+                ],
+            )
+        )
+
+    left_chart = alt.layer(*left_layers)
+
+    if not day_solar.empty:
+        solar_chart = alt.Chart(day_solar).mark_area(opacity=0.35, color=YELLOW_LIGHT).encode(
+            x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelPadding=8)),
+            y=alt.Y(
+                "solar_best_mw:Q",
+                title="Solar MW",
+                axis=alt.Axis(titlePadding=14, labelPadding=6),
+            ),
+            tooltip=[
+                alt.Tooltip("datetime:T", title="Time"),
+                alt.Tooltip("solar_best_mw:Q", title="Solar", format=",.2f"),
+                alt.Tooltip("solar_source:N", title="Solar source"),
+            ],
+        )
+        overlay = alt.layer(left_chart, solar_chart).resolve_scale(y="independent").properties(height=360)
     else:
-        d0, d1 = day_range
-        mix = mix[(mix["date"].dt.date >= d0) & (mix["date"].dt.date <= d1)].copy()
-        demand = demand[(demand["datetime"].dt.date >= d0) & (demand["datetime"].dt.date <= d1)].copy()
-        mix["Period"] = mix["date"].dt.strftime("%a %d-%b")
-        mix["sort_key"] = mix["date"].dt.normalize()
-        demand["Period"] = demand["datetime"].dt.strftime("%a %d-%b")
-        demand["sort_key"] = demand["datetime"].dt.normalize()
+        overlay = left_chart.properties(height=360)
 
-    mixp = mix.groupby(["Period", "sort_key", "technology"], as_index=False)["energy_mwh"].sum()
-    hydro = mixp[mixp["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro", "Hydro"])].groupby(["Period", "sort_key"], as_index=False)["energy_mwh"].sum()
-    if not hydro.empty:
-        hydro["technology"] = "Hydro"
-        keep = mixp[~mixp["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
-        mixp = pd.concat([keep, hydro], ignore_index=True).groupby(["Period", "sort_key", "technology"], as_index=False)["energy_mwh"].sum()
-
-    demandp = demand.groupby(["Period", "sort_key"], as_index=False)["demand_mw"].sum().rename(columns={"demand_mw": "demand_mwh"})
-    return mixp, demandp
+    return apply_common_chart_style(overlay, height=360)
 
 
-def build_renewable_share_period(mixp: pd.DataFrame):
-    if mixp.empty:
-        return pd.DataFrame(columns=["Period", "Renewable generation (MWh)", "Total generation (MWh)", "renewable_pct", "sort_key"])
-    tmp = mixp.copy()
-    tmp["is_renewable"] = tmp["technology"].isin(RENEWABLE_TECHS)
-    totals = tmp.groupby(["Period", "sort_key"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "Total generation (MWh)"})
-    ren = tmp[tmp["is_renewable"]].groupby(["Period", "sort_key"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "Renewable generation (MWh)"})
-    out = totals.merge(ren, on=["Period", "sort_key"], how="left")
+def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, price_hourly: pd.DataFrame):
+    if negative_df.empty:
+        return None
+
+    years = sorted(negative_df["year"].unique().tolist())
+    colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626"]
+    color_map = colors[: len(years)]
+
+    chart = alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X(
+            "month_num:O",
+            sort=list(range(1, 13)),
+            axis=alt.Axis(
+                title=None,
+                labelAngle=0,
+                labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]"
+            ),
+        ),
+        y=alt.Y(
+            "cum_count:Q",
+            title=("Cumulative # hours" if mode == "Zero and negative prices" else "Cumulative # negative hours")
+        ),
+        color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=color_map)),
+        detail="year:N",
+        tooltip=[
+            alt.Tooltip("year:N", title="Year"),
+            alt.Tooltip("month_name:N", title="Month"),
+            alt.Tooltip("cum_count:Q", title="Cumulative count", format=",.0f"),
+        ],
+    )
+    return apply_common_chart_style(chart.properties(height=330), height=330)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+
+# =========================================================
+# BASE DATA FROM /data
+# =========================================================
+def load_hist_book_sheet(sheet_name: str) -> pd.DataFrame:
+    if not HIST_BOOK_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_excel(HIST_BOOK_PATH, sheet_name=sheet_name)
+
+
+def load_price_hourly_base_from_data() -> pd.DataFrame:
+    df = load_hist_book_sheet("prices_hourly_avg")
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    for c in ["source", "geo_name", "geo_id"]:
+        if c not in df.columns:
+            df[c] = None
+    return df.dropna(subset=["datetime", "price"])[["datetime", "price", "source", "geo_name", "geo_id"]].sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+
+
+def load_solar_best_base_from_data() -> pd.DataFrame:
+    df = load_hist_book_sheet("solar_hourly_best")
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["solar_best_mw"] = pd.to_numeric(df["solar_best_mw"], errors="coerce")
+    for c in ["solar_source", "source", "geo_name", "geo_id"]:
+        if c not in df.columns:
+            df[c] = None
+    return df.dropna(subset=["datetime", "solar_best_mw"])[["datetime", "solar_best_mw", "solar_source", "source", "geo_name", "geo_id"]].sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+
+
+def load_demand_hourly_base_from_data() -> pd.DataFrame:
+    df = load_hist_book_sheet("demand_hourly")
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh", "source", "geo_name", "geo_id"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+    if "energy_mwh" not in df.columns:
+        df["energy_mwh"] = df["demand_mw"]
+    else:
+        df["energy_mwh"] = pd.to_numeric(df["energy_mwh"], errors="coerce")
+    for c in ["source", "geo_name", "geo_id"]:
+        if c not in df.columns:
+            df[c] = None
+    return df.dropna(subset=["datetime", "demand_mw"])[["datetime", "demand_mw", "energy_mwh", "source", "geo_name", "geo_id"]].sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+
+
+def load_mix_base_hourly_from_data() -> pd.DataFrame:
+    if not MIX_BASE_PATH.exists():
+        return pd.DataFrame(columns=["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id", "technology", "data_source"])
+    raw = pd.read_excel(MIX_BASE_PATH, sheet_name="data", header=None)
+    header = raw.iloc[4].tolist()
+    body = raw.iloc[5:].copy().reset_index(drop=True)
+    body.columns = header
+    body = body.rename(columns={body.columns[0]: "technology"})
+    body = body[body["technology"].notna()].copy()
+    body["technology"] = body["technology"].astype(str).str.strip()
+    body = body[~body["technology"].str.contains("total", case=False, na=False)].copy()
+    body = body[~body["technology"].str.contains("generación total", case=False, na=False)].copy()
+    long = body.melt(id_vars=["technology"], var_name="datetime", value_name="energy_gwh")
+    long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce")
+    long["energy_gwh"] = pd.to_numeric(long["energy_gwh"], errors="coerce")
+    long = long.dropna(subset=["datetime", "energy_gwh"]).copy()
+    tmap = {"Hidráulica":"Hydro","Hidraulica":"Hydro","Nuclear":"Nuclear","Carbón":"Coal","Carbon":"Coal","Fuel + Gas":"Fuel + Gas","Ciclo combinado":"CCGT","Eólica":"Wind","Eolica":"Wind","Solar fotovoltaica":"Solar PV","Solar térmica":"Solar thermal","Solar termica":"Solar thermal","Cogeneración":"CHP","Cogeneracion":"CHP","Biomasa":"Biomass","Biogás":"Biogas","Biogas":"Biogas","Residuos renovables":"Other renewables","Otras renovables":"Other renewables","Residuos no renovables":"Non-renewable waste"}
+    long["technology"] = long["technology"].map(lambda x: tmap.get(x, x))
+    long["mw"] = long["energy_gwh"] * 1000.0
+    long["energy_mwh"] = long["mw"]
+    long["source"] = "data_base"
+    long["geo_name"] = "Península"
+    long["geo_id"] = 8741
+    long["data_source"] = "Official"
+    return to_hourly_energy(long[["datetime", "mw", "energy_mwh", "source", "geo_name", "geo_id", "technology", "data_source"]])
+
+
+def load_installed_base_from_data() -> pd.DataFrame:
+    if not INSTALLED_BASE_PATH.exists():
+        return pd.DataFrame(columns=["datetime", "technology", "mw"])
+    raw = pd.read_excel(INSTALLED_BASE_PATH, sheet_name="data", header=None)
+    header = raw.iloc[4].tolist()
+    body = raw.iloc[5:].copy().reset_index(drop=True)
+    body.columns = header
+    body = body.rename(columns={body.columns[0]: "technology"})
+    body = body[body["technology"].notna()].copy()
+    body["technology"] = body["technology"].astype(str).str.strip()
+    body = body[~body["technology"].str.contains("total", case=False, na=False)].copy()
+    long = body.melt(id_vars=["technology"], var_name="datetime", value_name="mw")
+    long["datetime"] = pd.to_datetime(long["datetime"], errors="coerce", utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    long["mw"] = pd.to_numeric(long["mw"], errors="coerce")
+    long = long.dropna(subset=["datetime", "mw"]).copy()
+    tmap = {"Hidráulica":"Hydro","Hidraulica":"Hydro","Nuclear":"Nuclear","Carbón":"Coal","Carbon":"Coal","Fuel + Gas":"Fuel + Gas","Ciclo combinado":"CCGT","Eólica":"Wind","Eolica":"Wind","Solar fotovoltaica":"Solar PV","Solar térmica":"Solar thermal","Solar termica":"Solar thermal","Cogeneración":"CHP","Cogeneracion":"CHP","Biomasa":"Biomass","Biogás":"Biogas","Biogas":"Biogas","Residuos renovables":"Other renewables","Otras renovables":"Other renewables","Residuos no renovables":"Non-renewable waste"}
+    long["technology"] = long["technology"].map(lambda x: tmap.get(x, x))
+    return long[["datetime", "technology", "mw"]].sort_values(["datetime", "technology"]).drop_duplicates(subset=["datetime", "technology"], keep="last").reset_index(drop=True)
+
+
+def refresh_2026_only_raw(indicator_id: int, source_name: str, csv_path: Path, token: str, days_back: int) -> pd.DataFrame:
+    hist = load_raw_history(csv_path, source_name)
+    if not hist.empty:
+        hist = hist[hist["datetime"].dt.year >= 2026].copy()
+    else:
+        hist = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    updated = hist.copy()
+    start_day = max(date(2026, 1, 1), date.today() - timedelta(days=days_back))
+    last_day = max_refresh_day()
+    for day in daterange(start_day, last_day):
+        try:
+            raw = fetch_esios_day(indicator_id, day, token)
+            daily = parse_esios_indicator(raw, source_name=source_name, filter_date=day)
+            if not daily.empty:
+                updated = upsert_raw_data(updated, daily)
+        except Exception as e:
+            st.warning(f"No se pudo actualizar {source_name} {day}: {e}")
+    save_raw_history(updated, csv_path)
+    return updated
+
+
+def merge_base_with_2026_hourly(base_hourly: pd.DataFrame, raw_2026: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    hourly_2026 = to_hourly_mean(raw_2026, value_col) if not raw_2026.empty else pd.DataFrame(columns=["datetime", value_col, "source", "geo_name", "geo_id"])
+    combined = pd.concat([base_hourly, hourly_2026], ignore_index=True)
+    combined["datetime"] = pd.to_datetime(combined["datetime"], errors="coerce")
+    return combined.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+
+
+def merge_solar_best_with_2026(base_best: pd.DataFrame, p48_raw_2026: pd.DataFrame, fc_raw_2026: pd.DataFrame) -> pd.DataFrame:
+    p48_hourly = to_hourly_mean(p48_raw_2026, "solar_p48_mw") if not p48_raw_2026.empty else pd.DataFrame(columns=["datetime", "solar_p48_mw", "source", "geo_name", "geo_id"])
+    fc_hourly = to_hourly_mean(fc_raw_2026, "solar_forecast_mw") if not fc_raw_2026.empty else pd.DataFrame(columns=["datetime", "solar_forecast_mw", "source", "geo_name", "geo_id"])
+    best_2026 = build_best_solar_hourly(p48_hourly, fc_hourly)
+    combined = pd.concat([base_best, best_2026], ignore_index=True)
+    combined["datetime"] = pd.to_datetime(combined["datetime"], errors="coerce")
+    return combined.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+
+
+def refresh_2026_only_mix_best_energy(tech_name: str, official_id: int | None, forecast_id: int | None, token: str) -> pd.DataFrame:
+    official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+    if official_id is not None:
+        official_df = refresh_2026_only_raw(official_id, f"esios_{official_id}", get_mix_indicator_csv_path_variant(tech_name, official_id, "official"), token, REFRESH_DAYS_ENERGY_MIX)
+    if forecast_id is not None:
+        forecast_df = refresh_2026_only_raw(forecast_id, f"esios_{forecast_id}", get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"), token, REFRESH_DAYS_ENERGY_MIX)
+    official_energy = to_energy_intervals(official_df, value_col_name="mw", energy_col_name="energy_mwh")
+    forecast_energy = to_energy_intervals(forecast_df, value_col_name="mw", energy_col_name="energy_mwh")
+    best = build_best_mix_energy(official_energy, forecast_energy, tech_name)
+    return to_hourly_energy(best)
+
+
+def build_re_share_table(mix_period: pd.DataFrame) -> pd.DataFrame:
+    if mix_period.empty:
+        return pd.DataFrame(columns=["Period", "Renewable generation (MWh)", "Total generation (MWh)", "% RE", "sort_key"])
+    tmp = mix_period.copy()
+    tmp["is_re"] = tmp["technology"].isin(["Hydro", "Wind", "Solar PV", "Solar thermal", "Biomass", "Biogas", "Other renewables"])
+    total = tmp.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"].sum().rename(columns={"period_label": "Period", "energy_mwh": "Total generation (MWh)"})
+    ren = tmp[tmp["is_re"]].groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"].sum().rename(columns={"period_label": "Period", "energy_mwh": "Renewable generation (MWh)"})
+    out = total.merge(ren, on=["Period", "sort_key"], how="left")
     out["Renewable generation (MWh)"] = out["Renewable generation (MWh)"].fillna(0.0)
-    out["renewable_pct"] = out["Renewable generation (MWh)"] / out["Total generation (MWh)"]
+    out["% RE"] = out["Renewable generation (MWh)"] / out["Total generation (MWh)"]
     return out.sort_values("sort_key").reset_index(drop=True)
 
 
-def build_installed_capacity_period(installed: pd.DataFrame, granularity: str, year_sel=None, month_sel=None, day_range=None):
-    if installed.empty:
+def build_installed_period(installed_df: pd.DataFrame, granularity: str, year_sel=None, month_sel=None, week_start=None, day_range=None) -> pd.DataFrame:
+    if installed_df.empty:
         return pd.DataFrame(columns=["Period", "Technology", "Installed GW", "sort_key"])
-    tmp = installed.copy()
+    tmp = installed_df.copy()
     if granularity == "Annual":
         tmp["Period"] = tmp["datetime"].dt.year.astype(str)
         tmp["sort_key"] = tmp["datetime"].dt.year
@@ -626,13 +1604,15 @@ def build_installed_capacity_period(installed: pd.DataFrame, granularity: str, y
         tmp["Period"] = tmp["datetime"].dt.strftime("%b - %Y")
         tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
         tmp = tmp.sort_values("datetime").groupby(["Period", "technology"], as_index=False).tail(1)
+    elif granularity == "Weekly":
+        m = pd.Timestamp(month_sel)
+        tmp = tmp[tmp["datetime"].dt.to_period("M").dt.to_timestamp() == m].copy()
+        tmp["Period"] = tmp["datetime"].dt.strftime("%b - %Y")
+        tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+        tmp = tmp.sort_values("datetime").groupby(["Period", "technology"], as_index=False).tail(1)
     else:
-        if month_sel is not None:
-            m = pd.Timestamp(month_sel)
-            tmp = tmp[tmp["datetime"].dt.to_period("M").dt.to_timestamp() == m].copy()
-        elif day_range is not None:
-            _, d1 = day_range
-            tmp = tmp[tmp["datetime"].dt.date <= d1].copy()
+        _, d1 = day_range
+        tmp = tmp[tmp["datetime"].dt.date <= d1].copy()
         tmp["Period"] = tmp["datetime"].dt.strftime("%b - %Y")
         tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
         tmp = tmp.sort_values("datetime").groupby(["Period", "technology"], as_index=False).tail(1)
@@ -640,110 +1620,28 @@ def build_installed_capacity_period(installed: pd.DataFrame, granularity: str, y
     return tmp.rename(columns={"technology": "Technology"})[["Period", "Technology", "Installed GW", "sort_key"]].sort_values(["sort_key", "Technology"]).reset_index(drop=True)
 
 
-# ---------- plotly ----------
-def add_alternating_year_shading(fig: go.Figure, months: pd.Series):
-    if months.empty:
-        return
-    years = sorted(pd.to_datetime(months).dt.year.unique().tolist())
-    if len(years) < 2:
-        return
-    max_year = max(years)
-    for year in range(max_year - 1, min(years) - 1, -2):
-        fig.add_vrect(x0=pd.Timestamp(f"{year}-01-01"), x1=pd.Timestamp(f"{year+1}-01-01"), fillcolor=GREY_SHADE, opacity=0.8, line_width=0, layer="below")
+def build_re_share_chart(re_df: pd.DataFrame):
+    if re_df.empty:
+        return None
+    chart = alt.Chart(re_df).mark_line(point=True, strokeWidth=3, color=CORP_GREEN_DARK).encode(
+        x=alt.X("Period:N", sort=re_df["Period"].tolist(), axis=alt.Axis(title=None, labelAngle=0)),
+        y=alt.Y("% RE:Q", title="% RE over total generation", axis=alt.Axis(format=".0%")),
+        tooltip=[alt.Tooltip("Period:N"), alt.Tooltip("% RE:Q", format=".1%")],
+    )
+    return apply_common_chart_style(chart, height=320)
 
 
-def chart_monthly(monthly_combo: pd.DataFrame):
-    fig = go.Figure()
-    add_alternating_year_shading(fig, monthly_combo["month"])
-    fig.add_trace(go.Scatter(x=monthly_combo["month"], y=monthly_combo["avg_monthly_price"], mode="lines+markers", name="Average spot price", line=dict(color=BLUE_PRICE)))
-    fig.add_trace(go.Scatter(x=monthly_combo["month"], y=monthly_combo["captured_solar_price_curtailed"], mode="lines+markers", name="Solar captured (curtailed)", line=dict(color=YELLOW_DARK, dash="dot")))
-    fig.add_trace(go.Scatter(x=monthly_combo["month"], y=monthly_combo["captured_solar_price_uncurtailed"], mode="lines+markers", name="Solar captured (uncurtailed)", line=dict(color=YELLOW_LIGHT, dash="dash")))
-    fig.update_layout(height=430, margin=dict(l=20, r=20, t=20, b=20), yaxis_title="€/MWh", hovermode="x unified", legend=dict(orientation="h"))
-    return fig
-
-
-def chart_selected_day(day_price: pd.DataFrame, day_solar: pd.DataFrame, metrics: dict):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=day_price["datetime"], y=day_price["price"], mode="lines+markers", name="Price", line=dict(color=BLUE_PRICE)))
-    if metrics.get("captured_curtailed") is not None:
-        fig.add_hline(y=metrics["captured_curtailed"], line_dash="dot", line_color=YELLOW_DARK, annotation_text="Curtailed captured")
-    if metrics.get("captured_uncurtailed") is not None:
-        fig.add_hline(y=metrics["captured_uncurtailed"], line_dash="dash", line_color=YELLOW_LIGHT, annotation_text="Uncurtailed captured")
-    if not day_solar.empty:
-        fig.add_trace(go.Bar(x=day_solar["datetime"], y=day_solar["solar_best_mw"], name="Solar MW", yaxis="y2", opacity=0.35, marker_color=YELLOW_LIGHT))
-        fig.update_layout(yaxis2=dict(title="Solar MW", overlaying="y", side="right"))
-    fig.update_layout(height=420, margin=dict(l=20, r=20, t=20, b=20), yaxis_title="Price €/MWh", hovermode="x unified", legend=dict(orientation="h"), barmode="overlay")
-    return fig
-
-
-def chart_negative(df: pd.DataFrame, mode: str):
-    fig = go.Figure()
-    for y in sorted(df["year"].unique().tolist()):
-        tmp = df[df["year"] == y]
-        fig.add_trace(go.Scatter(x=tmp["month_name"], y=tmp["cum_count"], mode="lines+markers", name=str(y)))
-    fig.update_layout(height=380, margin=dict(l=20, r=20, t=20, b=20), yaxis_title=("Cumulative # hours" if mode == "Zero and negative prices" else "Cumulative # negative hours"), hovermode="x unified")
-    return fig
-
-
-def chart_energy_mix(mixp: pd.DataFrame, demandp: pd.DataFrame):
-    fig = go.Figure()
-    if mixp.empty:
-        return fig
-    order = mixp[["Period", "sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].tolist()
-    for tech in mixp["technology"].dropna().astype(str).unique().tolist():
-        tmp = mixp[mixp["technology"] == tech].groupby("Period", as_index=False)["energy_mwh"].sum()
-        tmp = tmp.set_index("Period").reindex(order).reset_index()
-        fig.add_trace(go.Bar(x=tmp["Period"], y=tmp["energy_mwh"] / 1000.0, name=tech, marker_color=TECH_COLORS.get(tech, None)))
-    if not demandp.empty:
-        d = demandp.groupby("Period", as_index=False)["demand_mwh"].sum().set_index("Period").reindex(order).reset_index()
-        fig.add_trace(go.Scatter(x=d["Period"], y=d["demand_mwh"] / 1000.0, mode="lines+markers", name="Demand", line=dict(color="#111827", width=2.5)))
-    fig.update_layout(height=500, margin=dict(l=20, r=20, t=20, b=20), barmode="stack", yaxis_title="Generation & demand (GWh)", hovermode="x unified", legend=dict(orientation="h"))
-    return fig
-
-
-def chart_re(df: pd.DataFrame):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["Period"], y=df["renewable_pct"], mode="lines+markers", name="% RE", line=dict(color=CORP_GREEN_DARK, width=3)))
-    fig.update_layout(height=360, margin=dict(l=20, r=20, t=20, b=20), yaxis_title="% RE over total generation", yaxis_tickformat=".0%", hovermode="x unified", legend=dict(orientation="h"))
-    return fig
-
-
-def chart_installed(df: pd.DataFrame):
-    fig = go.Figure()
-    if df.empty:
-        return fig
-    order = df[["Period", "sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].tolist()
-    for tech in df["Technology"].dropna().astype(str).unique().tolist():
-        tmp = df[df["Technology"] == tech].set_index("Period").reindex(order).reset_index()
-        fig.add_trace(go.Bar(x=tmp["Period"], y=tmp["Installed GW"], name=tech, marker_color=TECH_COLORS.get(tech, None)))
-    fig.update_layout(height=440, margin=dict(l=20, r=20, t=20, b=20), barmode="stack", yaxis_title="Installed capacity (GW)", hovermode="x unified", legend=dict(orientation="h"))
-    return fig
-
-
-def build_price_workbook(price_hourly, solar_hourly, demand_hourly, monthly_combo, negative_price_df) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        price_hourly.to_excel(writer, index=False, sheet_name="prices_hourly_avg")
-        solar_hourly.to_excel(writer, index=False, sheet_name="solar_hourly_best")
-        demand_hourly.to_excel(writer, index=False, sheet_name="demand_hourly")
-        monthly_combo.to_excel(writer, index=False, sheet_name="monthly_capture")
-        negative_price_df.to_excel(writer, index=False, sheet_name="negative_prices")
-    output.seek(0)
-    return output.getvalue()
-
-
-def build_energy_mix_workbook(mixp, demandp, re_df, inst_df) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        mixp.to_excel(writer, index=False, sheet_name="mix_period")
-        demandp.to_excel(writer, index=False, sheet_name="demand_period")
-        re_df.to_excel(writer, index=False, sheet_name="renewable_share")
-        inst_df.to_excel(writer, index=False, sheet_name="installed_capacity")
-    output.seek(0)
-    return output.getvalue()
-
-
-st.title("Day Ahead - Spain Spot Prices")
+def build_installed_chart(inst_df: pd.DataFrame):
+    if inst_df.empty:
+        return None
+    order = inst_df[["Period", "sort_key"]].drop_duplicates().sort_values("sort_key")["Period"].tolist()
+    chart = alt.Chart(inst_df).mark_bar().encode(
+        x=alt.X("Period:N", sort=order, axis=alt.Axis(title=None, labelAngle=0)),
+        y=alt.Y("Installed GW:Q", title="Installed capacity (GW)"),
+        color=alt.Color("Technology:N", title="Technology"),
+        tooltip=[alt.Tooltip("Period:N"), alt.Tooltip("Technology:N"), alt.Tooltip("Installed GW:Q", format=",.2f")],
+    )
+    return apply_common_chart_style(chart, height=360)
 
 try:
     token = require_esios_token()
@@ -751,96 +1649,130 @@ try:
     st.caption(
         f"Madrid time now: {now_madrid().strftime('%Y-%m-%d %H:%M:%S')} | "
         f"Tomorrow available: {'Yes' if allow_next_day_refresh() else 'No'} | "
-        f"Base history from /data through 2025 from workbook sheets | "
-        f"Only 2026 is refreshed online"
+        f"Prices refresh: last {REFRESH_DAYS_PRICES}d | "
+        f"Energy mix refresh: last {REFRESH_DAYS_ENERGY_MIX}d"
     )
 
     top_left, top_right = st.columns([1.8, 1.2])
-    with top_left:
-        start_day = st.date_input("Extraction start date", value=date(2021, 1, 1), min_value=date(2020, 1, 1), max_value=max_refresh_day())
-    with top_right:
-        b1, b2 = st.columns(2)
-        with b1:
-            st.write(""); st.write("")
-            rebuild_2026 = st.button("Rebuild 2026 online cache")
-        with b2:
-            st.write(""); st.write("")
-            refresh_energy_mix = st.button("Refresh energy mix / capacity")
 
-    if rebuild_2026:
-        for p in [PRICE_2026_CACHE, P48_2026_CACHE, SOLARFC_2026_CACHE, DEMAND_2026_CACHE, MIX_2026_CACHE, INST_2026_CACHE]:
-            if p.exists():
-                p.unlink()
-        st.success("2026 cache deleted. Reloading...")
+    with top_left:
+        start_day = st.date_input(
+            "Extraction start date",
+            value=DEFAULT_START_DATE,
+            min_value=date(2020, 1, 1),
+            max_value=max_refresh_day(),
+        )
+
+    with top_right:
+        btn1, btn2 = st.columns(2)
+        with btn1:
+            st.write("")
+            st.write("")
+            rebuild_hist = st.button("Rebuild price/solar history")
+        with btn2:
+            st.write("")
+            st.write("")
+            refresh_energy_mix = st.button("Refresh energy mix")
+
+    if rebuild_hist:
+        clear_file(PRICE_RAW_CSV_PATH)
+        clear_file(SOLAR_P48_RAW_CSV_PATH)
+        clear_file(SOLAR_FORECAST_RAW_CSV_PATH)
+        clear_file(DEMAND_RAW_CSV_PATH)
+        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
+            clear_file(get_mix_indicator_csv_path_variant(tech_name, official_id, "official"))
+            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
+            clear_file(get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast"))
+        st.success("2026 online cache deleted. Reloading...")
         st.rerun()
 
-    price_base = load_price_base()
-    solar_base = load_solar_base()
-    demand_base = load_demand_base()
-    mix_base = load_mix_base_daily()
-    installed_base = load_installed_base_monthly()
+    # Base 2021-2025 from /data
+    price_hourly_base = load_price_hourly_base_from_data()
+    solar_best_base = load_solar_best_base_from_data()
+    demand_hourly_base = load_demand_hourly_base_from_data()
 
-    with st.spinner("Refreshing 2026 price..."):
-        price_hourly, price_fail = update_hourly_2026(price_base, PRICE_INDICATOR_ID, PRICE_2026_CACHE, "price", token, "esios_600")
+    # Keep long-file logic for 2026 online only
+    with st.spinner("Refreshing recent price data (2026 online only)..."):
+        price_raw = refresh_2026_only_raw(PRICE_INDICATOR_ID, "esios_600", PRICE_RAW_CSV_PATH, token, REFRESH_DAYS_PRICES)
+    with st.spinner("Refreshing recent solar P48 data (2026 online only)..."):
+        solar_p48_raw = refresh_2026_only_raw(SOLAR_P48_INDICATOR_ID, "esios_84", SOLAR_P48_RAW_CSV_PATH, token, REFRESH_DAYS_PRICES)
+    with st.spinner("Refreshing recent solar forecast data (2026 online only)..."):
+        solar_forecast_raw = refresh_2026_only_raw(SOLAR_FORECAST_INDICATOR_ID, "esios_542", SOLAR_FORECAST_RAW_CSV_PATH, token, REFRESH_DAYS_PRICES)
+    with st.spinner("Refreshing recent demand P48 data (2026 online only)..."):
+        demand_raw = refresh_2026_only_raw(DEMAND_INDICATOR_ID, "esios_10027", DEMAND_RAW_CSV_PATH, token, REFRESH_DAYS_PRICES)
 
-    with st.spinner("Refreshing 2026 solar P48..."):
-        p48_hist = solar_base[solar_base["solar_source"].astype(str).str.contains("P48", case=False, na=False)][["datetime", "solar_best_mw"]].rename(columns={"solar_best_mw": "solar_p48_mw"})
-        solar_p48_hourly, p48_fail = update_hourly_2026(p48_hist, SOLAR_P48_INDICATOR_ID, P48_2026_CACHE, "solar_p48_mw", token, "esios_84")
+    max_allowed_day = max_refresh_day()
 
-    with st.spinner("Refreshing 2026 solar forecast..."):
-        fc_hist = solar_base[solar_base["solar_source"].astype(str).str.contains("Forecast", case=False, na=False)][["datetime", "solar_best_mw"]].rename(columns={"solar_best_mw": "solar_forecast_mw"})
-        solar_fc_hourly, sfc_fail = update_hourly_2026(fc_hist, SOLAR_FORECAST_INDICATOR_ID, SOLARFC_2026_CACHE, "solar_forecast_mw", token, "esios_542")
+    price_hourly = merge_base_with_2026_hourly(price_hourly_base, price_raw, "price")
+    solar_hourly = merge_solar_best_with_2026(solar_best_base, solar_p48_raw, solar_forecast_raw)
+    demand_hourly = merge_base_with_2026_hourly(demand_hourly_base[["datetime", "demand_mw", "source", "geo_name", "geo_id"]], demand_raw, "demand_mw")
+    demand_hourly["energy_mwh"] = demand_hourly["demand_mw"]
+    demand_energy = demand_hourly.copy()
 
-    with st.spinner("Refreshing 2026 demand..."):
-        demand_hourly, demand_fail = update_hourly_2026(demand_base[["datetime", "demand_mw"]], DEMAND_INDICATOR_ID, DEMAND_2026_CACHE, "demand_mw", token, "esios_10027")
-        demand_hourly["energy_mwh"] = demand_hourly["demand_mw"]
+    price_hourly = price_hourly[(price_hourly["datetime"].dt.date >= start_day) & (price_hourly["datetime"].dt.date <= max_allowed_day)].copy()
+    solar_hourly = solar_hourly[(solar_hourly["datetime"].dt.date >= start_day) & (solar_hourly["datetime"].dt.date <= max_allowed_day)].copy()
+    demand_hourly = demand_hourly[(demand_hourly["datetime"].dt.date >= start_day) & (demand_hourly["datetime"].dt.date <= max_allowed_day)].copy()
+    demand_energy = demand_hourly.copy()
 
-    with st.spinner("Refreshing 2026 energy mix..."):
-        mix_daily, mix_fail = update_mix_daily_2026(mix_base)
+    if price_hourly.empty:
+        st.error("No price data available yet.")
+        st.stop()
 
-    with st.spinner("Refreshing 2026 installed capacity..."):
-        installed_long, inst_fail = update_installed_2026(installed_base)
-
-    max_day = max_refresh_day()
-    for df, col in [(price_hourly, "datetime"), (solar_p48_hourly, "datetime"), (solar_fc_hourly, "datetime"), (demand_hourly, "datetime")]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    mix_daily["date"] = pd.to_datetime(mix_daily["date"], errors="coerce")
-    installed_long["datetime"] = pd.to_datetime(installed_long["datetime"], errors="coerce")
-
-    price_hourly = price_hourly[(price_hourly["datetime"].dt.date >= start_day) & (price_hourly["datetime"].dt.date <= max_day)].copy()
-    solar_p48_hourly = solar_p48_hourly[(solar_p48_hourly["datetime"].dt.date >= start_day) & (solar_p48_hourly["datetime"].dt.date <= max_day)].copy()
-    solar_fc_hourly = solar_fc_hourly[(solar_fc_hourly["datetime"].dt.date >= start_day) & (solar_fc_hourly["datetime"].dt.date <= max_day)].copy()
-    demand_hourly = demand_hourly[(demand_hourly["datetime"].dt.date >= start_day) & (demand_hourly["datetime"].dt.date <= max_day)].copy()
-    mix_daily = mix_daily[(mix_daily["date"].dt.date >= start_day) & (mix_daily["date"].dt.date <= max_day)].copy()
-
-    solar_p48_hourly["solar_source"] = "P48"
-    solar_hourly = build_best_solar_hourly(solar_p48_hourly, solar_fc_hourly)
     monthly_combo = build_monthly_capture_table(price_hourly, solar_hourly)
 
     section_header("Monthly spot and solar captured price - Spain")
-    st.plotly_chart(chart_monthly(monthly_combo), use_container_width=True)
+    monthly_chart = build_monthly_main_chart(monthly_combo)
+    if monthly_chart is not None:
+        st.altair_chart(monthly_chart, use_container_width=True)
 
-    mt = monthly_combo.copy()
-    mt["Month"] = mt["month"].dt.strftime("%b - %Y")
-    mt = mt.rename(columns={
-        "avg_monthly_price": "Average spot price",
-        "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
-        "captured_solar_price_curtailed": "Solar captured (curtailed)",
-        "capture_pct_uncurtailed": "Capture rate (uncurtailed)",
-        "capture_pct_curtailed": "Capture rate (curtailed)",
-    })
-    st.dataframe(styled_df(mt[["Month", "Average spot price", "Solar captured (uncurtailed)", "Solar captured (curtailed)", "Capture rate (uncurtailed)", "Capture rate (curtailed)"]], pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"]), use_container_width=True)
+    monthly_table = monthly_combo.copy()
+    if not monthly_table.empty:
+        monthly_table["Month"] = monthly_table["month"].dt.strftime("%b - %Y")
+        monthly_table = monthly_table.rename(columns={
+            "avg_monthly_price": "Average spot price",
+            "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
+            "captured_solar_price_curtailed": "Solar captured (curtailed)",
+            "capture_pct_uncurtailed": "Capture rate (uncurtailed)",
+            "capture_pct_curtailed": "Capture rate (curtailed)",
+        })
+        st.dataframe(
+            styled_df(
+                monthly_table[[
+                    "Month",
+                    "Average spot price",
+                    "Solar captured (uncurtailed)",
+                    "Solar captured (curtailed)",
+                    "Capture rate (uncurtailed)",
+                    "Capture rate (curtailed)",
+                ]],
+                pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"],
+            ),
+            use_container_width=True,
+        )
 
     section_header("Selected day: price vs solar")
     min_date = price_hourly["datetime"].dt.date.min()
     max_date = price_hourly["datetime"].dt.date.max()
-    selected_day = st.date_input("Select day", value=max_date, min_value=min_date, max_value=max_date, key="selected_day_overlay")
+
+    selected_day = st.date_input(
+        "Select day",
+        value=max_date,
+        min_value=min_date,
+        max_value=max_date,
+        key="selected_day_overlay",
+    )
+
     day_price = price_hourly[price_hourly["datetime"].dt.date == selected_day].copy()
     day_solar = solar_hourly[solar_hourly["datetime"].dt.date == selected_day].copy()
+
     if not day_solar.empty:
-        st.caption(f"Solar source used for selected day: {', '.join(sorted(day_solar['solar_source'].dropna().astype(str).unique().tolist()))}")
+        day_source_text = ", ".join(sorted(day_solar["solar_source"].dropna().unique().tolist()))
+        st.caption(f"Solar source used for selected day: {day_source_text}")
+
     day_metrics = compute_period_metrics(price_hourly, solar_hourly, selected_day, selected_day)
-    st.plotly_chart(chart_selected_day(day_price, day_solar, day_metrics), use_container_width=True)
+    selected_day_chart = build_selected_day_chart(day_price, day_solar, selected_day, day_metrics)
+    if selected_day_chart is not None:
+        st.altair_chart(selected_day_chart, use_container_width=True)
 
     d1, d2, d3 = st.columns(3)
     d1.metric("Average spot price", format_metric(day_metrics.get("avg_price"), " €/MWh"))
@@ -850,105 +1782,339 @@ try:
     section_header("Spot / captured metrics")
     month_start = selected_day.replace(day=1)
     ytd_start = selected_day.replace(month=1, day=1)
-    mtd = compute_period_metrics(price_hourly, solar_hourly, month_start, selected_day)
-    ytd = compute_period_metrics(price_hourly, solar_hourly, ytd_start, selected_day)
+
+    mtd_metrics = compute_period_metrics(price_hourly, solar_hourly, month_start, selected_day)
+    ytd_metrics = compute_period_metrics(price_hourly, solar_hourly, ytd_start, selected_day)
+
     metric_rows = pd.DataFrame([
-        {"Period": "Day", "Average spot price": day_metrics["avg_price"], "Captured solar (uncurtailed)": day_metrics["captured_uncurtailed"], "Captured solar (curtailed)": day_metrics["captured_curtailed"], "Capture rate (uncurtailed)": day_metrics["capture_pct_uncurtailed"], "Capture rate (curtailed)": day_metrics["capture_pct_curtailed"]},
-        {"Period": "MTD", "Average spot price": mtd["avg_price"], "Captured solar (uncurtailed)": mtd["captured_uncurtailed"], "Captured solar (curtailed)": mtd["captured_curtailed"], "Capture rate (uncurtailed)": mtd["capture_pct_uncurtailed"], "Capture rate (curtailed)": mtd["capture_pct_curtailed"]},
-        {"Period": "YTD", "Average spot price": ytd["avg_price"], "Captured solar (uncurtailed)": ytd["captured_uncurtailed"], "Captured solar (curtailed)": ytd["captured_curtailed"], "Capture rate (uncurtailed)": ytd["capture_pct_uncurtailed"], "Capture rate (curtailed)": ytd["capture_pct_curtailed"]},
+        {
+            "Period": "Day",
+            "Average spot price": day_metrics["avg_price"],
+            "Captured solar (uncurtailed)": day_metrics["captured_uncurtailed"],
+            "Captured solar (curtailed)": day_metrics["captured_curtailed"],
+            "Capture rate (uncurtailed)": day_metrics["capture_pct_uncurtailed"],
+            "Capture rate (curtailed)": day_metrics["capture_pct_curtailed"],
+        },
+        {
+            "Period": "MTD",
+            "Average spot price": mtd_metrics["avg_price"],
+            "Captured solar (uncurtailed)": mtd_metrics["captured_uncurtailed"],
+            "Captured solar (curtailed)": mtd_metrics["captured_curtailed"],
+            "Capture rate (uncurtailed)": mtd_metrics["capture_pct_uncurtailed"],
+            "Capture rate (curtailed)": mtd_metrics["capture_pct_curtailed"],
+        },
+        {
+            "Period": "YTD",
+            "Average spot price": ytd_metrics["avg_price"],
+            "Captured solar (uncurtailed)": ytd_metrics["captured_uncurtailed"],
+            "Captured solar (curtailed)": ytd_metrics["captured_curtailed"],
+            "Capture rate (uncurtailed)": ytd_metrics["capture_pct_uncurtailed"],
+            "Capture rate (curtailed)": ytd_metrics["capture_pct_curtailed"],
+        },
     ])
-    st.dataframe(styled_df(metric_rows, pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"]), use_container_width=True)
+    st.dataframe(
+        styled_df(metric_rows, pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"]),
+        use_container_width=True,
+    )
 
     section_header("Average 24h hourly profile for selected period")
     c1, c2 = st.columns(2)
     with c1:
-        start_sel = st.date_input("Profile start date", value=max(min_date, date(max_date.year, 1, 1)), min_value=min_date, max_value=max_date, key="profile_start")
+        start_sel = st.date_input(
+            "Profile start date",
+            value=max(min_date, date(2025, 5, 1)),
+            min_value=min_date,
+            max_value=max_date,
+            key="profile_start",
+        )
     with c2:
-        end_sel = st.date_input("Profile end date", value=max_date, min_value=min_date, max_value=max_date, key="profile_end")
-    if start_sel <= end_sel:
-        range_df = price_hourly[(price_hourly["datetime"].dt.date >= start_sel) & (price_hourly["datetime"].dt.date <= end_sel)].copy()
-        pm = compute_period_metrics(price_hourly, solar_hourly, start_sel, end_sel)
+        end_sel = st.date_input(
+            "Profile end date",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key="profile_end",
+        )
+
+    if start_sel > end_sel:
+        st.warning("Start date cannot be later than end date.")
+    else:
+        range_df = price_hourly[
+            (price_hourly["datetime"].dt.date >= start_sel) &
+            (price_hourly["datetime"].dt.date <= end_sel)
+        ].copy()
+
+        profile_metrics = compute_period_metrics(price_hourly, solar_hourly, start_sel, end_sel)
         m1, m2, m3 = st.columns(3)
-        m1.metric("Average price", format_metric(pm.get("avg_price"), " €/MWh"))
-        m2.metric("Captured solar (uncurtailed)", format_metric(pm.get("captured_uncurtailed"), " €/MWh"))
-        m3.metric("Captured solar (curtailed)", format_metric(pm.get("captured_curtailed"), " €/MWh"))
-        if not range_df.empty:
+        m1.metric("Average price", format_metric(profile_metrics.get("avg_price"), " €/MWh"))
+        m2.metric("Captured solar (uncurtailed)", format_metric(profile_metrics.get("captured_uncurtailed"), " €/MWh"))
+        m3.metric("Captured solar (curtailed)", format_metric(profile_metrics.get("captured_curtailed"), " €/MWh"))
+
+        if range_df.empty:
+            st.info("No data in the selected range.")
+        else:
             range_df["hour"] = range_df["datetime"].dt.hour
-            hp = range_df.groupby("hour", as_index=False)["price"].mean().rename(columns={"price": "Average price (€/MWh)"}).sort_values("hour")
-            hp["hour_label"] = hp["hour"].map(lambda x: f"{int(x):02d}:00")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hp["hour_label"], y=hp["Average price (€/MWh)"], mode="lines+markers", line=dict(color=BLUE_PRICE)))
-            fig.update_layout(height=360, margin=dict(l=20, r=20, t=20, b=20), xaxis_title="Hour", yaxis_title="Average price (€/MWh)")
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(styled_df(hp[["hour", "Average price (€/MWh)"]]), use_container_width=True)
+            hourly_profile = (
+                range_df.groupby("hour", as_index=False)["price"]
+                .mean()
+                .rename(columns={"price": "Average price (€/MWh)"})
+                .sort_values("hour")
+            )
+            hourly_profile["hour_label"] = hourly_profile["hour"].map(lambda x: f"{int(x):02d}:00")
+
+            profile_chart = alt.Chart(hourly_profile).mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
+                x=alt.X("hour_label:N", sort=hourly_profile["hour_label"].tolist(), axis=alt.Axis(title="Hour", labelAngle=0)),
+                y=alt.Y("Average price (€/MWh):Q", title="Average price (€/MWh)"),
+                tooltip=[
+                    alt.Tooltip("hour_label:N", title="Hour"),
+                    alt.Tooltip("Average price (€/MWh):Q", title="Average price", format=",.2f"),
+                ],
+            )
+            st.altair_chart(apply_common_chart_style(profile_chart.properties(height=320), height=320), use_container_width=True)
+            st.dataframe(styled_df(hourly_profile[["hour", "Average price (€/MWh)"]]), use_container_width=True)
 
     section_header("Negative prices")
-    neg_mode = st.radio("Series to display", ["Zero and negative prices", "Only negative prices"], index=0, horizontal=True)
-    neg_df = build_negative_price_curves(price_hourly, neg_mode)
-    st.plotly_chart(chart_negative(neg_df, neg_mode), use_container_width=True)
+    neg_mode = st.radio(
+        "Series to display",
+        ["Zero and negative prices", "Only negative prices"],
+        index=0,
+        horizontal=True,
+    )
+    negative_price_df = build_negative_price_curves(price_hourly, neg_mode)
+    neg_chart = build_negative_price_chart(negative_price_df, neg_mode, price_hourly)
+    if neg_chart is not None:
+        st.altair_chart(neg_chart, use_container_width=True)
+
     subtle_subsection("Negative prices data")
-    st.dataframe(styled_df(neg_df), use_container_width=True)
+    st.dataframe(styled_df(negative_price_df), use_container_width=True)
 
     section_header("Energy mix")
-    granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
-    available_years = sorted(mix_daily["date"].dt.year.unique().tolist()) if not mix_daily.empty else []
-    year_sel = None
-    month_sel = None
-    day_range = None
-    if granularity == "Monthly":
-        year_sel = st.selectbox("Year", available_years, index=len(available_years) - 1 if available_years else 0)
-    elif granularity == "Weekly":
-        monthly_options = sorted(mix_daily["date"].dt.to_period("M").dt.to_timestamp().drop_duplicates().tolist()) if not mix_daily.empty else []
-        month_sel = st.selectbox("Month", monthly_options, format_func=lambda x: pd.Timestamp(x).strftime("%b - %Y"), index=len(monthly_options) - 1 if monthly_options else 0)
-    elif granularity == "Daily":
-        dmin = mix_daily["date"].dt.date.min() if not mix_daily.empty else min_date
-        dmax = mix_daily["date"].dt.date.max() if not mix_daily.empty else max_date
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            ds = st.date_input("Daily range start", value=max(dmin, dmax - timedelta(days=14)), min_value=dmin, max_value=dmax, key="mix_daily_start")
-        with cc2:
-            de = st.date_input("Daily range end", value=dmax, min_value=dmin, max_value=dmax, key="mix_daily_end")
-        if ds > de:
-            st.warning("Daily range start cannot be later than daily range end.")
-            st.stop()
-        day_range = (ds, de)
-        st.caption(f"Showing daily periods from {ds} to {de}")
 
-    mixp, demandp = build_energy_mix_period(mix_daily, demand_hourly, granularity, year_sel, month_sel, day_range)
-    st.plotly_chart(chart_energy_mix(mixp, demandp), use_container_width=True)
+    mix_energy = {}
+    with st.spinner("Loading energy mix data..."):
+        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
+            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
 
-    subtle_subsection(f"Energy mix detail for {selected_day}")
-    dtable = mix_daily[mix_daily["date"].dt.date == selected_day].groupby("technology", as_index=False)["energy_mwh"].sum().rename(columns={"technology": "Technology", "energy_mwh": "Generation (MWh)"}).sort_values("Technology")
-    if not dtable.empty:
-        st.dataframe(styled_df(dtable), use_container_width=True)
+            official_path = get_mix_indicator_csv_path_variant(tech_name, official_id, "official")
+            forecast_path = get_mix_indicator_csv_path_variant(tech_name, forecast_id, "forecast")
+
+            official_exists = official_id is not None and official_path.exists()
+            forecast_exists = forecast_id is not None and forecast_path.exists()
+
+            should_build = refresh_energy_mix or (not official_exists and not forecast_exists)
+
+            if should_build:
+                mix_energy[tech_name] = refresh_mix_best_energy(
+                    tech_name=tech_name,
+                    official_id=official_id,
+                    forecast_id=forecast_id,
+                    start_day=start_day,
+                    token=token,
+                )
+            else:
+                mix_energy[tech_name] = load_mix_best_energy(
+                    tech_name=tech_name,
+                    official_id=official_id,
+                    forecast_id=forecast_id,
+                )
+
+    if any(not df.empty for df in mix_energy.values()):
+        granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
+
+        available_years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
+        year_sel = None
+        month_sel = None
+        week_start = None
+        day_range = None
+
+        if granularity == "Monthly":
+            year_sel = st.selectbox("Year", available_years, index=len(available_years) - 1)
+
+        elif granularity == "Weekly":
+            monthly_options = sorted(
+                price_hourly["datetime"].dt.to_period("M").dt.to_timestamp().drop_duplicates().tolist()
+            )
+            month_sel = st.selectbox(
+                "Month",
+                monthly_options,
+                format_func=lambda x: pd.Timestamp(x).strftime("%b - %Y"),
+                index=len(monthly_options) - 1,
+            )
+
+        elif granularity == "Daily":
+            daily_min = price_hourly["datetime"].dt.date.min()
+            daily_max = price_hourly["datetime"].dt.date.max()
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                daily_start = st.date_input(
+                    "Daily range start",
+                    value=max(daily_min, daily_max - timedelta(days=14)),
+                    min_value=daily_min,
+                    max_value=daily_max,
+                    key="mix_daily_start",
+                )
+            with cc2:
+                daily_end = st.date_input(
+                    "Daily range end",
+                    value=daily_max,
+                    min_value=daily_min,
+                    max_value=daily_max,
+                    key="mix_daily_end",
+                )
+
+            if daily_start > daily_end:
+                st.warning("Daily range start cannot be later than daily range end.")
+                st.stop()
+
+            day_range = (daily_start, daily_end)
+            st.caption(f"Showing daily periods from {daily_start} to {daily_end}")
+
+        mix_period, demand_period = build_energy_mix_period(
+            mix_energy,
+            demand_energy,
+            granularity=granularity,
+            year_sel=year_sel,
+            month_sel=month_sel,
+            week_start=week_start,
+            day_range=day_range,
+        )
+
+        chart = build_energy_mix_period_chart(mix_period, demand_period)
+        if chart is not None:
+            st.altair_chart(chart, use_container_width=True)
+
+        day_mix_table = build_day_energy_mix_table(mix_energy, selected_day)
+        subtle_subsection(f"Energy mix detail for {selected_day}")
+        if not day_mix_table.empty:
+            st.dataframe(styled_df(day_mix_table), use_container_width=True)
+        else:
+            st.info("No energy mix detail available for selected day.")
+
+        if not mix_period.empty:
+            mix_table = mix_period.rename(columns={
+                "period_label": "Period",
+                "technology": "Technology",
+                "data_source": "Data source",
+                "energy_mwh": "Generation (MWh)",
+            }).sort_values(["sort_key", "Technology", "Data source"])
+
+            if not demand_period.empty:
+                mix_table = mix_table.merge(
+                    demand_period.rename(columns={"period_label": "Period", "demand_mwh": "Demand (MWh)"}),
+                    on="Period",
+                    how="left",
+                )
+
+            mix_table = mix_table.drop(columns=["sort_key"], errors="ignore")
+            subtle_subsection("Energy mix table")
+            st.dataframe(styled_df(mix_table), use_container_width=True)
+
+            mix_workbook = build_energy_mix_workbook(mix_period, demand_period)
+            st.download_button(
+                label="Download energy mix Excel",
+                data=mix_workbook,
+                file_name="energy_mix_extraction.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            section_header("% RE over total generation")
+            re_share = build_re_share_table(mix_period)
+            re_chart = build_re_share_chart(re_share)
+            if re_chart is not None:
+                st.altair_chart(re_chart, use_container_width=True)
+            if not re_share.empty:
+                st.dataframe(styled_df(re_share[["Period", "Renewable generation (MWh)", "Total generation (MWh)", "% RE"]], pct_cols=["% RE"]), use_container_width=True)
+
+            section_header("Installed capacity")
+            installed_hist = load_installed_base_from_data()
+            inst_period = build_installed_period(installed_hist, granularity, year_sel=year_sel, month_sel=month_sel, week_start=week_start, day_range=day_range)
+            inst_chart = build_installed_chart(inst_period)
+            if inst_chart is not None:
+                st.altair_chart(inst_chart, use_container_width=True)
+            if not inst_period.empty:
+                st.dataframe(styled_df(inst_period[["Period", "Technology", "Installed GW"]]), use_container_width=True)
     else:
-        st.info("No daily energy mix data for the selected day.")
+        st.info("No energy mix data available yet.")
 
-    section_header("% RE over total generation")
-    re_df = build_renewable_share_period(mixp)
-    st.plotly_chart(chart_re(re_df), use_container_width=True)
-    show_re = re_df[["Period", "Renewable generation (MWh)", "Total generation (MWh)", "renewable_pct"]].rename(columns={"renewable_pct": "% RE"})
-    st.dataframe(styled_df(show_re, pct_cols=["% RE"]), use_container_width=True)
+    section_header("Extraction workbook")
+    st.write("Rows in raw prices:", len(price_raw))
+    st.write("Rows in hourly prices:", len(price_hourly))
+    st.write("Rows in raw solar P48:", len(solar_p48_raw))
+    st.write("Rows in raw solar forecast:", len(solar_forecast_raw))
+    st.write("Rows in hourly solar best:", len(solar_hourly))
 
-    section_header("Installed capacity")
-    inst_period = build_installed_capacity_period(installed_long, granularity, year_sel, month_sel, day_range)
-    st.plotly_chart(chart_installed(inst_period), use_container_width=True)
-    st.dataframe(styled_df(inst_period[["Period", "Technology", "Installed GW"]]), use_container_width=True)
+    workbook_bytes = build_price_workbook(
+        price_raw=price_raw,
+        price_hourly=price_hourly,
+        solar_hourly=solar_hourly,
+        demand_hourly=demand_hourly,
+        monthly_combo=monthly_combo,
+        negative_price_df=negative_price_df,
+    )
+    st.download_button(
+        label="Download Excel workbook",
+        data=workbook_bytes,
+        file_name="day_ahead_prices_extraction.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-    section_header("Downloads")
-    wb1 = build_price_workbook(price_hourly, solar_hourly, demand_hourly, monthly_combo, neg_df)
-    wb2 = build_energy_mix_workbook(mixp, demandp, re_df, inst_period)
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button("Download Day Ahead workbook", data=wb1, file_name="day_ahead_outputs.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with dl2:
-        st.download_button("Download Energy Mix workbook", data=wb2, file_name="day_ahead_energy_mix_outputs.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    subtle_subsection("Raw price extraction (QH when available)")
+    st.dataframe(styled_df(price_raw.head(500)), use_container_width=True)
 
-    section_header("Refresh status")
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Price / solar / demand 2026", f"P:{price_fail} | P48:{p48_fail} | FC:{sfc_fail} | D:{demand_fail}")
-    s2.metric("Energy mix 2026", f"Failures: {mix_fail}")
-    s3.metric("Installed capacity 2026", f"Failures: {inst_fail}")
+    subtle_subsection("Hourly averaged prices")
+    st.dataframe(styled_df(price_hourly.head(500)), use_container_width=True)
+
+    subtle_subsection("Solar hourly series used in analytics")
+    st.dataframe(styled_df(solar_hourly.head(500)), use_container_width=True)
+
+    if st.button("Force refresh"):
+        with st.spinner("Refreshing..."):
+            price_raw = refresh_raw_history(
+                PRICE_INDICATOR_ID,
+                "esios_600",
+                PRICE_RAW_CSV_PATH,
+                price_raw,
+                token,
+                REFRESH_DAYS_PRICES,
+            )
+            solar_p48_raw = refresh_raw_history(
+                SOLAR_P48_INDICATOR_ID,
+                "esios_84",
+                SOLAR_P48_RAW_CSV_PATH,
+                solar_p48_raw,
+                token,
+                REFRESH_DAYS_PRICES,
+            )
+            solar_forecast_raw = refresh_raw_history(
+                SOLAR_FORECAST_INDICATOR_ID,
+                "esios_542",
+                SOLAR_FORECAST_RAW_CSV_PATH,
+                solar_forecast_raw,
+                token,
+                REFRESH_DAYS_PRICES,
+            )
+            demand_raw = refresh_raw_history(
+                DEMAND_INDICATOR_ID,
+                "esios_10027",
+                DEMAND_RAW_CSV_PATH,
+                demand_raw,
+                token,
+                REFRESH_DAYS_PRICES,
+            )
+
+            for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
+                forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
+                refresh_mix_best_energy(
+                    tech_name=tech_name,
+                    official_id=official_id,
+                    forecast_id=forecast_id,
+                    start_day=start_day,
+                    token=token,
+                )
+
+        st.success("Data refreshed.")
+        st.rerun()
 
 except Exception as e:
-    st.error(f"Unexpected error: {e}")
+    st.error(f"Error: {e}")
