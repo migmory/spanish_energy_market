@@ -98,6 +98,8 @@ ENERGY_MIX_INDICATORS_FORECAST = {
 
 LOCAL_MIX_TECH_MAP = {
     "Hidráulica": "Hydro",
+    "Hidroeólica": "Other renewables",
+    "Turbinación bombeo": "Pumped hydro",
     "Nuclear": "Nuclear",
     "Carbón": "Coal",
     "Fuel + Gas": "Fuel + Gas",
@@ -110,6 +112,8 @@ LOCAL_MIX_TECH_MAP = {
     "Cogeneración": "CHP",
     "Residuos no renovables": "Other non-renewables",
     "Residuos renovables": "Biomass",
+    "Biogás": "Biogas",
+    "Biomasa": "Biomass",
 }
 
 RENEWABLE_TECHS = {
@@ -169,6 +173,8 @@ YELLOW_DARK = "#D97706"
 YELLOW_LIGHT = "#FBBF24"
 BLUE_PRICE = "#1D4ED8"
 GREEN_RENEWABLES = "#059669"
+REE_API_BASE = "https://apidatos.ree.es/es/datos"
+REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
 
 # =========================================================
 # DISPLAY HELPERS
@@ -441,6 +447,89 @@ def to_programmed_generation_energy(df: pd.DataFrame) -> pd.DataFrame:
         out["energy_mwh"] = pd.to_numeric(out["mw"], errors="coerce")
     out = out.dropna(subset=["datetime", "energy_mwh"]).copy()
     return out[["datetime", "energy_mwh"]]
+
+
+def normalize_ree_energy_to_mwh(series: pd.Series) -> pd.Series:
+    vals = pd.to_numeric(series, errors="coerce")
+    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
+    if pd.notna(max_abs) and max_abs < 10000:
+        return vals * 1000.0
+    return vals
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_ree_widget(category: str, widget: str, start_day: date, end_day: date, time_trunc: str = "day") -> dict:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": time_trunc,
+        **REE_PENINSULAR_PARAMS,
+    }
+    url = f"{REE_API_BASE}/{category}/{widget}"
+    resp = requests.get(url, params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
+            rows.append({
+                "datetime": dt,
+                "title": str(title).strip(),
+                value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
+            })
+    return pd.DataFrame(rows)
+
+
+def load_live_2026_mix_daily_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    try:
+        payload = fetch_ree_widget("generacion", "estructura-generacion", start_day, end_day, time_trunc="day")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
+    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+    df["energy_mwh"] = normalize_ree_energy_to_mwh(df["value"])
+    df["data_source"] = "REE API"
+    df = df.dropna(subset=["datetime", "technology", "energy_mwh"]).copy()
+    df = df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum()
+    hydro = df[df["technology"].isin(["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
+    hydro["technology"] = "Hydro"
+    non_hydro = df[~df["technology"].isin(["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
+    df = pd.concat([non_hydro, hydro], ignore_index=True)
+    df = df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+    return df
+
+
+def load_live_2026_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
+    try:
+        payload = fetch_ree_widget("generacion", "potencia-instalada", start_day, end_day, time_trunc="month")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+    df["capacity_mw"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
+    return df[["datetime", "technology", "capacity_mw"]].groupby(["datetime", "technology"], as_index=False)["capacity_mw"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
 
 
 # =========================================================
@@ -959,7 +1048,7 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 
     bars = alt.Chart(plot).mark_bar().encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("energy_gwh:Q", title="Generation / demand (GWh)"),
+        y=alt.Y("energy_gwh:Q", title="Generation / demand (GWh)", axis=alt.Axis(orient="left")),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
@@ -969,11 +1058,10 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
     )
 
     layers = [bars]
-
     if summary["demand_gwh"].notna().any():
         demand_line = alt.Chart(summary.dropna(subset=["demand_gwh"]))            .mark_line(point=True, color="#111827", strokeWidth=2.8)            .encode(
                 x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-                y=alt.Y("demand_gwh:Q", title="Generation / demand (GWh)"),
+                y=alt.Y("demand_gwh:Q", title="Generation / demand (GWh)", axis=alt.Axis(orient="left")),
                 tooltip=[
                     alt.Tooltip("period_label:N", title="Period"),
                     alt.Tooltip("demand_gwh:Q", title="Demand (GWh)", format=",.2f"),
@@ -983,7 +1071,7 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 
     re_line = alt.Chart(summary).mark_line(point=True, color=GREEN_RENEWABLES, strokeWidth=3).encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("renewable_share_pct:Q", title="% RE", axis=alt.Axis(format=".0%", values=[0,0.2,0.4,0.6,0.8,1.0]), scale=alt.Scale(domain=[0,1])),
+        y=alt.Y("renewable_share_pct:Q", title="% RE", axis=alt.Axis(format=".0%", values=[0,0.2,0.4,0.6,0.8,1.0], orient="right"), scale=alt.Scale(domain=[0,1])),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("renewable_generation_mwh:Q", title="Renewables (MWh)", format=",.0f"),
@@ -1243,16 +1331,18 @@ try:
         hist_prices = load_historical_prices()
         hist_solar = load_historical_solar()
         hist_mix = load_historical_generation_mix_daily()
-        installed_capacity = load_installed_capacity_monthly()
+        hist_installed_capacity = load_installed_capacity_monthly()
 
         live_prices = load_live_2026_prices(token, live_start, live_end)
         live_solar = load_live_2026_solar(token, live_start, live_end)
         live_demand = load_live_2026_demand(token, live_start, live_end)
         live_mix = load_live_2026_mix_daily(token, live_start, live_end)
+        live_installed_capacity = load_live_2026_installed_capacity_from_ree(live_start, live_end)
 
     price_hourly = combine_hist_and_live(hist_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_and_live(hist_solar, live_solar, ["datetime"])
     mix_daily = combine_hist_and_live(hist_mix, live_mix, ["datetime", "technology", "data_source"])
+    installed_capacity = combine_hist_and_live(hist_installed_capacity, live_installed_capacity, ["datetime", "technology"])
     demand_hourly = live_demand.copy() if live_demand is not None else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
     if demand_hourly.empty:
         demand_hourly = pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
@@ -1427,8 +1517,6 @@ try:
     if installed_capacity.empty:
         st.info("No installed capacity file found in /data.")
     else:
-        if 2026 not in sorted(installed_capacity["datetime"].dt.year.unique().tolist()):
-            st.caption("Installed capacity: el fichero histórico cargado llega hasta 2025. La extensión live 2026 desde ESIOS requiere identificar las series de potencia instalada por tecnología del sistema peninsular.")
         cap_years = sorted(installed_capacity["datetime"].dt.year.unique().tolist())
         default_years = cap_years[-3:] if len(cap_years) >= 3 else cap_years
         selected_cap_years = st.multiselect("Installed capacity years", cap_years, default=default_years)
