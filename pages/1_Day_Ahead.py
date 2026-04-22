@@ -57,6 +57,7 @@ MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_SOLAR_FILE = DATA_DIR / "p48solar_since21.csv"
+HIST_WORKBOOK_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_MIX_FILE = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
 HIST_INSTALLED_CAP_FILE = DATA_DIR / "installed_capacity_monthly.xlsx"
 
@@ -416,6 +417,22 @@ def to_energy_intervals(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["datetime", "mw", "energy_mwh"]).copy()
 
 
+def to_programmed_generation_energy(df: pd.DataFrame) -> pd.DataFrame:
+    '''
+    For 2026 live generation-mix indicators we keep the ESIOS values as energy per period.
+    This avoids undercounting the post-2025 quarter-hour series by a factor of ~4 versus REE monthly totals.
+    '''
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "energy_mwh"])
+    out = df.copy()
+    if "value" in out.columns and "energy_mwh" not in out.columns:
+        out["energy_mwh"] = pd.to_numeric(out["value"], errors="coerce")
+    elif "mw" in out.columns and "energy_mwh" not in out.columns:
+        out["energy_mwh"] = pd.to_numeric(out["mw"], errors="coerce")
+    out = out.dropna(subset=["datetime", "energy_mwh"]).copy()
+    return out[["datetime", "energy_mwh"]]
+
+
 # =========================================================
 # HISTORICAL FILE LOADERS
 # =========================================================
@@ -423,7 +440,12 @@ def to_energy_intervals(df: pd.DataFrame) -> pd.DataFrame:
 def load_historical_prices() -> pd.DataFrame:
     if not HIST_PRICES_FILE.exists():
         return pd.DataFrame(columns=["datetime", "price"])
-    df = pd.read_excel(HIST_PRICES_FILE, sheet_name="prices_hourly_avg")
+    try:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name="prices_hourly_avg")
+    except Exception:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name=0)
+        if "price" not in df.columns and "value" in df.columns:
+            df = df.rename(columns={"value": "price"})
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df = df.dropna(subset=["datetime", "price"])
@@ -433,8 +455,23 @@ def load_historical_prices() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_historical_solar() -> pd.DataFrame:
+    # Prefer the full workbook export because the standalone CSV may be only a short slice.
+    if HIST_WORKBOOK_FILE.exists():
+        try:
+            df = pd.read_excel(HIST_WORKBOOK_FILE, sheet_name="solar_hourly_best")
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df["solar_best_mw"] = pd.to_numeric(df["solar_best_mw"], errors="coerce")
+            if "solar_source" not in df.columns:
+                df["solar_source"] = "Historical workbook"
+            df = df.dropna(subset=["datetime", "solar_best_mw"])
+            df = df[df["datetime"].dt.year <= 2025].copy()
+            return df[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+        except Exception:
+            pass
+
     if not HIST_SOLAR_FILE.exists():
         return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
+
     df = pd.read_csv(HIST_SOLAR_FILE)
     if "solar_best_mw" not in df.columns and "value" in df.columns:
         df = df.rename(columns={"value": "solar_best_mw"})
@@ -609,8 +646,9 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
             forecast = fetch_esios_range(forecast_id, start_day, end_day, token)[["datetime", "value"]].copy()
             forecast["data_source"] = "Forecast"
 
-        off_e = to_energy_intervals(official.rename(columns={"value": "mw"})) if not official.empty else pd.DataFrame()
-        fc_e = to_energy_intervals(forecast.rename(columns={"value": "mw"})) if not forecast.empty else pd.DataFrame()
+        # For post-2025 P48 generation indicators, ESIOS quarter-hour values align with period energy.
+        off_e = to_programmed_generation_energy(official) if not official.empty else pd.DataFrame()
+        fc_e = to_programmed_generation_energy(forecast) if not forecast.empty else pd.DataFrame()
 
         if off_e.empty and fc_e.empty:
             continue
