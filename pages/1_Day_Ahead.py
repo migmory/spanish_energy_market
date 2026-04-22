@@ -555,7 +555,13 @@ def load_installed_capacity_monthly() -> pd.DataFrame:
 # LIVE 2026 EXTRACTION
 # =========================================================
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_esios_range(indicator_id: int, start_day: date, end_day: date, token: str) -> pd.DataFrame:
+def fetch_esios_range(
+    indicator_id: int,
+    start_day: date,
+    end_day: date,
+    token: str,
+    time_trunc: str | None = None,
+) -> pd.DataFrame:
     if start_day > end_day:
         return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
@@ -564,7 +570,9 @@ def fetch_esios_range(indicator_id: int, start_day: date, end_day: date, token: 
     start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
     end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    time_trunc = "quarter_hour" if start_day >= date(2025, 10, 1) else "hour"
+    if time_trunc is None:
+        time_trunc = "quarter_hour" if start_day >= date(2025, 10, 1) else "hour"
+
     url = f"https://api.esios.ree.es/indicators/{indicator_id}"
     resp = requests.get(
         url,
@@ -578,7 +586,6 @@ def fetch_esios_range(indicator_id: int, start_day: date, end_day: date, token: 
     )
     resp.raise_for_status()
     return parse_esios_indicator(resp.json(), source_name=f"esios_{indicator_id}")
-
 
 def build_best_solar_hourly(solar_p48_hourly: pd.DataFrame, solar_forecast_hourly: pd.DataFrame) -> pd.DataFrame:
     if solar_p48_hourly.empty and solar_forecast_hourly.empty:
@@ -639,14 +646,25 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
         forecast = pd.DataFrame(columns=["datetime", "value"])
 
         if official_id is not None:
-            official = fetch_esios_range(official_id, start_day, end_day, token)[["datetime", "value"]].copy()
+            try:
+                official = fetch_esios_range(official_id, start_day, end_day, token, time_trunc="day")[["datetime", "value"]].copy()
+            except Exception:
+                official = fetch_esios_range(official_id, start_day, end_day, token)[["datetime", "value"]].copy()
             official["data_source"] = "Official"
+
         forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
         if forecast_id is not None:
-            forecast = fetch_esios_range(forecast_id, start_day, end_day, token)[["datetime", "value"]].copy()
+            try:
+                forecast = fetch_esios_range(forecast_id, start_day, end_day, token, time_trunc="day")[["datetime", "value"]].copy()
+            except Exception:
+                forecast = fetch_esios_range(forecast_id, start_day, end_day, token)[["datetime", "value"]].copy()
             forecast["data_source"] = "Forecast"
 
-        # For post-2025 P48 generation indicators, ESIOS quarter-hour values align with period energy.
+        if not official.empty:
+            official["datetime"] = pd.to_datetime(official["datetime"]).dt.normalize()
+        if not forecast.empty:
+            forecast["datetime"] = pd.to_datetime(forecast["datetime"]).dt.normalize()
+
         off_e = to_programmed_generation_energy(official) if not official.empty else pd.DataFrame()
         fc_e = to_programmed_generation_energy(forecast) if not forecast.empty else pd.DataFrame()
 
@@ -667,7 +685,6 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
             best["data_source"] = best["off_energy"].apply(lambda x: "Official" if pd.notna(x) else "Forecast")
             best = best[["datetime", "energy_mwh", "data_source"]]
 
-        best["datetime"] = best["datetime"].dt.floor("D")
         best = best.groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
         best["technology"] = tech_name
         frames.append(best)
@@ -676,20 +693,18 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
         return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
 
     out = pd.concat(frames, ignore_index=True)
+
     hydro = (
         out[out["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])]
         .groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
     )
     hydro["technology"] = "Hydro"
+
     keep = out[~out["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
     out = pd.concat([keep, hydro], ignore_index=True)
     out = out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum()
     return out.sort_values(["datetime", "technology", "data_source"]).reset_index(drop=True)
 
-
-# =========================================================
-# COMBINE HIST + LIVE
-# =========================================================
 def combine_hist_and_live(hist_df: pd.DataFrame, live_df: pd.DataFrame, subset_cols: list[str]) -> pd.DataFrame:
     combined = pd.concat([hist_df, live_df], ignore_index=True)
     if combined.empty:
@@ -905,14 +920,32 @@ def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, m
     return apply_common_chart_style(chart, height=360)
 
 
+def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
+    years = sorted(monthly_combo["month"].dt.year.unique().tolist()) if not monthly_combo.empty else []
+    if len(years) < 2:
+        return pd.DataFrame(columns=["x_start", "x_end", "year"])
+    shade_year = years[-2]
+    return pd.DataFrame(
+        {
+            "x_start": [pd.Timestamp(shade_year, 1, 1)],
+            "x_end": [pd.Timestamp(shade_year + 1, 1, 1)],
+            "year": [str(shade_year)],
+        }
+    )
+
+
 def build_monthly_main_chart(monthly_combo: pd.DataFrame):
     if monthly_combo.empty:
         return None
-    plot_df = monthly_combo.copy().rename(columns={
-        "avg_monthly_price": "Average spot price",
-        "captured_solar_price_curtailed": "Solar captured (curtailed)",
-        "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
-    })
+
+    plot_df = monthly_combo.copy().rename(
+        columns={
+            "avg_monthly_price": "Average spot price",
+            "captured_solar_price_curtailed": "Solar captured (curtailed)",
+            "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
+        }
+    )
+
     long_df = plot_df.melt(
         id_vars=["month"],
         value_vars=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
@@ -920,14 +953,81 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
         value_name="value",
     ).dropna(subset=["value"])
 
-    chart = alt.Chart(long_df).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("month:T", axis=alt.Axis(title=None, format="%b-%y", labelAngle=0)),
-        y=alt.Y("value:Q", title="€/MWh"),
-        color=alt.Color("series:N", title=None, scale=alt.Scale(domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"], range=[BLUE_PRICE, YELLOW_DARK, YELLOW_LIGHT])),
-        tooltip=[alt.Tooltip("month:T", title="Month"), alt.Tooltip("series:N", title="Series"), alt.Tooltip("value:Q", title="€/MWh", format=",.2f")],
-    ).properties(height=330)
-    return apply_common_chart_style(chart, height=330)
+    long_df["year"] = long_df["month"].dt.year.astype(str)
+    long_df["year_mid"] = pd.to_datetime(long_df["month"].dt.year.astype(str) + "-07-01")
 
+    shading = build_monthly_shading_df(monthly_combo)
+
+    color_scale = alt.Scale(
+        domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        range=[BLUE_PRICE, YELLOW_DARK, YELLOW_LIGHT],
+    )
+    dash_scale = alt.Scale(
+        domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        range=[[1, 0], [6, 4], [2, 2]],
+    )
+
+    base = alt.Chart(long_df).encode(
+        x=alt.X(
+            "month:T",
+            axis=alt.Axis(
+                title=None,
+                format="%b",
+                labelAngle=0,
+                labelPadding=8,
+                ticks=False,
+                domain=False,
+                grid=False,
+            ),
+        )
+    )
+
+    layers = []
+    if not shading.empty:
+        layers.append(
+            alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(
+                x="x_start:T",
+                x2="x_end:T",
+            )
+        )
+
+    layers.append(
+        base.mark_line(point=True, strokeWidth=3).encode(
+            y=alt.Y("value:Q", title="€/MWh"),
+            color=alt.Color("series:N", title=None, scale=color_scale),
+            strokeDash=alt.StrokeDash("series:N", title=None, scale=dash_scale),
+            tooltip=[
+                alt.Tooltip("month:T", title="Month"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+            ],
+        )
+    )
+
+    main = alt.layer(*layers).properties(height=330)
+
+    year_df = long_df[["year", "year_mid"]].drop_duplicates().sort_values("year_mid").reset_index(drop=True)
+
+    year_layers = []
+    if not shading.empty:
+        year_layers.append(
+            alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(
+                x="x_start:T",
+                x2="x_end:T",
+            )
+        )
+
+    year_layers.append(
+        alt.Chart(year_df).mark_text(fontWeight="bold", dy=0, fontSize=13, color="#111827").encode(
+            x=alt.X("year_mid:T", axis=alt.Axis(title=None, labels=False, ticks=False, domain=False, grid=False)),
+            text="year:N",
+        )
+    )
+
+    year_band = alt.layer(*year_layers).properties(height=24)
+
+    chart = alt.vconcat(main, year_band, spacing=2).resolve_scale(x="shared")
+    return apply_common_chart_style(chart, height=330)
 
 def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     if negative_df.empty:
@@ -1076,7 +1176,7 @@ try:
         st.info("No energy mix data available.")
     else:
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Daily"], index=1)
-        available_years = sorted(mix_daily["datetime"].dt.year.unique().tolist())
+        available_years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
         year_sel = available_years[-1]
         day_range = None
         if granularity == "Monthly":
@@ -1092,6 +1192,8 @@ try:
             day_range = (daily_start, daily_end)
 
         mix_period = build_energy_mix_period(mix_daily, granularity, year_sel=year_sel, day_range=day_range)
+        if granularity == "Monthly" and mix_period.empty:
+            st.info(f"No energy mix historical file is available for {year_sel}. In /data the uploaded mix file only contains 2021, and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period)
         if mix_chart is not None:
             st.altair_chart(mix_chart, use_container_width=True)
