@@ -476,6 +476,7 @@ def build_energy_mix_chart_from_period(mix_period: pd.DataFrame, demand_period: 
 
 
 
+PENINSULAR_GEO_ID = 8741
 RENEWABLE_TECHS = {
     "Hydro",
     "Wind",
