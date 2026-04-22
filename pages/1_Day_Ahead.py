@@ -2217,6 +2217,12 @@ def build_complete_daily_mix_table(mix_period: pd.DataFrame, start_day: date, en
     merged["period_label"] = pd.to_datetime(merged["sort_key"]).dt.strftime("%a %d-%b")
     return merged
 
+def build_full_daily_mix_table(mix_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    return build_complete_daily_mix_table(mix_period, start_day, end_day)
+
+def build_full_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    return build_complete_daily_demand_table(demand_period, start_day, end_day)
+
 def build_complete_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
     full_days = pd.DataFrame({"sort_key": pd.date_range(start_day, end_day, freq="D")})
     full_days["period_label"] = full_days["sort_key"].dt.strftime("%a %d-%b")
