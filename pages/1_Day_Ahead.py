@@ -474,6 +474,22 @@ def build_energy_mix_chart_from_period(mix_period: pd.DataFrame, demand_period: 
 
     return alt.layer(*layers).properties(height=430)
 
+
+def tech_map(x: str) -> str:
+    x = str(x).strip()
+    mapping = {
+        "Hidráulica": "Hydro", "Hidraulica": "Hydro",
+        "Nuclear": "Nuclear", "Carbón": "Coal", "Carbon": "Coal",
+        "Fuel + Gas": "Fuel + Gas", "Ciclo combinado": "CCGT",
+        "Eólica": "Wind", "Eolica": "Wind",
+        "Solar fotovoltaica": "Solar PV", "Solar térmica": "Solar thermal", "Solar termica": "Solar thermal",
+        "Cogeneración": "CHP", "Cogeneracion": "CHP",
+        "Residuos no renovables": "Non-renewable waste", "Residuos renovables": "Renewable waste",
+        "Biomasa": "Biomass", "Biogás": "Biogas", "Biogas": "Biogas",
+        "Turbina de vapor": "Steam turbine", "Otras renovables": "Other renewables",
+    }
+    return mapping.get(x, x)
+
 def section_header(title: str):
     st.markdown(
         f"""
