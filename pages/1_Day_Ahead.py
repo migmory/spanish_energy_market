@@ -1007,11 +1007,11 @@ def refresh_raw_history(
 # =========================================================
 def build_best_solar_hourly(
     solar_p48_hourly: pd.DataFrame,
-    solar_forecast_hourly: pd.DataFrame,
+    solar_fc_hourly: pd.DataFrame,
 ) -> pd.DataFrame:
     base_cols = ["datetime", "source", "geo_name", "geo_id"]
     p48 = solar_p48_hourly.copy()
-    fc = solar_forecast_hourly.copy()
+    fc = solar_fc_hourly.copy()
 
     if p48.empty and fc.empty:
         return pd.DataFrame(columns=["datetime", "solar_best_mw", "solar_source"])
@@ -2183,8 +2183,8 @@ try:
     day_price = price_hourly[price_hourly["datetime"].dt.date == selected_day].copy()
     day_solar = solar_hourly[solar_hourly["datetime"].dt.date == selected_day].copy()
     today_local = pd.Timestamp.now(tz="Europe/Madrid").date()
-    if selected_day >= today_local and not solar_forecast_hourly.empty:
-        day_fc = solar_forecast_hourly[solar_forecast_hourly["datetime"].dt.date == selected_day].copy()
+    if selected_day >= today_local and not solar_fc_hourly.empty:
+        day_fc = solar_fc_hourly[solar_fc_hourly["datetime"].dt.date == selected_day].copy()
         if not day_fc.empty:
             day_fc["solar_best_mw"] = pd.to_numeric(day_fc["solar_forecast_mw"], errors="coerce")
             day_fc["solar_source"] = "Forecast"
