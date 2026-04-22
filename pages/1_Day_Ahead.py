@@ -104,10 +104,21 @@ RENEWABLE_TECHS = {
 # DISPLAY HELPERS
 # =========================================================
 
+
+def force_naive_datetime(series: pd.Series) -> pd.Series:
+    s = pd.to_datetime(series, errors="coerce", utc=True)
+    try:
+        return s.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    except Exception:
+        try:
+            return s.dt.tz_localize(None)
+        except Exception:
+            return pd.to_datetime(series, errors="coerce")
+
 def ensure_datetime_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
     out = df.copy()
     if col in out.columns:
-        out[col] = pd.to_datetime(out[col], errors="coerce")
+        out[col] = force_naive_datetime(out[col])
     return out
 
 def section_header(title: str):
@@ -413,7 +424,7 @@ def build_or_refresh_raw_2026(indicator_id: int, source_name: str, csv_path: Pat
 def load_price_book_base():
     xls = pd.ExcelFile(PRICE_BOOK_PATH)
     price_raw = pd.read_excel(xls, sheet_name="prices_raw_qh")
-    price_raw["datetime"] = pd.to_datetime(price_raw["datetime"], errors="coerce")
+    price_raw["datetime"] = force_naive_datetime(price_raw["datetime"])
     price_raw["value"] = pd.to_numeric(price_raw["value"], errors="coerce")
     price_raw = price_raw.dropna(subset=["datetime", "value"])
     if "source" not in price_raw.columns:
@@ -424,14 +435,14 @@ def load_price_book_base():
         price_raw["geo_id"] = None
 
     solar_best = pd.read_excel(xls, sheet_name="solar_hourly_best")
-    solar_best["datetime"] = pd.to_datetime(solar_best["datetime"], errors="coerce")
+    solar_best["datetime"] = force_naive_datetime(solar_best["datetime"])
     solar_best["solar_best_mw"] = pd.to_numeric(solar_best["solar_best_mw"], errors="coerce")
     solar_best = solar_best.dropna(subset=["datetime", "solar_best_mw"])
     if "solar_source" not in solar_best.columns:
         solar_best["solar_source"] = "P48"
 
     demand = pd.read_excel(xls, sheet_name="demand_hourly")
-    demand["datetime"] = pd.to_datetime(demand["datetime"], errors="coerce")
+    demand["datetime"] = force_naive_datetime(demand["datetime"])
     demand["demand_mw"] = pd.to_numeric(demand["demand_mw"], errors="coerce")
     if "energy_mwh" in demand.columns:
         demand["energy_mwh"] = pd.to_numeric(demand["energy_mwh"], errors="coerce")
@@ -451,7 +462,7 @@ def load_mix_daily_base_from_excel() -> pd.DataFrame:
     body = body[body["technology"].notna()].copy()
     body["technology"] = body["technology"].astype(str).str.strip()
     long = body.melt(id_vars=["technology"], var_name="sort_key", value_name="energy_gwh")
-    long["sort_key"] = pd.to_datetime(long["sort_key"], errors="coerce", dayfirst=True)
+    long["sort_key"] = force_naive_datetime(long["sort_key"])
     long["energy_gwh"] = pd.to_numeric(long["energy_gwh"], errors="coerce")
     long = long.dropna(subset=["sort_key", "energy_gwh"]).copy()
     mask_total = long["technology"].str.contains("total", case=False, na=False) | long["technology"].str.contains("generación total", case=False, na=False)
@@ -506,7 +517,7 @@ def refresh_mix_daily_2026(token: str | None = None) -> pd.DataFrame:
     # token not used but kept for symmetry/future
     cache = pd.read_csv(MIX_DAILY_2026_CSV_PATH) if MIX_DAILY_2026_CSV_PATH.exists() else pd.DataFrame()
     if not cache.empty:
-        cache["sort_key"] = pd.to_datetime(cache["sort_key"], errors="coerce")
+        cache["sort_key"] = force_naive_datetime(cache["sort_key"])
         cache["energy_gwh"] = pd.to_numeric(cache["energy_gwh"], errors="coerce")
         cache = cache.dropna(subset=["sort_key", "technology", "energy_gwh"])
 
@@ -550,7 +561,7 @@ def refresh_mix_daily_2026(token: str | None = None) -> pd.DataFrame:
     if rows:
         new = pd.DataFrame(rows)
         cache = pd.concat([cache, new], ignore_index=True)
-        cache["sort_key"] = pd.to_datetime(cache["sort_key"], errors="coerce")
+        cache["sort_key"] = force_naive_datetime(cache["sort_key"])
         cache["energy_gwh"] = pd.to_numeric(cache["energy_gwh"], errors="coerce")
         cache = cache.dropna(subset=["sort_key", "technology", "energy_gwh"]).sort_values(["sort_key", "technology"]).drop_duplicates(["sort_key", "technology"], keep="last")
         cache.to_csv(MIX_DAILY_2026_CSV_PATH, index=False)
@@ -800,7 +811,7 @@ def build_energy_mix_period_from_daily_combined(mix_daily_all: pd.DataFrame, dem
     demand_energy = ensure_datetime_col(demand_energy, "datetime") if not demand_energy.empty else demand_energy
     mix = mix_daily_all.copy()
     demand = demand_energy.copy()
-    demand["datetime"] = pd.to_datetime(demand["datetime"], errors="coerce")
+    demand["datetime"] = force_naive_datetime(demand["datetime"])
     demand["sort_key"] = demand["datetime"].dt.normalize()
     demand["energy_gwh"] = pd.to_numeric(demand["energy_mwh"], errors="coerce") / 1000.0
 
@@ -997,7 +1008,7 @@ try:
 
     max_allowed_day = max_refresh_day()
     for df, dtcol in [(price_hourly, "datetime"), (solar_p48_hourly, "datetime"), (solar_forecast_hourly, "datetime"), (solar_hourly, "datetime"), (demand_hourly, "datetime")]:
-        df[dtcol] = pd.to_datetime(df[dtcol], errors="coerce")
+        df[dtcol] = force_naive_datetime(df[dtcol])
     price_hourly = price_hourly[(price_hourly["datetime"].dt.date >= start_day) & (price_hourly["datetime"].dt.date <= max_allowed_day)].copy()
     solar_p48_hourly = solar_p48_hourly[(solar_p48_hourly["datetime"].dt.date >= start_day) & (solar_p48_hourly["datetime"].dt.date <= max_allowed_day)].copy()
     solar_forecast_hourly = solar_forecast_hourly[(solar_forecast_hourly["datetime"].dt.date >= start_day) & (solar_forecast_hourly["datetime"].dt.date <= max_allowed_day)].copy()
