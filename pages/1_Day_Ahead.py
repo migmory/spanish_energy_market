@@ -489,18 +489,13 @@ def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.D
     return pd.DataFrame(rows)
 
 
-def load_live_2026_mix_daily_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
-    start_day = max(start_day, LIVE_START_DATE)
-    if start_day > end_day:
-        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
-    try:
-        payload = fetch_ree_widget("generacion", "estructura-generacion", start_day, end_day, time_trunc="day")
-        df = parse_ree_included_series(payload, value_field="value")
-    except Exception:
-        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+def _postprocess_ree_mix_df(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
+    if freq == "month":
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    else:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
     df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
     df["energy_mwh"] = normalize_ree_energy_to_mwh(df["value"])
     df["data_source"] = "REE API"
@@ -510,8 +505,32 @@ def load_live_2026_mix_daily_from_ree(start_day: date, end_day: date) -> pd.Data
     hydro["technology"] = "Hydro"
     non_hydro = df[~df["technology"].isin(["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
     df = pd.concat([non_hydro, hydro], ignore_index=True)
-    df = df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
-    return df
+    return df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+def load_live_2026_mix_daily_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    try:
+        payload = fetch_ree_widget("generacion", "estructura-generacion", start_day, end_day, time_trunc="day")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    return _postprocess_ree_mix_df(df, freq="day")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_mix_monthly_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    try:
+        payload = fetch_ree_widget("generacion", "estructura-generacion", start_day, end_day, time_trunc="month")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+    return _postprocess_ree_mix_df(df, freq="month")
 
 
 def load_live_2026_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
@@ -1057,21 +1076,28 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
         ],
     )
 
-    layers = [bars]
+    left_layers = [bars]
     if summary["demand_gwh"].notna().any():
         demand_line = alt.Chart(summary.dropna(subset=["demand_gwh"]))            .mark_line(point=True, color="#111827", strokeWidth=2.8)            .encode(
                 x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-                y=alt.Y("demand_gwh:Q", title="Generation / demand (GWh)", axis=alt.Axis(orient="left")),
+                y=alt.Y("demand_gwh:Q", axis=None),
                 tooltip=[
                     alt.Tooltip("period_label:N", title="Period"),
                     alt.Tooltip("demand_gwh:Q", title="Demand (GWh)", format=",.2f"),
                 ],
             )
-        layers.append(demand_line)
+        left_layers.append(demand_line)
+
+    left_chart = alt.layer(*left_layers)
 
     re_line = alt.Chart(summary).mark_line(point=True, color=GREEN_RENEWABLES, strokeWidth=3).encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("renewable_share_pct:Q", title="% RE", axis=alt.Axis(format=".0%", values=[0,0.2,0.4,0.6,0.8,1.0], orient="right"), scale=alt.Scale(domain=[0,1])),
+        y=alt.Y(
+            "renewable_share_pct:Q",
+            title="% RE",
+            axis=alt.Axis(format=".0%", values=[0, 0.2, 0.4, 0.6, 0.8, 1.0], orient="right"),
+            scale=alt.Scale(domain=[0, 1]),
+        ),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("renewable_generation_mwh:Q", title="Renewables (MWh)", format=",.0f"),
@@ -1079,9 +1105,8 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
             alt.Tooltip("renewable_share_pct:Q", title="% RE", format=".1%"),
         ],
     )
-    layers.append(re_line)
 
-    chart = alt.layer(*layers).resolve_scale(y="independent").properties(height=430)
+    chart = alt.layer(left_chart, re_line).resolve_scale(y="independent").properties(height=430)
     return apply_common_chart_style(chart, height=430)
 
 def build_monthly_renewables_table(mix_df: pd.DataFrame) -> pd.DataFrame:
@@ -1492,7 +1517,15 @@ try:
                 daily_end = st.date_input("Daily range end", value=daily_max, min_value=daily_min, max_value=daily_max, key="mix_daily_end")
             day_range = (daily_start, daily_end)
 
-        mix_period = build_energy_mix_period(mix_daily, granularity, year_sel=year_sel, day_range=day_range)
+        mix_source_df = mix_daily
+        if granularity == "Monthly" and year_sel >= 2026:
+            monthly_live = load_live_2026_mix_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
+            if not monthly_live.empty:
+                mix_source_df = pd.concat([
+                    mix_daily[mix_daily["datetime"].dt.year < 2026],
+                    monthly_live,
+                ], ignore_index=True)
+        mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
         demand_period = build_demand_period(demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]), granularity, year_sel=year_sel, day_range=day_range)
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
