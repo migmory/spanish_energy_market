@@ -704,8 +704,9 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
             except Exception:
                 forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-        official_energy = to_energy_intervals(official_df) if not official_df.empty else pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
-        forecast_energy = to_energy_intervals(forecast_df) if not forecast_df.empty else pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
+        # Keep 2026 exactly on the ESIOS live path: these mix indicators are handled as energy per bucket.
+        official_energy = to_programmed_generation_energy(official_df) if not official_df.empty else pd.DataFrame(columns=["datetime", "energy_mwh"])
+        forecast_energy = to_programmed_generation_energy(forecast_df) if not forecast_df.empty else pd.DataFrame(columns=["datetime", "energy_mwh"])
 
         if official_energy.empty and forecast_energy.empty:
             continue
@@ -717,35 +718,22 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
             best = official_energy.copy()
             best["data_source"] = "Official"
         else:
-            off = official_energy[["datetime", "mw", "energy_mwh"]].rename(
-                columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"}
-            )
-            fc = forecast_energy[["datetime", "mw", "energy_mwh"]].rename(
-                columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"}
-            )
+            off = official_energy.rename(columns={"energy_mwh": "energy_mwh_official"})
+            fc = forecast_energy.rename(columns={"energy_mwh": "energy_mwh_forecast"})
             best = off.merge(fc, on="datetime", how="outer")
-            best["mw"] = best["mw_official"].combine_first(best["mw_forecast"])
             best["energy_mwh"] = best["energy_mwh_official"].combine_first(best["energy_mwh_forecast"])
-            best["data_source"] = best["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
-            best.loc[best["data_source"].isna() & best["mw_forecast"].notna(), "data_source"] = "Forecast"
-            best = best[["datetime", "mw", "energy_mwh", "data_source"]]
+            best["data_source"] = best["energy_mwh_official"].apply(lambda x: "Official" if pd.notna(x) else None)
+            best.loc[best["data_source"].isna() & best["energy_mwh_forecast"].notna(), "data_source"] = "Forecast"
+            best = best[["datetime", "energy_mwh", "data_source"]]
 
-        # Keep the exact live path aligned with the original Day Ahead logic:
-        # quarter-hour/hour -> energy per interval -> hourly -> daily aggregation.
         hourly = best.copy()
         hourly["datetime"] = pd.to_datetime(hourly["datetime"], errors="coerce").dt.floor("h")
-        hourly = (
-            hourly.groupby(["datetime", "data_source"], as_index=False)["energy_mwh"]
-            .sum()
-        )
+        hourly = hourly.groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
         hourly["technology"] = tech_name
 
         daily = hourly.copy()
         daily["datetime"] = daily["datetime"].dt.normalize()
-        daily = (
-            daily.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"]
-            .sum()
-        )
+        daily = daily.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum()
         frames.append(daily)
 
     if not frames:
@@ -840,6 +828,25 @@ def build_monthly_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.Dat
     monthly_combo["capture_pct_uncurtailed"] = monthly_combo["captured_solar_price_uncurtailed"] / monthly_combo["avg_monthly_price"]
     monthly_combo["capture_pct_curtailed"] = monthly_combo["captured_solar_price_curtailed"] / monthly_combo["avg_monthly_price"]
     return monthly_combo
+
+
+def build_hourly_profile_table(price_hourly: pd.DataFrame, start_sel: date, end_sel: date) -> pd.DataFrame:
+    range_df = price_hourly[
+        (price_hourly["datetime"].dt.date >= start_sel) &
+        (price_hourly["datetime"].dt.date <= end_sel)
+    ].copy()
+    if range_df.empty:
+        return pd.DataFrame(columns=["hour", "Average price (€/MWh)"])
+
+    range_df["hour"] = range_df["datetime"].dt.hour
+    hourly_profile = (
+        range_df.groupby("hour", as_index=False)["price"]
+        .mean()
+        .rename(columns={"price": "Average price (€/MWh)"})
+        .sort_values("hour")
+    )
+    hourly_profile["hour_label"] = hourly_profile["hour"].map(lambda x: f"{int(x):02d}:00")
+    return hourly_profile
 
 
 def build_negative_price_curves(price_hourly: pd.DataFrame, mode: str) -> pd.DataFrame:
@@ -1119,12 +1126,30 @@ def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[st
     plot = cap_df[cap_df["technology"].isin(selected_techs)].copy()
     if plot.empty:
         return None
+
+    plot["datetime"] = pd.to_datetime(plot["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    plot = (
+        plot.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
+        .sum()
+        .sort_values(["datetime", "technology"])
+    )
     plot["month_label"] = plot["datetime"].dt.strftime("%b-%y")
+    month_order = (
+        plot[["datetime", "month_label"]]
+        .drop_duplicates()
+        .sort_values("datetime")["month_label"]
+        .tolist()
+    )
+
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%b-%y", labelAngle=0)),
+        x=alt.X("month_label:N", sort=month_order, axis=alt.Axis(title=None, labelAngle=0)),
         y=alt.Y("capacity_mw:Q", title="Installed capacity (MW)"),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
-        tooltip=[alt.Tooltip("datetime:T", title="Month"), alt.Tooltip("technology:N", title="Technology"), alt.Tooltip("capacity_mw:Q", title="MW", format=",.2f")],
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Month"),
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("capacity_mw:Q", title="MW", format=",.2f"),
+        ],
     ).properties(height=360)
     return apply_common_chart_style(chart, height=360)
 
@@ -1230,6 +1255,65 @@ try:
     c3.metric("Captured solar (curtailed)", format_metric(day_metrics.get("captured_curtailed"), " €/MWh"))
 
     # Negative prices
+    section_header("Average prices / solar / captured for selected range")
+    c1, c2 = st.columns(2)
+    min_date = price_hourly["datetime"].dt.date.min()
+    max_date = price_hourly["datetime"].dt.date.max()
+    with c1:
+        range_start = st.date_input(
+            "Average range start",
+            value=max(min_date, date(max_date.year, 1, 1)),
+            min_value=min_date,
+            max_value=max_date,
+            key="avg_range_start",
+        )
+    with c2:
+        range_end = st.date_input(
+            "Average range end",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key="avg_range_end",
+        )
+
+    if range_start > range_end:
+        st.warning("Average range start cannot be later than average range end.")
+    else:
+        avg_metrics = compute_period_metrics(price_hourly, solar_hourly, range_start, range_end)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Average spot price", format_metric(avg_metrics.get("avg_price"), " €/MWh"))
+        m2.metric("Captured solar (uncurtailed)", format_metric(avg_metrics.get("captured_uncurtailed"), " €/MWh"))
+        m3.metric("Captured solar (curtailed)", format_metric(avg_metrics.get("captured_curtailed"), " €/MWh"))
+
+        avg_table = pd.DataFrame([
+            {
+                "Range start": pd.Timestamp(range_start),
+                "Range end": pd.Timestamp(range_end),
+                "Average spot price": avg_metrics.get("avg_price"),
+                "Captured solar (uncurtailed)": avg_metrics.get("captured_uncurtailed"),
+                "Captured solar (curtailed)": avg_metrics.get("captured_curtailed"),
+                "Capture rate (uncurtailed)": avg_metrics.get("capture_pct_uncurtailed"),
+                "Capture rate (curtailed)": avg_metrics.get("capture_pct_curtailed"),
+            }
+        ])
+        st.dataframe(
+            styled_df(avg_table, pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"]),
+            use_container_width=True,
+        )
+
+        hourly_profile = build_hourly_profile_table(price_hourly, range_start, range_end)
+        if not hourly_profile.empty:
+            profile_chart = alt.Chart(hourly_profile).mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
+                x=alt.X("hour_label:N", sort=hourly_profile["hour_label"].tolist(), axis=alt.Axis(title="Hour", labelAngle=0)),
+                y=alt.Y("Average price (€/MWh):Q", title="Average price (€/MWh)"),
+                tooltip=[
+                    alt.Tooltip("hour_label:N", title="Hour"),
+                    alt.Tooltip("Average price (€/MWh):Q", title="Average price", format=",.2f"),
+                ],
+            )
+            st.altair_chart(apply_common_chart_style(profile_chart.properties(height=320), height=320), use_container_width=True)
+            st.dataframe(styled_df(hourly_profile[["hour", "Average price (€/MWh)"]]), use_container_width=True)
+
     section_header("Negative prices")
     neg_mode = st.radio("Series to display", ["Zero and negative prices", "Only negative prices"], horizontal=True)
     negative_price_df = build_negative_price_curves(price_hourly, neg_mode)
