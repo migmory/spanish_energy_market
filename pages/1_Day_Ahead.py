@@ -658,6 +658,18 @@ def load_live_2026_prices(token: str, start_day: date, end_day: date) -> pd.Data
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_demand(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    raw = fetch_esios_range(DEMAND_INDICATOR_ID, start_day, end_day, token)
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
+    out = raw[["datetime", "value"]].rename(columns={"value": "demand_mw"})
+    out["datetime"] = out["datetime"].dt.floor("h")
+    out = out.groupby("datetime", as_index=False)["demand_mw"].mean().sort_values("datetime")
+    out["energy_mwh"] = out["demand_mw"]
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_live_2026_solar(token: str, start_day: date, end_day: date) -> pd.DataFrame:
     p48 = fetch_esios_range(SOLAR_P48_INDICATOR_ID, start_day, end_day, token)
     fc = fetch_esios_range(SOLAR_FORECAST_INDICATOR_ID, start_day, end_day, token)
@@ -1233,15 +1245,18 @@ try:
 
         live_prices = load_live_2026_prices(token, live_start, live_end)
         live_solar = load_live_2026_solar(token, live_start, live_end)
+        live_demand = load_live_2026_demand(token, live_start, live_end)
         live_mix = load_live_2026_mix_daily(token, live_start, live_end)
 
     price_hourly = combine_hist_and_live(hist_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_and_live(hist_solar, live_solar, ["datetime"])
     mix_daily = combine_hist_and_live(hist_mix, live_mix, ["datetime", "technology", "data_source"])
+    demand_hourly = live_demand.copy()
 
     price_hourly = price_hourly[price_hourly["datetime"].dt.date >= start_day].copy()
     solar_hourly = solar_hourly[solar_hourly["datetime"].dt.date >= start_day].copy()
     mix_daily = mix_daily[mix_daily["datetime"].dt.date >= start_day].copy()
+    demand_hourly = demand_hourly[demand_hourly["datetime"].dt.date >= start_day].copy()
 
     if price_hourly.empty:
         st.error("No price data available.")
