@@ -904,18 +904,49 @@ def build_energy_mix_period(mix_df: pd.DataFrame, granularity: str, year_sel: in
     return grouped.merge(summary, on=["period_label", "sort_key"], how="left")
 
 
-def build_energy_mix_period_chart(mix_period: pd.DataFrame):
+def build_demand_period(demand_hourly: pd.DataFrame, granularity: str, year_sel: int | None = None, day_range: tuple[date, date] | None = None) -> pd.DataFrame:
+    if demand_hourly.empty:
+        return pd.DataFrame(columns=["period_label", "sort_key", "demand_mwh"])
+
+    tmp = demand_hourly.copy()
+    if "energy_mwh" not in tmp.columns and "demand_mw" in tmp.columns:
+        tmp["energy_mwh"] = tmp["demand_mw"]
+
+    if granularity == "Annual":
+        tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+        tmp["sort_key"] = tmp["datetime"].dt.year
+    elif granularity == "Monthly":
+        if year_sel is not None:
+            tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
+        tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+        tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+    else:
+        if day_range is not None:
+            d0, d1 = day_range
+            tmp = tmp[(tmp["datetime"].dt.date >= d0) & (tmp["datetime"].dt.date <= d1)].copy()
+        tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+        tmp["sort_key"] = tmp["datetime"].dt.normalize()
+
+    return tmp.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "demand_mwh"})
+
+def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.DataFrame | None = None):
     if mix_period.empty:
         return None
 
     plot = mix_period.copy()
     plot["energy_gwh"] = plot["energy_mwh"] / 1000.0
     summary = plot[["period_label", "sort_key", "total_generation_mwh", "renewable_generation_mwh", "renewable_share_pct"]].drop_duplicates().sort_values("sort_key")
+    if demand_period is not None and not demand_period.empty:
+        demand_tmp = demand_period.copy()
+        demand_tmp["demand_gwh"] = demand_tmp["demand_mwh"] / 1000.0
+        summary = summary.merge(demand_tmp[["period_label", "sort_key", "demand_gwh"]], on=["period_label", "sort_key"], how="left")
+    else:
+        summary["demand_gwh"] = pd.NA
     order_list = summary["period_label"].tolist()
 
     bars = alt.Chart(plot).mark_bar().encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("energy_gwh:Q", title="Generation (GWh)"),
+        y=alt.Y("energy_gwh:Q", title="Generation / demand (GWh)"),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
@@ -924,20 +955,33 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame):
         ],
     )
 
-    line = alt.Chart(summary).mark_line(point=True, color=GREEN_RENEWABLES, strokeWidth=3).encode(
+    layers = [bars]
+
+    if summary["demand_gwh"].notna().any():
+        demand_line = alt.Chart(summary.dropna(subset=["demand_gwh"]))            .mark_line(point=True, color="#111827", strokeWidth=2.8)            .encode(
+                x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
+                y=alt.Y("demand_gwh:Q", title="Generation / demand (GWh)"),
+                tooltip=[
+                    alt.Tooltip("period_label:N", title="Period"),
+                    alt.Tooltip("demand_gwh:Q", title="Demand (GWh)", format=",.2f"),
+                ],
+            )
+        layers.append(demand_line)
+
+    re_line = alt.Chart(summary).mark_line(point=True, color=GREEN_RENEWABLES, strokeWidth=3).encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
-        y=alt.Y("renewable_share_pct:Q", title="% Renewables", axis=alt.Axis(format=".0%")),
+        y=alt.Y("renewable_share_pct:Q", title="% RE", axis=alt.Axis(format=".0%", values=[0,0.2,0.4,0.6,0.8,1.0]), scale=alt.Scale(domain=[0,1])),
         tooltip=[
             alt.Tooltip("period_label:N", title="Period"),
             alt.Tooltip("renewable_generation_mwh:Q", title="Renewables (MWh)", format=",.0f"),
             alt.Tooltip("total_generation_mwh:Q", title="Total generation (MWh)", format=",.0f"),
-            alt.Tooltip("renewable_share_pct:Q", title="% Renewables", format=".1%"),
+            alt.Tooltip("renewable_share_pct:Q", title="% RE", format=".1%"),
         ],
     )
+    layers.append(re_line)
 
-    chart = alt.layer(bars, line).resolve_scale(y="independent").properties(height=430)
+    chart = alt.layer(*layers).resolve_scale(y="independent").properties(height=430)
     return apply_common_chart_style(chart, height=430)
-
 
 def build_monthly_renewables_table(mix_df: pd.DataFrame) -> pd.DataFrame:
     if mix_df.empty:
@@ -1133,16 +1177,9 @@ def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[st
         .sum()
         .sort_values(["datetime", "technology"])
     )
-    plot["month_label"] = plot["datetime"].dt.strftime("%b-%y")
-    month_order = (
-        plot[["datetime", "month_label"]]
-        .drop_duplicates()
-        .sort_values("datetime")["month_label"]
-        .tolist()
-    )
 
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("month_label:N", sort=month_order, axis=alt.Axis(title=None, labelAngle=0)),
+        x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%b-%y", labelAngle=0, tickCount="month")),
         y=alt.Y("capacity_mw:Q", title="Installed capacity (MW)"),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
         tooltip=[
@@ -1152,7 +1189,6 @@ def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[st
         ],
     ).properties(height=360)
     return apply_common_chart_style(chart, height=360)
-
 
 def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame) -> bytes:
     output = BytesIO()
@@ -1345,11 +1381,13 @@ try:
             day_range = (daily_start, daily_end)
 
         mix_period = build_energy_mix_period(mix_daily, granularity, year_sel=year_sel, day_range=day_range)
+        demand_period = build_demand_period(demand_hourly, granularity, year_sel=year_sel, day_range=day_range)
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
-        mix_chart = build_energy_mix_period_chart(mix_period)
+        mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
         if mix_chart is not None:
             st.altair_chart(mix_chart, use_container_width=True)
+            st.caption("Línea verde = % RE (eje derecho 0%-100%). Línea negra = demanda total del periodo (eje izquierdo).")
 
         subtle_subsection("Monthly renewables summary")
         monthly_renewables_table = build_monthly_renewables_table(mix_daily)
@@ -1367,9 +1405,12 @@ try:
     if installed_capacity.empty:
         st.info("No installed capacity file found in /data.")
     else:
+        if 2026 not in sorted(installed_capacity["datetime"].dt.year.unique().tolist()):
+            st.caption("Installed capacity: el fichero histórico cargado llega hasta 2025. La extensión live 2026 desde ESIOS requiere identificar las series de potencia instalada por tecnología del sistema peninsular.")
         cap_years = sorted(installed_capacity["datetime"].dt.year.unique().tolist())
-        cap_year = st.selectbox("Installed capacity year", cap_years, index=len(cap_years) - 1)
-        cap_df_year = installed_capacity[installed_capacity["datetime"].dt.year == cap_year].copy()
+        default_years = cap_years[-3:] if len(cap_years) >= 3 else cap_years
+        selected_cap_years = st.multiselect("Installed capacity years", cap_years, default=default_years)
+        cap_df_year = installed_capacity[installed_capacity["datetime"].dt.year.isin(selected_cap_years)].copy()
         default_techs = [t for t in ["Solar PV", "Wind", "Hydro", "CCGT", "Nuclear"] if t in cap_df_year["technology"].unique()]
         selected_techs = st.multiselect("Technologies", sorted(cap_df_year["technology"].unique().tolist()), default=default_techs or sorted(cap_df_year["technology"].unique().tolist())[:5])
         cap_chart = build_installed_capacity_chart(cap_df_year, selected_techs)
