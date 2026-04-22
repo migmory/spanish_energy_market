@@ -475,6 +475,36 @@ def build_energy_mix_chart_from_period(mix_period: pd.DataFrame, demand_period: 
     return alt.layer(*layers).properties(height=430)
 
 
+
+RENEWABLE_TECHS = {
+    "Hydro",
+    "Wind",
+    "Solar PV",
+    "Solar thermal",
+    "Biomass",
+    "Biogas",
+    "Other renewables",
+    "Renewable waste",
+}
+
+TECH_COLORS = {
+    "CCGT": "#9CA3AF",
+    "Hydro": "#60A5FA",
+    "Nuclear": "#C084FC",
+    "Solar PV": "#FACC15",
+    "Solar thermal": "#FCA5A5",
+    "Wind": "#2563EB",
+    "CHP": "#F97316",
+    "Biomass": "#16A34A",
+    "Biogas": "#22C55E",
+    "Other renewables": "#14B8A6",
+    "Coal": "#6B7280",
+    "Fuel + Gas": "#A16207",
+    "Renewable waste": "#34D399",
+    "Non-renewable waste": "#64748B",
+    "Steam turbine": "#FF2D2D",
+}
+
 def tech_map(x: str) -> str:
     x = str(x).strip()
     mapping = {
