@@ -317,6 +317,15 @@ def parse_mixed_date(value):
     if not s:
         return pd.NaT
 
+    # Historical file has two different date encodings:
+    # 2021 -> dd/mm/YYYY
+    # 2022+ -> weird REE export like 2022006001T00:00:00+02:00 (= 2022-06-01)
+    # Pattern = YYYY + "00" + M_or_MM + DDD, where day is zero-padded to 3 digits.
+    m = re.match(r"^(\d{4})00(\d{1,2})(\d{3})T", s)
+    if m:
+        y, mth, d = m.groups()
+        return pd.Timestamp(int(y), int(mth), int(d))
+
     m = re.match(r"^(\d{4})0(\d{2})(\d{2})T", s)
     if m:
         y, mth, d = m.groups()
@@ -983,14 +992,6 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
     )
 
     layers = []
-    if not shading.empty:
-        layers.append(
-            alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(
-                x="x_start:T",
-                x2="x_end:T",
-            )
-        )
-
     layers.append(
         base.mark_line(point=True, strokeWidth=3).encode(
             y=alt.Y("value:Q", title="€/MWh"),
@@ -1011,7 +1012,7 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
     year_layers = []
     if not shading.empty:
         year_layers.append(
-            alt.Chart(shading).mark_rect(color=GREY_SHADE, opacity=0.8).encode(
+            alt.Chart(shading[shading["shade"] == 1]).mark_rect(color=GREY_SHADE, opacity=0.9).encode(
                 x="x_start:T",
                 x2="x_end:T",
             )
@@ -1024,7 +1025,7 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
         )
     )
 
-    year_band = alt.layer(*year_layers).properties(height=24)
+    year_band = alt.layer(*year_layers).properties(height=34)
 
     chart = alt.vconcat(main, year_band, spacing=2).resolve_scale(x="shared")
     return apply_common_chart_style(chart, height=330)
