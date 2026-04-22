@@ -1939,24 +1939,23 @@ try:
     mix_energy = {}
     mix_base_hourly = load_mix_base_hourly_from_data()
     if not mix_base_hourly.empty and "datetime" in mix_base_hourly.columns:
-        mix_base_hourly["datetime"] = ensure_dt(mix_base_hourly["datetime"])
+        mix_base_hourly["datetime"] = pd.to_datetime(mix_base_hourly["datetime"], errors="coerce")
 
     with st.spinner("Loading energy mix data..."):
         for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
             forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
-
-            # Base 2021-2025 from /data
             base_tech = mix_base_hourly[mix_base_hourly["technology"] == tech_name].copy()
-
-            # Only refresh 2026 online
             refreshed_2026 = refresh_2026_only_mix_best_energy(
                 tech_name=tech_name,
                 official_id=official_id,
                 forecast_id=forecast_id,
                 token=token,
             )
-
-            mix_energy[tech_name] = merge_mix_base_with_2026(base_tech if not base_tech.empty else mix_base_hourly, tech_name, refreshed_2026)
+            mix_energy[tech_name] = merge_mix_base_with_2026(
+                base_tech if not base_tech.empty else mix_base_hourly,
+                tech_name,
+                refreshed_2026,
+            )
 
     if any(not df.empty for df in mix_energy.values()):
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
@@ -2020,9 +2019,14 @@ try:
             day_range=day_range,
         )
 
-        chart = build_energy_mix_period_chart(mix_period, demand_period)
-        if chart is not None:
-            st.altair_chart(chart, use_container_width=True)
+        if granularity == "Daily" and day_range is not None:
+            mix_period = build_complete_daily_mix_table(mix_period, day_range[0], day_range[1])
+            demand_period = build_complete_daily_demand_table(demand_period, day_range[0], day_range[1])
+
+        re_share = build_re_share_table(mix_period)
+        emix_chart = build_energy_mix_chart_with_re(mix_period, demand_period, re_share)
+        if emix_chart is not None:
+            st.altair_chart(emix_chart, use_container_width=True)
 
         day_mix_table = build_day_energy_mix_table(mix_energy, selected_day)
         subtle_subsection(f"Energy mix detail for {selected_day}")
@@ -2059,10 +2063,6 @@ try:
             )
 
             section_header("% RE over total generation")
-            re_share = build_re_share_table(mix_period)
-            re_chart = build_re_share_chart(re_share)
-            if re_chart is not None:
-                st.altair_chart(re_chart, use_container_width=True)
             if not re_share.empty:
                 st.dataframe(
                     styled_df(
@@ -2071,26 +2071,51 @@ try:
                     ),
                     use_container_width=True,
                 )
+    else:
+        st.info("No energy mix data available yet.")
 
-            section_header("Installed capacity")
-            installed_hist = load_installed_base_from_data()
-            if not installed_hist.empty and "datetime" in installed_hist.columns:
-                installed_hist["datetime"] = ensure_dt(installed_hist["datetime"])
-            inst_period = build_installed_period(
+    section_header("Installed capacity")
+    installed_hist = load_installed_base_from_data()
+    if not installed_hist.empty and "datetime" in installed_hist.columns:
+        installed_hist["datetime"] = pd.to_datetime(installed_hist["datetime"], errors="coerce")
+
+    if not installed_hist.empty:
+        min_month = installed_hist["datetime"].dropna().dt.to_period("M").dt.to_timestamp().min()
+        max_month = installed_hist["datetime"].dropna().dt.to_period("M").dt.to_timestamp().max()
+
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            installed_start = st.date_input(
+                "Installed capacity period start",
+                value=min_month.date() if pd.notna(min_month) else date(2021, 1, 1),
+                min_value=min_month.date() if pd.notna(min_month) else date(2021, 1, 1),
+                max_value=max_month.date() if pd.notna(max_month) else date.today(),
+                key="installed_start_long",
+            )
+        with ic2:
+            installed_end = st.date_input(
+                "Installed capacity period end",
+                value=max_month.date() if pd.notna(max_month) else date.today(),
+                min_value=min_month.date() if pd.notna(min_month) else date(2021, 1, 1),
+                max_value=max_month.date() if pd.notna(max_month) else date.today(),
+                key="installed_end_long",
+            )
+
+        if installed_start <= installed_end:
+            inst_period = build_installed_monthly_long(
                 installed_hist,
-                granularity,
-                year_sel=year_sel,
-                month_sel=month_sel,
-                week_start=week_start,
-                day_range=day_range,
+                start_month=pd.Timestamp(installed_start).to_period("M").to_timestamp(),
+                end_month=pd.Timestamp(installed_end).to_period("M").to_timestamp(),
             )
             inst_chart = build_installed_chart(inst_period)
             if inst_chart is not None:
                 st.altair_chart(inst_chart, use_container_width=True)
             if not inst_period.empty:
                 st.dataframe(styled_df(inst_period[["Period", "Technology", "Installed GW"]]), use_container_width=True)
+        else:
+            st.warning("Installed capacity start cannot be later than end.")
     else:
-        st.info("No energy mix data available yet.")
+        st.info("No installed capacity data available.")
 
     section_header("Extraction workbook")
     st.write("Rows in raw prices:", len(price_raw))
@@ -2173,3 +2198,99 @@ try:
 
 except Exception as e:
     st.error(f"Error: {e}")
+
+def build_complete_daily_mix_table(mix_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    if mix_period.empty:
+        return mix_period.copy()
+    full_days = pd.date_range(start_day, end_day, freq="D")
+    techs = sorted(mix_period["technology"].dropna().astype(str).unique().tolist())
+    if not techs:
+        return mix_period.copy()
+    base = pd.MultiIndex.from_product([full_days, techs], names=["sort_key", "technology"]).to_frame(index=False)
+    merged = base.merge(
+        mix_period[["sort_key", "technology", "energy_mwh", "data_source"]],
+        on=["sort_key", "technology"],
+        how="left",
+    )
+    merged["energy_mwh"] = pd.to_numeric(merged["energy_mwh"], errors="coerce").fillna(0.0)
+    merged["data_source"] = merged["data_source"].fillna("filled")
+    merged["period_label"] = pd.to_datetime(merged["sort_key"]).dt.strftime("%a %d-%b")
+    return merged
+
+def build_complete_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    full_days = pd.DataFrame({"sort_key": pd.date_range(start_day, end_day, freq="D")})
+    full_days["period_label"] = full_days["sort_key"].dt.strftime("%a %d-%b")
+    if demand_period.empty:
+        full_days["demand_mwh"] = 0.0
+        return full_days
+    merged = full_days.merge(
+        demand_period[["sort_key", "demand_mwh"]],
+        on="sort_key",
+        how="left",
+    )
+    merged["demand_mwh"] = pd.to_numeric(merged["demand_mwh"], errors="coerce").fillna(0.0)
+    return merged
+
+def build_energy_mix_chart_with_re(mix_period: pd.DataFrame, demand_period: pd.DataFrame, re_share: pd.DataFrame):
+    import altair as alt
+
+    if mix_period.empty:
+        return None
+
+    order = mix_period[["period_label", "sort_key"]].drop_duplicates().sort_values("sort_key")
+    order_list = order["period_label"].tolist()
+
+    bars = alt.Chart(mix_period).mark_bar().encode(
+        x=alt.X("period_label:N", sort=order_list, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("sum(energy_mwh):Q", title="Generation & demand (MWh)", stack=True, axis=alt.Axis(format="~s")),
+        color=alt.Color("technology:N", title="Technology"),
+        tooltip=[
+            alt.Tooltip("period_label:N", title="Period"),
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("sum(energy_mwh):Q", title="Generation (MWh)", format=",.0f"),
+        ],
+    )
+
+    layers = [bars]
+
+    if not demand_period.empty:
+        demand_chart = alt.Chart(demand_period).mark_line(color="#1F2937", point=True).encode(
+            x=alt.X("period_label:N", sort=order_list, title=None),
+            y=alt.Y("demand_mwh:Q", title="Generation & demand (MWh)", axis=alt.Axis(format="~s")),
+            tooltip=[
+                alt.Tooltip("period_label:N", title="Period"),
+                alt.Tooltip("demand_mwh:Q", title="Demand (MWh)", format=",.0f"),
+            ],
+        )
+        layers.append(demand_chart)
+
+    if not re_share.empty:
+        re_chart = alt.Chart(re_share).mark_line(color="#0F766E", point=alt.OverlayMarkDef(shape="diamond", filled=True, size=70)).encode(
+            x=alt.X("Period:N", sort=order_list, title=None),
+            y=alt.Y("% RE:Q", title="% RE", axis=alt.Axis(format=".0%"), scale=alt.Scale(domain=[0, 1])),
+            tooltip=[
+                alt.Tooltip("Period:N", title="Period"),
+                alt.Tooltip("% RE:Q", title="% RE", format=".1%"),
+            ],
+        )
+        chart = alt.layer(*layers, re_chart).resolve_scale(y="independent").properties(height=430)
+    else:
+        chart = alt.layer(*layers).properties(height=430)
+
+    return chart
+
+def build_installed_monthly_long(installed_hist: pd.DataFrame, start_month: pd.Timestamp | None = None, end_month: pd.Timestamp | None = None) -> pd.DataFrame:
+    if installed_hist.empty:
+        return pd.DataFrame(columns=["Period", "Technology", "Installed GW", "sort_key"])
+    tmp = ensure_datetime_col(installed_hist.copy(), "datetime")
+    tmp = tmp.dropna(subset=["datetime"]).copy()
+    tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+    if start_month is not None:
+        tmp = tmp[tmp["sort_key"] >= pd.Timestamp(start_month)].copy()
+    if end_month is not None:
+        tmp = tmp[tmp["sort_key"] <= pd.Timestamp(end_month)].copy()
+    tmp["Period"] = tmp["sort_key"].dt.strftime("%b - %Y")
+    tmp = tmp.sort_values("datetime").groupby(["Period", "sort_key", "technology"], as_index=False).tail(1)
+    tmp["Installed GW"] = pd.to_numeric(tmp["mw"], errors="coerce") / 1000.0
+    return tmp.rename(columns={"technology": "Technology"})[["Period", "Technology", "Installed GW", "sort_key"]].sort_values(["sort_key", "Technology"]).reset_index(drop=True)
+
