@@ -155,6 +155,8 @@ def build_installed_monthly_long(installed_hist: pd.DataFrame, start_month: pd.T
 
 
 
+
+solar_fc_hourly = pd.DataFrame(columns=["datetime", "solar_forecast_mw"])
 st.title("Day Ahead - Spain Spot Prices")
 
 CACHE_DIR = BASE_DIR / "historical_data"
@@ -2184,7 +2186,9 @@ try:
     day_solar = solar_hourly[solar_hourly["datetime"].dt.date == selected_day].copy()
     today_local = pd.Timestamp.now(tz="Europe/Madrid").date()
     if selected_day >= today_local and not solar_fc_hourly.empty:
-        day_fc = solar_fc_hourly[solar_fc_hourly["datetime"].dt.date == selected_day].copy()
+        tmp_fc = solar_fc_hourly.copy()
+        tmp_fc["datetime"] = pd.to_datetime(tmp_fc["datetime"], errors="coerce")
+        day_fc = tmp_fc[tmp_fc["datetime"].dt.date == selected_day].copy()
         if not day_fc.empty:
             day_fc["solar_best_mw"] = pd.to_numeric(day_fc["solar_forecast_mw"], errors="coerce")
             day_fc["solar_source"] = "Forecast"
