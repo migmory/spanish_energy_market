@@ -499,18 +499,32 @@ def load_historical_generation_mix_daily() -> pd.DataFrame:
         return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
 
     raw = pd.read_excel(HIST_MIX_FILE, sheet_name="data", header=None)
-    dates = [parse_mixed_date(v) for v in raw.iloc[4, 1:].tolist()]
-    tech_rows = raw.iloc[5:19, :].copy()
+
+    # Row 4 contains daily timestamps from 2022-01-01 to 2025-12-31 in ISO format.
+    # We still run parse_mixed_date as a fallback because some REE exports use mixed encodings.
+    date_values = raw.iloc[4, 1:].tolist()
+    dates = []
+    for v in date_values:
+        dt = pd.to_datetime(v, utc=True, errors="coerce")
+        if pd.notna(dt):
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None).normalize()
+        else:
+            dt = parse_mixed_date(v)
+            if pd.notna(dt):
+                dt = pd.Timestamp(dt).normalize()
+        dates.append(dt)
+
+    # Technology rows. Exclude "Generación total" because totals are computed later.
+    tech_rows = raw.iloc[5:18, :].copy()
 
     records = []
     for _, row in tech_rows.iterrows():
         tech_raw = str(row.iloc[0]).strip()
         tech = LOCAL_MIX_TECH_MAP.get(tech_raw, tech_raw)
-        for col_idx, dt in enumerate(dates, start=1):
-            if pd.isna(dt):
-                continue
-            val = pd.to_numeric(row.iloc[col_idx], errors="coerce")
-            if pd.isna(val):
+
+        values = pd.to_numeric(row.iloc[1:], errors="coerce")
+        for dt, val in zip(dates, values):
+            if pd.isna(dt) or pd.isna(val):
                 continue
             records.append(
                 {
@@ -523,9 +537,27 @@ def load_historical_generation_mix_daily() -> pd.DataFrame:
 
     out = pd.DataFrame(records)
     if out.empty:
-        return out
-    out = out[out["datetime"].dt.year <= 2025].copy()
-    return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+
+    out = out[out["datetime"].dt.year.between(2022, 2025)].copy()
+
+    # Align historical hydro format with the chart format used elsewhere.
+    hydro = (
+        out[out["technology"] == "Hydro"]
+        .groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
+    )
+    hydro["technology"] = "Hydro"
+
+    non_hydro = out[out["technology"] != "Hydro"].copy()
+    out = pd.concat([non_hydro, hydro], ignore_index=True)
+    out = (
+        out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"]
+        .sum()
+        .sort_values(["datetime", "technology", "data_source"])
+        .reset_index(drop=True)
+    )
+    return out
+
 
 
 @st.cache_data(show_spinner=False)
@@ -649,54 +681,72 @@ def load_live_2026_solar(token: str, start_day: date, end_day: date) -> pd.DataF
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
+
     frames = []
+
     for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
-        official = pd.DataFrame(columns=["datetime", "value"])
-        forecast = pd.DataFrame(columns=["datetime", "value"])
+        official_df = pd.DataFrame(columns=["datetime", "value"])
+        forecast_df = pd.DataFrame(columns=["datetime", "value"])
 
         if official_id is not None:
             try:
-                official = fetch_esios_range(official_id, start_day, end_day, token, time_trunc="day")[["datetime", "value"]].copy()
+                official_df = fetch_esios_range(official_id, start_day, end_day, token)
             except Exception:
-                official = fetch_esios_range(official_id, start_day, end_day, token)[["datetime", "value"]].copy()
-            official["data_source"] = "Official"
+                official_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
         forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
         if forecast_id is not None:
             try:
-                forecast = fetch_esios_range(forecast_id, start_day, end_day, token, time_trunc="day")[["datetime", "value"]].copy()
+                forecast_df = fetch_esios_range(forecast_id, start_day, end_day, token)
             except Exception:
-                forecast = fetch_esios_range(forecast_id, start_day, end_day, token)[["datetime", "value"]].copy()
-            forecast["data_source"] = "Forecast"
+                forecast_df = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-        if not official.empty:
-            official["datetime"] = pd.to_datetime(official["datetime"]).dt.normalize()
-        if not forecast.empty:
-            forecast["datetime"] = pd.to_datetime(forecast["datetime"]).dt.normalize()
+        official_energy = to_energy_intervals(official_df) if not official_df.empty else pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
+        forecast_energy = to_energy_intervals(forecast_df) if not forecast_df.empty else pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
 
-        off_e = to_programmed_generation_energy(official) if not official.empty else pd.DataFrame()
-        fc_e = to_programmed_generation_energy(forecast) if not forecast.empty else pd.DataFrame()
-
-        if off_e.empty and fc_e.empty:
+        if official_energy.empty and forecast_energy.empty:
             continue
 
-        if off_e.empty:
-            best = fc_e.copy()
+        if official_energy.empty:
+            best = forecast_energy.copy()
             best["data_source"] = "Forecast"
-        elif fc_e.empty:
-            best = off_e.copy()
+        elif forecast_energy.empty:
+            best = official_energy.copy()
             best["data_source"] = "Official"
         else:
-            a = off_e[["datetime", "energy_mwh"]].rename(columns={"energy_mwh": "off_energy"})
-            b = fc_e[["datetime", "energy_mwh"]].rename(columns={"energy_mwh": "fc_energy"})
-            best = a.merge(b, on="datetime", how="outer")
-            best["energy_mwh"] = best["off_energy"].combine_first(best["fc_energy"])
-            best["data_source"] = best["off_energy"].apply(lambda x: "Official" if pd.notna(x) else "Forecast")
-            best = best[["datetime", "energy_mwh", "data_source"]]
+            off = official_energy[["datetime", "mw", "energy_mwh"]].rename(
+                columns={"mw": "mw_official", "energy_mwh": "energy_mwh_official"}
+            )
+            fc = forecast_energy[["datetime", "mw", "energy_mwh"]].rename(
+                columns={"mw": "mw_forecast", "energy_mwh": "energy_mwh_forecast"}
+            )
+            best = off.merge(fc, on="datetime", how="outer")
+            best["mw"] = best["mw_official"].combine_first(best["mw_forecast"])
+            best["energy_mwh"] = best["energy_mwh_official"].combine_first(best["energy_mwh_forecast"])
+            best["data_source"] = best["mw_official"].apply(lambda x: "Official" if pd.notna(x) else None)
+            best.loc[best["data_source"].isna() & best["mw_forecast"].notna(), "data_source"] = "Forecast"
+            best = best[["datetime", "mw", "energy_mwh", "data_source"]]
 
-        best = best.groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
-        best["technology"] = tech_name
-        frames.append(best)
+        # Keep the exact live path aligned with the original Day Ahead logic:
+        # quarter-hour/hour -> energy per interval -> hourly -> daily aggregation.
+        hourly = best.copy()
+        hourly["datetime"] = pd.to_datetime(hourly["datetime"], errors="coerce").dt.floor("h")
+        hourly = (
+            hourly.groupby(["datetime", "data_source"], as_index=False)["energy_mwh"]
+            .sum()
+        )
+        hourly["technology"] = tech_name
+
+        daily = hourly.copy()
+        daily["datetime"] = daily["datetime"].dt.normalize()
+        daily = (
+            daily.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"]
+            .sum()
+        )
+        frames.append(daily)
 
     if not frames:
         return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "data_source"])
@@ -711,8 +761,14 @@ def load_live_2026_mix_daily(token: str, start_day: date, end_day: date) -> pd.D
 
     keep = out[~out["technology"].isin(["Hydro UGH", "Hydro non-UGH", "Pumped hydro"])].copy()
     out = pd.concat([keep, hydro], ignore_index=True)
-    out = out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum()
-    return out.sort_values(["datetime", "technology", "data_source"]).reset_index(drop=True)
+    out = (
+        out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"]
+        .sum()
+        .sort_values(["datetime", "technology", "data_source"])
+        .reset_index(drop=True)
+    )
+    return out
+
 
 def combine_hist_and_live(hist_df: pd.DataFrame, live_df: pd.DataFrame, subset_cols: list[str]) -> pd.DataFrame:
     combined = pd.concat([hist_df, live_df], ignore_index=True)
@@ -932,7 +988,7 @@ def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, m
 def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
     years = sorted(monthly_combo["month"].dt.year.unique().tolist()) if not monthly_combo.empty else []
     if not years:
-        return pd.DataFrame(columns=["x_start", "x_end", "year", "shade"])
+        return pd.DataFrame(columns=["x_start", "x_end", "year", "shade_flag"])
 
     rows = []
     for i, year in enumerate(years):
@@ -941,7 +997,7 @@ def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
                 "x_start": pd.Timestamp(year, 1, 1),
                 "x_end": pd.Timestamp(year + 1, 1, 1),
                 "year": str(year),
-                "shade": 1 if i % 2 == 0 else 0,
+                "shade_flag": 1 if i % 2 == 0 else 0,
             }
         )
     return pd.DataFrame(rows)
@@ -1018,7 +1074,7 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
     year_layers = []
     if not shading.empty:
         year_layers.append(
-            alt.Chart(shading[shading["shade"] == 1]).mark_rect(color=GREY_SHADE, opacity=0.9).encode(
+            alt.Chart(shading[shading.get("shade_flag", pd.Series(dtype=int)) == 1]).mark_rect(color=GREY_SHADE, opacity=0.9).encode(
                 x="x_start:T",
                 x2="x_end:T",
             )
@@ -1189,7 +1245,7 @@ try:
         st.info("No energy mix data available.")
     else:
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Daily"], index=1)
-        available_years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
+        available_years = sorted(mix_daily["datetime"].dt.year.unique().tolist())
         year_sel = available_years[-1]
         day_range = None
         if granularity == "Monthly":
@@ -1206,7 +1262,7 @@ try:
 
         mix_period = build_energy_mix_period(mix_daily, granularity, year_sel=year_sel, day_range=day_range)
         if granularity == "Monthly" and mix_period.empty:
-            st.info(f"No energy mix historical file is available for {year_sel}. In /data the uploaded mix file only contains 2021, and live extraction starts in 2026.")
+            st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period)
         if mix_chart is not None:
             st.altair_chart(mix_chart, use_container_width=True)
