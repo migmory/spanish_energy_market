@@ -103,6 +103,13 @@ RENEWABLE_TECHS = {
 # =========================================================
 # DISPLAY HELPERS
 # =========================================================
+
+def ensure_datetime_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    out = df.copy()
+    if col in out.columns:
+        out[col] = pd.to_datetime(out[col], errors="coerce")
+    return out
+
 def section_header(title: str):
     st.markdown(
         f"""
@@ -290,7 +297,7 @@ def load_raw_history(csv_path: Path, source_name: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if df.empty:
         return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True).dt.tz_convert("Europe/Madrid").dt.tz_localize(None) if pd.to_datetime(df["datetime"], errors="coerce", utc=True).notna().any() else pd.to_datetime(df["datetime"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     if "source" not in df.columns:
         df["source"] = source_name
@@ -747,6 +754,8 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
 
 
 def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, metrics: dict):
+    day_price = ensure_datetime_col(day_price, "datetime")
+    day_solar = ensure_datetime_col(day_solar, "datetime")
     if day_price.empty:
         return None
     price_base = alt.Chart(day_price).encode(x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%H:%M", labelAngle=0, labelPadding=8)))
@@ -787,6 +796,8 @@ def build_negative_price_chart(negative_df: pd.DataFrame):
 # ENERGY MIX & RE / INSTALLED
 # =========================================================
 def build_energy_mix_period_from_daily_combined(mix_daily_all: pd.DataFrame, demand_energy: pd.DataFrame, granularity: str, year_sel=None, month_sel=None, day_range=None):
+    mix_daily_all = ensure_datetime_col(mix_daily_all, "sort_key")
+    demand_energy = ensure_datetime_col(demand_energy, "datetime") if not demand_energy.empty else demand_energy
     mix = mix_daily_all.copy()
     demand = demand_energy.copy()
     demand["datetime"] = pd.to_datetime(demand["datetime"], errors="coerce")
