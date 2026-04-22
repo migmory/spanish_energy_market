@@ -931,16 +931,20 @@ def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, m
 
 def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
     years = sorted(monthly_combo["month"].dt.year.unique().tolist()) if not monthly_combo.empty else []
-    if len(years) < 2:
-        return pd.DataFrame(columns=["x_start", "x_end", "year"])
-    shade_year = years[-2]
-    return pd.DataFrame(
-        {
-            "x_start": [pd.Timestamp(shade_year, 1, 1)],
-            "x_end": [pd.Timestamp(shade_year + 1, 1, 1)],
-            "year": [str(shade_year)],
-        }
-    )
+    if not years:
+        return pd.DataFrame(columns=["x_start", "x_end", "year", "shade"])
+
+    rows = []
+    for i, year in enumerate(years):
+        rows.append(
+            {
+                "x_start": pd.Timestamp(year, 1, 1),
+                "x_end": pd.Timestamp(year + 1, 1, 1),
+                "year": str(year),
+                "shade": 1 if i % 2 == 0 else 0,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def build_monthly_main_chart(monthly_combo: pd.DataFrame):
@@ -984,9 +988,11 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
                 format="%b",
                 labelAngle=0,
                 labelPadding=8,
+                labelFlush=False,
                 ticks=False,
                 domain=False,
                 grid=False,
+                labelOverlap="greedy",
             ),
         )
     )
@@ -1018,6 +1024,12 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
             )
         )
 
+        year_layers.append(
+            alt.Chart(shading.iloc[1:]).mark_rule(color="#D1D5DB", strokeWidth=1.2).encode(
+                x="x_start:T"
+            )
+        )
+
     year_layers.append(
         alt.Chart(year_df).mark_text(fontWeight="bold", dy=0, fontSize=13, color="#111827").encode(
             x=alt.X("year_mid:T", axis=alt.Axis(title=None, labels=False, ticks=False, domain=False, grid=False)),
@@ -1025,9 +1037,9 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
         )
     )
 
-    year_band = alt.layer(*year_layers).properties(height=34)
+    year_band = alt.layer(*year_layers).properties(height=36)
 
-    chart = alt.vconcat(main, year_band, spacing=2).resolve_scale(x="shared")
+    chart = alt.vconcat(main, year_band, spacing=1).resolve_scale(x="shared")
     return apply_common_chart_style(chart, height=330)
 
 def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
