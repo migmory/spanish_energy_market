@@ -52,6 +52,109 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def build_complete_daily_mix_table(mix_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    if mix_period.empty:
+        return mix_period.copy()
+    full_days = pd.date_range(start_day, end_day, freq="D")
+    techs = sorted(mix_period["technology"].dropna().astype(str).unique().tolist())
+    if not techs:
+        return mix_period.copy()
+    base = pd.MultiIndex.from_product([full_days, techs], names=["sort_key", "technology"]).to_frame(index=False)
+    merged = base.merge(
+        mix_period[["sort_key", "technology", "energy_mwh", "data_source"]],
+        on=["sort_key", "technology"],
+        how="left",
+    )
+    merged["energy_mwh"] = pd.to_numeric(merged["energy_mwh"], errors="coerce").fillna(0.0)
+    merged["data_source"] = merged["data_source"].fillna("filled")
+    merged["period_label"] = pd.to_datetime(merged["sort_key"]).dt.strftime("%a %d-%b")
+    return merged
+
+def build_full_daily_mix_table(mix_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    return build_complete_daily_mix_table(mix_period, start_day, end_day)
+
+def build_full_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    return build_complete_daily_demand_table(demand_period, start_day, end_day)
+
+def build_complete_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    full_days = pd.DataFrame({"sort_key": pd.date_range(start_day, end_day, freq="D")})
+    full_days["period_label"] = full_days["sort_key"].dt.strftime("%a %d-%b")
+    if demand_period.empty:
+        full_days["demand_mwh"] = 0.0
+        return full_days
+    merged = full_days.merge(
+        demand_period[["sort_key", "demand_mwh"]],
+        on="sort_key",
+        how="left",
+    )
+    merged["demand_mwh"] = pd.to_numeric(merged["demand_mwh"], errors="coerce").fillna(0.0)
+    return merged
+
+def build_energy_mix_chart_with_re(mix_period: pd.DataFrame, demand_period: pd.DataFrame, re_share: pd.DataFrame):
+    import altair as alt
+
+    if mix_period.empty:
+        return None
+
+    order = mix_period[["period_label", "sort_key"]].drop_duplicates().sort_values("sort_key")
+    order_list = order["period_label"].tolist()
+
+    bars = alt.Chart(mix_period).mark_bar().encode(
+        x=alt.X("period_label:N", sort=order_list, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("sum(energy_mwh):Q", title="Generation & demand (MWh)", stack=True, axis=alt.Axis(format="~s")),
+        color=alt.Color("technology:N", title="Technology"),
+        tooltip=[
+            alt.Tooltip("period_label:N", title="Period"),
+            alt.Tooltip("technology:N", title="Technology"),
+            alt.Tooltip("sum(energy_mwh):Q", title="Generation (MWh)", format=",.0f"),
+        ],
+    )
+
+    layers = [bars]
+
+    if not demand_period.empty:
+        demand_chart = alt.Chart(demand_period).mark_line(color="#1F2937", point=True).encode(
+            x=alt.X("period_label:N", sort=order_list, title=None),
+            y=alt.Y("demand_mwh:Q", title="Generation & demand (MWh)", axis=alt.Axis(format="~s")),
+            tooltip=[
+                alt.Tooltip("period_label:N", title="Period"),
+                alt.Tooltip("demand_mwh:Q", title="Demand (MWh)", format=",.0f"),
+            ],
+        )
+        layers.append(demand_chart)
+
+    if not re_share.empty:
+        re_chart = alt.Chart(re_share).mark_line(color="#0F766E", point=alt.OverlayMarkDef(shape="diamond", filled=True, size=70)).encode(
+            x=alt.X("Period:N", sort=order_list, title=None),
+            y=alt.Y("% RE:Q", title="% RE", axis=alt.Axis(format=".0%"), scale=alt.Scale(domain=[0, 1])),
+            tooltip=[
+                alt.Tooltip("Period:N", title="Period"),
+                alt.Tooltip("% RE:Q", title="% RE", format=".1%"),
+            ],
+        )
+        chart = alt.layer(*layers, re_chart).resolve_scale(y="independent").properties(height=430)
+    else:
+        chart = alt.layer(*layers).properties(height=430)
+
+    return chart
+
+def build_installed_monthly_long(installed_hist: pd.DataFrame, start_month: pd.Timestamp | None = None, end_month: pd.Timestamp | None = None) -> pd.DataFrame:
+    if installed_hist.empty:
+        return pd.DataFrame(columns=["Period", "Technology", "Installed GW", "sort_key"])
+    tmp = ensure_datetime_col(installed_hist.copy(), "datetime")
+    tmp = tmp.dropna(subset=["datetime"]).copy()
+    tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+    if start_month is not None:
+        tmp = tmp[tmp["sort_key"] >= pd.Timestamp(start_month)].copy()
+    if end_month is not None:
+        tmp = tmp[tmp["sort_key"] <= pd.Timestamp(end_month)].copy()
+    tmp["Period"] = tmp["sort_key"].dt.strftime("%b - %Y")
+    tmp = tmp.sort_values("datetime").groupby(["Period", "sort_key", "technology"], as_index=False).tail(1)
+    tmp["Installed GW"] = pd.to_numeric(tmp["mw"], errors="coerce") / 1000.0
+    return tmp.rename(columns={"technology": "Technology"})[["Period", "Technology", "Installed GW", "sort_key"]].sort_values(["sort_key", "Technology"]).reset_index(drop=True)
+
+
+
 st.title("Day Ahead - Spain Spot Prices")
 
 CACHE_DIR = BASE_DIR / "historical_data"
@@ -2198,105 +2301,4 @@ try:
 
 except Exception as e:
     st.error(f"Error: {e}")
-
-def build_complete_daily_mix_table(mix_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
-    if mix_period.empty:
-        return mix_period.copy()
-    full_days = pd.date_range(start_day, end_day, freq="D")
-    techs = sorted(mix_period["technology"].dropna().astype(str).unique().tolist())
-    if not techs:
-        return mix_period.copy()
-    base = pd.MultiIndex.from_product([full_days, techs], names=["sort_key", "technology"]).to_frame(index=False)
-    merged = base.merge(
-        mix_period[["sort_key", "technology", "energy_mwh", "data_source"]],
-        on=["sort_key", "technology"],
-        how="left",
-    )
-    merged["energy_mwh"] = pd.to_numeric(merged["energy_mwh"], errors="coerce").fillna(0.0)
-    merged["data_source"] = merged["data_source"].fillna("filled")
-    merged["period_label"] = pd.to_datetime(merged["sort_key"]).dt.strftime("%a %d-%b")
-    return merged
-
-def build_full_daily_mix_table(mix_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
-    return build_complete_daily_mix_table(mix_period, start_day, end_day)
-
-def build_full_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
-    return build_complete_daily_demand_table(demand_period, start_day, end_day)
-
-def build_complete_daily_demand_table(demand_period: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
-    full_days = pd.DataFrame({"sort_key": pd.date_range(start_day, end_day, freq="D")})
-    full_days["period_label"] = full_days["sort_key"].dt.strftime("%a %d-%b")
-    if demand_period.empty:
-        full_days["demand_mwh"] = 0.0
-        return full_days
-    merged = full_days.merge(
-        demand_period[["sort_key", "demand_mwh"]],
-        on="sort_key",
-        how="left",
-    )
-    merged["demand_mwh"] = pd.to_numeric(merged["demand_mwh"], errors="coerce").fillna(0.0)
-    return merged
-
-def build_energy_mix_chart_with_re(mix_period: pd.DataFrame, demand_period: pd.DataFrame, re_share: pd.DataFrame):
-    import altair as alt
-
-    if mix_period.empty:
-        return None
-
-    order = mix_period[["period_label", "sort_key"]].drop_duplicates().sort_values("sort_key")
-    order_list = order["period_label"].tolist()
-
-    bars = alt.Chart(mix_period).mark_bar().encode(
-        x=alt.X("period_label:N", sort=order_list, title=None, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("sum(energy_mwh):Q", title="Generation & demand (MWh)", stack=True, axis=alt.Axis(format="~s")),
-        color=alt.Color("technology:N", title="Technology"),
-        tooltip=[
-            alt.Tooltip("period_label:N", title="Period"),
-            alt.Tooltip("technology:N", title="Technology"),
-            alt.Tooltip("sum(energy_mwh):Q", title="Generation (MWh)", format=",.0f"),
-        ],
-    )
-
-    layers = [bars]
-
-    if not demand_period.empty:
-        demand_chart = alt.Chart(demand_period).mark_line(color="#1F2937", point=True).encode(
-            x=alt.X("period_label:N", sort=order_list, title=None),
-            y=alt.Y("demand_mwh:Q", title="Generation & demand (MWh)", axis=alt.Axis(format="~s")),
-            tooltip=[
-                alt.Tooltip("period_label:N", title="Period"),
-                alt.Tooltip("demand_mwh:Q", title="Demand (MWh)", format=",.0f"),
-            ],
-        )
-        layers.append(demand_chart)
-
-    if not re_share.empty:
-        re_chart = alt.Chart(re_share).mark_line(color="#0F766E", point=alt.OverlayMarkDef(shape="diamond", filled=True, size=70)).encode(
-            x=alt.X("Period:N", sort=order_list, title=None),
-            y=alt.Y("% RE:Q", title="% RE", axis=alt.Axis(format=".0%"), scale=alt.Scale(domain=[0, 1])),
-            tooltip=[
-                alt.Tooltip("Period:N", title="Period"),
-                alt.Tooltip("% RE:Q", title="% RE", format=".1%"),
-            ],
-        )
-        chart = alt.layer(*layers, re_chart).resolve_scale(y="independent").properties(height=430)
-    else:
-        chart = alt.layer(*layers).properties(height=430)
-
-    return chart
-
-def build_installed_monthly_long(installed_hist: pd.DataFrame, start_month: pd.Timestamp | None = None, end_month: pd.Timestamp | None = None) -> pd.DataFrame:
-    if installed_hist.empty:
-        return pd.DataFrame(columns=["Period", "Technology", "Installed GW", "sort_key"])
-    tmp = ensure_datetime_col(installed_hist.copy(), "datetime")
-    tmp = tmp.dropna(subset=["datetime"]).copy()
-    tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-    if start_month is not None:
-        tmp = tmp[tmp["sort_key"] >= pd.Timestamp(start_month)].copy()
-    if end_month is not None:
-        tmp = tmp[tmp["sort_key"] <= pd.Timestamp(end_month)].copy()
-    tmp["Period"] = tmp["sort_key"].dt.strftime("%b - %Y")
-    tmp = tmp.sort_values("datetime").groupby(["Period", "sort_key", "technology"], as_index=False).tail(1)
-    tmp["Installed GW"] = pd.to_numeric(tmp["mw"], errors="coerce") / 1000.0
-    return tmp.rename(columns={"technology": "Technology"})[["Period", "Technology", "Installed GW", "sort_key"]].sort_values(["sort_key", "Technology"]).reset_index(drop=True)
 
