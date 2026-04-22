@@ -254,6 +254,226 @@ TEAL_ACCENT = "#0F766E"
 # =========================================================
 # DISPLAY HELPERS
 # =========================================================
+
+def load_mix_daily_base_from_data() -> pd.DataFrame:
+    raw = pd.read_excel(DATA_DIR / "generation_mix_daily_2021_2025.xlsx", sheet_name="data", header=None)
+    header = raw.iloc[4].tolist()
+    body = raw.iloc[5:].copy().reset_index(drop=True)
+    body.columns = header
+    body = body.rename(columns={body.columns[0]: "technology"})
+    body = body[body["technology"].notna()].copy()
+    body["technology"] = body["technology"].astype(str).str.strip()
+    long = body.melt(id_vars=["technology"], var_name="date", value_name="energy_gwh")
+    long["date"] = pd.to_datetime(long["date"], errors="coerce")
+    long["energy_gwh"] = pd.to_numeric(long["energy_gwh"], errors="coerce")
+    long = long.dropna(subset=["date", "energy_gwh"]).copy()
+    mask_total = long["technology"].str.contains("total", case=False, na=False) | long["technology"].str.contains("generación total", case=False, na=False)
+    long = long[~mask_total].copy()
+    long["technology"] = long["technology"].map(tech_map)
+    long["energy_mwh"] = long["energy_gwh"] * 1000.0
+    long["renewable"] = long["technology"].isin(RENEWABLE_TECHS)
+    long["sort_key"] = pd.to_datetime(long["date"]).dt.normalize()
+    long["period_label"] = long["sort_key"].dt.strftime("%a %d-%b")
+    long["data_source"] = "data"
+    return long[["sort_key", "period_label", "technology", "energy_mwh", "renewable", "data_source"]].sort_values(["sort_key", "technology"]).reset_index(drop=True)
+
+def refresh_mix_daily_2026_from_ree() -> pd.DataFrame:
+    cache_path = HISTORICAL_DATA_DIR / "mix_daily_2026_cache.csv"
+    if cache_path.exists():
+        cache = pd.read_csv(cache_path)
+    else:
+        cache = pd.DataFrame(columns=["sort_key", "period_label", "technology", "energy_mwh", "renewable", "data_source"])
+    if not cache.empty:
+        cache["sort_key"] = pd.to_datetime(cache["sort_key"], errors="coerce")
+        cache["energy_mwh"] = pd.to_numeric(cache["energy_mwh"], errors="coerce")
+        cache = cache.dropna(subset=["sort_key", "technology", "energy_mwh"]).copy()
+
+    start_day = date(2026, 1, 1)
+    if not cache.empty:
+        last_day = cache["sort_key"].max()
+        if pd.notna(last_day):
+            start_day = last_day.date() + timedelta(days=1)
+
+    end_day = max_refresh_day()
+    rows = []
+    if start_day <= end_day:
+        url = (
+            "https://apidatos.ree.es/es/datos/generacion/estructura-generacion"
+            f"?start_date={start_day:%Y-%m-%d}T00:00&end_date={end_day:%Y-%m-%d}T23:59"
+            f"&time_trunc=day&geo_trunc=electric_system&geo_limit=peninsular&geo_ids={PENINSULAR_GEO_ID}"
+        )
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            payload = resp.json()
+            for item in payload.get("included", []):
+                attrs = item.get("attributes", {})
+                tech = tech_map(attrs.get("title"))
+                if "total" in str(tech).lower():
+                    continue
+                renewable = str(attrs.get("type", "")).strip().lower() == "renovable"
+                for v in attrs.get("values", []):
+                    dt = normalize_remote_datetime(pd.Series([v.get("datetime")])).iloc[0]
+                    val = pd.to_numeric(v.get("value"), errors="coerce")
+                    if pd.isna(dt) or pd.isna(val):
+                        continue
+                    rows.append({
+                        "sort_key": pd.Timestamp(dt).normalize(),
+                        "period_label": pd.Timestamp(dt).normalize().strftime("%a %d-%b"),
+                        "technology": tech,
+                        "energy_mwh": float(val) * 1000.0,
+                        "renewable": renewable,
+                        "data_source": "ree_2026",
+                    })
+        except Exception:
+            pass
+
+    if rows:
+        new = pd.DataFrame(rows)
+        cache = pd.concat([cache, new], ignore_index=True)
+        cache["sort_key"] = pd.to_datetime(cache["sort_key"], errors="coerce")
+        cache["energy_mwh"] = pd.to_numeric(cache["energy_mwh"], errors="coerce")
+        cache = cache.dropna(subset=["sort_key", "technology", "energy_mwh"]).sort_values(["sort_key", "technology"]).drop_duplicates(["sort_key", "technology"], keep="last")
+        cache.to_csv(cache_path, index=False)
+
+    return cache.sort_values(["sort_key", "technology"]).reset_index(drop=True)
+
+def load_energy_mix_combined_daily() -> pd.DataFrame:
+    base = load_mix_daily_base_from_data()
+    ref2026 = refresh_mix_daily_2026_from_ree()
+    out = pd.concat([base, ref2026], ignore_index=True)
+    out["sort_key"] = pd.to_datetime(out["sort_key"], errors="coerce")
+    out["energy_mwh"] = pd.to_numeric(out["energy_mwh"], errors="coerce")
+    out = out.dropna(subset=["sort_key", "technology", "energy_mwh"]).sort_values(["sort_key", "technology"]).drop_duplicates(["sort_key", "technology", "data_source"], keep="last")
+    out["period_label"] = out["sort_key"].dt.strftime("%a %d-%b")
+    return out.reset_index(drop=True)
+
+def build_energy_mix_period_from_daily_combined(mix_daily_all: pd.DataFrame, demand_energy: pd.DataFrame, granularity: str, year_sel=None, month_sel=None, day_range=None):
+    mix = mix_daily_all.copy()
+    mix["sort_key"] = pd.to_datetime(mix["sort_key"], errors="coerce")
+
+    demand = demand_energy.copy()
+    if not demand.empty:
+        demand["datetime"] = pd.to_datetime(demand["datetime"], errors="coerce")
+        demand["sort_key"] = demand["datetime"].dt.normalize()
+
+    if granularity == "Annual":
+        mix["Period"] = mix["sort_key"].dt.year.astype(str)
+        mix["period_order"] = mix["sort_key"].dt.year
+        mixp = mix.groupby(["Period", "period_order", "technology"], as_index=False)["energy_mwh"].sum()
+
+        if not demand.empty:
+            demand["Period"] = demand["sort_key"].dt.year.astype(str)
+            demand["period_order"] = demand["sort_key"].dt.year
+            demandp = demand.groupby(["Period", "period_order"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "demand_mwh"})
+        else:
+            demandp = pd.DataFrame(columns=["Period", "period_order", "demand_mwh"])
+
+    elif granularity == "Monthly":
+        mix = mix[mix["sort_key"].dt.year == year_sel].copy()
+        mix["Period"] = mix["sort_key"].dt.strftime("%b - %Y")
+        mix["period_order"] = mix["sort_key"].dt.to_period("M").dt.to_timestamp()
+        mixp = mix.groupby(["Period", "period_order", "technology"], as_index=False)["energy_mwh"].sum()
+
+        if not demand.empty:
+            demand = demand[demand["sort_key"].dt.year == year_sel].copy()
+            demand["Period"] = demand["sort_key"].dt.strftime("%b - %Y")
+            demand["period_order"] = demand["sort_key"].dt.to_period("M").dt.to_timestamp()
+            demandp = demand.groupby(["Period", "period_order"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "demand_mwh"})
+        else:
+            demandp = pd.DataFrame(columns=["Period", "period_order", "demand_mwh"])
+
+    elif granularity == "Daily":
+        d0, d1 = day_range
+        mix = mix[(mix["sort_key"].dt.date >= d0) & (mix["sort_key"].dt.date <= d1)].copy()
+        mix["Period"] = mix["sort_key"].dt.strftime("%a %d-%b")
+        mix["period_order"] = mix["sort_key"]
+        mixp = mix.groupby(["Period", "period_order", "technology"], as_index=False)["energy_mwh"].sum()
+
+        full_days = pd.date_range(d0, d1, freq="D")
+        techs = sorted(mixp["technology"].dropna().astype(str).unique().tolist())
+        if techs:
+            scaffold = pd.MultiIndex.from_product([full_days, techs], names=["period_order", "technology"]).to_frame(index=False)
+            scaffold["Period"] = pd.to_datetime(scaffold["period_order"]).dt.strftime("%a %d-%b")
+            mixp = scaffold.merge(mixp, on=["Period", "period_order", "technology"], how="left")
+            mixp["energy_mwh"] = pd.to_numeric(mixp["energy_mwh"], errors="coerce").fillna(0.0)
+
+        if not demand.empty:
+            demand = demand[(demand["sort_key"].dt.date >= d0) & (demand["sort_key"].dt.date <= d1)].copy()
+            demand["Period"] = demand["sort_key"].dt.strftime("%a %d-%b")
+            demand["period_order"] = demand["sort_key"]
+            demandp = demand.groupby(["Period", "period_order"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "demand_mwh"})
+            full_d = pd.DataFrame({"period_order": full_days})
+            full_d["Period"] = full_d["period_order"].dt.strftime("%a %d-%b")
+            demandp = full_d.merge(demandp, on=["Period", "period_order"], how="left")
+            demandp["demand_mwh"] = pd.to_numeric(demandp["demand_mwh"], errors="coerce").fillna(0.0)
+        else:
+            demandp = pd.DataFrame({"period_order": full_days})
+            demandp["Period"] = demandp["period_order"].dt.strftime("%a %d-%b")
+            demandp["demand_mwh"] = 0.0
+    else:
+        # weekly
+        month_ts = pd.Timestamp(month_sel)
+        mix = mix[mix["sort_key"].dt.to_period("M").dt.to_timestamp() == month_ts].copy()
+        mix["Period"] = "W" + mix["sort_key"].dt.isocalendar().week.astype(str)
+        mix["period_order"] = mix["sort_key"].dt.to_period("W-MON").apply(lambda p: p.start_time)
+        mixp = mix.groupby(["Period", "period_order", "technology"], as_index=False)["energy_mwh"].sum()
+
+        if not demand.empty:
+            demand = demand[demand["sort_key"].dt.to_period("M").dt.to_timestamp() == month_ts].copy()
+            demand["Period"] = "W" + demand["sort_key"].dt.isocalendar().week.astype(str)
+            demand["period_order"] = demand["sort_key"].dt.to_period("W-MON").apply(lambda p: p.start_time)
+            demandp = demand.groupby(["Period", "period_order"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "demand_mwh"})
+        else:
+            demandp = pd.DataFrame(columns=["Period", "period_order", "demand_mwh"])
+
+    return mixp, demandp
+
+
+def build_re_share_table_from_period(mix_period: pd.DataFrame) -> pd.DataFrame:
+    if mix_period.empty:
+        return pd.DataFrame(columns=["Period", "period_order", "Renewable generation (MWh)", "Total generation (MWh)", "% RE"])
+    tmp = mix_period.copy()
+    tmp["is_renewable"] = tmp["technology"].isin(RENEWABLE_TECHS)
+    total = tmp.groupby(["Period", "period_order"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "Total generation (MWh)"})
+    ren = tmp[tmp["is_renewable"]].groupby(["Period", "period_order"], as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "Renewable generation (MWh)"})
+    out = total.merge(ren, on=["Period", "period_order"], how="left")
+    out["Renewable generation (MWh)"] = out["Renewable generation (MWh)"].fillna(0.0)
+    out["% RE"] = out["Renewable generation (MWh)"] / out["Total generation (MWh)"]
+    return out.sort_values("period_order").reset_index(drop=True)
+
+def build_energy_mix_chart_from_period(mix_period: pd.DataFrame, demand_period: pd.DataFrame, re_share: pd.DataFrame):
+    import altair as alt
+    if mix_period.empty:
+        return None
+
+    order_df = mix_period[["Period", "period_order"]].drop_duplicates().sort_values("period_order")
+    order_list = order_df["Period"].tolist()
+
+    bars = alt.Chart(mix_period).mark_bar().encode(
+        x=alt.X("Period:N", sort=order_list, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("sum(energy_mwh):Q", title="Generation & demand (MWh)", stack=True, axis=alt.Axis(format="~s")),
+        color=alt.Color("technology:N", title="Technology"),
+    )
+
+    layers = [bars]
+
+    if not demand_period.empty:
+        demand_chart = alt.Chart(demand_period).mark_line(color="#1F2937", point=True).encode(
+            x=alt.X("Period:N", sort=order_list, title=None),
+            y=alt.Y("demand_mwh:Q", title="Generation & demand (MWh)", axis=alt.Axis(format="~s")),
+        )
+        layers.append(demand_chart)
+
+    if not re_share.empty:
+        re_chart = alt.Chart(re_share).mark_line(color="#0F766E", point=alt.OverlayMarkDef(shape="diamond", filled=True, size=70)).encode(
+            x=alt.X("Period:N", sort=order_list, title=None),
+            y=alt.Y("% RE:Q", title="% RE", axis=alt.Axis(format=".0%"), scale=alt.Scale(domain=[0, 1])),
+        )
+        return alt.layer(*layers, re_chart).resolve_scale(y="independent").properties(height=430)
+
+    return alt.layer(*layers).properties(height=430)
+
 def section_header(title: str):
     st.markdown(
         f"""
@@ -2039,34 +2259,14 @@ try:
 
     section_header("Energy mix")
 
-    mix_energy = {}
-    mix_base_hourly = load_mix_base_hourly_from_data()
-    if not mix_base_hourly.empty and "datetime" in mix_base_hourly.columns:
-        mix_base_hourly["datetime"] = pd.to_datetime(mix_base_hourly["datetime"], errors="coerce")
+    mix_daily_all = load_energy_mix_combined_daily()
 
-    with st.spinner("Loading energy mix data..."):
-        for tech_name, official_id in ENERGY_MIX_INDICATORS_OFFICIAL.items():
-            forecast_id = ENERGY_MIX_INDICATORS_FORECAST.get(tech_name)
-            base_tech = mix_base_hourly[mix_base_hourly["technology"] == tech_name].copy()
-            refreshed_2026 = refresh_2026_only_mix_best_energy(
-                tech_name=tech_name,
-                official_id=official_id,
-                forecast_id=forecast_id,
-                token=token,
-            )
-            mix_energy[tech_name] = merge_mix_base_with_2026(
-                base_tech if not base_tech.empty else mix_base_hourly,
-                tech_name,
-                refreshed_2026,
-            )
-
-    if any(not df.empty for df in mix_energy.values()):
+    if not mix_daily_all.empty:
         granularity = st.selectbox("Granularity", ["Annual", "Monthly", "Weekly", "Daily"], index=3)
 
-        available_years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
+        available_years = sorted(mix_daily_all["sort_key"].dt.year.unique().tolist())
         year_sel = None
         month_sel = None
-        week_start = None
         day_range = None
 
         if granularity == "Monthly":
@@ -2074,7 +2274,7 @@ try:
 
         elif granularity == "Weekly":
             monthly_options = sorted(
-                price_hourly["datetime"].dt.to_period("M").dt.to_timestamp().drop_duplicates().tolist()
+                mix_daily_all["sort_key"].dt.to_period("M").dt.to_timestamp().drop_duplicates().tolist()
             )
             month_sel = st.selectbox(
                 "Month",
@@ -2084,8 +2284,8 @@ try:
             )
 
         elif granularity == "Daily":
-            daily_min = price_hourly["datetime"].dt.date.min()
-            daily_max = price_hourly["datetime"].dt.date.max()
+            daily_min = mix_daily_all["sort_key"].dt.date.min()
+            daily_max = mix_daily_all["sort_key"].dt.date.max()
 
             cc1, cc2 = st.columns(2)
             with cc1:
@@ -2112,27 +2312,24 @@ try:
             day_range = (daily_start, daily_end)
             st.caption(f"Showing daily periods from {daily_start} to {daily_end}")
 
-        mix_period, demand_period = build_energy_mix_period(
-            mix_energy,
+        mix_period, demand_period = build_energy_mix_period_from_daily_combined(
+            mix_daily_all,
             demand_energy,
             granularity=granularity,
             year_sel=year_sel,
             month_sel=month_sel,
-            week_start=week_start,
             day_range=day_range,
         )
 
-        if granularity == "Daily" and day_range is not None:
-            mix_period = build_complete_daily_mix_table(mix_period, day_range[0], day_range[1])
-            demand_period = build_complete_daily_demand_table(demand_period, day_range[0], day_range[1])
-
-        re_share = build_re_share_table(mix_period)
-        emix_chart = build_energy_mix_chart_with_re(mix_period, demand_period, re_share)
+        # overlay %RE
+        re_share = build_re_share_table_from_period(mix_period)
+        emix_chart = build_energy_mix_chart_from_period(mix_period, demand_period, re_share)
         if emix_chart is not None:
             st.altair_chart(emix_chart, use_container_width=True)
 
-        day_mix_table = build_day_energy_mix_table(mix_energy, selected_day)
         subtle_subsection(f"Energy mix detail for {selected_day}")
+        day_key = pd.Timestamp(selected_day)
+        day_mix_table = mix_daily_all[mix_daily_all["sort_key"] == day_key].groupby("technology", as_index=False)["energy_mwh"].sum().rename(columns={"technology": "Technology", "energy_mwh": "Generation (MWh)"}).sort_values("Technology")
         if not day_mix_table.empty:
             st.dataframe(styled_df(day_mix_table), use_container_width=True)
         else:
@@ -2140,30 +2337,21 @@ try:
 
         if not mix_period.empty:
             mix_table = mix_period.rename(columns={
-                "period_label": "Period",
+                "Period": "Period",
                 "technology": "Technology",
-                "data_source": "Data source",
                 "energy_mwh": "Generation (MWh)",
-            }).sort_values(["sort_key", "Technology", "Data source"])
+            }).sort_values(["period_order", "Technology"])
 
             if not demand_period.empty:
                 mix_table = mix_table.merge(
-                    demand_period.rename(columns={"period_label": "Period", "demand_mwh": "Demand (MWh)"}),
-                    on="Period",
+                    demand_period.rename(columns={"demand_mwh": "Demand (MWh)"}),
+                    on=["Period", "period_order"],
                     how="left",
                 )
 
-            mix_table = mix_table.drop(columns=["sort_key"], errors="ignore")
+            mix_table = mix_table.drop(columns=["period_order"], errors="ignore")
             subtle_subsection("Energy mix table")
             st.dataframe(styled_df(mix_table), use_container_width=True)
-
-            mix_workbook = build_energy_mix_workbook(mix_period, demand_period)
-            st.download_button(
-                label="Download energy mix Excel",
-                data=mix_workbook,
-                file_name="energy_mix_extraction.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
 
             section_header("% RE over total generation")
             if not re_share.empty:
