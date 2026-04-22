@@ -1218,6 +1218,7 @@ def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame,
 # =========================================================
 # MAIN
 # =========================================================
+demand_hourly = pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
 try:
     token = require_esios_token()
 
@@ -1251,12 +1252,17 @@ try:
     price_hourly = combine_hist_and_live(hist_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_and_live(hist_solar, live_solar, ["datetime"])
     mix_daily = combine_hist_and_live(hist_mix, live_mix, ["datetime", "technology", "data_source"])
-    demand_hourly = live_demand.copy()
+    demand_hourly = live_demand.copy() if live_demand is not None else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
+    if demand_hourly.empty:
+        demand_hourly = pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
+    elif "energy_mwh" not in demand_hourly.columns and "demand_mw" in demand_hourly.columns:
+        demand_hourly["energy_mwh"] = demand_hourly["demand_mw"]
 
     price_hourly = price_hourly[price_hourly["datetime"].dt.date >= start_day].copy()
     solar_hourly = solar_hourly[solar_hourly["datetime"].dt.date >= start_day].copy()
     mix_daily = mix_daily[mix_daily["datetime"].dt.date >= start_day].copy()
-    demand_hourly = demand_hourly[demand_hourly["datetime"].dt.date >= start_day].copy()
+    if not demand_hourly.empty:
+        demand_hourly = demand_hourly[demand_hourly["datetime"].dt.date >= start_day].copy()
 
     if price_hourly.empty:
         st.error("No price data available.")
@@ -1396,7 +1402,7 @@ try:
             day_range = (daily_start, daily_end)
 
         mix_period = build_energy_mix_period(mix_daily, granularity, year_sel=year_sel, day_range=day_range)
-        demand_period = build_demand_period(demand_hourly, granularity, year_sel=year_sel, day_range=day_range)
+        demand_period = build_demand_period(demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]), granularity, year_sel=year_sel, day_range=day_range)
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
