@@ -640,7 +640,7 @@ def build_dataset(
 
     default_gen, default_load = build_generic_vectors(default_data, years)
 
-    if mode in ["BESS con demanda", "BESS sin demanda"]:
+    if mode in ["BESS with demand", "BESS without demand"]:
         if uploaded_generation_file is not None:
             generation_df = normalize_generation_upload(uploaded_generation_file, years, scale_factor=bess_mw)
         else:
@@ -657,15 +657,15 @@ def build_dataset(
     df["generation"] = df["generation"].fillna(0.0)
     df["consumption"] = df["consumption"].fillna(0.0)
 
-    if mode == "BESS standalone":
+    if mode == "Standalone BESS":
         df["omie_compra"] = df["omie_venta"]
         df["generation"] = 0.0
         df["consumption"] = 0.0
 
-    elif mode == "BESS con demanda":
+    elif mode == "BESS with demand":
         df["omie_compra"] = df["omie_venta"]
 
-    elif mode == "BESS sin demanda":
+    elif mode == "BESS without demand":
         df["omie_compra"] = 1000.0
         df["consumption"] = 0.0
 
@@ -730,7 +730,9 @@ def optimize_day_pulp(
     load = df_day["consumo"].astype(float).tolist()
 
     max_power = power_mw
-    max_grid_flow = max(max(gen + load + [0.0]) + max_power, 1.0)
+    # Export / import gate is capped at the BESS inverter power.
+    # This keeps g_to_grid + batt_for_sell within BESS size * c-rate.
+    max_grid_flow = max(max_power, 1e-9)
 
     model = pulp.LpProblem("bess_daily_optimization", pulp.LpMaximize)
 
@@ -1043,7 +1045,7 @@ def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float, eta_dis: float
     )
     out = pd.concat([grouped, yearly], ignore_index=True, sort=False)
 
-    if mode == "BESS standalone":
+    if mode == "Standalone BESS":
         out["Captured Solar (€/MWh)"] = np.nan
         out["Captured Hybrid (€/MWh)"] = np.nan
 
@@ -1207,7 +1209,7 @@ left, right = st.columns([1.15, 1.45])
 with left:
     mode = st.selectbox(
         "Analysis mode",
-        ["BESS standalone", "BESS con demanda", "BESS sin demanda"],
+        ["Standalone BESS", "BESS with demand", "BESS without demand"],
         index=0,
     )
 
@@ -1296,9 +1298,9 @@ with right:
     st.info("If unlocked, forward years use nominal hourly prices stored in the repo and selected by provider (Aurora or Baringa).")
 
     st.markdown("### Scenario rules")
-    if mode == "BESS standalone":
+    if mode == "Standalone BESS":
         st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
-    elif mode == "BESS con demanda":
+    elif mode == "BESS with demand":
         st.info("omie_venta = price, omie_compra = same price, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
     else:
         st.info("omie_venta = price, omie_compra = 1000, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 €/MWh is intentionally unattractive.")
@@ -1543,7 +1545,7 @@ if st.session_state.dispatch is not None:
             ax_flow.bar(x - 0.18, avg_profile["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
             ax_flow.bar(x - 0.18, avg_profile["grid_charge"], width=0.35, bottom=avg_profile["g_to_batt"], color="#8fd19e", alpha=0.95)
             ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
-            if mode_result != "BESS standalone":
+            if mode_result != "Standalone BESS":
                 ax_flow.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
                 ax_flow.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22)
             ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
@@ -1558,10 +1560,10 @@ if st.session_state.dispatch is not None:
                 st.pyplot(fig, use_container_width=True)
             with cbox:
                 legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
-                if mode_result != "BESS standalone":
+                if mode_result != "Standalone BESS":
                     legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
                 draw_side_legend(legend_items)
-                if mode_result != "BESS standalone":
+                if mode_result != "Standalone BESS":
                     solar_cap, hybrid_cap = compute_period_capture_metrics(period_df)
                     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                     st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
@@ -1584,12 +1586,12 @@ if st.session_state.dispatch is not None:
         ax_flow.bar(x - 0.18, day_df["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
         ax_flow.bar(x - 0.18, day_df["grid_charge"], width=0.35, bottom=day_df["g_to_batt"], color="#8fd19e", alpha=0.95)
         ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
-        if mode_result != "BESS standalone":
+        if mode_result != "Standalone BESS":
             ax_flow.plot(x, day_df["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
             ax_flow.fill_between(x, day_df["hybrid profile (MWh)"], color="#facc15", alpha=0.22)
         ax_price.set_xlabel("Hour")
         ax_price.set_ylabel("OMIE (€/MWh)")
-        right_label = "Charge / Discharge (MWh)" if mode_result == "BESS standalone" else "Charge / Discharge / Solar / Hybrid (MWh)"
+        right_label = "Charge / Discharge (MWh)" if mode_result == "Standalone BESS" else "Charge / Discharge / Solar / Hybrid (MWh)"
         ax_flow.set_ylabel(right_label, labelpad=16)
         ax_price.grid(axis="y", alpha=0.25)
         ax_price.set_xticks(x)
@@ -1599,14 +1601,14 @@ if st.session_state.dispatch is not None:
             st.pyplot(fig, use_container_width=True)
         with dside:
             legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
-            if mode_result != "BESS standalone":
+            if mode_result != "Standalone BESS":
                 legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
             draw_side_legend(legend_items)
         if float(day_df["charge_mwh"].sum() + day_df["discharge_mwh"].sum()) <= 1e-9:
-            if mode_result == "BESS sin demanda":
+            if mode_result == "BESS without demand":
                 solar_day = float(day_df["generacion"].sum()) if "generacion" in day_df.columns else 0.0
                 st.caption(
-                    f"No battery cycling on this selected day. In 'BESS sin demanda' the model sets omie_compra = 1000 €/MWh, so the battery usually only charges from solar. Solar available on this day: {solar_day:,.2f} MWh."
+                    f"No battery cycling on this selected day. In 'BESS without demand' the model sets omie_compra = 1000 €/MWh, so the battery usually only charges from solar. Solar available on this day: {solar_day:,.2f} MWh."
                 )
             else:
                 st.caption("No battery cycling on this selected day under the current price profile, solar profile and model constraints.")
@@ -1624,7 +1626,7 @@ if st.session_state.dispatch is not None:
         "Avg_Effective_Capacity_MWh",
         "Avg_SOH",
     ]
-    if mode_result == "BESS standalone":
+    if mode_result == "Standalone BESS":
         captured_cols = base_cols
     else:
         captured_cols = [
