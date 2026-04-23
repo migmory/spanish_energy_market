@@ -47,16 +47,16 @@ st.markdown(
         color: white;
         box-shadow: 0 8px 24px rgba(31, 78, 121, 0.12);
         border: 1px solid rgba(255,255,255,0.18);
-        background: linear-gradient(90deg, #1f4e79 0%, #2f6da5 46%, #6fa0cc 76%, #d7e5f2 100%);
+        background: linear-gradient(90deg, #0b9f85 0%, #10b981 45%, #55c8b0 75%, #b7e2d0 100%);
     }
     .section-data {
         padding: 8px 12px;
-        border-left: 4px solid #94a3b8;
-        background: linear-gradient(90deg, #f8fafc 0%, #ffffff 100%);
+        border-left: 4px solid #10b981;
+        background: linear-gradient(90deg, #effaf6 0%, #ffffff 100%);
         border-radius: 8px;
         margin: 18px 0 8px 0;
         font-weight: 650;
-        color: #334155;
+        color: #0f5132;
     }
     div[data-testid="stMetric"] {
         background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
@@ -69,7 +69,7 @@ st.markdown(
         font-weight: 700;
     }
     div[data-testid="stMetricValue"] {
-        color: #163a63;
+        color: #0b6b5f;
     }
     div[data-testid="stDataFrame"] {
         border-radius: 12px;
@@ -112,8 +112,8 @@ def style_total_rows(df: pd.DataFrame):
                 {
                     "selector": "thead th",
                     "props": [
-                        ("background", "#eaf2fb"),
-                        ("color", "#1e3a5f"),
+                        ("background", "#e8f7f1"),
+                        ("color", "#0b6b5f"),
                         ("font-weight", "700"),
                         ("border-bottom", "1px solid #cbd5e1"),
                         ("padding", "8px 10px"),
@@ -154,17 +154,45 @@ if "bess_admin_password" in st.secrets:
         st.stop()
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "historical_data"
+DATA_DIR = BASE_DIR / "data"
 FORWARD_DIR = BASE_DIR / "forward_curves"
 
-PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
-DEFAULT_DATA_XLSX = BASE_DIR / "data.xlsx"
-DEFAULT_SOLAR_PROFILE_XLSX = BASE_DIR / "profile_production_1y_hourly.xlsx"
-DEFAULT_DEGRADATION_XLSX = BASE_DIR / "BESS degradation_SOH(%).xlsx"
+def resolve_existing(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+PRICE_RAW_CSV_PATH = resolve_existing(
+    DATA_DIR / "hourly_avg_price_since2021.xlsx",
+    DATA_DIR / "historical_prices.xlsx",
+    BASE_DIR / "hourly_avg_price_since2021.xlsx",
+    BASE_DIR / "historical_prices.xlsx",
+    BASE_DIR / "historical_data" / "day_ahead_spain_spot_600_raw.csv",
+)
+DEFAULT_DATA_XLSX = resolve_existing(
+    DATA_DIR / "data.xlsx",
+    BASE_DIR / "data.xlsx",
+)
+DEFAULT_SOLAR_PROFILE_XLSX = resolve_existing(
+    DATA_DIR / "profile_production_1y_hourly.xlsx",
+    BASE_DIR / "profile_production_1y_hourly.xlsx",
+)
+DEFAULT_DEGRADATION_XLSX = resolve_existing(
+    DATA_DIR / "BESS degradation_SOH(%).xlsx",
+    BASE_DIR / "BESS degradation_SOH(%).xlsx",
+)
 
 FORWARD_PROVIDER_FILES = {
-    "Aurora": FORWARD_DIR / "Aurora Q1-26 central.xlsx",
-    "Baringa": FORWARD_DIR / "Baringa nominal.xlsx",
+    "Aurora": resolve_existing(
+        DATA_DIR / "Aurora Q1-26 central.xlsx",
+        BASE_DIR / "Aurora Q1-26 central.xlsx",
+        FORWARD_DIR / "Aurora Q1-26 central.xlsx",
+    ),
+    "Baringa": resolve_existing(
+        DATA_DIR / "Baringa nominal.xlsx",
+        FORWARD_DIR / "Baringa nominal.xlsx",
+    ),
 }
 
 
@@ -197,19 +225,33 @@ def standardize_price_history_from_day_ahead(raw_csv_path: Path) -> pd.DataFrame
     if not raw_csv_path.exists():
         return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
 
-    df = pd.read_csv(raw_csv_path)
+    if raw_csv_path.suffix.lower() in {".xlsx", ".xls"}:
+        try:
+            xls = pd.ExcelFile(raw_csv_path)
+            sheet_name = "prices_hourly_avg" if "prices_hourly_avg" in xls.sheet_names else xls.sheet_names[0]
+            df = pd.read_excel(raw_csv_path, sheet_name=sheet_name)
+        except Exception:
+            df = pd.read_excel(raw_csv_path)
+    else:
+        df = pd.read_csv(raw_csv_path)
+
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
 
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    col_map = {str(c).lower().strip(): c for c in df.columns}
+    dt_col = col_map.get("datetime")
+    value_col = col_map.get("value") or col_map.get("price") or col_map.get("price_eur_mwh")
+
+    if dt_col is None or value_col is None:
+        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
+
+    df["datetime"] = pd.to_datetime(df[dt_col], errors="coerce")
+    df["value"] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna(subset=["datetime", "value"]).copy()
     if df.empty:
         return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
 
-    # Prevent duplicated refresh rows from distorting hourly averages
     df = df.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").copy()
-
     df["timestamp"] = df["datetime"].dt.floor("h")
     hourly = (
         df.groupby("timestamp", as_index=False)["value"]
