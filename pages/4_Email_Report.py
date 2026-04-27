@@ -22,14 +22,19 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
-DATA_DIR = BASE_DIR / "historical_data"
-DATA_DIR.mkdir(exist_ok=True)
+HISTORICAL_DIR = BASE_DIR / "historical_data"
+HISTORICAL_DIR.mkdir(exist_ok=True)
+DATA_DIR = BASE_DIR / "data"
 
-PRICE_RAW_CSV_PATH = DATA_DIR / "day_ahead_spain_spot_600_raw.csv"
-SOLAR_P48_RAW_CSV_PATH = DATA_DIR / "solar_p48_spain_84_raw.csv"
-SOLAR_FORECAST_RAW_CSV_PATH = DATA_DIR / "solar_forecast_spain_542_raw.csv"
-DEMAND_RAW_CSV_PATH = DATA_DIR / "demand_p48_total_10027_raw.csv"
-REE_MIX_DAILY_CSV_PATH = DATA_DIR / "ree_generation_structure_daily_peninsular.csv"
+PRICE_RAW_CSV_PATH = HISTORICAL_DIR / "day_ahead_spain_spot_600_raw.csv"
+SOLAR_P48_RAW_CSV_PATH = HISTORICAL_DIR / "solar_p48_spain_84_raw.csv"
+SOLAR_FORECAST_RAW_CSV_PATH = HISTORICAL_DIR / "solar_forecast_spain_542_raw.csv"
+DEMAND_RAW_CSV_PATH = HISTORICAL_DIR / "demand_p48_total_10027_raw.csv"
+REE_MIX_DAILY_CSV_PATH = HISTORICAL_DIR / "ree_generation_structure_daily_peninsular.csv"
+
+HIST_PRICES_XLSX_PATH = DATA_DIR / "hourly_avg_price_since2021.xlsx"
+HIST_SOLAR_CSV_PATH = DATA_DIR / "p48solar_since21.csv"
+HIST_MIX_XLSX_PATH = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
 
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
@@ -292,7 +297,11 @@ def load_raw_history(csv_path: Path, source_name: str | None = None) -> pd.DataF
     if not csv_path.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(csv_path)
+    if csv_path.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(csv_path)
+    else:
+        df = pd.read_csv(csv_path)
+
     if df.empty:
         return pd.DataFrame()
 
@@ -312,6 +321,55 @@ def load_raw_history(csv_path: Path, source_name: str | None = None) -> pd.DataF
 
     return df
 
+
+
+def load_price_history_fallback() -> pd.DataFrame:
+    if PRICE_RAW_CSV_PATH.exists():
+        return load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
+
+    if not HIST_PRICES_XLSX_PATH.exists():
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(HIST_PRICES_XLSX_PATH, sheet_name="prices_hourly_avg")
+    except Exception:
+        df = pd.read_excel(HIST_PRICES_XLSX_PATH)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    if "price" in df.columns and "value" not in df.columns:
+        df = df.rename(columns={"price": "value"})
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    if "value" in df.columns:
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["source"] = "historical_prices_xlsx"
+    df["geo_name"] = None
+    df["geo_id"] = None
+    return df
+
+def load_solar_p48_history_fallback() -> pd.DataFrame:
+    if SOLAR_P48_RAW_CSV_PATH.exists():
+        return load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
+
+    if not HIST_SOLAR_CSV_PATH.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(HIST_SOLAR_CSV_PATH)
+    if df.empty:
+        return pd.DataFrame()
+
+    if "solar_best_mw" in df.columns and "value" not in df.columns:
+        df = df.rename(columns={"solar_best_mw": "value"})
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    if "value" in df.columns:
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["source"] = "historical_solar_csv"
+    df["geo_name"] = None
+    df["geo_id"] = None
+    return df
 
 def infer_interval_hours(df: pd.DataFrame) -> pd.Series:
     if df.empty or "datetime" not in df.columns:
@@ -1434,14 +1492,14 @@ def build_monthly_mix_compare_chart(ree_daily_df: pd.DataFrame, primary_month: p
 # =========================================================
 token = require_esios_token()
 
-price_raw = load_raw_history(PRICE_RAW_CSV_PATH, "esios_600")
-solar_p48_raw = load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
+price_raw = load_price_history_fallback()
+solar_p48_raw = load_solar_p48_history_fallback()
 solar_forecast_raw = load_raw_history(SOLAR_FORECAST_RAW_CSV_PATH, "esios_542")
 demand_raw = load_raw_history(DEMAND_RAW_CSV_PATH, "esios_10027")
 ree_daily_raw = load_ree_mix_daily()
 
 if price_raw.empty:
-    st.error("No price history found yet. Build Day Ahead first.")
+    st.error("No price history found. The app looked first in /historical_data and then in /data/hourly_avg_price_since2021.xlsx.")
     st.stop()
 
 price_hourly = to_hourly_mean(price_raw, value_col_name="price")
