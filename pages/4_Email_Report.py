@@ -1482,6 +1482,156 @@ def month_start_end(period_ts: pd.Timestamp) -> tuple[date, date]:
     return start, end
 
 
+def build_period_metric_row(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, label: str, start_d: date, end_d: date) -> dict:
+    metrics = compute_period_metrics(price_hourly, solar_hourly, start_d, end_d)
+    period_price = price_hourly[
+        (price_hourly["datetime"].dt.date >= start_d)
+        & (price_hourly["datetime"].dt.date <= end_d)
+    ].copy()
+    period_solar = solar_hourly[
+        (solar_hourly["datetime"].dt.date >= start_d)
+        & (solar_hourly["datetime"].dt.date <= end_d)
+    ].copy()
+    merged = period_price.merge(period_solar[["datetime", "solar_best_mw"]], on="datetime", how="left")
+    merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+    zero_neg_hours = int((period_price["price"] <= 0).sum()) if not period_price.empty else 0
+    solar_zero_neg_hours = int(((merged["price"] <= 0) & (merged["solar_best_mw"] > 0)).sum()) if not merged.empty else 0
+    return {
+        "Period": label,
+        "Average price (€/MWh)": metrics.get("avg_price"),
+        "Captured solar uncurtailed (€/MWh)": metrics.get("captured_uncurtailed"),
+        "Captured solar curtailed (€/MWh)": metrics.get("captured_curtailed"),
+        "Solar capture rate uncurtailed (%)": metrics.get("capture_pct_uncurtailed"),
+        "Solar capture rate curtailed (%)": metrics.get("capture_pct_curtailed"),
+        "Zero / negative hours": zero_neg_hours,
+        "Zero / negative hours during solar": solar_zero_neg_hours,
+    }
+
+
+def build_monthly_mtd_ytd_comparison_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, primary_month: pd.Timestamp, compare_month: pd.Timestamp) -> pd.DataFrame:
+    rows = []
+
+    p_start, p_end = month_start_end(primary_month)
+    c_start, c_end = month_start_end(compare_month)
+
+    primary_cutoff = p_end
+    latest_day = price_hourly["datetime"].dt.date.max() if not price_hourly.empty else p_end
+    if primary_month.to_period("M") == pd.Timestamp(latest_day).to_period("M"):
+        primary_cutoff = min(latest_day, p_end)
+
+    compare_cutoff_day = min(primary_cutoff.day, c_end.day)
+    compare_cutoff = c_start.replace(day=compare_cutoff_day)
+
+    rows.append(build_period_metric_row(price_hourly, solar_hourly, f"MTD {primary_month.strftime('%b-%Y')}", p_start, primary_cutoff))
+    rows.append(build_period_metric_row(price_hourly, solar_hourly, f"MTD {compare_month.strftime('%b-%Y')}", c_start, compare_cutoff))
+
+    p_ytd_start = date(primary_month.year, 1, 1)
+    c_ytd_start = date(compare_month.year, 1, 1)
+    compare_ytd_cutoff = date(compare_month.year, compare_month.month, compare_cutoff_day)
+    rows.append(build_period_metric_row(price_hourly, solar_hourly, f"YTD {primary_month.year}", p_ytd_start, primary_cutoff))
+    rows.append(build_period_metric_row(price_hourly, solar_hourly, f"YTD {compare_month.year}", c_ytd_start, compare_ytd_cutoff))
+
+    return pd.DataFrame(rows)
+
+
+def build_monthly_negative_pct_table(price_hourly: pd.DataFrame, years: list[int]) -> pd.DataFrame:
+    rows = []
+    for year in years:
+        tmp = price_hourly[price_hourly["datetime"].dt.year == year].copy()
+        if tmp.empty:
+            continue
+        tmp["month_num"] = tmp["datetime"].dt.month
+        tmp["month_name"] = tmp["datetime"].dt.strftime("%b")
+        total = tmp.groupby(["month_num", "month_name"], as_index=False)["price"].count().rename(columns={"price": "total_hours"})
+        neg = tmp[tmp["price"] <= 0].groupby(["month_num", "month_name"], as_index=False)["price"].count().rename(columns={"price": "zero_neg_hours"})
+        out = total.merge(neg, on=["month_num", "month_name"], how="left")
+        out["zero_neg_hours"] = out["zero_neg_hours"].fillna(0)
+        out["pct_zero_neg"] = out["zero_neg_hours"] / out["total_hours"]
+        out["Year"] = year
+        rows.append(out)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    out["Month"] = out["month_name"]
+    return out[["Year", "Month", "zero_neg_hours", "total_hours", "pct_zero_neg"]].sort_values(["Year", "Month"])
+
+
+def build_monthly_negative_chart(price_hourly: pd.DataFrame, years: list[int]):
+    table = build_monthly_negative_pct_table(price_hourly, years)
+    if table.empty:
+        return None
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    chart = alt.Chart(table).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("Month:N", sort=month_order, title=None),
+        y=alt.Y("pct_zero_neg:Q", title="% zero / negative hours", axis=alt.Axis(format=".0%")),
+        color=alt.Color("Year:N", title="Year"),
+        tooltip=["Year", "Month", alt.Tooltip("zero_neg_hours:Q", title="Zero / negative hours", format=",.0f"), alt.Tooltip("pct_zero_neg:Q", title="% zero / negative hours", format=".1%")],
+    ).properties(height=320)
+    return chart
+
+
+def build_monthly_curtailment_chart(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, years: list[int]):
+    rows = []
+    for year in years:
+        tmp_p = price_hourly[price_hourly["datetime"].dt.year == year].copy()
+        tmp_s = solar_hourly[solar_hourly["datetime"].dt.year == year].copy()
+        if tmp_p.empty or tmp_s.empty:
+            continue
+        tmp = tmp_p.merge(tmp_s[["datetime", "solar_best_mw"]], on="datetime", how="left")
+        tmp["solar_best_mw"] = tmp["solar_best_mw"].fillna(0.0)
+        tmp = tmp[tmp["solar_best_mw"] > 0].copy()
+        if tmp.empty:
+            continue
+        tmp["month_name"] = tmp["datetime"].dt.strftime("%b")
+        tmp["month_num"] = tmp["datetime"].dt.month
+        total = tmp.groupby(["month_num", "month_name"], as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "total_p48"})
+        aff = tmp[tmp["price"] <= 0].groupby(["month_num", "month_name"], as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "affected_p48"})
+        out = total.merge(aff, on=["month_num", "month_name"], how="left")
+        out["affected_p48"] = out["affected_p48"].fillna(0.0)
+        out["pct_curtailment"] = out["affected_p48"] / out["total_p48"]
+        out["Year"] = year
+        rows.append(out)
+    if not rows:
+        return None, pd.DataFrame()
+    plot = pd.concat(rows, ignore_index=True)
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    chart = alt.Chart(plot).mark_bar().encode(
+        x=alt.X("Month:N", sort=month_order, title=None),
+        y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+        color=alt.Color("Year:N", title="Year"),
+        xOffset="Year:N",
+        tooltip=["Year", "Month", alt.Tooltip("affected_p48:Q", title="Affected P48", format=",.0f"), alt.Tooltip("total_p48:Q", title="Total P48", format=",.0f"), alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%")],
+    ).properties(height=320)
+    return chart, plot
+
+
+def build_spot_capture_evolution_chart(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, year: int):
+    tmp_p = price_hourly[price_hourly["datetime"].dt.year == year].copy()
+    tmp_s = solar_hourly[solar_hourly["datetime"].dt.year == year].copy()
+    if tmp_p.empty:
+        return None, pd.DataFrame()
+    rows = []
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    for m in range(1, 13):
+        d0 = date(year, m, 1)
+        d1 = (pd.Timestamp(d0) + pd.offsets.MonthEnd(0)).date()
+        metrics = compute_period_metrics(price_hourly, solar_hourly, d0, d1)
+        rows.append({"Month": pd.Timestamp(d0).strftime("%b"), "Series": "Average spot price", "value": metrics.get("avg_price")})
+        rows.append({"Month": pd.Timestamp(d0).strftime("%b"), "Series": "Captured solar (uncurtailed)", "value": metrics.get("captured_uncurtailed")})
+        rows.append({"Month": pd.Timestamp(d0).strftime("%b"), "Series": "Captured solar (curtailed)", "value": metrics.get("captured_curtailed")})
+    plot = pd.DataFrame(rows).dropna(subset=["value"])
+    if plot.empty:
+        return None, pd.DataFrame()
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("Month:N", sort=month_order, title=None),
+        y=alt.Y("value:Q", title="€/MWh"),
+        color=alt.Color("Series:N", title=None),
+        strokeDash=alt.StrokeDash("Series:N", title=None),
+        tooltip=["Series", "Month", alt.Tooltip("value:Q", format=".2f")],
+    ).properties(height=320, title=f"Spot and solar capture evolution ({year})")
+    return chart, plot
+
+
 def build_monthly_comparison_table(price_hourly: pd.DataFrame, historical_best_solar: pd.DataFrame, primary_month: pd.Timestamp, compare_month: pd.Timestamp) -> pd.DataFrame:
     rows = []
     for label, month_ts in [("Primary", primary_month), ("Comparison", compare_month)]:
@@ -1671,9 +1821,17 @@ else:
     if primary_month is None or compare_month is None:
         st.warning("Select both primary and comparison months.")
         st.stop()
-    monthly_comp_df = build_monthly_comparison_table(price_hourly, historical_best_solar, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
-    monthly_profile_chart = build_monthly_avg_profile_chart(price_hourly, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
-    monthly_mix_chart, monthly_mix_table = build_monthly_mix_compare_chart(ree_daily_raw, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
+    primary_ts = pd.Timestamp(primary_month)
+    compare_ts = pd.Timestamp(compare_month)
+    monthly_comp_df = build_monthly_comparison_table(price_hourly, historical_best_solar, primary_ts, compare_ts)
+    monthly_mtd_ytd_df = build_monthly_mtd_ytd_comparison_table(price_hourly, historical_best_solar, primary_ts, compare_ts)
+    monthly_profile_chart = build_monthly_avg_profile_chart(price_hourly, primary_ts, compare_ts)
+    monthly_mix_chart, monthly_mix_table = build_monthly_mix_compare_chart(ree_daily_raw, primary_ts, compare_ts)
+    compare_years = sorted({primary_ts.year, compare_ts.year})
+    neg_pct_chart = build_monthly_negative_chart(price_hourly, compare_years)
+    neg_pct_table = build_monthly_negative_pct_table(price_hourly, compare_years)
+    curt_chart, curt_table = build_monthly_curtailment_chart(price_hourly, historical_best_solar, compare_years)
+    spot_capture_chart, spot_capture_table = build_spot_capture_evolution_chart(price_hourly, historical_best_solar, primary_ts.year)
     overlay_chart_b64 = chart_to_base64_png(monthly_profile_chart)
     mix_with_demand_b64 = chart_to_base64_png(monthly_mix_chart)
 
@@ -1690,6 +1848,11 @@ if report_mode == "1-day report":
         st.altair_chart(overlay_chart, use_container_width=True)
 
     st.subheader("Preview metrics")
+    mdf = metrics_df.set_index("Period")
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Captured solar Day", f"{mdf.loc['Day', 'Captured solar uncurtailed (€/MWh)']:.2f} €/MWh" if pd.notna(mdf.loc['Day', 'Captured solar uncurtailed (€/MWh)']) else "n/a")
+    mc2.metric("Captured solar MTD", f"{mdf.loc['MTD', 'Captured solar uncurtailed (€/MWh)']:.2f} €/MWh" if pd.notna(mdf.loc['MTD', 'Captured solar uncurtailed (€/MWh)']) else "n/a")
+    mc3.metric("Captured solar YTD", f"{mdf.loc['YTD', 'Captured solar uncurtailed (€/MWh)']:.2f} €/MWh" if pd.notna(mdf.loc['YTD', 'Captured solar uncurtailed (€/MWh)']) else "n/a")
     st.dataframe(metrics_df, use_container_width=True)
 
     st.subheader("Preview TB spreads")
@@ -1719,6 +1882,8 @@ if report_mode == "1-day report":
 else:
     st.subheader("Monthly comparison metrics")
     st.dataframe(monthly_comp_df, use_container_width=True)
+    st.subheader("MTD / YTD comparison")
+    st.dataframe(monthly_mtd_ytd_df, use_container_width=True)
     st.subheader("Average hourly price profile by month")
     if monthly_profile_chart is not None:
         st.altair_chart(monthly_profile_chart, use_container_width=True)
@@ -1727,6 +1892,21 @@ else:
         st.altair_chart(monthly_mix_chart, use_container_width=True)
     if not monthly_mix_table.empty:
         st.dataframe(monthly_mix_table, use_container_width=True)
+    st.subheader("Monthly zero / negative price frequency")
+    if neg_pct_chart is not None:
+        st.altair_chart(neg_pct_chart, use_container_width=True)
+    if not neg_pct_table.empty:
+        st.dataframe(neg_pct_table, use_container_width=True)
+    st.subheader("Monthly economic curtailment")
+    if curt_chart is not None:
+        st.altair_chart(curt_chart, use_container_width=True)
+    if not curt_table.empty:
+        st.dataframe(curt_table, use_container_width=True)
+    st.subheader("Spot and capture evolution")
+    if spot_capture_chart is not None:
+        st.altair_chart(spot_capture_chart, use_container_width=True)
+    if not spot_capture_table.empty:
+        st.dataframe(spot_capture_table, use_container_width=True)
 
 if report_mode == "1-day report":
     capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
@@ -1782,7 +1962,11 @@ if report_mode == "1-day report":
     """
 else:
     monthly_metrics_html = df_to_html_table(monthly_comp_df, pct_cols=["Solar capture rate (%)"])
+    monthly_mtd_ytd_html = df_to_html_table(monthly_mtd_ytd_df, pct_cols=["Solar capture rate uncurtailed (%)", "Solar capture rate curtailed (%)"])
     monthly_mix_html = df_to_html_table(monthly_mix_table) if not monthly_mix_table.empty else "<p>No monthly mix available.</p>"
+    neg_pct_html = df_to_html_table(neg_pct_table, pct_cols=["pct_zero_neg"]) if not neg_pct_table.empty else "<p>No monthly negative-price table available.</p>"
+    curt_html = df_to_html_table(curt_table, pct_cols=["pct_curtailment"]) if not curt_table.empty else "<p>No monthly curtailment table available.</p>"
+    spot_capture_html = df_to_html_table(spot_capture_table) if not spot_capture_table.empty else "<p>No spot/capture evolution table available.</p>"
     overlay_chart_html = ""
     if overlay_chart_b64:
         overlay_chart_html = f"""
@@ -1797,6 +1981,30 @@ else:
         <img src="data:image/png;base64,{mix_with_demand_b64}" alt="Monthly mix comparison" style="max-width:100%; height:auto; border:1px solid #ddd;" />
         <br><br>
         """
+    neg_chart_html = ""
+    neg_b64 = chart_to_base64_png(neg_pct_chart)
+    if neg_b64:
+        neg_chart_html = f"""
+        <h3>Monthly zero / negative price frequency</h3>
+        <img src="data:image/png;base64,{neg_b64}" alt="Negative price frequency" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    curt_chart_html = ""
+    curt_b64 = chart_to_base64_png(curt_chart)
+    if curt_b64:
+        curt_chart_html = f"""
+        <h3>Monthly economic curtailment</h3>
+        <img src="data:image/png;base64,{curt_b64}" alt="Economic curtailment" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    spot_capture_chart_html = ""
+    spot_capture_b64 = chart_to_base64_png(spot_capture_chart)
+    if spot_capture_b64:
+        spot_capture_chart_html = f"""
+        <h3>Spot and capture evolution</h3>
+        <img src="data:image/png;base64,{spot_capture_b64}" alt="Spot and capture evolution" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
     kpi_cards_html = make_kpi_cards_html([
         ("Primary month", pd.Timestamp(primary_month).strftime('%b-%Y')),
         ("Comparison month", pd.Timestamp(compare_month).strftime('%b-%Y')),
@@ -1806,8 +2014,15 @@ else:
       <p>{intro_text.replace(chr(10), '<br>')}</p>
       {kpi_cards_html}<br><br>
       <h3>Monthly comparison metrics</h3>{monthly_metrics_html}<br>
+      <h3>MTD / YTD comparison</h3>{monthly_mtd_ytd_html}<br>
       {overlay_chart_html}
       {mix_chart_html}
+      {neg_chart_html}
+      <h3>Monthly zero / negative price table</h3>{neg_pct_html}<br>
+      {curt_chart_html}
+      <h3>Monthly economic curtailment table</h3>{curt_html}<br>
+      {spot_capture_chart_html}
+      <h3>Spot and capture evolution table</h3>{spot_capture_html}<br>
       <h3>Monthly energy mix table</h3>{monthly_mix_html}<br>
       <p>Best regards,</p>
     </body></html>
