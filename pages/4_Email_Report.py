@@ -560,6 +560,18 @@ def fetch_live_hourly_prices_for_day(day: date, token: str | None) -> pd.DataFra
     except Exception:
         return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
 
+def fetch_live_hourly_mean_for_indicator(indicator_id: int, day: date, token: str | None, value_col_name: str) -> pd.DataFrame:
+    if not token:
+        return pd.DataFrame(columns=["datetime", value_col_name, "source", "geo_name", "geo_id"])
+    try:
+        raw = fetch_esios_day(indicator_id, day, token)
+        df = parse_esios_indicator(raw, source_name=f"esios_{indicator_id}", filter_date=day)
+        if df.empty:
+            return pd.DataFrame(columns=["datetime", value_col_name, "source", "geo_name", "geo_id"])
+        return to_hourly_mean(df, value_col_name=value_col_name)
+    except Exception:
+        return pd.DataFrame(columns=["datetime", value_col_name, "source", "geo_name", "geo_id"])
+
 
 # =========================================================
 # SOLAR
@@ -615,18 +627,38 @@ def build_solar_profile_for_report_day(
     report_day: date,
     token: str | None,
 ) -> pd.DataFrame:
+    """
+    Mirror the Day Ahead logic: for the selected day, combine hourly P48 and forecast
+    and prioritize P48 when available, falling back to forecast only where needed.
+    """
     tomorrow = today_madrid() + timedelta(days=1)
 
     solar_p48_hourly = ensure_datetime_col(solar_p48_hourly, "datetime")
     solar_forecast_hourly = ensure_datetime_col(solar_forecast_hourly, "datetime")
 
-    # Intento 1: forecast horario real del propio día
-    if token:
-        fc_live = fetch_hourly_energy_for_indicator(SOLAR_FORECAST_INDICATOR_ID, report_day, token)
-        if not fc_live.empty:
-            out = fc_live.rename(columns={"mw": "solar_best_mw"}).copy()
-            out["solar_source"] = "Forecast"
-            return out[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+    # Try live data for the selected day first, using the same priority as Day Ahead:
+    # P48 first, then forecast as fallback.
+    live_p48 = fetch_live_hourly_mean_for_indicator(SOLAR_P48_INDICATOR_ID, report_day, token, "solar_p48_mw")
+    live_fc = fetch_live_hourly_mean_for_indicator(SOLAR_FORECAST_INDICATOR_ID, report_day, token, "solar_forecast_mw")
+    if not live_p48.empty or not live_fc.empty:
+        live_best = build_best_solar_hourly(live_p48, live_fc)
+        if not live_best.empty:
+            return live_best[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+
+    # For tomorrow, if there is no live day-ahead profile, shift the previous day's reliable profile.
+    if report_day == tomorrow:
+        prev_day = report_day - timedelta(days=1)
+        prev_p48 = solar_p48_hourly[solar_p48_hourly["datetime"].dt.date == prev_day].copy()
+        prev_fc = solar_forecast_hourly[solar_forecast_hourly["datetime"].dt.date == prev_day].copy()
+        shifted_best = build_best_solar_hourly(prev_p48, prev_fc)
+        if not shifted_best.empty:
+            shifted_best["datetime"] = shifted_best["datetime"] + pd.Timedelta(days=1)
+            return shifted_best[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+
+    # Historical exact day fallback.
+    best = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+    out = best[best["datetime"].dt.date == report_day].copy()
+    return out[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
 
     if report_day == tomorrow:
         prev_day = report_day - timedelta(days=1)
@@ -992,12 +1024,23 @@ def compute_period_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
     merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
     merged = merged[merged["solar_best_mw"] > 0].copy()
 
-    captured = None
-    if not merged.empty:
-        captured = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
+    captured_uncurtailed = None
+    captured_curtailed = None
+    if not merged.empty and merged["solar_best_mw"].sum() > 0:
+        captured_uncurtailed = (merged["price"] * merged["solar_best_mw"]).sum() / merged["solar_best_mw"].sum()
+        positive = merged[merged["price"] > 0].copy()
+        if not positive.empty and positive["solar_best_mw"].sum() > 0:
+            captured_curtailed = (positive["price"] * positive["solar_best_mw"]).sum() / positive["solar_best_mw"].sum()
 
-    capture_pct = (captured / avg_price) if (captured is not None and avg_price not in [None, 0]) else None
-    return {"avg_price": avg_price, "captured": captured, "capture_pct": capture_pct}
+    return {
+        "avg_price": avg_price,
+        "captured": captured_uncurtailed,
+        "captured_uncurtailed": captured_uncurtailed,
+        "captured_curtailed": captured_curtailed,
+        "capture_pct": (captured_uncurtailed / avg_price) if (captured_uncurtailed is not None and avg_price not in [None, 0]) else None,
+        "capture_pct_uncurtailed": (captured_uncurtailed / avg_price) if (captured_uncurtailed is not None and avg_price not in [None, 0]) else None,
+        "capture_pct_curtailed": (captured_curtailed / avg_price) if (captured_curtailed is not None and avg_price not in [None, 0]) else None,
+    }
 
 
 def make_metrics_df(
@@ -1020,20 +1063,26 @@ def make_metrics_df(
             {
                 "Period": "Day",
                 "Average price (€/MWh)": day_metrics["avg_price"],
-                "Captured solar (€/MWh)": day_metrics["captured"],
-                "Solar capture rate (%)": day_metrics["capture_pct"],
+                "Captured solar uncurtailed (€/MWh)": day_metrics["captured_uncurtailed"],
+                "Captured solar curtailed (€/MWh)": day_metrics["captured_curtailed"],
+                "Solar capture rate uncurtailed (%)": day_metrics["capture_pct_uncurtailed"],
+                "Solar capture rate curtailed (%)": day_metrics["capture_pct_curtailed"],
             },
             {
                 "Period": "MTD",
                 "Average price (€/MWh)": mtd_metrics["avg_price"],
-                "Captured solar (€/MWh)": mtd_metrics["captured"],
-                "Solar capture rate (%)": mtd_metrics["capture_pct"],
+                "Captured solar uncurtailed (€/MWh)": mtd_metrics["captured_uncurtailed"],
+                "Captured solar curtailed (€/MWh)": mtd_metrics["captured_curtailed"],
+                "Solar capture rate uncurtailed (%)": mtd_metrics["capture_pct_uncurtailed"],
+                "Solar capture rate curtailed (%)": mtd_metrics["capture_pct_curtailed"],
             },
             {
                 "Period": "YTD",
                 "Average price (€/MWh)": ytd_metrics["avg_price"],
-                "Captured solar (€/MWh)": ytd_metrics["captured"],
-                "Solar capture rate (%)": ytd_metrics["capture_pct"],
+                "Captured solar uncurtailed (€/MWh)": ytd_metrics["captured_uncurtailed"],
+                "Captured solar curtailed (€/MWh)": ytd_metrics["captured_curtailed"],
+                "Solar capture rate uncurtailed (%)": ytd_metrics["capture_pct_uncurtailed"],
+                "Solar capture rate curtailed (%)": ytd_metrics["capture_pct_curtailed"],
             },
         ]
     )
@@ -1561,6 +1610,18 @@ intro_text = st.text_area(
     height=120,
 )
 
+available_months = sorted(price_hourly["datetime"].dt.to_period("M").astype(str).unique().tolist()) if not price_hourly.empty else []
+primary_month = None
+compare_month = None
+if report_mode == "Monthly comparison" and available_months:
+    mc1, mc2 = st.columns(2)
+    default_primary = "2026-04" if "2026-04" in available_months else available_months[-1]
+    default_compare = "2025-04" if "2025-04" in available_months else (available_months[-2] if len(available_months) > 1 else available_months[0])
+    with mc1:
+        primary_month = st.selectbox("Primary month", available_months, index=available_months.index(default_primary), key="primary_month_select")
+    with mc2:
+        compare_month = st.selectbox("Comparison month", available_months, index=available_months.index(default_compare), key="compare_month_select")
+
 if report_mode == "1-day report":
     if report_day > latest_available_day:
         live_price_day = fetch_live_hourly_prices_for_day(report_day, token)
@@ -1607,6 +1668,9 @@ if report_mode == "1-day report":
     mix_with_demand_b64 = mix_with_demand_png_base64(day_mix_hourly, demand_hourly_day) or chart_to_base64_png(mix_with_demand_chart)
 else:
     historical_best_solar = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+    if primary_month is None or compare_month is None:
+        st.warning("Select both primary and comparison months.")
+        st.stop()
     monthly_comp_df = build_monthly_comparison_table(price_hourly, historical_best_solar, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
     monthly_profile_chart = build_monthly_avg_profile_chart(price_hourly, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
     monthly_mix_chart, monthly_mix_table = build_monthly_mix_compare_chart(ree_daily_raw, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
@@ -1671,7 +1735,7 @@ if report_mode == "1-day report":
     renewable_text = f"{renewable_pct:.1%}" if renewable_pct is not None else "n/a"
     tb_df = make_tb_spreads_table(hourly_df)
     tb_html = df_to_html_table(tb_df, small=True)
-    metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
+    metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate uncurtailed (%)", "Solar capture rate curtailed (%)"])
     hourly_html = df_to_html_table(preview_table)
     mix_hourly_html = df_to_html_table(mix_preview) if not mix_preview.empty else "<p>No hourly energy mix / demand available.</p>"
     kpi_cards_html = make_kpi_cards_html(
