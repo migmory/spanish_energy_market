@@ -1380,11 +1380,21 @@ def build_zero_negative_heatmap(price_hourly: pd.DataFrame, year_sel: int):
     table = build_zero_negative_hour_table(price_hourly, year_sel)
     if table.empty:
         return None
+
     plot = table.melt(id_vars="Month", var_name="Hour", value_name="pct_hours")
-    plot["pct_label"] = plot["pct_hours"].map(lambda x: f"{x:.0f}%")
-    rect = alt.Chart(plot).mark_rect().encode(
+    month_order = [datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]
+
+    available_months = set(
+        price_hourly[price_hourly["datetime"].dt.year == year_sel]["datetime"].dt.strftime("%b").unique().tolist()
+    )
+    plot["is_future"] = ~plot["Month"].isin(available_months)
+    plot["pct_label"] = plot.apply(lambda r: "" if r["is_future"] else f'{r["pct_hours"]:.0f}%', axis=1)
+
+    base = alt.Chart(plot)
+
+    rect_past = base.transform_filter("!datum.is_future").mark_rect().encode(
         x=alt.X("Hour:N", title="Hour of day"),
-        y=alt.Y("Month:N", title="Month", sort=[datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]),
+        y=alt.Y("Month:N", title="Month", sort=month_order),
         color=alt.Color("pct_hours:Q", title="% hours", scale=alt.Scale(scheme="teals")),
         tooltip=[
             alt.Tooltip("Month:N", title="Month"),
@@ -1392,13 +1402,31 @@ def build_zero_negative_heatmap(price_hourly: pd.DataFrame, year_sel: int):
             alt.Tooltip("pct_hours:Q", title="% of hours", format=",.1f"),
         ],
     )
-    text = alt.Chart(plot).mark_text(fontSize=9).encode(
+
+    rect_future = base.transform_filter("datum.is_future").mark_rect(
+        fill="white",
+        stroke="#D1D5DB",
+        strokeWidth=0.6
+    ).encode(
+        x=alt.X("Hour:N", title="Hour of day"),
+        y=alt.Y("Month:N", title="Month", sort=month_order),
+        tooltip=[
+            alt.Tooltip("Month:N", title="Month"),
+            alt.Tooltip("Hour:N", title="Hour"),
+        ],
+    )
+
+    text_past = base.transform_filter("!datum.is_future").mark_text(fontSize=9).encode(
         x="Hour:N",
-        y=alt.Y("Month:N", sort=[datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]),
+        y=alt.Y("Month:N", sort=month_order),
         text="pct_label:N",
         color=alt.condition("datum.pct_hours >= 50", alt.value("white"), alt.value("#111827")),
     )
-    chart = alt.layer(rect, text).properties(height=420, title=f"Annual Zero/Negative Prices Frequency ({year_sel})")
+
+    chart = alt.layer(rect_future, rect_past, text_past).properties(
+        height=420,
+        title=f"Annual Zero/Negative Prices Frequency ({year_sel})"
+    )
     return apply_common_chart_style(chart, height=420)
 
 
@@ -1437,11 +1465,17 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame):
         return None
     years = sorted(curt_df["year"].unique().tolist())
     colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
-    chart = alt.Chart(curt_df).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
-        y=alt.Y("pct_curtailment:Q", title="Economic curtailment (% of monthly P48)", axis=alt.Axis(format=".0%")),
+    plot = curt_df.copy()
+    plot["month_label"] = plot["month_name"] + " - " + plot["year"].astype(str)
+    chart = alt.Chart(plot).mark_bar().encode(
+        x=alt.X(
+            "month_label:N",
+            title=None,
+            sort=plot.sort_values(["year", "month_num"])["month_label"].tolist(),
+            axis=alt.Axis(labelAngle=0),
+        ),
+        y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
         color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
-        detail="year:N",
         tooltip=[
             alt.Tooltip("year:N", title="Year"),
             alt.Tooltip("month_name:N", title="Month"),
