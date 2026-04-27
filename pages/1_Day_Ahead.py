@@ -64,7 +64,7 @@ HIST_INSTALLED_CAP_FILE = DATA_DIR / "installed_capacity_monthly.xlsx"
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
 SOLAR_FORECAST_INDICATOR_ID = 542
-DEMAND_INDICATOR_ID = 10027
+DEMAND_INDICATOR_ID = 1293
 
 ENERGY_MIX_INDICATORS_OFFICIAL = {
     "Nuclear": 74,
@@ -790,7 +790,7 @@ def load_live_2026_prices(token: str, start_day: date, end_day: date) -> pd.Data
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_live_2026_demand(token: str, start_day: date, end_day: date) -> pd.DataFrame:
-    raw = fetch_esios_range(DEMAND_INDICATOR_ID, start_day, end_day, token)
+    raw = fetch_esios_range(DEMAND_INDICATOR_ID, start_day, end_day, token, time_trunc="hour")
     if raw.empty:
         return pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
     out = raw[["datetime", "value"]].rename(columns={"value": "demand_mw"})
@@ -1354,6 +1354,104 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     return apply_common_chart_style(chart, height=330)
 
 
+def build_zero_negative_hour_table(price_hourly: pd.DataFrame, year_sel: int) -> pd.DataFrame:
+    months = [datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]
+    cols = [f"H{h:02d}" for h in range(24)]
+    if price_hourly.empty:
+        return pd.DataFrame(columns=["Month"] + cols)
+
+    tmp = price_hourly[price_hourly["datetime"].dt.year == year_sel].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["Month"] + cols)
+
+    tmp["month_num"] = tmp["datetime"].dt.month
+    tmp["hour"] = tmp["datetime"].dt.hour
+    tmp["flag"] = (tmp["price"] <= 0).astype(float)
+
+    grouped = tmp.groupby(["month_num", "hour"], as_index=False)["flag"].mean()
+    pivot = grouped.pivot(index="month_num", columns="hour", values="flag").reindex(index=range(1, 13), columns=range(24)).fillna(0.0)
+    pivot = pivot * 100.0
+    pivot.insert(0, "Month", months)
+    pivot.columns = ["Month"] + cols
+    return pivot.reset_index(drop=True)
+
+
+def build_zero_negative_heatmap(price_hourly: pd.DataFrame, year_sel: int):
+    table = build_zero_negative_hour_table(price_hourly, year_sel)
+    if table.empty:
+        return None
+    plot = table.melt(id_vars="Month", var_name="Hour", value_name="pct_hours")
+    plot["pct_label"] = plot["pct_hours"].map(lambda x: f"{x:.0f}%")
+    rect = alt.Chart(plot).mark_rect().encode(
+        x=alt.X("Hour:N", title="Hour of day"),
+        y=alt.Y("Month:N", title="Month", sort=[datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]),
+        color=alt.Color("pct_hours:Q", title="% hours", scale=alt.Scale(scheme="teals")),
+        tooltip=[
+            alt.Tooltip("Month:N", title="Month"),
+            alt.Tooltip("Hour:N", title="Hour"),
+            alt.Tooltip("pct_hours:Q", title="% of hours", format=",.1f"),
+        ],
+    )
+    text = alt.Chart(plot).mark_text(fontSize=9).encode(
+        x="Hour:N",
+        y=alt.Y("Month:N", sort=[datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]),
+        text="pct_label:N",
+        color=alt.condition("datum.pct_hours >= 50", alt.value("white"), alt.value("#111827")),
+    )
+    return apply_common_chart_style(alt.layer(rect, text).properties(height=420), height=420)
+
+
+def build_economic_curtailment_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, years: list[int] | None = None) -> pd.DataFrame:
+    cols = ["year", "month_num", "month_name", "affected_production_mwh", "total_production_mwh", "pct_curtailment"]
+    if price_hourly.empty or solar_hourly.empty:
+        return pd.DataFrame(columns=cols)
+
+    merged = price_hourly[["datetime", "price"]].merge(
+        solar_hourly[["datetime", "solar_best_mw"]], on="datetime", how="inner"
+    )
+    merged["solar_best_mw"] = pd.to_numeric(merged["solar_best_mw"], errors="coerce").fillna(0.0)
+    merged = merged[merged["solar_best_mw"] > 0].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=cols)
+
+    merged["year"] = merged["datetime"].dt.year
+    if years:
+        merged = merged[merged["year"].isin(years)].copy()
+    if merged.empty:
+        return pd.DataFrame(columns=cols)
+
+    merged["month_num"] = merged["datetime"].dt.month
+    merged["month_name"] = merged["datetime"].dt.strftime("%b")
+    total = merged.groupby(["year", "month_num", "month_name"], as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "total_production_mwh"})
+    affected = merged[merged["price"] <= 0].groupby(["year", "month_num", "month_name"], as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "affected_production_mwh"})
+    out = total.merge(affected, on=["year", "month_num", "month_name"], how="left")
+    out["affected_production_mwh"] = out["affected_production_mwh"].fillna(0.0)
+    out["pct_curtailment"] = out["affected_production_mwh"] / out["total_production_mwh"].where(out["total_production_mwh"] != 0)
+    out["pct_curtailment"] = out["pct_curtailment"].fillna(0.0)
+    return out[cols].sort_values(["year", "month_num"]).reset_index(drop=True)
+
+
+def build_economic_curtailment_chart(curt_df: pd.DataFrame):
+    if curt_df.empty:
+        return None
+    years = sorted(curt_df["year"].unique().tolist())
+    colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
+    chart = alt.Chart(curt_df).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
+        y=alt.Y("pct_curtailment:Q", title="Economic curtailment (% of monthly P48)", axis=alt.Axis(format=".0%")),
+        color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
+        detail="year:N",
+        tooltip=[
+            alt.Tooltip("year:N", title="Year"),
+            alt.Tooltip("month_name:N", title="Month"),
+            alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
+            alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
+            alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
+        ],
+    ).properties(height=330)
+    return apply_common_chart_style(chart, height=330)
+
+
 def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[str]):
     if cap_df.empty or not selected_techs:
         return None
@@ -1380,7 +1478,7 @@ def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[st
     ).properties(height=360)
     return apply_common_chart_style(chart, height=360)
 
-def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame) -> bytes:
+def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         price_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_hourly")
@@ -1389,6 +1487,12 @@ def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame,
         negative_price_df.to_excel(writer, index=False, sheet_name="negative_prices")
         mix_monthly_table.to_excel(writer, index=False, sheet_name="monthly_renewables")
         installed_capacity.sort_values(["datetime", "technology"]).to_excel(writer, index=False, sheet_name="installed_capacity")
+        if curtailment_table is not None and not curtailment_table.empty:
+            curtailment_table.to_excel(writer, index=False, sheet_name="economic_curtailment")
+        if zero_negative_hour_table is not None and not zero_negative_hour_table.empty:
+            zero_negative_hour_table.to_excel(writer, index=False, sheet_name="zero_neg_12x24")
+        if demand_hourly is not None and not demand_hourly.empty:
+            demand_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="demand_hourly")
     output.seek(0)
     return output.getvalue()
 
@@ -1560,6 +1664,44 @@ try:
     subtle_subsection("Negative prices data")
     st.dataframe(styled_df(negative_price_df), use_container_width=True)
 
+    section_header("Economic curtailment and zero / negative price occurrence")
+    available_price_years = sorted(price_hourly["datetime"].dt.year.unique().tolist()) if not price_hourly.empty else []
+    selected_curtailment_years = st.multiselect(
+        "Years for economic curtailment",
+        available_price_years,
+        default=available_price_years[-3:] if len(available_price_years) >= 3 else available_price_years,
+        key="selected_curtailment_years",
+    )
+    curt_df = build_economic_curtailment_monthly(price_hourly, solar_hourly, selected_curtailment_years)
+    curt_chart = build_economic_curtailment_chart(curt_df)
+    if curt_chart is not None:
+        st.altair_chart(curt_chart, use_container_width=True)
+        st.caption("Monthly economic curtailment = % of monthly P48 production generated during zero or negative price hours.")
+    if not curt_df.empty:
+        curt_table = curt_df.copy()
+        curt_table["Month"] = curt_table["month_name"] + " - " + curt_table["year"].astype(str)
+        curt_table = curt_table[["Month", "affected_production_mwh", "total_production_mwh", "pct_curtailment"]].rename(columns={
+            "affected_production_mwh": "Affected P48 (MWh)",
+            "total_production_mwh": "Total P48 (MWh)",
+            "pct_curtailment": "Economic curtailment",
+        })
+        subtle_subsection("Economic curtailment table")
+        st.dataframe(styled_df(curt_table, pct_cols=["Economic curtailment"]), use_container_width=True)
+
+    heatmap_year = st.selectbox(
+        "Year for 12x24 zero / negative price table",
+        available_price_years,
+        index=len(available_price_years) - 1 if available_price_years else 0,
+        key="heatmap_year_select",
+    ) if available_price_years else None
+    if heatmap_year is not None:
+        heat_table = build_zero_negative_hour_table(price_hourly, heatmap_year)
+        subtle_subsection("12x24 table: % of hours with zero or negative prices")
+        st.dataframe(styled_df(heat_table), use_container_width=True)
+        heat_chart = build_zero_negative_heatmap(price_hourly, heatmap_year)
+        if heat_chart is not None:
+            st.altair_chart(heat_chart, use_container_width=True)
+
     # Energy mix
     section_header("Energy mix")
     if mix_daily.empty:
@@ -1590,27 +1732,12 @@ try:
                     monthly_live,
                 ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
-        if granularity == "Monthly" and year_sel >= 2026:
-            demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
-            if not demand_live_monthly.empty:
-                demand_period = demand_live_monthly.copy()
-                demand_period["period_label"] = demand_period["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
-                demand_period["sort_key"] = demand_period["datetime"].dt.to_period("M").dt.to_timestamp()
-                demand_period = demand_period[["period_label", "sort_key", "demand_mwh"]].copy()
-            else:
-                demand_period = build_demand_period(
-                    demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-                    granularity,
-                    year_sel=year_sel,
-                    day_range=day_range,
-                )
-        else:
-            demand_period = build_demand_period(
-                demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-                granularity,
-                year_sel=year_sel,
-                day_range=day_range,
-            )
+        demand_period = build_demand_period(
+            demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+            granularity,
+            year_sel=year_sel,
+            day_range=day_range,
+        )
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
@@ -1662,6 +1789,9 @@ try:
         negative_price_df=negative_price_df,
         mix_monthly_table=build_monthly_renewables_table(mix_daily),
         installed_capacity=installed_capacity,
+        curtailment_table=build_economic_curtailment_monthly(price_hourly, solar_hourly, sorted(price_hourly["datetime"].dt.year.unique().tolist())),
+        zero_negative_hour_table=build_zero_negative_hour_table(price_hourly, int(price_hourly["datetime"].dt.year.max())) if not price_hourly.empty else pd.DataFrame(),
+        demand_hourly=demand_hourly,
     )
     st.download_button(
         label="Download Excel workbook",
