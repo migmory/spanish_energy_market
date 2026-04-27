@@ -1767,27 +1767,12 @@ try:
                     monthly_live,
                 ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
-        if granularity == "Monthly" and year_sel >= 2026:
-            demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
-            if not demand_live_monthly.empty:
-                demand_period = demand_live_monthly.copy()
-                demand_period["period_label"] = demand_period["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
-                demand_period["sort_key"] = demand_period["datetime"].dt.to_period("M").dt.to_timestamp()
-                demand_period = demand_period[["period_label", "sort_key", "demand_mwh"]].copy()
-            else:
-                demand_period = build_demand_period(
-                    demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-                    granularity,
-                    year_sel=year_sel,
-                    day_range=day_range,
-                )
-        else:
-            demand_period = build_demand_period(
-                demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-                granularity,
-                year_sel=year_sel,
-                day_range=day_range,
-            )
+        demand_period = build_demand_period(
+            demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+            granularity,
+            year_sel=year_sel,
+            day_range=day_range,
+        )
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
