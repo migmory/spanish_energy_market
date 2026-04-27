@@ -550,7 +550,12 @@ def load_live_2026_demand_monthly_from_ree(start_day: date, end_day: date) -> pd
     if preferred.empty:
         preferred = df.copy()
     preferred["datetime"] = pd.to_datetime(preferred["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-    preferred["demand_mwh"] = normalize_ree_energy_to_mwh(preferred["value"])
+
+    # In the REE monthly demand widget, values are reported in GWh for the monthly view.
+    # Convert them explicitly to MWh so the chart, which later divides by 1000 to display GWh,
+    # lands in the correct 20k-24k GWh range.
+    preferred["demand_mwh"] = pd.to_numeric(preferred["value"], errors="coerce") * 1000.0
+
     preferred = preferred.dropna(subset=["datetime", "demand_mwh"]).copy()
     return preferred.groupby("datetime", as_index=False)["demand_mwh"].sum().sort_values("datetime").reset_index(drop=True)
 
@@ -796,6 +801,14 @@ def load_live_2026_demand(token: str, start_day: date, end_day: date) -> pd.Data
     out = raw[["datetime", "value"]].rename(columns={"value": "demand_mw"})
     out["datetime"] = out["datetime"].dt.floor("h")
     out = out.groupby("datetime", as_index=False)["demand_mw"].mean().sort_values("datetime")
+
+    # The live demand series can arrive one order of magnitude above the expected
+    # Spanish hourly load level in this extraction path. Keep the hourly-series logic
+    # but normalize the scale when the median is clearly out of range.
+    median_mw = out["demand_mw"].median() if not out.empty else None
+    if median_mw is not None and pd.notna(median_mw) and median_mw > 100000:
+        out["demand_mw"] = out["demand_mw"] / 10.0
+
     out["energy_mwh"] = out["demand_mw"]
     return out
 
@@ -1767,12 +1780,27 @@ try:
                     monthly_live,
                 ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
-        demand_period = build_demand_period(
-            demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-            granularity,
-            year_sel=year_sel,
-            day_range=day_range,
-        )
+        if granularity == "Monthly" and year_sel >= 2026:
+            demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
+            if not demand_live_monthly.empty:
+                demand_period = demand_live_monthly.copy()
+                demand_period["period_label"] = demand_period["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+                demand_period["sort_key"] = demand_period["datetime"].dt.to_period("M").dt.to_timestamp()
+                demand_period = demand_period[["period_label", "sort_key", "demand_mwh"]].copy()
+            else:
+                demand_period = build_demand_period(
+                    demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+                    granularity,
+                    year_sel=year_sel,
+                    day_range=day_range,
+                )
+        else:
+            demand_period = build_demand_period(
+                demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+                granularity,
+                year_sel=year_sel,
+                day_range=day_range,
+            )
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
