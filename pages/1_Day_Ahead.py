@@ -1081,9 +1081,7 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 
     summary = (
         plot.groupby(["period_label", "sort_key"], as_index=False)
-        .agg(
-            total_generation_mwh=("energy_mwh", "sum"),
-        )
+        .agg(total_generation_mwh=("energy_mwh", "sum"))
         .sort_values("sort_key")
     )
     renew = (
@@ -1138,8 +1136,7 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
         ],
     )
 
-    layers = [bars]
-
+    left_layers = [bars]
     if summary["demand_gwh"].notna().any():
         demand_line = (
             alt.Chart(summary.dropna(subset=["demand_gwh"]))
@@ -1153,7 +1150,9 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
                 ],
             )
         )
-        layers.append(demand_line)
+        left_layers.append(demand_line)
+
+    left_chart = alt.layer(*left_layers)
 
     re_line = alt.Chart(summary).mark_line(point=True, color=GREEN_RENEWABLES, strokeWidth=3).encode(
         x=alt.X("period_label:N", sort=order_list, axis=alt.Axis(title=None, labelAngle=0)),
@@ -1170,9 +1169,8 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
             alt.Tooltip("renewable_share_pct:Q", title="% RE", format=".1%"),
         ],
     )
-    layers.append(re_line)
 
-    chart = alt.layer(*layers).resolve_scale(y="independent").properties(height=430)
+    chart = alt.layer(left_chart, re_line).resolve_scale(y="independent").properties(height=430)
     return apply_common_chart_style(chart, height=430)
 
 def build_monthly_renewables_table(mix_df: pd.DataFrame) -> pd.DataFrame:
@@ -1592,12 +1590,27 @@ try:
                     monthly_live,
                 ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
-        demand_period = build_demand_period(
-            demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-            granularity,
-            year_sel=year_sel,
-            day_range=day_range,
-        )
+        if granularity == "Monthly" and year_sel >= 2026:
+            demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
+            if not demand_live_monthly.empty:
+                demand_period = demand_live_monthly.copy()
+                demand_period["period_label"] = demand_period["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+                demand_period["sort_key"] = demand_period["datetime"].dt.to_period("M").dt.to_timestamp()
+                demand_period = demand_period[["period_label", "sort_key", "demand_mwh"]].copy()
+            else:
+                demand_period = build_demand_period(
+                    demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+                    granularity,
+                    year_sel=year_sel,
+                    day_range=day_range,
+                )
+        else:
+            demand_period = build_demand_period(
+                demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+                granularity,
+                year_sel=year_sel,
+                day_range=day_range,
+            )
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
