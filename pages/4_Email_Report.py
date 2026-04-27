@@ -546,6 +546,20 @@ def fetch_hourly_energy_for_indicator(indicator_id: int | None, day: date, token
     except Exception:
         return pd.DataFrame(columns=["datetime", "mw", "energy_mwh"])
 
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_live_hourly_prices_for_day(day: date, token: str | None) -> pd.DataFrame:
+    if not token:
+        return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
+    try:
+        raw = fetch_esios_day(PRICE_INDICATOR_ID, day, token)
+        df = parse_esios_indicator(raw, source_name=f"esios_{PRICE_INDICATOR_ID}", filter_date=day)
+        if df.empty:
+            return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
+        out = to_hourly_mean(df, value_col_name="price")
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "price", "source", "geo_name", "geo_id"])
+
 
 # =========================================================
 # SOLAR
@@ -1548,6 +1562,12 @@ intro_text = st.text_area(
 )
 
 if report_mode == "1-day report":
+    if report_day > latest_available_day:
+        live_price_day = fetch_live_hourly_prices_for_day(report_day, token)
+        if not live_price_day.empty:
+            cached = price_hourly[price_hourly["datetime"].dt.date != report_day].copy()
+            price_hourly = pd.concat([cached, live_price_day], ignore_index=True).sort_values("datetime").reset_index(drop=True)
+
     solar_profile_day = build_solar_profile_for_report_day(
         solar_p48_hourly=solar_p48_hourly,
         solar_forecast_hourly=solar_forecast_hourly,
@@ -1593,8 +1613,12 @@ else:
     overlay_chart_b64 = chart_to_base64_png(monthly_profile_chart)
     mix_with_demand_b64 = chart_to_base64_png(monthly_mix_chart)
 
-renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
-tb_df = make_tb_spreads_table(hourly_df)
+if report_mode == "1-day report":
+    renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
+    tb_df = make_tb_spreads_table(hourly_df)
+else:
+    renewable_pct, negative_hours = None, None
+    tb_df = pd.DataFrame()
 
 if report_mode == "1-day report":
     st.subheader("Preview chart")
