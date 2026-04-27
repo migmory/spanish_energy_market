@@ -1576,7 +1576,7 @@ try:
 
         live_prices = load_live_2026_prices(token, live_start, live_end)
         live_solar = load_live_2026_solar(token, live_start, live_end)
-        live_demand = load_live_2026_demand(token, live_start, live_end)
+        live_demand = pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
         live_mix = load_live_2026_mix_daily(token, live_start, live_end)
         live_installed_capacity = load_live_2026_installed_capacity_from_ree(live_start, live_end)
 
@@ -1803,10 +1803,10 @@ try:
             )
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
-        mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
+        mix_chart = build_energy_mix_period_chart(mix_period, None)
         if mix_chart is not None:
             st.altair_chart(mix_chart, use_container_width=True)
-            st.caption("Línea verde = % RE (eje derecho 0%-100%). Línea negra = demanda total del periodo (eje izquierdo).")
+            st.caption("Línea verde = % RE (eje derecho 0%-100%).")
 
         subtle_subsection("Monthly renewables summary")
         monthly_renewables_table = build_monthly_renewables_table(mix_daily)
