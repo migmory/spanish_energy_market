@@ -1125,7 +1125,7 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
         y=alt.Y(
             "energy_gwh:Q",
             title=None,
-            axis=alt.Axis(title="Generation / demand (GWh)", orient="left"),
+            axis=alt.Axis(title="Generation and demand (GWh)", orient="left"),
             scale=left_scale,
         ),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
@@ -1398,7 +1398,8 @@ def build_zero_negative_heatmap(price_hourly: pd.DataFrame, year_sel: int):
         text="pct_label:N",
         color=alt.condition("datum.pct_hours >= 50", alt.value("white"), alt.value("#111827")),
     )
-    return apply_common_chart_style(alt.layer(rect, text).properties(height=420), height=420)
+    chart = alt.layer(rect, text).properties(height=420, title=f"Annual Zero/Negative Prices Frequency ({year_sel})")
+    return apply_common_chart_style(chart, height=420)
 
 
 def build_economic_curtailment_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, years: list[int] | None = None) -> pd.DataFrame:
@@ -1689,15 +1690,15 @@ try:
         st.dataframe(styled_df(curt_table, pct_cols=["Economic curtailment"]), use_container_width=True)
 
     heatmap_year = st.selectbox(
-        "Year for 12x24 zero / negative price table",
+        "Year for annual zero / negative price frequency",
         available_price_years,
         index=len(available_price_years) - 1 if available_price_years else 0,
         key="heatmap_year_select",
     ) if available_price_years else None
+    heat_table = pd.DataFrame()
     if heatmap_year is not None:
         heat_table = build_zero_negative_hour_table(price_hourly, heatmap_year)
-        subtle_subsection("12x24 table: % of hours with zero or negative prices")
-        st.dataframe(styled_df(heat_table), use_container_width=True)
+        subtle_subsection("Annual Zero/Negative Prices Frequency")
         heat_chart = build_zero_negative_heatmap(price_hourly, heatmap_year)
         if heat_chart is not None:
             st.altair_chart(heat_chart, use_container_width=True)
@@ -1732,12 +1733,27 @@ try:
                     monthly_live,
                 ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
-        demand_period = build_demand_period(
-            demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-            granularity,
-            year_sel=year_sel,
-            day_range=day_range,
-        )
+        if granularity == "Monthly" and year_sel >= 2026:
+            demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
+            if not demand_live_monthly.empty:
+                demand_period = demand_live_monthly.copy()
+                demand_period["period_label"] = demand_period["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+                demand_period["sort_key"] = demand_period["datetime"].dt.to_period("M").dt.to_timestamp()
+                demand_period = demand_period[["period_label", "sort_key", "demand_mwh"]].copy()
+            else:
+                demand_period = build_demand_period(
+                    demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+                    granularity,
+                    year_sel=year_sel,
+                    day_range=day_range,
+                )
+        else:
+            demand_period = build_demand_period(
+                demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
+                granularity,
+                year_sel=year_sel,
+                day_range=day_range,
+            )
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, demand_period)
@@ -1779,6 +1795,20 @@ try:
         cap_table["Month"] = cap_table["datetime"].dt.strftime("%b - %Y")
         subtle_subsection("Installed capacity monthly summary")
         st.dataframe(styled_df(cap_table[["Month", "Total installed capacity (MW)", "Renewable capacity (MW)", "% Renewable capacity"]], pct_cols=["% Renewable capacity"]), use_container_width=True)
+
+    # Raw 12x24 table download (kept at the end)
+    if not heat_table.empty:
+        subtle_subsection("Download raw 12x24 zero / negative price table")
+        with st.expander("Show raw 12x24 table", expanded=False):
+            st.dataframe(heat_table, use_container_width=True)
+        csv_zero_neg = heat_table.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download 12x24 zero / negative price table (CSV)",
+            data=csv_zero_neg,
+            file_name=f"zero_negative_price_frequency_{heatmap_year}.csv",
+            mime="text/csv",
+            key="download_zero_negative_table_csv",
+        )
 
     # Download workbook
     section_header("Extraction workbook")
