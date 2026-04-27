@@ -166,6 +166,8 @@ pwd = st.text_input("Password", type="password")
 if pwd != st.secrets["email_admin_password"]:
     st.stop()
 
+report_mode = st.selectbox("Report mode", ["1-day report", "Monthly comparison"], index=0)
+
 
 # =========================================================
 # TIME / TOKEN
@@ -1351,6 +1353,83 @@ def mix_with_demand_png_base64(day_mix_hourly: pd.DataFrame, demand_hourly_day: 
 
 
 # =========================================================
+# MONTHLY COMPARISON HELPERS
+# =========================================================
+def month_start_end(period_ts: pd.Timestamp) -> tuple[date, date]:
+    start = period_ts.to_period("M").to_timestamp().date()
+    end = (period_ts.to_period("M").to_timestamp() + pd.offsets.MonthEnd(0)).date()
+    return start, end
+
+
+def build_monthly_comparison_table(price_hourly: pd.DataFrame, historical_best_solar: pd.DataFrame, primary_month: pd.Timestamp, compare_month: pd.Timestamp) -> pd.DataFrame:
+    rows = []
+    for label, month_ts in [("Primary", primary_month), ("Comparison", compare_month)]:
+        d0, d1 = month_start_end(month_ts)
+        metrics = compute_period_metrics(price_hourly, historical_best_solar, d0, d1)
+        p = price_hourly[(price_hourly["datetime"].dt.date >= d0) & (price_hourly["datetime"].dt.date <= d1)].copy()
+        s = historical_best_solar[(historical_best_solar["datetime"].dt.date >= d0) & (historical_best_solar["datetime"].dt.date <= d1)].copy()
+        merged = p.merge(s[["datetime", "solar_best_mw"]], on="datetime", how="left")
+        merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+        zero_neg_hours = int((p["price"] <= 0).sum()) if not p.empty else 0
+        solar_zero_neg_hours = int(((merged["price"] <= 0) & (merged["solar_best_mw"] > 0)).sum()) if not merged.empty else 0
+        rows.append({
+            "Label": label,
+            "Month": month_ts.strftime("%b-%Y"),
+            "Average price (€/MWh)": metrics.get("avg_price"),
+            "Captured solar (€/MWh)": metrics.get("captured"),
+            "Solar capture rate (%)": metrics.get("capture_pct"),
+            "Zero / negative hours": zero_neg_hours,
+            "Zero / negative hours during solar": solar_zero_neg_hours,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_monthly_avg_profile_chart(price_hourly: pd.DataFrame, primary_month: pd.Timestamp, compare_month: pd.Timestamp):
+    rows = []
+    for label, month_ts in [(primary_month.strftime("%b-%Y"), primary_month), (compare_month.strftime("%b-%Y"), compare_month)]:
+        d0, d1 = month_start_end(month_ts)
+        p = price_hourly[(price_hourly["datetime"].dt.date >= d0) & (price_hourly["datetime"].dt.date <= d1)].copy()
+        if p.empty:
+            continue
+        p["Hour"] = p["datetime"].dt.hour
+        g = p.groupby("Hour", as_index=False)["price"].mean()
+        g["Series"] = label
+        rows.append(g)
+    if not rows:
+        return None
+    plot = pd.concat(rows, ignore_index=True)
+    return alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("Hour:O", title="Hour"),
+        y=alt.Y("price:Q", title="Average price (€/MWh)"),
+        color=alt.Color("Series:N", title=None),
+        tooltip=["Series", "Hour", alt.Tooltip("price:Q", format=".2f")],
+    ).properties(height=320)
+
+
+def build_monthly_mix_compare_chart(ree_daily_df: pd.DataFrame, primary_month: pd.Timestamp, compare_month: pd.Timestamp):
+    if ree_daily_df.empty:
+        return None, pd.DataFrame()
+    rows = []
+    for label, month_ts in [(primary_month.strftime("%b-%Y"), primary_month), (compare_month.strftime("%b-%Y"), compare_month)]:
+        d0, d1 = month_start_end(month_ts)
+        tmp = ree_daily_df[(ree_daily_df["datetime"].dt.date >= d0) & (ree_daily_df["datetime"].dt.date <= d1)].copy()
+        if tmp.empty:
+            continue
+        g = tmp.groupby("technology", as_index=False)["value_gwh"].sum()
+        g["MonthLabel"] = label
+        rows.append(g)
+    if not rows:
+        return None, pd.DataFrame()
+    plot = pd.concat(rows, ignore_index=True)
+    chart = alt.Chart(plot).mark_bar().encode(
+        x=alt.X("MonthLabel:N", title=None),
+        y=alt.Y("value_gwh:Q", title="Generation (GWh)"),
+        color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
+        tooltip=["MonthLabel", "technology", alt.Tooltip("value_gwh:Q", title="Generation (GWh)", format=",.1f")],
+    ).properties(height=340)
+    return chart, plot
+
+# =========================================================
 # LOAD DATA
 # =========================================================
 token = require_esios_token()
@@ -1410,162 +1489,183 @@ intro_text = st.text_area(
     height=120,
 )
 
-solar_profile_day = build_solar_profile_for_report_day(
-    solar_p48_hourly=solar_p48_hourly,
-    solar_forecast_hourly=solar_forecast_hourly,
-    report_day=report_day,
-    token=token,
-)
+if report_mode == "1-day report":
+    solar_profile_day = build_solar_profile_for_report_day(
+        solar_p48_hourly=solar_p48_hourly,
+        solar_forecast_hourly=solar_forecast_hourly,
+        report_day=report_day,
+        token=token,
+    )
 
-hourly_df, capture_price = build_daily_dataset(price_hourly, solar_profile_day, report_day)
+    hourly_df, capture_price = build_daily_dataset(price_hourly, solar_profile_day, report_day)
 
-historical_best_solar = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
-metrics_df = make_metrics_df(
-    price_hourly=price_hourly,
-    historical_best_solar=historical_best_solar,
-    solar_profile_day=solar_profile_day,
-    report_day=report_day,
-)
+    historical_best_solar = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+    metrics_df = make_metrics_df(
+        price_hourly=price_hourly,
+        historical_best_solar=historical_best_solar,
+        solar_profile_day=solar_profile_day,
+        report_day=report_day,
+    )
 
-day_mix_hourly = build_all_mix_hourly_for_day(
-    report_day=report_day,
-    ree_daily_df=ree_daily_raw,
-    solar_profile_day=solar_profile_day,
-    token=token,
-)
+    day_mix_hourly = build_all_mix_hourly_for_day(
+        report_day=report_day,
+        ree_daily_df=ree_daily_raw,
+        solar_profile_day=solar_profile_day,
+        token=token,
+    )
 
-demand_hourly_day = build_hourly_demand_for_day(demand_raw, report_day)
+    demand_hourly_day = build_hourly_demand_for_day(demand_raw, report_day)
 
-if hourly_df.empty:
-    st.warning("No hourly price data available for the selected report day.")
-    st.stop()
+    if hourly_df.empty:
+        st.warning("No hourly price data available for the selected report day.")
+        st.stop()
 
-preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy()
-overlay_chart = build_overlay_chart(hourly_df)
-overlay_chart_b64 = line_area_png_base64(hourly_df) or chart_to_base64_png(overlay_chart)
+    preview_table = hourly_df[["Hour", "Price (€/MWh)", "Solar (MW)", "Solar source"]].copy()
+    overlay_chart = build_overlay_chart(hourly_df)
+    overlay_chart_b64 = line_area_png_base64(hourly_df) or chart_to_base64_png(overlay_chart)
 
-mix_preview = build_mix_matrix_table(day_mix_hourly, demand_hourly_day)
-mix_with_demand_chart = build_mix_with_demand_chart(day_mix_hourly, demand_hourly_day)
-mix_with_demand_b64 = mix_with_demand_png_base64(day_mix_hourly, demand_hourly_day) or chart_to_base64_png(mix_with_demand_chart)
+    mix_preview = build_mix_matrix_table(day_mix_hourly, demand_hourly_day)
+    mix_with_demand_chart = build_mix_with_demand_chart(day_mix_hourly, demand_hourly_day)
+    mix_with_demand_b64 = mix_with_demand_png_base64(day_mix_hourly, demand_hourly_day) or chart_to_base64_png(mix_with_demand_chart)
+else:
+    historical_best_solar = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+    monthly_comp_df = build_monthly_comparison_table(price_hourly, historical_best_solar, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
+    monthly_profile_chart = build_monthly_avg_profile_chart(price_hourly, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
+    monthly_mix_chart, monthly_mix_table = build_monthly_mix_compare_chart(ree_daily_raw, pd.Timestamp(primary_month), pd.Timestamp(compare_month))
+    overlay_chart_b64 = chart_to_base64_png(monthly_profile_chart)
+    mix_with_demand_b64 = chart_to_base64_png(monthly_mix_chart)
 
 renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
 tb_df = make_tb_spreads_table(hourly_df)
 
-st.subheader("Preview chart")
-if overlay_chart is not None:
-    st.altair_chart(overlay_chart, use_container_width=True)
+if report_mode == "1-day report":
+    st.subheader("Preview chart")
+    if overlay_chart is not None:
+        st.altair_chart(overlay_chart, use_container_width=True)
 
-st.subheader("Preview metrics")
-st.dataframe(metrics_df, use_container_width=True)
+    st.subheader("Preview metrics")
+    st.dataframe(metrics_df, use_container_width=True)
 
-st.subheader("Preview TB spreads")
-st.dataframe(tb_df, use_container_width=True)
+    st.subheader("Preview TB spreads")
+    st.dataframe(tb_df, use_container_width=True)
 
-st.subheader("Preview hourly table")
-st.dataframe(preview_table, use_container_width=True)
+    st.subheader("Preview hourly table")
+    st.dataframe(preview_table, use_container_width=True)
 
-st.subheader("Preview hourly energy mix + demand")
-if not mix_preview.empty:
-    st.dataframe(mix_preview, use_container_width=True)
+    st.subheader("Preview hourly energy mix + demand")
+    if not mix_preview.empty:
+        st.dataframe(mix_preview, use_container_width=True)
+    else:
+        st.info("No hourly energy mix / demand available for selected day.")
+
+    st.subheader("Preview hourly energy mix + demand chart")
+    if mix_with_demand_chart is not None:
+        st.altair_chart(mix_with_demand_chart, use_container_width=True)
+    else:
+        st.info("No hourly energy mix / demand chart available.")
+
+    st.caption(
+        f"Debug | mix rows: {len(day_mix_hourly)} | "
+        f"mix techs: {', '.join(sorted(day_mix_hourly['technology'].unique().tolist())) if not day_mix_hourly.empty else 'none'} | "
+        f"demand rows: {len(demand_hourly_day)} | "
+        f"solar source(s): {', '.join(sorted(hourly_df['Solar source'].dropna().unique().tolist()))}"
+    )
 else:
-    st.info("No hourly energy mix / demand available for selected day.")
+    st.subheader("Monthly comparison metrics")
+    st.dataframe(monthly_comp_df, use_container_width=True)
+    st.subheader("Average hourly price profile by month")
+    if monthly_profile_chart is not None:
+        st.altair_chart(monthly_profile_chart, use_container_width=True)
+    st.subheader("Monthly energy mix comparison")
+    if monthly_mix_chart is not None:
+        st.altair_chart(monthly_mix_chart, use_container_width=True)
+    if not monthly_mix_table.empty:
+        st.dataframe(monthly_mix_table, use_container_width=True)
 
-st.subheader("Preview hourly energy mix + demand chart")
-if mix_with_demand_chart is not None:
-    st.altair_chart(mix_with_demand_chart, use_container_width=True)
+if report_mode == "1-day report":
+    capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
+    day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
+    renewable_pct, negative_hours = compute_energy_mix_kpis(day_mix_hourly, hourly_df)
+    renewable_text = f"{renewable_pct:.1%}" if renewable_pct is not None else "n/a"
+    tb_df = make_tb_spreads_table(hourly_df)
+    tb_html = df_to_html_table(tb_df, small=True)
+    metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
+    hourly_html = df_to_html_table(preview_table)
+    mix_hourly_html = df_to_html_table(mix_preview) if not mix_preview.empty else "<p>No hourly energy mix / demand available.</p>"
+    kpi_cards_html = make_kpi_cards_html(
+        [
+            ("Captured solar price", capture_text),
+            ("Renewables share", renewable_text),
+            ("Zero / negative price hours", str(negative_hours)),
+            ("Solar source used", day_sources if day_sources else "n/a"),
+        ]
+    )
+    overlay_chart_html = ""
+    if overlay_chart_b64:
+        overlay_chart_html = f"""
+        <h3>Hourly price and solar chart</h3>
+        <img src="data:image/png;base64,{overlay_chart_b64}" alt="Hourly chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    mix_with_demand_chart_html = ""
+    if mix_with_demand_b64:
+        mix_with_demand_chart_html = f"""
+        <h3>Hourly energy mix and demand chart</h3>
+        <img src="data:image/png;base64,{mix_with_demand_b64}" alt="Hourly energy mix and demand chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    tomorrow = today_madrid() + timedelta(days=1)
+    mix_source_note = (
+        "Tomorrow: solar uses next-day forecast when available; otherwise it uses the previous day's reliable profile shifted to tomorrow. Demand and technology-level mix also use previous-day hourly shapes when next-day hourly data is not reliably available, while REE daily totals are used to preserve daily technology totals."
+        if report_day == tomorrow
+        else "Selected day: solar uses the best available hourly series for the selected day. Technology-level mix uses ESIOS hourly shapes when available and REE daily totals with hourly shaping as fallback."
+    )
+    email_html = f"""
+    <html><body style="font-family: Arial, sans-serif; font-size: 13px; color: #111111;">
+      <p>{intro_text.replace(chr(10), '<br>')}</p>
+      <p><strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br><strong>Energy mix source rule:</strong> {mix_source_note}</p>
+      {kpi_cards_html}<br><br>
+      {overlay_chart_html}
+      <h3>Summary metrics</h3>{metrics_html}<br>
+      <h3>BESS daily spreads</h3>{tb_html}<br>
+      <h3>Hourly price / solar table</h3>{hourly_html}<br>
+      {mix_with_demand_chart_html}
+      <h3>Hourly energy mix and demand table</h3>{mix_hourly_html}<br>
+      <p>Best regards,</p>
+    </body></html>
+    """
 else:
-    st.info("No hourly energy mix / demand chart available.")
-
-st.caption(
-    f"Debug | mix rows: {len(day_mix_hourly)} | "
-    f"mix techs: {', '.join(sorted(day_mix_hourly['technology'].unique().tolist())) if not day_mix_hourly.empty else 'none'} | "
-    f"demand rows: {len(demand_hourly_day)} | "
-    f"solar source(s): {', '.join(sorted(hourly_df['Solar source'].dropna().unique().tolist()))}"
-)
-
-capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
-day_sources = ", ".join(sorted(hourly_df["Solar source"].dropna().unique().tolist()))
-renewable_text = f"{renewable_pct:.1%}" if renewable_pct is not None else "n/a"
-
-tb_html = df_to_html_table(tb_df, small=True)
-metrics_html = df_to_html_table(metrics_df, pct_cols=["Solar capture rate (%)"])
-hourly_html = df_to_html_table(preview_table)
-mix_hourly_html = df_to_html_table(mix_preview) if not mix_preview.empty else "<p>No hourly energy mix / demand available.</p>"
-
-kpi_cards_html = make_kpi_cards_html(
-    [
-        ("Captured solar price", capture_text),
-        ("Renewables share", renewable_text),
-        ("Zero / negative price hours", str(negative_hours)),
-        ("Solar source used", day_sources if day_sources else "n/a"),
-    ]
-)
-
-overlay_chart_html = ""
-if overlay_chart_b64:
-    overlay_chart_html = f"""
-    <h3>Hourly price and solar chart</h3>
-    <img src="data:image/png;base64,{overlay_chart_b64}" alt="Hourly chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
-    <br><br>
+    monthly_metrics_html = df_to_html_table(monthly_comp_df, pct_cols=["Solar capture rate (%)"])
+    monthly_mix_html = df_to_html_table(monthly_mix_table) if not monthly_mix_table.empty else "<p>No monthly mix available.</p>"
+    overlay_chart_html = ""
+    if overlay_chart_b64:
+        overlay_chart_html = f"""
+        <h3>Average hourly price profile</h3>
+        <img src="data:image/png;base64,{overlay_chart_b64}" alt="Monthly average profile" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    mix_chart_html = ""
+    if mix_with_demand_b64:
+        mix_chart_html = f"""
+        <h3>Monthly energy mix comparison</h3>
+        <img src="data:image/png;base64,{mix_with_demand_b64}" alt="Monthly mix comparison" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    kpi_cards_html = make_kpi_cards_html([
+        ("Primary month", pd.Timestamp(primary_month).strftime('%b-%Y')),
+        ("Comparison month", pd.Timestamp(compare_month).strftime('%b-%Y')),
+    ])
+    email_html = f"""
+    <html><body style="font-family: Arial, sans-serif; font-size: 13px; color: #111111;">
+      <p>{intro_text.replace(chr(10), '<br>')}</p>
+      {kpi_cards_html}<br><br>
+      <h3>Monthly comparison metrics</h3>{monthly_metrics_html}<br>
+      {overlay_chart_html}
+      {mix_chart_html}
+      <h3>Monthly energy mix table</h3>{monthly_mix_html}<br>
+      <p>Best regards,</p>
+    </body></html>
     """
-
-mix_with_demand_chart_html = ""
-if mix_with_demand_b64:
-    mix_with_demand_chart_html = f"""
-    <h3>Hourly energy mix and demand chart</h3>
-    <img src="data:image/png;base64,{mix_with_demand_b64}" alt="Hourly energy mix and demand chart" style="max-width:100%; height:auto; border:1px solid #ddd;" />
-    <br><br>
-    """
-
-tomorrow = today_madrid() + timedelta(days=1)
-mix_source_note = (
-    "Tomorrow: solar uses next-day forecast when available; otherwise it uses the previous day's reliable profile shifted to tomorrow. "
-    "Demand and technology-level mix also use previous-day hourly shapes when next-day hourly data is not reliably available, while REE daily totals are used to preserve daily technology totals."
-    if report_day == tomorrow
-    else "Selected day: solar uses the best available hourly series for the selected day. Technology-level mix uses ESIOS hourly shapes when available and REE daily totals with hourly shaping as fallback."
-)
-
-email_html = f"""
-<html>
-  <body style="font-family: Arial, sans-serif; font-size: 13px; color: #111111;">
-    <p>{intro_text.replace(chr(10), '<br>')}</p>
-
-    <p>
-      <strong>Selected day:</strong> {report_day.strftime('%d-%b-%Y')}<br>
-      <strong>Energy mix source rule:</strong> {mix_source_note}
-    </p>
-
-    {kpi_cards_html}
-
-    <br><br>
-
-    {overlay_chart_html}
-
-    <h3>Summary metrics</h3>
-    {metrics_html}
-
-    <br>
-
-    <h3>BESS daily spreads</h3>
-    {tb_html}
-
-    <br>
-
-    <h3>Hourly price / solar table</h3>
-    {hourly_html}
-
-    <br>
-
-    {mix_with_demand_chart_html}
-
-    <h3>Hourly energy mix and demand table</h3>
-    {mix_hourly_html}
-
-    <br>
-    <p>Best regards,</p>
-  </body>
-</html>
-"""
 
 st.subheader("Email HTML preview")
 st.code(email_html, language="html")
