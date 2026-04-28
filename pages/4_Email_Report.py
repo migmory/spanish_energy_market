@@ -1534,6 +1534,63 @@ def build_monthly_mtd_ytd_comparison_table(price_hourly: pd.DataFrame, solar_hou
     return pd.DataFrame(rows)
 
 
+def build_zero_negative_hour_table(price_hourly: pd.DataFrame, year_sel: int) -> pd.DataFrame:
+    if price_hourly.empty:
+        return pd.DataFrame()
+    tmp = price_hourly[price_hourly["datetime"].dt.year == year_sel].copy()
+    if tmp.empty:
+        return pd.DataFrame()
+    tmp["Month"] = tmp["datetime"].dt.strftime("%b")
+    tmp["Hour"] = tmp["datetime"].dt.strftime("H%H")
+    total = tmp.groupby(["Month", "Hour"], as_index=False)["price"].count().rename(columns={"price": "total_hours"})
+    neg = tmp[tmp["price"] <= 0].groupby(["Month", "Hour"], as_index=False)["price"].count().rename(columns={"price": "zero_neg_hours"})
+    out = total.merge(neg, on=["Month", "Hour"], how="left")
+    out["zero_neg_hours"] = out["zero_neg_hours"].fillna(0)
+    out["pct_zero_neg"] = out["zero_neg_hours"] / out["total_hours"]
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    hour_order = [f"H{i:02d}" for i in range(24)]
+    pivot = out.pivot(index="Month", columns="Hour", values="pct_zero_neg").reindex(index=month_order, columns=hour_order)
+    return pivot.reset_index()
+
+def build_zero_negative_heatmap(price_hourly: pd.DataFrame, year_sel: int):
+    table = build_zero_negative_hour_table(price_hourly, year_sel)
+    if table.empty:
+        return None
+    plot = table.melt(id_vars="Month", var_name="Hour", value_name="pct_zero_neg")
+    plot["pct_label"] = plot["pct_zero_neg"].map(lambda x: "" if pd.isna(x) else f"{x:.0%}")
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    rect = alt.Chart(plot).mark_rect().encode(
+        x=alt.X("Hour:N", title="Hour"),
+        y=alt.Y("Month:N", sort=month_order, title="Month"),
+        color=alt.Color("pct_zero_neg:Q", title="% zero / negative hours", scale=alt.Scale(scheme="teals")),
+        tooltip=["Month", "Hour", alt.Tooltip("pct_zero_neg:Q", title="% zero / negative hours", format=".1%")],
+    )
+    txt = alt.Chart(plot).mark_text(fontSize=8).encode(
+        x="Hour:N",
+        y=alt.Y("Month:N", sort=month_order),
+        text="pct_label:N",
+        color=alt.condition("datum.pct_zero_neg >= 0.5", alt.value("white"), alt.value("#111827")),
+    )
+    return alt.layer(rect, txt).properties(height=380, title=f"12x24 zero / negative price frequency ({year_sel})")
+
+def build_curtailment_pct_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, years: list[int]) -> pd.DataFrame:
+    _, plot = build_monthly_curtailment_chart(price_hourly, solar_hourly, years)
+    if plot.empty:
+        return pd.DataFrame()
+    out = plot[["Year", "month_num", "month_name", "pct_curtailment"]].copy()
+    out["Month"] = out["month_name"]
+    return out[["Year", "Month", "pct_curtailment"]].sort_values(["Year", "month_num"]).drop(columns=["month_num"], errors="ignore")
+
+def build_spot_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, year: int) -> pd.DataFrame:
+    _, plot = build_spot_capture_evolution_chart(price_hourly, solar_hourly, year)
+    if plot.empty:
+        return pd.DataFrame()
+    pivot = plot.pivot(index="Month", columns="Series", values="value").reset_index()
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot["month_num"] = pivot["Month"].map({m:i for i,m in enumerate(month_order,1)})
+    pivot = pivot.sort_values("month_num").drop(columns=["month_num"])
+    return pivot
+
 def build_monthly_negative_pct_table(price_hourly: pd.DataFrame, years: list[int]) -> pd.DataFrame:
     rows = []
     for year in years:
@@ -1607,7 +1664,6 @@ def build_monthly_curtailment_chart(price_hourly: pd.DataFrame, solar_hourly: pd
 
 def build_spot_capture_evolution_chart(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, year: int):
     tmp_p = price_hourly[price_hourly["datetime"].dt.year == year].copy()
-    tmp_s = solar_hourly[solar_hourly["datetime"].dt.year == year].copy()
     if tmp_p.empty:
         return None, pd.DataFrame()
     rows = []
@@ -1622,11 +1678,19 @@ def build_spot_capture_evolution_chart(price_hourly: pd.DataFrame, solar_hourly:
     plot = pd.DataFrame(rows).dropna(subset=["value"])
     if plot.empty:
         return None, pd.DataFrame()
+    color_scale = alt.Scale(
+        domain=["Average spot price", "Captured solar (uncurtailed)", "Captured solar (curtailed)"],
+        range=["#2563EB", "#FBBF24", "#D97706"],
+    )
+    dash_scale = alt.Scale(
+        domain=["Average spot price", "Captured solar (uncurtailed)", "Captured solar (curtailed)"],
+        range=[[1,0], [2,2], [6,4]],
+    )
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("Month:N", sort=month_order, title=None),
         y=alt.Y("value:Q", title="€/MWh"),
-        color=alt.Color("Series:N", title=None),
-        strokeDash=alt.StrokeDash("Series:N", title=None),
+        color=alt.Color("Series:N", title=None, scale=color_scale),
+        strokeDash=alt.StrokeDash("Series:N", title=None, scale=dash_scale),
         tooltip=["Series", "Month", alt.Tooltip("value:Q", format=".2f")],
     ).properties(height=320, title=f"Spot and solar capture evolution ({year})")
     return chart, plot
@@ -1830,8 +1894,14 @@ else:
     compare_years = sorted({primary_ts.year, compare_ts.year})
     neg_pct_chart = build_monthly_negative_chart(price_hourly, compare_years)
     neg_pct_table = build_monthly_negative_pct_table(price_hourly, compare_years)
+    primary_heatmap = build_zero_negative_heatmap(price_hourly, primary_ts.year)
+    compare_heatmap = build_zero_negative_heatmap(price_hourly, compare_ts.year) if compare_ts.year != primary_ts.year else None
+    heatmap_table_primary = build_zero_negative_hour_table(price_hourly, primary_ts.year)
+    heatmap_table_compare = build_zero_negative_hour_table(price_hourly, compare_ts.year) if compare_ts.year != primary_ts.year else pd.DataFrame()
     curt_chart, curt_table = build_monthly_curtailment_chart(price_hourly, historical_best_solar, compare_years)
+    curt_pct_table = build_curtailment_pct_table(price_hourly, historical_best_solar, compare_years)
     spot_capture_chart, spot_capture_table = build_spot_capture_evolution_chart(price_hourly, historical_best_solar, primary_ts.year)
+    spot_capture_pivot = build_spot_capture_table(price_hourly, historical_best_solar, primary_ts.year)
     overlay_chart_b64 = chart_to_base64_png(monthly_profile_chart)
     mix_with_demand_b64 = chart_to_base64_png(monthly_mix_chart)
 
@@ -1897,16 +1967,28 @@ else:
         st.altair_chart(neg_pct_chart, use_container_width=True)
     if not neg_pct_table.empty:
         st.dataframe(neg_pct_table, use_container_width=True)
+
+    st.subheader("12x24 zero / negative price frequency")
+    if primary_heatmap is not None:
+        st.altair_chart(primary_heatmap, use_container_width=True)
+    if compare_heatmap is not None:
+        st.altair_chart(compare_heatmap, use_container_width=True)
+    if not heatmap_table_primary.empty:
+        st.dataframe(heatmap_table_primary, use_container_width=True)
+    if not heatmap_table_compare.empty:
+        st.dataframe(heatmap_table_compare, use_container_width=True)
+
     st.subheader("Monthly economic curtailment")
     if curt_chart is not None:
         st.altair_chart(curt_chart, use_container_width=True)
-    if not curt_table.empty:
-        st.dataframe(curt_table, use_container_width=True)
+    if not curt_pct_table.empty:
+        st.dataframe(curt_pct_table, use_container_width=True)
+
     st.subheader("Spot and capture evolution")
     if spot_capture_chart is not None:
         st.altair_chart(spot_capture_chart, use_container_width=True)
-    if not spot_capture_table.empty:
-        st.dataframe(spot_capture_table, use_container_width=True)
+    if not spot_capture_pivot.empty:
+        st.dataframe(spot_capture_pivot, use_container_width=True)
 
 if report_mode == "1-day report":
     capture_text = f"{capture_price:.2f} €/MWh" if capture_price is not None else "n/a"
@@ -1965,8 +2047,10 @@ else:
     monthly_mtd_ytd_html = df_to_html_table(monthly_mtd_ytd_df, pct_cols=["Solar capture rate uncurtailed (%)", "Solar capture rate curtailed (%)"])
     monthly_mix_html = df_to_html_table(monthly_mix_table) if not monthly_mix_table.empty else "<p>No monthly mix available.</p>"
     neg_pct_html = df_to_html_table(neg_pct_table, pct_cols=["pct_zero_neg"]) if not neg_pct_table.empty else "<p>No monthly negative-price table available.</p>"
-    curt_html = df_to_html_table(curt_table, pct_cols=["pct_curtailment"]) if not curt_table.empty else "<p>No monthly curtailment table available.</p>"
-    spot_capture_html = df_to_html_table(spot_capture_table) if not spot_capture_table.empty else "<p>No spot/capture evolution table available.</p>"
+    heatmap_primary_html = df_to_html_table(heatmap_table_primary, pct_cols=[c for c in heatmap_table_primary.columns if c.startswith("H")]) if not heatmap_table_primary.empty else "<p>No 12x24 table available for primary year.</p>"
+    heatmap_compare_html = df_to_html_table(heatmap_table_compare, pct_cols=[c for c in heatmap_table_compare.columns if c.startswith("H")]) if not heatmap_table_compare.empty else ""
+    curt_html = df_to_html_table(curt_pct_table, pct_cols=["pct_curtailment"]) if not curt_pct_table.empty else "<p>No monthly curtailment table available.</p>"
+    spot_capture_html = df_to_html_table(spot_capture_pivot) if not spot_capture_pivot.empty else "<p>No spot/capture evolution table available.</p>"
     overlay_chart_html = ""
     if overlay_chart_b64:
         overlay_chart_html = f"""
@@ -1987,6 +2071,22 @@ else:
         neg_chart_html = f"""
         <h3>Monthly zero / negative price frequency</h3>
         <img src="data:image/png;base64,{neg_b64}" alt="Negative price frequency" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    heatmap_primary_html_block = ""
+    h1_b64 = chart_to_base64_png(primary_heatmap)
+    if h1_b64:
+        heatmap_primary_html_block = f"""
+        <h3>12x24 zero / negative frequency ({primary_ts.year})</h3>
+        <img src="data:image/png;base64,{h1_b64}" alt="12x24 zero negative primary" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+        <br><br>
+        """
+    heatmap_compare_html_block = ""
+    h2_b64 = chart_to_base64_png(compare_heatmap) if compare_heatmap is not None else None
+    if h2_b64:
+        heatmap_compare_html_block = f"""
+        <h3>12x24 zero / negative frequency ({compare_ts.year})</h3>
+        <img src="data:image/png;base64,{h2_b64}" alt="12x24 zero negative compare" style="max-width:100%; height:auto; border:1px solid #ddd;" />
         <br><br>
         """
     curt_chart_html = ""
@@ -2019,6 +2119,10 @@ else:
       {mix_chart_html}
       {neg_chart_html}
       <h3>Monthly zero / negative price table</h3>{neg_pct_html}<br>
+      {heatmap_primary_html_block}
+      <h3>12x24 zero / negative table ({primary_ts.year})</h3>{heatmap_primary_html}<br>
+      {heatmap_compare_html_block}
+      {("<h3>12x24 zero / negative table (" + str(compare_ts.year) + ")</h3>" + heatmap_compare_html + "<br>") if heatmap_compare_html else ""}
       {curt_chart_html}
       <h3>Monthly economic curtailment table</h3>{curt_html}<br>
       {spot_capture_chart_html}
