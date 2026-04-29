@@ -949,42 +949,99 @@ def compute_period_metrics(price_df: pd.DataFrame, solar_df: pd.DataFrame, start
     }
 
 
-def build_monthly_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
-    monthly_avg = (
-        price_hourly.assign(month=price_hourly["datetime"].dt.to_period("M").dt.to_timestamp())
-        .groupby("month", as_index=False)["price"]
+def build_capture_price_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, aggregation: str = "Monthly") -> pd.DataFrame:
+    """
+    Build spot and solar captured prices at the selected aggregation level.
+
+    Spot price is a simple average of hourly prices.
+    Solar captured price is a generation-weighted average:
+        sum(price * solar_generation) / sum(solar_generation)
+
+    For the curtailed captured price, hours with price <= 0 are excluded.
+    """
+    if aggregation not in {"Daily", "Weekly", "Monthly", "Annual"}:
+        aggregation = "Monthly"
+
+    def add_period(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if aggregation == "Daily":
+            out["period"] = out["datetime"].dt.normalize()
+        elif aggregation == "Weekly":
+            # Monday-start week, so each point represents the week starting on that Monday.
+            out["period"] = out["datetime"].dt.to_period("W-SUN").dt.start_time
+        elif aggregation == "Monthly":
+            out["period"] = out["datetime"].dt.to_period("M").dt.to_timestamp()
+        else:
+            out["period"] = out["datetime"].dt.to_period("Y").dt.to_timestamp()
+        return out
+
+    cols = [
+        "period",
+        "avg_spot_price",
+        "captured_solar_price_uncurtailed",
+        "captured_solar_price_curtailed",
+        "capture_pct_uncurtailed",
+        "capture_pct_curtailed",
+    ]
+    if price_hourly.empty:
+        return pd.DataFrame(columns=cols)
+
+    price_period = add_period(price_hourly)
+    avg_price = (
+        price_period.groupby("period", as_index=False)["price"]
         .mean()
-        .rename(columns={"price": "avg_monthly_price"})
+        .rename(columns={"price": "avg_spot_price"})
     )
+
+    if solar_hourly.empty:
+        avg_price["captured_solar_price_uncurtailed"] = pd.NA
+        avg_price["captured_solar_price_curtailed"] = pd.NA
+        avg_price["capture_pct_uncurtailed"] = pd.NA
+        avg_price["capture_pct_curtailed"] = pd.NA
+        return avg_price.sort_values("period").reset_index(drop=True)
 
     merged = price_hourly.merge(solar_hourly[["datetime", "solar_best_mw"]], on="datetime", how="inner")
     merged = merged[merged["solar_best_mw"] > 0].copy()
     if merged.empty:
-        monthly_avg["captured_solar_price_uncurtailed"] = pd.NA
-        monthly_avg["captured_solar_price_curtailed"] = pd.NA
-        monthly_avg["capture_pct_uncurtailed"] = pd.NA
-        monthly_avg["capture_pct_curtailed"] = pd.NA
-        return monthly_avg
+        avg_price["captured_solar_price_uncurtailed"] = pd.NA
+        avg_price["captured_solar_price_curtailed"] = pd.NA
+        avg_price["capture_pct_uncurtailed"] = pd.NA
+        avg_price["capture_pct_curtailed"] = pd.NA
+        return avg_price.sort_values("period").reset_index(drop=True)
 
-    merged["month"] = merged["datetime"].dt.to_period("M").dt.to_timestamp()
+    merged = add_period(merged)
     merged["weighted_price"] = merged["price"] * merged["solar_best_mw"]
-    all_months = merged.groupby("month", as_index=False).agg(weighted_price_sum=("weighted_price", "sum"), solar_sum=("solar_best_mw", "sum"))
-    all_months["captured_solar_price_uncurtailed"] = all_months["weighted_price_sum"] / all_months["solar_sum"]
+
+    uncurtailed = (
+        merged.groupby("period", as_index=False)
+        .agg(weighted_price_sum=("weighted_price", "sum"), solar_sum=("solar_best_mw", "sum"))
+    )
+    uncurtailed["captured_solar_price_uncurtailed"] = uncurtailed["weighted_price_sum"] / uncurtailed["solar_sum"]
+    uncurtailed = uncurtailed[["period", "captured_solar_price_uncurtailed"]]
 
     curtailed = merged[merged["price"] > 0].copy()
     if curtailed.empty:
-        curtailed_months = pd.DataFrame(columns=["month", "captured_solar_price_curtailed"])
+        curtailed_periods = pd.DataFrame(columns=["period", "captured_solar_price_curtailed"])
     else:
-        curtailed["weighted_price"] = curtailed["price"] * curtailed["solar_best_mw"]
-        curtailed_months = curtailed.groupby("month", as_index=False).agg(weighted_price_sum=("weighted_price", "sum"), solar_sum=("solar_best_mw", "sum"))
-        curtailed_months["captured_solar_price_curtailed"] = curtailed_months["weighted_price_sum"] / curtailed_months["solar_sum"]
-        curtailed_months = curtailed_months[["month", "captured_solar_price_curtailed"]]
+        curtailed_periods = (
+            curtailed.groupby("period", as_index=False)
+            .agg(weighted_price_sum=("weighted_price", "sum"), solar_sum=("solar_best_mw", "sum"))
+        )
+        curtailed_periods["captured_solar_price_curtailed"] = curtailed_periods["weighted_price_sum"] / curtailed_periods["solar_sum"]
+        curtailed_periods = curtailed_periods[["period", "captured_solar_price_curtailed"]]
 
-    monthly_combo = monthly_avg.merge(all_months[["month", "captured_solar_price_uncurtailed"]], on="month", how="left").merge(curtailed_months, on="month", how="left")
-    monthly_combo["capture_pct_uncurtailed"] = monthly_combo["captured_solar_price_uncurtailed"] / monthly_combo["avg_monthly_price"]
-    monthly_combo["capture_pct_curtailed"] = monthly_combo["captured_solar_price_curtailed"] / monthly_combo["avg_monthly_price"]
-    return monthly_combo
+    out = avg_price.merge(uncurtailed, on="period", how="left").merge(curtailed_periods, on="period", how="left")
+    out["capture_pct_uncurtailed"] = out["captured_solar_price_uncurtailed"] / out["avg_spot_price"]
+    out["capture_pct_curtailed"] = out["captured_solar_price_curtailed"] / out["avg_spot_price"]
+    return out.sort_values("period").reset_index(drop=True)
 
+
+def build_monthly_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
+    """Backwards-compatible monthly wrapper."""
+    out = build_capture_price_table(price_hourly, solar_hourly, "Monthly").rename(
+        columns={"period": "month", "avg_spot_price": "avg_monthly_price"}
+    )
+    return out
 
 def build_hourly_profile_table(price_hourly: pd.DataFrame, start_sel: date, end_sel: date) -> pd.DataFrame:
     range_df = price_hourly[
@@ -1239,8 +1296,11 @@ def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, m
     return apply_common_chart_style(chart, height=360)
 
 
-def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
-    years = sorted(monthly_combo["month"].dt.year.unique().tolist()) if not monthly_combo.empty else []
+def build_period_shading_df(capture_combo: pd.DataFrame) -> pd.DataFrame:
+    if capture_combo.empty or "period" not in capture_combo.columns:
+        return pd.DataFrame(columns=["x_start", "x_end", "year", "shade_flag"])
+
+    years = sorted(capture_combo["period"].dt.year.unique().tolist())
     if not years:
         return pd.DataFrame(columns=["x_start", "x_end", "year", "shade_flag"])
 
@@ -1257,29 +1317,32 @@ def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_monthly_main_chart(monthly_combo: pd.DataFrame):
-    if monthly_combo.empty:
+def build_capture_price_chart(capture_combo: pd.DataFrame, aggregation: str = "Monthly"):
+    if capture_combo.empty:
         return None
 
-    plot_df = monthly_combo.copy().rename(
+    plot_df = capture_combo.copy().rename(
         columns={
-            "avg_monthly_price": "Average spot price",
+            "avg_spot_price": "Average spot price",
             "captured_solar_price_curtailed": "Solar captured (curtailed)",
             "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
         }
     )
 
     long_df = plot_df.melt(
-        id_vars=["month"],
+        id_vars=["period"],
         value_vars=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
         var_name="series",
         value_name="value",
     ).dropna(subset=["value"])
 
-    long_df["year"] = long_df["month"].dt.year.astype(str)
-    long_df["year_mid"] = pd.to_datetime(long_df["month"].dt.year.astype(str) + "-07-01")
+    if long_df.empty:
+        return None
 
-    shading = build_monthly_shading_df(monthly_combo)
+    long_df["year"] = long_df["period"].dt.year.astype(str)
+    long_df["year_mid"] = pd.to_datetime(long_df["period"].dt.year.astype(str) + "-07-01")
+
+    shading = build_period_shading_df(capture_combo)
 
     color_scale = alt.Scale(
         domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
@@ -1290,38 +1353,46 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
         range=[[1, 0], [6, 4], [2, 2]],
     )
 
+    x_format = {
+        "Daily": "%d-%b",
+        "Weekly": "%d-%b",
+        "Monthly": "%b",
+        "Annual": "%Y",
+    }.get(aggregation, "%b")
+
+    label_overlap = False if aggregation == "Annual" else "greedy"
+
     base = alt.Chart(long_df).encode(
         x=alt.X(
-            "month:T",
+            "period:T",
             axis=alt.Axis(
                 title=None,
-                format="%b",
-                labelAngle=0,
+                format=x_format,
+                labelAngle=0 if aggregation in ["Monthly", "Annual"] else -35,
                 labelPadding=8,
                 labelFlush=False,
                 ticks=False,
                 domain=False,
                 grid=False,
-                labelOverlap="greedy",
+                labelOverlap=label_overlap,
             ),
         )
     )
 
-    layers = []
-    layers.append(
-        base.mark_line(point=True, strokeWidth=3).encode(
-            y=alt.Y("value:Q", title="€/MWh"),
-            color=alt.Color("series:N", title=None, scale=color_scale),
-            strokeDash=alt.StrokeDash("series:N", title=None, scale=dash_scale),
-            tooltip=[
-                alt.Tooltip("month:T", title="Month"),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
-            ],
-        )
-    )
+    main = base.mark_line(point=True, strokeWidth=3).encode(
+        y=alt.Y("value:Q", title="€/MWh"),
+        color=alt.Color("series:N", title=None, scale=color_scale),
+        strokeDash=alt.StrokeDash("series:N", title=None, scale=dash_scale),
+        tooltip=[
+            alt.Tooltip("period:T", title="Period"),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+        ],
+    ).properties(height=330)
 
-    main = alt.layer(*layers).properties(height=330)
+    # For annual view, the x-axis already contains the year. Keep the extra year band only for sub-annual views.
+    if aggregation == "Annual":
+        return apply_common_chart_style(main, height=330)
 
     year_df = long_df[["year", "year_mid"]].drop_duplicates().sort_values("year_mid").reset_index(drop=True)
 
@@ -1351,6 +1422,18 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
 
     chart = alt.vconcat(main, year_band, spacing=1).resolve_scale(x="shared")
     return apply_common_chart_style(chart, height=330)
+
+
+def build_monthly_shading_df(monthly_combo: pd.DataFrame) -> pd.DataFrame:
+    tmp = monthly_combo.rename(columns={"month": "period"}) if "month" in monthly_combo.columns else monthly_combo.copy()
+    return build_period_shading_df(tmp)
+
+
+def build_monthly_main_chart(monthly_combo: pd.DataFrame):
+    tmp = monthly_combo.rename(
+        columns={"month": "period", "avg_monthly_price": "avg_spot_price"}
+    ) if "month" in monthly_combo.columns else monthly_combo.copy()
+    return build_capture_price_chart(tmp, "Monthly")
 
 def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     if negative_df.empty:
@@ -1600,18 +1683,34 @@ try:
         st.error("No price data available.")
         st.stop()
 
-    # Monthly spot / captured price
-    monthly_combo = build_monthly_capture_table(price_hourly, solar_hourly)
-    section_header("Monthly spot and solar captured price - Spain")
-    monthly_chart = build_monthly_main_chart(monthly_combo)
-    if monthly_chart is not None:
-        st.altair_chart(monthly_chart, use_container_width=True)
+    # Spot / captured price by selected aggregation
+    section_header("Spot and solar captured price - Spain")
+    capture_aggregation = st.radio(
+        "Aggregation",
+        options=["Daily", "Weekly", "Monthly", "Annual"],
+        index=2,
+        horizontal=True,
+        key="capture_price_aggregation",
+    )
 
-    monthly_table = monthly_combo.copy()
-    if not monthly_table.empty:
-        monthly_table["Month"] = monthly_table["month"].dt.strftime("%b - %Y")
-        monthly_table = monthly_table.rename(columns={
-            "avg_monthly_price": "Average spot price",
+    capture_combo = build_capture_price_table(price_hourly, solar_hourly, capture_aggregation)
+    capture_chart = build_capture_price_chart(capture_combo, capture_aggregation)
+    if capture_chart is not None:
+        st.altair_chart(capture_chart, use_container_width=True)
+
+    capture_table = capture_combo.copy()
+    if not capture_table.empty:
+        if capture_aggregation == "Daily":
+            capture_table["Period"] = capture_table["period"].dt.strftime("%d-%b-%Y")
+        elif capture_aggregation == "Weekly":
+            capture_table["Period"] = capture_table["period"].dt.strftime("Week from %d-%b-%Y")
+        elif capture_aggregation == "Monthly":
+            capture_table["Period"] = capture_table["period"].dt.strftime("%b - %Y")
+        else:
+            capture_table["Period"] = capture_table["period"].dt.strftime("%Y")
+
+        capture_table = capture_table.rename(columns={
+            "avg_spot_price": "Average spot price",
             "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
             "captured_solar_price_curtailed": "Solar captured (curtailed)",
             "capture_pct_uncurtailed": "Capture rate (uncurtailed)",
@@ -1619,11 +1718,14 @@ try:
         })
         st.dataframe(
             styled_df(
-                monthly_table[["Month", "Average spot price", "Solar captured (uncurtailed)", "Solar captured (curtailed)", "Capture rate (uncurtailed)", "Capture rate (curtailed)"]],
+                capture_table[["Period", "Average spot price", "Solar captured (uncurtailed)", "Solar captured (curtailed)", "Capture rate (uncurtailed)", "Capture rate (curtailed)"]],
                 pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"],
             ),
             use_container_width=True,
         )
+
+    # Keep the monthly table available for the Excel export, regardless of the chart aggregation selected above.
+    monthly_combo = build_monthly_capture_table(price_hourly, solar_hourly)
 
     # Selected day
     section_header("Selected day: price vs solar")
