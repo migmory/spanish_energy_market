@@ -1,6 +1,7 @@
 import os
 import re
 from datetime import date, datetime, time, timedelta
+from time import sleep
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -739,30 +740,73 @@ def fetch_esios_range(
     token: str,
     time_trunc: str | None = None,
 ) -> pd.DataFrame:
+    """
+    Fetch ESIOS data in smaller chunks.
+
+    The ESIOS endpoint often times out when asking for several months of
+    quarter-hourly data in a single request. Chunking + retries avoids the
+    Streamlit app crashing with Read timed out errors. If a chunk still fails,
+    it is skipped and the rest of the app continues with historical data.
+    """
     if start_day > end_day:
         return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-
-    start_local = pd.Timestamp(start_day, tz="Europe/Madrid")
-    end_local = pd.Timestamp(end_day + timedelta(days=1), tz="Europe/Madrid")
-    start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if time_trunc is None:
         time_trunc = "quarter_hour" if start_day >= date(2025, 10, 1) else "hour"
 
     url = f"https://api.esios.ree.es/indicators/{indicator_id}"
-    resp = requests.get(
-        url,
-        headers=build_headers(token),
-        params={
-            "start_date": start_utc,
-            "end_date": end_utc,
-            "time_trunc": time_trunc,
-        },
-        timeout=60,
+    frames = []
+
+    chunk_start = start_day
+    chunk_days = 14 if time_trunc == "quarter_hour" else 31
+
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=chunk_days - 1))
+
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=build_headers(token),
+                    params={
+                        "start_date": start_utc,
+                        "end_date": end_utc,
+                        "time_trunc": time_trunc,
+                    },
+                    timeout=(15, 120),
+                )
+                resp.raise_for_status()
+                parsed = parse_esios_indicator(resp.json(), source_name=f"esios_{indicator_id}")
+                if not parsed.empty:
+                    frames.append(parsed)
+                last_error = None
+                break
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                sleep(1.5 * (attempt + 1))
+
+        if last_error is not None:
+            # Do not crash the whole dashboard if ESIOS is slow/down for one chunk.
+            # Returning partial data is better than blocking the historical analysis.
+            pass
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["datetime", "geo_id", "source"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
     )
-    resp.raise_for_status()
-    return parse_esios_indicator(resp.json(), source_name=f"esios_{indicator_id}")
 
 def build_best_solar_hourly(solar_p48_hourly: pd.DataFrame, solar_forecast_hourly: pd.DataFrame) -> pd.DataFrame:
     if solar_p48_hourly.empty and solar_forecast_hourly.empty:
