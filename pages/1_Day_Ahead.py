@@ -1397,14 +1397,45 @@ def build_capture_price_chart(capture_combo: pd.DataFrame, aggregation: str = "M
         range=[[1, 0], [6, 4], [2, 2]],
     )
 
+    if aggregation == "Annual":
+        # Use a nominal x-axis for yearly data. If we keep period:T, Vega-Lite auto-generates
+        # intermediate monthly ticks, which makes the same year appear many times.
+        annual_order = sorted(long_df["period"].dt.year.astype(str).unique().tolist())
+        long_df["period_label"] = long_df["period"].dt.year.astype(str)
+
+        base = alt.Chart(long_df).encode(
+            x=alt.X(
+                "period_label:N",
+                sort=annual_order,
+                axis=alt.Axis(
+                    title=None,
+                    labelAngle=0,
+                    labelPadding=8,
+                    ticks=False,
+                    domain=False,
+                    grid=False,
+                ),
+            )
+        )
+
+        main = base.mark_line(point=True, strokeWidth=3).encode(
+            y=alt.Y("value:Q", title="€/MWh"),
+            color=alt.Color("series:N", title=None, scale=color_scale),
+            strokeDash=alt.StrokeDash("series:N", title=None, scale=dash_scale),
+            tooltip=[
+                alt.Tooltip("period_label:N", title="Year"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+            ],
+        ).properties(height=330)
+
+        return apply_common_chart_style(main, height=330)
+
     x_format = {
         "Daily": "%d-%b",
         "Weekly": "%d-%b",
         "Monthly": "%b",
-        "Annual": "%Y",
     }.get(aggregation, "%b")
-
-    label_overlap = False if aggregation == "Annual" else "greedy"
 
     base = alt.Chart(long_df).encode(
         x=alt.X(
@@ -1412,13 +1443,13 @@ def build_capture_price_chart(capture_combo: pd.DataFrame, aggregation: str = "M
             axis=alt.Axis(
                 title=None,
                 format=x_format,
-                labelAngle=0 if aggregation in ["Monthly", "Annual"] else -35,
+                labelAngle=0 if aggregation == "Monthly" else -35,
                 labelPadding=8,
                 labelFlush=False,
                 ticks=False,
                 domain=False,
                 grid=False,
-                labelOverlap=label_overlap,
+                labelOverlap="greedy",
             ),
         )
     )
@@ -1433,10 +1464,6 @@ def build_capture_price_chart(capture_combo: pd.DataFrame, aggregation: str = "M
             alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
         ],
     ).properties(height=330)
-
-    # For annual view, the x-axis already contains the year. Keep the extra year band only for sub-annual views.
-    if aggregation == "Annual":
-        return apply_common_chart_style(main, height=330)
 
     year_df = long_df[["year", "year_mid"]].drop_duplicates().sort_values("year_mid").reset_index(drop=True)
 
