@@ -272,7 +272,12 @@ def load_private_key():
         return None
     key_file = StringIO(str(key_text))
     last_error = None
-    for loader in [paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey, paramiko.DSSKey]:
+    key_loaders = []
+    for key_name in ["Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey"]:
+        loader = getattr(paramiko, key_name, None)
+        if loader is not None:
+            key_loaders.append(loader)
+    for loader in key_loaders:
         try:
             key_file.seek(0)
             return loader.from_private_key(key_file)
@@ -477,45 +482,152 @@ def make_forwards(raw: pd.DataFrame) -> pd.DataFrame:
     return forwards[["trading_day", "product", "delivery_start", "delivery_end", "price", "price_source", "volume_traded_mwh", "source_file", "series"]].sort_values(["trading_day", "product"])
 
 # =========================================================
-# CHARTS
+# AGGREGATION / CHARTS
 # =========================================================
-def chart_actuals(actuals: pd.DataFrame):
-    if actuals.empty:
+def aggregate_price_series(df: pd.DataFrame, granularity: str, group_cols: list[str]) -> pd.DataFrame:
+    """Aggregate price data to daily, monthly, annual, or rolling 30D average."""
+    if df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp["trading_day"] = pd.to_datetime(tmp["trading_day"], errors="coerce")
+    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
+    tmp = tmp.dropna(subset=["trading_day", "price"])
+
+    if tmp.empty:
+        return pd.DataFrame()
+
+    if granularity == "Daily":
+        tmp["period"] = tmp["trading_day"].dt.normalize()
+        out = (
+            tmp.groupby(group_cols + ["period"], as_index=False)
+            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
+            .sort_values(group_cols + ["period"])
+        )
+        out["period_label"] = out["period"].dt.strftime("%Y-%m-%d")
+        return out
+
+    if granularity == "Monthly":
+        tmp["period"] = tmp["trading_day"].dt.to_period("M").dt.to_timestamp()
+        out = (
+            tmp.groupby(group_cols + ["period"], as_index=False)
+            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
+            .sort_values(group_cols + ["period"])
+        )
+        out["period_label"] = out["period"].dt.strftime("%b-%Y")
+        return out
+
+    if granularity == "Annual":
+        tmp["year"] = tmp["trading_day"].dt.year
+        out = (
+            tmp.groupby(group_cols + ["year"], as_index=False)
+            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
+            .sort_values(group_cols + ["year"])
+        )
+        out["period"] = pd.to_datetime(out["year"].astype(str) + "-01-01")
+        out["period_label"] = out["year"].astype(str)
+        return out
+
+    if granularity == "Rolling 30D average":
+        tmp["period"] = tmp["trading_day"].dt.normalize()
+        daily = (
+            tmp.groupby(group_cols + ["period"], as_index=False)
+            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
+            .sort_values(group_cols + ["period"])
+        )
+        frames = []
+        for _, g in daily.groupby(group_cols, dropna=False):
+            g = g.sort_values("period").copy()
+            g["price"] = g["price"].rolling(window=30, min_periods=1).mean()
+            frames.append(g)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        out["period_label"] = out["period"].dt.strftime("%Y-%m-%d")
+        return out
+
+    return tmp
+
+
+def build_price_chart(df: pd.DataFrame, granularity: str, title_y: str, color_field: str | None = None, color_scale=None):
+    if df.empty:
         return None
-    chart = alt.Chart(actuals).mark_line(point=True, strokeWidth=2.5, color=BLUE_PRICE).encode(
-        x=alt.X("trading_day:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0)),
-        y=alt.Y("price:Q", title="€/MWh"),
-        tooltip=[
-            alt.Tooltip("trading_day:T", title="Trading day", format="%Y-%m-%d"),
-            alt.Tooltip("product:N", title="Product"),
-            alt.Tooltip("price:Q", title="Reference Price €/MWh", format=",.2f"),
-            alt.Tooltip("delivery_start:T", title="Delivery start", format="%Y-%m-%d"),
-            alt.Tooltip("source_file:N", title="Source"),
-        ],
-    )
+
+    if granularity == "Annual":
+        x_enc = alt.X("period_label:N", title=None, sort=sorted(df["period_label"].unique().tolist()), axis=alt.Axis(labelAngle=0))
+    else:
+        x_enc = alt.X("period:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0))
+
+    tooltip = [
+        alt.Tooltip("period_label:N", title="Period"),
+        alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
+        alt.Tooltip("volume_traded_mwh:Q", title="Volume MWh", format=",.0f"),
+    ]
+
+    if color_field and color_field in df.columns:
+        tooltip.insert(1, alt.Tooltip(f"{color_field}:N", title=color_field.replace("_", " ").title()))
+        chart = (
+            alt.Chart(df)
+            .mark_line(point=True, strokeWidth=2.5)
+            .encode(
+                x=x_enc,
+                y=alt.Y("price:Q", title=title_y),
+                color=alt.Color(f"{color_field}:N", title="Product", scale=color_scale),
+                tooltip=tooltip,
+            )
+        )
+    else:
+        chart = (
+            alt.Chart(df)
+            .mark_line(point=True, strokeWidth=2.5, color=BLUE_PRICE)
+            .encode(
+                x=x_enc,
+                y=alt.Y("price:Q", title=title_y),
+                tooltip=tooltip,
+            )
+        )
+
     return apply_common_chart_style(chart, height=380)
 
 
-def chart_forwards(forwards: pd.DataFrame):
-    if forwards.empty:
-        return None
+def render_actuals_section(actuals_f: pd.DataFrame):
+    st.subheader("Historical actuals - GDAES D+1 Reference Price")
+    granularity = st.radio(
+        "Actuals granularity",
+        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
+        index=1,
+        horizontal=True,
+        key="actuals_granularity",
+    )
+    plot_df = aggregate_price_series(actuals_f, granularity, group_cols=["product"])
+    c = build_price_chart(plot_df, granularity, "Reference Price €/MWh")
+    if c is None:
+        st.warning("No GDAES_D+1 Reference Price data found.")
+    else:
+        st.altair_chart(c, use_container_width=True)
+
+    with st.expander("Show actuals data"):
+        st.dataframe(actuals_f.sort_values("trading_day", ascending=False), use_container_width=True, hide_index=True)
+
+
+def render_forwards_section(forwards_f: pd.DataFrame):
+    st.subheader("Forward prices - GYES Y+1 and Y+2")
+    st.caption("The chart uses EOD Price when available; otherwise Last Price; otherwise Reference Price.")
+    granularity = st.radio(
+        "Forwards granularity",
+        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
+        index=1,
+        horizontal=True,
+        key="forwards_granularity",
+    )
+    plot_df = aggregate_price_series(forwards_f, granularity, group_cols=["product"])
     color_scale = alt.Scale(domain=["GYES_Y+1", "GYES_Y+2"], range=[YELLOW_DARK, BLUE_PRICE])
-    chart = alt.Chart(forwards).mark_line(point=True, strokeWidth=2.5).encode(
-        x=alt.X("trading_day:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0)),
-        y=alt.Y("price:Q", title="€/MWh"),
-        color=alt.Color("product:N", title="Product", scale=color_scale),
-        tooltip=[
-            alt.Tooltip("trading_day:T", title="Trading day", format="%Y-%m-%d"),
-            alt.Tooltip("product:N", title="Product"),
-            alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
-            alt.Tooltip("price_source:N", title="Price source"),
-            alt.Tooltip("delivery_start:T", title="Delivery start", format="%Y-%m-%d"),
-            alt.Tooltip("delivery_end:T", title="Delivery end", format="%Y-%m-%d"),
-            alt.Tooltip("source_file:N", title="Source"),
-        ],
-    )
-    return apply_common_chart_style(chart, height=380)
+    c = build_price_chart(plot_df, granularity, "Price €/MWh", color_field="product", color_scale=color_scale)
+    if c is None:
+        st.warning("No GYES_Y+1 / GYES_Y+2 data found.")
+    else:
+        st.altair_chart(c, use_container_width=True)
 
+    with st.expander("Show forward data"):
+        st.dataframe(forwards_f.sort_values(["trading_day", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
 # =========================================================
 # PAGE
 # =========================================================
@@ -585,31 +697,13 @@ else:
     k3.metric("Latest GYES Y+1", "-")
     k4.metric("Latest GYES Y+2", "-")
 
-tab_actuals, tab_forwards, tab_raw, tab_diagnostics = st.tabs([
-    "Actuals GDAES D+1",
-    "Forwards GYES Y+1 / Y+2",
-    "Raw data",
-    "Diagnostics",
-])
+st.markdown("---")
 
-with tab_actuals:
-    st.subheader("GDAES D+1 - Reference Price")
-    c = chart_actuals(actuals_f)
-    if c is None:
-        st.warning("No GDAES_D+1 Reference Price data found.")
-    else:
-        st.altair_chart(c, use_container_width=True)
-    st.dataframe(actuals_f.sort_values("trading_day", ascending=False), use_container_width=True, hide_index=True)
+# Requested layout: one actuals chart, then one forwards chart underneath.
+render_actuals_section(actuals_f)
+render_forwards_section(forwards_f)
 
-with tab_forwards:
-    st.subheader("GYES Y+1 and Y+2 - yearly gas forward prices")
-    st.caption("If an EOD Price column is not present, the page uses Last Price; if Last Price is also empty, it uses Reference Price.")
-    c = chart_forwards(forwards_f)
-    if c is None:
-        st.warning("No GYES_Y+1 / GYES_Y+2 data found.")
-    else:
-        st.altair_chart(c, use_container_width=True)
-    st.dataframe(forwards_f.sort_values(["trading_day", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
+tab_raw, tab_diagnostics = st.tabs(["Raw data", "Diagnostics"])
 
 with tab_raw:
     st.dataframe(raw.sort_values(["trading_day", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
@@ -624,16 +718,5 @@ with tab_diagnostics:
     if not sftp_log.empty:
         st.dataframe(sftp_log, use_container_width=True, hide_index=True)
     st.write("Secrets expected in Streamlit Cloud → App → Settings → Secrets:")
-    st.code(
-        '''MIBGAS_SFTP_HOST = "secureftpbucket.omie.es"
-MIBGAS_SFTP_PORT = 22
-MIBGAS_SFTP_USER = "m.moreno"
-MIBGAS_SFTP_BASE_PATH = "/MIBGAS"
-
-MIBGAS_SFTP_KEY = """
------BEGIN OPENSSH PRIVATE KEY-----
-PASTE_FULL_GASkey_CONTENT_HERE
------END OPENSSH PRIVATE KEY-----
-"""''',
-        language="toml",
-    )
+    secrets_example = 'MIBGAS_SFTP_HOST = "secureftpbucket.omie.es"\nMIBGAS_SFTP_PORT = 22\nMIBGAS_SFTP_USER = "m.moreno"\nMIBGAS_SFTP_BASE_PATH = "/MIBGAS"\n\nMIBGAS_SFTP_KEY = """\n-----BEGIN OPENSSH PRIVATE KEY-----\nPASTE_FULL_GASkey_CONTENT_HERE\n-----END OPENSSH PRIVATE KEY-----\n"""'
+    st.code(secrets_example, language="toml")
