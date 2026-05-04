@@ -1,5 +1,3 @@
-import os
-import re
 import stat
 import zipfile
 from io import BytesIO, StringIO
@@ -11,21 +9,22 @@ import streamlit as st
 
 try:
     import paramiko
-except Exception:
+except Exception:  # lets local historical view work even if paramiko is missing
     paramiko = None
 
 # =========================================================
-# CONFIG
+# PAGE CONFIG
 # =========================================================
 st.set_page_config(page_title="MIBGAS", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
-LOCAL_FILE_PATTERN = "MIBGAS_Data_*.xlsx"
+
 LOCAL_START_YEAR = 2021
 LOCAL_END_YEAR = 2025
 LIVE_YEAR = 2026
-CACHE_FILE = DATA_DIR / "mibgas_2026_cache.csv"
+
+CACHE_FILE_2026 = DATA_DIR / "mibgas_2026_cache.csv"
 
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
@@ -34,10 +33,8 @@ YELLOW_DARK = "#D97706"
 YELLOW_LIGHT = "#FBBF24"
 GREY_SHADE = "#F3F4F6"
 
-TARGET_SHEET = "Trading Data PVB&VTP"
-
 # =========================================================
-# STYLE / HELPERS
+# STYLE HELPERS
 # =========================================================
 def section_header(title: str):
     st.markdown(
@@ -82,552 +79,705 @@ def apply_common_chart_style(chart, height: int = 360):
     )
 
 
-def normalize_col_name(col) -> str:
-    if pd.isna(col):
+def format_metric(value, suffix="", decimals=2):
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{value:,.{decimals}f}{suffix}"
+
+# =========================================================
+# GENERIC NORMALIZATION HELPERS
+# =========================================================
+def normalize_text(value) -> str:
+    """Robust text normalization for column names and product names."""
+    if value is None or pd.isna(value):
         return ""
-    s = str(col)
-    s = s.replace("\xa0", " ").replace("\n", " ").strip().lower()
+    text = str(value).strip().lower()
     repl = {
         "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n",
-        "[": "", "]": "", "(": "", ")": "", "%": "pct", "/": "_", "-": "_", ".": "_",
+        "\n": " ", "\r": " ", "\t": " ",
     }
     for a, b in repl.items():
-        s = s.replace(a, b)
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s
+        text = text.replace(a, b)
+    text = " ".join(text.split())
+    text = text.replace("[", "").replace("]", "")
+    text = text.replace("(", "").replace(")", "")
+    text = text.replace("/", "_").replace("-", "_").replace(".", "_")
+    text = text.replace(" ", "_")
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text.strip("_")
 
 
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [normalize_col_name(c) for c in out.columns]
-    return out
-
-
-def to_number(series: pd.Series) -> pd.Series:
-    # Handles both already numeric columns and Spanish-formatted text numbers.
+def parse_number_series(series: pd.Series) -> pd.Series:
+    """Parse Spanish/European numeric strings while preserving already numeric values."""
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
-    s = series.astype(str).str.strip()
-    s = s.str.replace("€", "", regex=False)
-    s = s.str.replace(" ", "", regex=False)
-    s = s.str.replace("\xa0", "", regex=False)
-    # If both thousand dot and decimal comma exist: 1.234,56 -> 1234.56
-    s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+
+    txt = series.astype(str).str.strip()
+    txt = txt.replace({"": None, "nan": None, "None": None, "NaN": None})
+    txt = txt.str.replace("€", "", regex=False)
+    txt = txt.str.replace("MWh", "", regex=False)
+    txt = txt.str.replace(" ", "", regex=False)
+
+    # If comma exists, assume European format: 1.234,56 -> 1234.56
+    has_comma = txt.str.contains(",", na=False)
+    european = txt.where(~has_comma, txt.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+    return pd.to_numeric(european, errors="coerce")
 
 
-def first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = set(df.columns)
-    for c in candidates:
-        nc = normalize_col_name(c)
-        if nc in cols:
-            return nc
+def find_col(df: pd.DataFrame, possible_names: list[str]) -> str | None:
+    norm_map = {normalize_text(c): c for c in df.columns}
+    for name in possible_names:
+        norm = normalize_text(name)
+        if norm in norm_map:
+            return norm_map[norm]
     return None
 
-# =========================================================
-# LOCAL EXCEL LOADING
-# =========================================================
-def read_mibgas_excel(path: Path) -> pd.DataFrame:
-    """Read the relevant MIBGAS sheet only."""
-    try:
-        xls = pd.ExcelFile(path)
-    except Exception as e:
-        raise ValueError(f"cannot open Excel: {e}")
 
-    # Prefer the correct sheet. Fall back to any sheet containing PVB&VTP.
-    sheet = None
-    if TARGET_SHEET in xls.sheet_names:
-        sheet = TARGET_SHEET
-    else:
-        for s in xls.sheet_names:
-            if "PVB" in str(s).upper() and "VTP" in str(s).upper():
-                sheet = s
-                break
-    if sheet is None:
-        raise ValueError(f"sheet '{TARGET_SHEET}' not found. Available sheets: {xls.sheet_names}")
+def standardize_mibgas_raw(raw: pd.DataFrame, source_file: str) -> pd.DataFrame:
+    """
+    Standardizes raw MIBGAS data to a compact schema.
+    Required useful fields:
+    - trading_day
+    - product
+    - area
+    - daily_reference_price_eur_mwh
+    - eod_price_eur_mwh
+    - delivery_start
+    - delivery_end
+    - daily_volume_traded_mwh
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame()
 
-    df = pd.read_excel(path, sheet_name=sheet)
-    df = clean_columns(df)
-    df["source_file"] = f"{path.name}/{sheet}"
-    return standardize_raw_mibgas(df)
+    df = raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-
-def standardize_raw_mibgas(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a standardized raw trading dataframe."""
+    # Drop fully empty rows/columns.
+    df = df.dropna(how="all").dropna(axis=1, how="all")
     if df.empty:
         return pd.DataFrame()
 
-    # Some SFTP files may arrive with a first blank row/header issue. Try to repair if product/trading_day missing.
-    if "product" not in df.columns or "trading_day" not in df.columns:
-        # Try using first row as header if it looks like header text.
-        maybe = df.copy()
-        if len(maybe) > 0:
-            new_cols = [normalize_col_name(x) for x in maybe.iloc[0].tolist()]
-            if "product" in new_cols and "trading_day" in new_cols:
-                maybe = maybe.iloc[1:].copy()
-                maybe.columns = new_cols
-                if "source_file" not in maybe.columns and "source_file" in df.columns:
-                    maybe["source_file"] = df["source_file"].iloc[0]
-                df = maybe
+    col_trading_day = find_col(df, ["Trading day", "Trading Day", "Fecha", "Fecha negociacion", "Fecha negociación"])
+    col_product = find_col(df, ["Product", "Producto", "Contract", "Contrato"])
+    col_area = find_col(df, ["Area", "Área"])
+    col_place = find_col(df, ["Place of delivery", "Place Delivery", "PVB/VTP"])
+    col_delivery_start = find_col(df, ["First Day Delivery", "First delivery day", "Delivery start"])
+    col_delivery_end = find_col(df, ["Last Day Delivery", "Last delivery day", "Delivery end"])
 
-    colmap = {
-        "trading_day": first_col(df, ["Trading day", "trading_day"]),
-        "product": first_col(df, ["Product", "product"]),
-        "area": first_col(df, ["Area", "area"]),
-        "place_of_delivery": first_col(df, ["Place of delivery", "place_of_delivery"]),
-        "delivery_start": first_col(df, ["First Day Delivery", "first_day_delivery"]),
-        "delivery_end": first_col(df, ["Last Day Delivery", "last_day_delivery"]),
-        "reference_price": first_col(df, ["Reference Price [EUR/MWh]", "Daily Reference Price [EUR/MWh]", "reference_price_eur_mwh", "daily_reference_price_eur_mwh"]),
-        "auction_price": first_col(df, ["Auction Price [EUR/MWh]", "Daily Auction Price [EUR/MWh]"]),
-        "last_price": first_col(df, ["Last Price [EUR/MWh]", "Last Daily Price [EUR/MWh]"]),
-        "eod_price": first_col(df, ["EOD Price [EUR/MWh]", "EOD Price"]),
-        "bid": first_col(df, ["Bid [EUR/MWh]", "Bid"]),
-        "ask": first_col(df, ["Ask [EUR/MWh]", "Ask"]),
-        "volume": first_col(df, ["Volume Traded [MWh]", "Daily Volume Traded [MWh]", "Volume", "MWh"]),
-    }
+    col_daily_ref = find_col(
+        df,
+        [
+            "Daily Reference Price [EUR/MWh]",
+            "Daily Reference Price EUR/MWh",
+            "Reference Price [EUR/MWh]",
+            "Reference Price EUR/MWh",
+            "Precio de Referencia Diario [EUR/MWh]",
+        ],
+    )
+    col_eod = find_col(
+        df,
+        [
+            "EOD Price [EUR/MWh]",
+            "EOD Price EUR/MWh",
+            "End of Day Price [EUR/MWh]",
+            "Last Daily Price [EUR/MWh]",
+            "Last Daily Price EUR/MWh",
+            "Last Price [EUR/MWh]",
+        ],
+    )
+    col_last_daily = find_col(df, ["Last Daily Price [EUR/MWh]", "Last Daily Price EUR/MWh"])
+    col_daily_auction = find_col(df, ["Daily Auction Price [EUR/MWh]", "Daily Auction Price EUR/MWh"])
+    col_volume = find_col(df, ["Daily Volume Traded [MWh]", "Daily Volume Traded MWh", "Volume", "Volumen"])
 
-    required = ["trading_day", "product"]
-    missing = [k for k in required if colmap[k] is None]
-    if missing:
-        raise ValueError(f"missing required columns {missing}. Columns found: {df.columns.tolist()}")
+    if col_trading_day is None or col_product is None:
+        # This is usually not the trading data sheet.
+        return pd.DataFrame()
 
     out = pd.DataFrame()
-    out["trading_day"] = pd.to_datetime(df[colmap["trading_day"]], dayfirst=True, errors="coerce")
-    out["product"] = df[colmap["product"]].astype(str).str.strip()
-    out["area"] = df[colmap["area"]].astype(str).str.strip() if colmap["area"] else None
-    out["place_of_delivery"] = df[colmap["place_of_delivery"]].astype(str).str.strip() if colmap["place_of_delivery"] else None
-    out["delivery_start"] = pd.to_datetime(df[colmap["delivery_start"]], dayfirst=True, errors="coerce") if colmap["delivery_start"] else pd.NaT
-    out["delivery_end"] = pd.to_datetime(df[colmap["delivery_end"]], dayfirst=True, errors="coerce") if colmap["delivery_end"] else pd.NaT
+    out["trading_day"] = pd.to_datetime(df[col_trading_day], dayfirst=True, errors="coerce")
+    out["product"] = df[col_product].astype(str).str.strip()
 
-    for out_col, key in [
-        ("reference_price_eur_mwh", "reference_price"),
-        ("auction_price_eur_mwh", "auction_price"),
-        ("last_price_eur_mwh", "last_price"),
-        ("eod_price_eur_mwh", "eod_price"),
-        ("bid_eur_mwh", "bid"),
-        ("ask_eur_mwh", "ask"),
-        ("volume_traded_mwh", "volume"),
-    ]:
-        if colmap[key]:
-            out[out_col] = to_number(df[colmap[key]])
-        else:
-            out[out_col] = pd.NA
-
-    if "source_file" in df.columns:
-        out["source_file"] = df["source_file"].astype(str)
+    if col_area is not None:
+        out["area"] = df[col_area].astype(str).str.strip()
     else:
-        out["source_file"] = "unknown"
+        out["area"] = None
 
-    out = out.dropna(subset=["trading_day"])
-    out = out[out["product"].notna() & (out["product"].str.lower() != "nan")]
+    if col_place is not None:
+        out["place_of_delivery"] = df[col_place].astype(str).str.strip()
+    else:
+        out["place_of_delivery"] = None
+
+    if col_delivery_start is not None:
+        out["delivery_start"] = pd.to_datetime(df[col_delivery_start], dayfirst=True, errors="coerce")
+    else:
+        out["delivery_start"] = pd.NaT
+
+    if col_delivery_end is not None:
+        out["delivery_end"] = pd.to_datetime(df[col_delivery_end], dayfirst=True, errors="coerce")
+    else:
+        out["delivery_end"] = pd.NaT
+
+    if col_daily_ref is not None:
+        out["daily_reference_price_eur_mwh"] = parse_number_series(df[col_daily_ref])
+    else:
+        out["daily_reference_price_eur_mwh"] = pd.NA
+
+    if col_eod is not None:
+        out["eod_price_eur_mwh"] = parse_number_series(df[col_eod])
+    else:
+        out["eod_price_eur_mwh"] = pd.NA
+
+    if col_last_daily is not None:
+        out["last_daily_price_eur_mwh"] = parse_number_series(df[col_last_daily])
+    else:
+        out["last_daily_price_eur_mwh"] = pd.NA
+
+    if col_daily_auction is not None:
+        out["daily_auction_price_eur_mwh"] = parse_number_series(df[col_daily_auction])
+    else:
+        out["daily_auction_price_eur_mwh"] = pd.NA
+
+    if col_volume is not None:
+        out["daily_volume_traded_mwh"] = parse_number_series(df[col_volume])
+    else:
+        out["daily_volume_traded_mwh"] = pd.NA
+
+    out["source_file"] = source_file
+    out = out.dropna(subset=["trading_day"]).copy()
+
+    # Clean obvious garbage product strings.
+    out = out[out["product"].notna() & (out["product"].astype(str).str.lower() != "nan")].copy()
+
     return out.reset_index(drop=True)
 
+# =========================================================
+# LOCAL FILE LOADERS
+# =========================================================
+def read_excel_trading_sheets(path_or_bytes, source_file: str) -> pd.DataFrame:
+    """Read the correct MIBGAS trading sheet. Fallback to all sheets if needed."""
+    try:
+        xls = pd.ExcelFile(path_or_bytes)
+    except Exception as e:
+        raise ValueError(f"Could not open Excel file: {e}")
 
-@st.cache_data(show_spinner=True)
-def load_local_history() -> tuple[pd.DataFrame, pd.DataFrame]:
-    files = sorted(DATA_DIR.glob(LOCAL_FILE_PATTERN))
-    logs = []
+    sheet_names = xls.sheet_names
+    preferred = []
+    for sh in sheet_names:
+        sh_norm = normalize_text(sh)
+        if "trading" in sh_norm and ("pvb" in sh_norm or "vtp" in sh_norm):
+            preferred.append(sh)
+    for sh in sheet_names:
+        sh_norm = normalize_text(sh)
+        if sh not in preferred and "trading" in sh_norm:
+            preferred.append(sh)
+
+    # Try preferred sheets first, then every sheet.
+    ordered_sheets = preferred + [s for s in sheet_names if s not in preferred]
+
     frames = []
+    errors = []
+    for sheet in ordered_sheets:
+        try:
+            raw = pd.read_excel(path_or_bytes, sheet_name=sheet)
+            std = standardize_mibgas_raw(raw, source_file=f"{source_file}/{sheet}")
+            if not std.empty:
+                frames.append(std)
+        except Exception as e:
+            errors.append(f"{sheet}: {e}")
 
-    for path in files:
-        # Optional filter by year in filename, but keep if no year is found.
-        m = re.search(r"(20\d{2})", path.name)
-        if m:
-            y = int(m.group(1))
-            if y < LOCAL_START_YEAR or y > LOCAL_END_YEAR:
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def read_csv_like_bytes(content: bytes, source_file: str) -> pd.DataFrame:
+    frames = []
+    for enc in ["utf-8", "latin1", "cp1252"]:
+        for sep in [";", ",", "\t", "|"]:
+            try:
+                raw = pd.read_csv(BytesIO(content), sep=sep, encoding=enc, engine="python")
+                if raw.shape[1] <= 1:
+                    continue
+                std = standardize_mibgas_raw(raw, source_file=source_file)
+                if not std.empty:
+                    frames.append(std)
+                    return pd.concat(frames, ignore_index=True)
+            except Exception:
                 continue
-        try:
-            df = read_mibgas_excel(path)
-            frames.append(df)
-            logs.append({"file": path.name, "status": "OK", "rows": len(df), "message": ""})
-        except Exception as e:
-            logs.append({"file": path.name, "status": "ERROR", "rows": 0, "message": str(e)})
-
-    if frames:
-        out = pd.concat(frames, ignore_index=True)
-        out = out[out["trading_day"].dt.year.between(LOCAL_START_YEAR, LOCAL_END_YEAR)]
-        out = out.drop_duplicates(subset=["trading_day", "product", "area"], keep="last")
-        out = out.sort_values(["trading_day", "product"]).reset_index(drop=True)
-    else:
-        out = pd.DataFrame()
-
-    return out, pd.DataFrame(logs)
-
-# =========================================================
-# SFTP LIVE 2026
-# =========================================================
-def get_secret(name: str, default=None):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
+    return pd.DataFrame()
 
 
-def load_private_key():
-    if paramiko is None:
-        raise ValueError("paramiko is not installed. Add 'paramiko' to requirements.txt.")
-    key_text = get_secret("MIBGAS_SFTP_KEY")
-    if not key_text:
-        return None
-    key_file = StringIO(str(key_text))
-    last_error = None
-    key_loaders = []
-    for key_name in ["Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey"]:
-        loader = getattr(paramiko, key_name, None)
-        if loader is not None:
-            key_loaders.append(loader)
-    for loader in key_loaders:
-        try:
-            key_file.seek(0)
-            return loader.from_private_key(key_file)
-        except Exception as e:
-            last_error = e
-    raise ValueError(f"Could not load private key from Streamlit Secrets: {last_error}")
-
-
-def connect_sftp():
-    if paramiko is None:
-        raise ValueError("paramiko is not installed. Add 'paramiko' to requirements.txt.")
-
-    host = get_secret("MIBGAS_SFTP_HOST", "secureftpbucket.omie.es")
-    port = int(get_secret("MIBGAS_SFTP_PORT", 22))
-    user = get_secret("MIBGAS_SFTP_USER")
-    password = get_secret("MIBGAS_SFTP_PASSWORD")
-    key = load_private_key()
-
-    if not user:
-        raise ValueError("MIBGAS_SFTP_USER is missing in Streamlit Secrets.")
-    if key is None and not password:
-        raise ValueError("MIBGAS_SFTP_KEY or MIBGAS_SFTP_PASSWORD is missing in Streamlit Secrets.")
-
-    transport = paramiko.Transport((host, port))
-    if key is not None:
-        transport.connect(username=user, pkey=key)
-    else:
-        transport.connect(username=user, password=password)
-    return paramiko.SFTPClient.from_transport(transport), transport
-
-
-def sftp_file_exists(sftp, path: str) -> bool:
-    try:
-        attr = sftp.stat(path)
-        return stat.S_ISREG(attr.st_mode)
-    except Exception:
-        return False
-
-
-def sftp_dir_exists(sftp, path: str) -> bool:
-    try:
-        attr = sftp.stat(path)
-        return stat.S_ISDIR(attr.st_mode)
-    except Exception:
-        return False
-
-
-def find_year_dir(sftp, year: int) -> str:
-    configured = str(get_secret("MIBGAS_SFTP_BASE_PATH", "/MIBGAS")).rstrip("/")
-    candidates = [
-        f"{configured}/AGNO_{year}",
-        f"/MIBGAS/AGNO_{year}",
-        f"MIBGAS/AGNO_{year}",
-        f"/secureftpbucket.omie.es/MIBGAS/AGNO_{year}",
-        f"secureftpbucket.omie.es/MIBGAS/AGNO_{year}",
-        f"/AGNO_{year}",
-        f"AGNO_{year}",
-    ]
-    seen = set()
-    for c in candidates:
-        c = c.replace("//", "/")
-        if c in seen:
-            continue
-        seen.add(c)
-        if sftp_dir_exists(sftp, c):
-            return c
-    raise ValueError(f"Could not find AGNO_{year} directory. Tried: {candidates}")
-
-
-def read_remote_excel_or_zip(sftp, remote_path: str, filename: str) -> pd.DataFrame:
-    with sftp.open(remote_path, "rb") as f:
-        content = f.read()
+def read_mibgas_file_from_bytes(content: bytes, filename: str) -> pd.DataFrame:
     lower = filename.lower()
-
     if lower.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(BytesIO(content), sheet_name=TARGET_SHEET)
-        df = clean_columns(df)
-        df["source_file"] = filename
-        return standardize_raw_mibgas(df)
+        return read_excel_trading_sheets(BytesIO(content), filename)
 
     if lower.endswith(".zip"):
         frames = []
         with zipfile.ZipFile(BytesIO(content)) as z:
             for inner in z.namelist():
-                if inner.lower().endswith((".xlsx", ".xls")):
-                    with z.open(inner) as g:
-                        try:
-                            df = pd.read_excel(BytesIO(g.read()), sheet_name=TARGET_SHEET)
-                        except Exception:
-                            continue
-                    df = clean_columns(df)
-                    df["source_file"] = f"{filename}/{inner}"
-                    frames.append(standardize_raw_mibgas(df))
+                if inner.endswith("/"):
+                    continue
+                inner_lower = inner.lower()
+                if not inner_lower.endswith((".xlsx", ".xls", ".csv", ".txt")):
+                    continue
+                with z.open(inner) as f:
+                    inner_content = f.read()
+                std = read_mibgas_file_from_bytes(inner_content, f"{filename}/{inner}")
+                if not std.empty:
+                    frames.append(std)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    if lower.endswith((".csv", ".txt")):
+        return read_csv_like_bytes(content, filename)
 
     return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=True, ttl=1800)
-def load_live_2026() -> tuple[pd.DataFrame, str, pd.DataFrame]:
-    rows = []
+@st.cache_data(show_spinner=True)
+def load_local_mibgas_data() -> pd.DataFrame:
+    """Load historical files from /data/MIBGAS_Data_*.xlsx for 2021-2025."""
+    files = []
+    for year in range(LOCAL_START_YEAR, LOCAL_END_YEAR + 1):
+        files.extend(sorted(DATA_DIR.glob(f"MIBGAS_Data_{year}.xlsx")))
+        files.extend(sorted(DATA_DIR.glob(f"MIBGAS_Data_{year}.xls")))
+        files.extend(sorted(DATA_DIR.glob(f"MIBGAS_Data_{year}.csv")))
+
     frames = []
-    sftp, transport = connect_sftp()
+    read_errors = []
+
+    for path in files:
+        try:
+            if path.suffix.lower() in [".xlsx", ".xls"]:
+                df = read_excel_trading_sheets(path, path.name)
+            else:
+                df = read_csv_like_bytes(path.read_bytes(), path.name)
+
+            if df.empty:
+                read_errors.append(f"{path.name}: no usable trading sheet/data found")
+                continue
+            frames.append(df)
+        except Exception as e:
+            read_errors.append(f"{path.name}: {e}")
+
+    if read_errors:
+        st.session_state["mibgas_local_read_errors"] = read_errors
+    else:
+        st.session_state["mibgas_local_read_errors"] = []
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out["trading_day"] = pd.to_datetime(out["trading_day"], errors="coerce")
+    out = out.dropna(subset=["trading_day"])
+    out = out[out["trading_day"].dt.year.between(LOCAL_START_YEAR, LOCAL_END_YEAR)].copy()
+    out = out.drop_duplicates(subset=["trading_day", "product", "area", "source_file"], keep="last")
+    return out.sort_values(["trading_day", "product"]).reset_index(drop=True)
+
+# =========================================================
+# SFTP HELPERS
+# =========================================================
+def load_private_key_from_secrets():
+    if paramiko is None:
+        raise ValueError("paramiko is not installed. Add paramiko to requirements.txt.")
+
+    key_text = st.secrets.get("MIBGAS_SFTP_KEY", None)
+    if not key_text:
+        return None
+
+    key_text = str(key_text).strip()
+
+    # Do not support raw PuTTY keys in secrets. They must be converted to PEM/OpenSSH first.
+    if key_text.startswith("PuTTY-User-Key-File"):
+        raise ValueError("The key is still in PuTTY .ppk format. Convert it to PEM/OpenSSH before pasting it in Secrets.")
+
+    loaders = [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey]
+    last_error = None
+    for loader in loaders:
+        try:
+            return loader.from_private_key(StringIO(key_text))
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"Could not load private key from Streamlit Secrets: {last_error}")
+
+
+def connect_mibgas_sftp():
+    if paramiko is None:
+        raise ValueError("paramiko is not installed. Add paramiko to requirements.txt.")
+
+    host = st.secrets.get("MIBGAS_SFTP_HOST", None)
+    port = int(st.secrets.get("MIBGAS_SFTP_PORT", 22))
+    user = st.secrets.get("MIBGAS_SFTP_USER", None)
+    password = st.secrets.get("MIBGAS_SFTP_PASSWORD", None)
+
+    if not host:
+        raise ValueError("MIBGAS_SFTP_HOST is missing in Streamlit Secrets.")
+    if not user:
+        raise ValueError("MIBGAS_SFTP_USER is missing in Streamlit Secrets.")
+
+    host = str(host).strip().replace("sftp://", "").replace("/", "")
+    user = str(user).strip()
+
+    key = load_private_key_from_secrets()
+
+    transport = paramiko.Transport((host, port))
+    if key is not None:
+        transport.connect(username=user, pkey=key)
+    elif password:
+        transport.connect(username=user, password=password)
+    else:
+        raise ValueError("No MIBGAS_SFTP_KEY or MIBGAS_SFTP_PASSWORD found in Streamlit Secrets.")
+
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    return sftp, transport
+
+
+def mibgas_base_path() -> str:
+    return str(st.secrets.get("MIBGAS_SFTP_BASE_PATH", "/secureftpbucket.omie.es/MIBGAS")).rstrip("/")
+
+
+def is_sftp_file(attr) -> bool:
+    return stat.S_ISREG(attr.st_mode)
+
+
+def is_sftp_dir(attr) -> bool:
+    return stat.S_ISDIR(attr.st_mode)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def list_remote_files_for_year(year: int = LIVE_YEAR) -> pd.DataFrame:
+    """List files in AGNO_YYYY plus common subfolders like XLS/CSV."""
+    base = mibgas_base_path()
+
+    candidate_dirs = [
+        f"{base}/AGNO_{year}",
+        f"{base}/AGNO_{year}/XLS",
+        f"{base}/AGNO_{year}/CSV",
+        f"{base}/AGNO_{year}/TXT",
+    ]
+
+    # Also include common alternative base paths in case secrets only contain /MIBGAS.
+    alternative_bases = [
+        "/secureftpbucket.omie.es/MIBGAS",
+        "/MIBGAS",
+    ]
+    for alt_base in alternative_bases:
+        if alt_base.rstrip("/") != base:
+            candidate_dirs.extend([
+                f"{alt_base}/AGNO_{year}",
+                f"{alt_base}/AGNO_{year}/XLS",
+                f"{alt_base}/AGNO_{year}/CSV",
+                f"{alt_base}/AGNO_{year}/TXT",
+            ])
+
+    rows = []
+    checked_dirs = []
+    errors = []
+
+    sftp, transport = connect_mibgas_sftp()
     try:
-        year_dir = find_year_dir(sftp, LIVE_YEAR)
-        items = sftp.listdir_attr(year_dir)
-        for item in items:
-            if not stat.S_ISREG(item.st_mode):
+        for remote_dir in candidate_dirs:
+            if remote_dir in checked_dirs:
                 continue
-            filename = item.filename
-            if not filename.lower().endswith((".xlsx", ".xls", ".zip")):
-                continue
-            remote_path = f"{year_dir}/{filename}"
+            checked_dirs.append(remote_dir)
             try:
-                df = read_remote_excel_or_zip(sftp, remote_path, filename)
-                if not df.empty:
-                    frames.append(df)
-                rows.append({"filename": filename, "remote_path": remote_path, "status": "OK", "rows": len(df), "message": ""})
+                items = sftp.listdir_attr(remote_dir)
             except Exception as e:
-                rows.append({"filename": filename, "remote_path": remote_path, "status": "ERROR", "rows": 0, "message": str(e)})
+                errors.append(f"{remote_dir}: {e}")
+                continue
+
+            for item in items:
+                if not is_sftp_file(item):
+                    continue
+                filename = item.filename
+                lower = filename.lower()
+                if not lower.endswith((".xlsx", ".xls", ".csv", ".txt", ".zip")):
+                    continue
+                if "mibgas" not in lower and "gas" not in lower:
+                    continue
+                rows.append({
+                    "year": year,
+                    "filename": filename,
+                    "remote_dir": remote_dir,
+                    "remote_path": f"{remote_dir}/{filename}",
+                    "size_bytes": item.st_size,
+                    "modified": pd.to_datetime(item.st_mtime, unit="s", errors="coerce"),
+                })
     finally:
         sftp.close()
         transport.close()
 
-    if frames:
-        out = pd.concat(frames, ignore_index=True)
-        out = out[out["trading_day"].dt.year == LIVE_YEAR]
-        out = out.drop_duplicates(subset=["trading_day", "product", "area"], keep="last")
-        out = out.sort_values(["trading_day", "product"]).reset_index(drop=True)
-        try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            out.to_csv(CACHE_FILE, index=False)
-        except Exception:
-            pass
-        msg = f"2026 data loaded from MIBGAS SFTP ({len(out):,} rows)."
-    else:
-        out = pd.DataFrame()
-        msg = "Connected to SFTP, but no 2026 MIBGAS trading files were loaded."
-    return out, msg, pd.DataFrame(rows)
+    st.session_state["mibgas_sftp_checked_dirs"] = checked_dirs
+    st.session_state["mibgas_sftp_list_errors"] = errors
+
+    if not rows:
+        return pd.DataFrame(columns=["year", "filename", "remote_dir", "remote_path", "size_bytes", "modified"])
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(subset=["remote_path"])
+        .sort_values(["modified", "filename"])
+        .reset_index(drop=True)
+    )
 
 
-def load_cached_2026() -> pd.DataFrame:
-    if not CACHE_FILE.exists():
+def read_remote_file_bytes(remote_path: str) -> bytes:
+    sftp, transport = connect_mibgas_sftp()
+    try:
+        with sftp.open(remote_path, "rb") as f:
+            return f.read()
+    finally:
+        sftp.close()
+        transport.close()
+
+
+@st.cache_data(show_spinner=True, ttl=1800)
+def load_sftp_2026_data() -> pd.DataFrame:
+    files = list_remote_files_for_year(LIVE_YEAR)
+    if files.empty:
         return pd.DataFrame()
-    df = pd.read_csv(CACHE_FILE)
-    for c in ["trading_day", "delivery_start", "delivery_end"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce")
-    return df
 
+    frames = []
+    errors = []
+    for _, row in files.iterrows():
+        remote_path = row["remote_path"]
+        filename = row["filename"]
+        try:
+            content = read_remote_file_bytes(remote_path)
+            df = read_mibgas_file_from_bytes(content, filename)
+            if df.empty:
+                errors.append(f"{filename}: no usable trading data found")
+                continue
+            frames.append(df)
+        except Exception as e:
+            errors.append(f"{filename}: {e}")
 
-def load_all_data() -> tuple[pd.DataFrame, pd.DataFrame, str, pd.DataFrame]:
-    hist, local_log = load_local_history()
+    st.session_state["mibgas_sftp_read_errors"] = errors
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out["trading_day"] = pd.to_datetime(out["trading_day"], errors="coerce")
+    out = out.dropna(subset=["trading_day"])
+    out = out[out["trading_day"].dt.year == LIVE_YEAR].copy()
+    out = out.drop_duplicates(subset=["trading_day", "product", "area", "source_file"], keep="last")
 
     try:
-        live, live_msg, sftp_log = load_live_2026()
-    except Exception as e:
-        cached = load_cached_2026()
-        if not cached.empty:
-            live, live_msg = cached, f"2026 SFTP data not loaded; using cache. Reason: {e}"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out.to_csv(CACHE_FILE_2026, index=False)
+    except Exception:
+        pass
+
+    return out.sort_values(["trading_day", "product"]).reset_index(drop=True)
+
+
+def load_cached_2026_data() -> pd.DataFrame:
+    if not CACHE_FILE_2026.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(CACHE_FILE_2026)
+        df["trading_day"] = pd.to_datetime(df["trading_day"], errors="coerce")
+        for col in [
+            "daily_reference_price_eur_mwh", "eod_price_eur_mwh", "last_daily_price_eur_mwh",
+            "daily_auction_price_eur_mwh", "daily_volume_traded_mwh",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["trading_day"])
+    except Exception:
+        return pd.DataFrame()
+
+# =========================================================
+# DATASET BUILDERS
+# =========================================================
+def load_all_raw_data() -> tuple[pd.DataFrame, str]:
+    hist = load_local_mibgas_data()
+
+    live_status = ""
+    try:
+        live = load_sftp_2026_data()
+        if live.empty:
+            live_status = "Connected to SFTP, but no 2026 MIBGAS trading files were loaded."
         else:
-            live, live_msg = pd.DataFrame(), f"2026 SFTP data not loaded: {e}"
-        sftp_log = pd.DataFrame()
+            live_status = f"Loaded {len(live):,} rows from 2026 SFTP."
+    except Exception as e:
+        live = load_cached_2026_data()
+        if live.empty:
+            live_status = f"2026 SFTP data not loaded: {e}"
+        else:
+            live_status = f"Using cached 2026 data because SFTP failed: {e}"
 
-    combined = pd.concat([hist, live], ignore_index=True) if not hist.empty or not live.empty else pd.DataFrame()
-    if not combined.empty:
-        combined = combined.sort_values(["trading_day", "product"]).reset_index(drop=True)
-    return combined, local_log, live_msg, sftp_log
+    combined = pd.concat([hist, live], ignore_index=True)
+    if combined.empty:
+        return combined, live_status
 
-# =========================================================
-# DATASETS
-# =========================================================
-def make_actuals(raw: pd.DataFrame) -> pd.DataFrame:
+    combined["trading_day"] = pd.to_datetime(combined["trading_day"], errors="coerce")
+    combined = combined.dropna(subset=["trading_day"])
+    combined = combined.drop_duplicates(subset=["trading_day", "product", "area", "source_file"], keep="last")
+    combined = combined.sort_values(["trading_day", "product"]).reset_index(drop=True)
+    return combined, live_status
+
+
+def build_actuals(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.empty:
-        return pd.DataFrame()
-    df = raw.copy()
-    actuals = df[(df["product"] == "GDAES_D+1") & (df["area"].fillna("ES") == "ES")].copy()
-    actuals["price"] = pd.to_numeric(actuals["reference_price_eur_mwh"], errors="coerce")
-    actuals = actuals.dropna(subset=["trading_day", "price"])
-    actuals["series"] = "GDAES_D+1 Reference Price"
-    return actuals[["trading_day", "product", "delivery_start", "delivery_end", "price", "volume_traded_mwh", "source_file", "series"]].sort_values("trading_day")
+        return pd.DataFrame(columns=["date", "product", "price", "source_file"])
+
+    tmp = raw.copy()
+    tmp["product_norm"] = tmp["product"].astype(str).str.strip().str.upper()
+    if "area" in tmp.columns:
+        tmp["area_norm"] = tmp["area"].astype(str).str.strip().str.upper()
+    else:
+        tmp["area_norm"] = ""
+
+    # Main actual daily product. Area filter is loose because some sheets may not have area.
+    mask = tmp["product_norm"].eq("GDAES_D+1")
+    mask &= tmp["area_norm"].isin(["ES", "", "NONE", "NAN"]) | tmp["area_norm"].isna()
+
+    actuals = tmp[mask].copy()
+    actuals["price"] = pd.to_numeric(actuals["daily_reference_price_eur_mwh"], errors="coerce")
+
+    out = actuals[["trading_day", "product", "price", "source_file"]].rename(columns={"trading_day": "date"})
+    out["series"] = "GDAES_D+1 Daily Reference Price"
+    out = out.dropna(subset=["date", "price"]).sort_values("date")
+    return out.drop_duplicates(subset=["date", "product"], keep="last").reset_index(drop=True)
 
 
-def make_forwards(raw: pd.DataFrame) -> pd.DataFrame:
+def build_forwards(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.empty:
-        return pd.DataFrame()
-    df = raw.copy()
-    forwards = df[(df["product"].isin(["GYES_Y+1", "GYES_Y+2"])) & (df["area"].fillna("ES") == "ES")].copy()
+        return pd.DataFrame(columns=["date", "product", "price", "delivery_start", "delivery_end", "source_file"])
 
-    # Your older files may have EOD Price. The newer MIBGAS file has Last Price instead.
-    # Use EOD when present, otherwise Last Price, otherwise Reference Price.
-    eod = pd.to_numeric(forwards.get("eod_price_eur_mwh"), errors="coerce") if "eod_price_eur_mwh" in forwards.columns else pd.Series(index=forwards.index, dtype=float)
-    last = pd.to_numeric(forwards.get("last_price_eur_mwh"), errors="coerce") if "last_price_eur_mwh" in forwards.columns else pd.Series(index=forwards.index, dtype=float)
-    ref = pd.to_numeric(forwards.get("reference_price_eur_mwh"), errors="coerce") if "reference_price_eur_mwh" in forwards.columns else pd.Series(index=forwards.index, dtype=float)
-    forwards["price"] = eod.combine_first(last).combine_first(ref)
-    forwards["price_source"] = "EOD Price"
-    forwards.loc[eod.isna() & last.notna(), "price_source"] = "Last Price"
-    forwards.loc[eod.isna() & last.isna() & ref.notna(), "price_source"] = "Reference Price"
+    tmp = raw.copy()
+    tmp["product_norm"] = tmp["product"].astype(str).str.strip().str.upper()
+    if "area" in tmp.columns:
+        tmp["area_norm"] = tmp["area"].astype(str).str.strip().str.upper()
+    else:
+        tmp["area_norm"] = ""
 
-    forwards = forwards.dropna(subset=["trading_day", "price"])
-    forwards["series"] = forwards["product"] + " " + forwards["price_source"]
-    return forwards[["trading_day", "product", "delivery_start", "delivery_end", "price", "price_source", "volume_traded_mwh", "source_file", "series"]].sort_values(["trading_day", "product"])
+    mask = tmp["product_norm"].isin(["GYES_Y+1", "GYES_Y+2"])
+    mask &= tmp["area_norm"].isin(["ES", "", "NONE", "NAN"]) | tmp["area_norm"].isna()
+    fw = tmp[mask].copy()
+
+    # Prefer EOD. If blank, fallback to last daily, then reference.
+    fw["price"] = pd.to_numeric(fw["eod_price_eur_mwh"], errors="coerce")
+    fw["price"] = fw["price"].combine_first(pd.to_numeric(fw.get("last_daily_price_eur_mwh"), errors="coerce"))
+    fw["price"] = fw["price"].combine_first(pd.to_numeric(fw.get("daily_reference_price_eur_mwh"), errors="coerce"))
+
+    out = fw[["trading_day", "product", "price", "delivery_start", "delivery_end", "source_file"]].rename(columns={"trading_day": "date"})
+    out["series"] = out["product"].astype(str) + " EOD Price"
+    out = out.dropna(subset=["date", "price"]).sort_values(["date", "product"])
+    return out.drop_duplicates(subset=["date", "product"], keep="last").reset_index(drop=True)
 
 # =========================================================
-# AGGREGATION / CHARTS
+# GRANULARITY / CHARTS
 # =========================================================
-def aggregate_price_series(df: pd.DataFrame, granularity: str, group_cols: list[str]) -> pd.DataFrame:
-    """Aggregate price data to daily, monthly, annual, or rolling 30D average."""
+def apply_granularity(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame()
+        return df
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date", "price"])
 
-    tmp = df.copy()
-    tmp["trading_day"] = pd.to_datetime(tmp["trading_day"], errors="coerce")
-    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
-    tmp = tmp.dropna(subset=["trading_day", "price"])
-
-    if tmp.empty:
-        return pd.DataFrame()
+    group_cols = ["product"] if "product" in out.columns else []
+    if "series" in out.columns:
+        group_cols.append("series")
 
     if granularity == "Daily":
-        tmp["period"] = tmp["trading_day"].dt.normalize()
-        out = (
-            tmp.groupby(group_cols + ["period"], as_index=False)
-            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
-            .sort_values(group_cols + ["period"])
-        )
-        out["period_label"] = out["period"].dt.strftime("%Y-%m-%d")
-        return out
-
-    if granularity == "Monthly":
-        tmp["period"] = tmp["trading_day"].dt.to_period("M").dt.to_timestamp()
-        out = (
-            tmp.groupby(group_cols + ["period"], as_index=False)
-            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
-            .sort_values(group_cols + ["period"])
-        )
-        out["period_label"] = out["period"].dt.strftime("%b-%Y")
-        return out
-
-    if granularity == "Annual":
-        tmp["year"] = tmp["trading_day"].dt.year
-        out = (
-            tmp.groupby(group_cols + ["year"], as_index=False)
-            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
-            .sort_values(group_cols + ["year"])
-        )
-        out["period"] = pd.to_datetime(out["year"].astype(str) + "-01-01")
-        out["period_label"] = out["year"].astype(str)
+        out["plot_date"] = out["date"]
+        out["plot_label"] = out["plot_date"].dt.strftime("%Y-%m-%d")
         return out
 
     if granularity == "Rolling 30D average":
-        tmp["period"] = tmp["trading_day"].dt.normalize()
-        daily = (
-            tmp.groupby(group_cols + ["period"], as_index=False)
-            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
-            .sort_values(group_cols + ["period"])
-        )
         frames = []
-        for _, g in daily.groupby(group_cols, dropna=False):
-            g = g.sort_values("period").copy()
-            g["price"] = g["price"].rolling(window=30, min_periods=1).mean()
-            frames.append(g)
-        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        out["period_label"] = out["period"].dt.strftime("%Y-%m-%d")
+        if group_cols:
+            grouped = out.groupby(group_cols, dropna=False)
+            for keys, g in grouped:
+                g = g.sort_values("date").copy()
+                g["price"] = g["price"].rolling(window=30, min_periods=1).mean()
+                g["plot_date"] = g["date"]
+                g["plot_label"] = g["plot_date"].dt.strftime("%Y-%m-%d")
+                frames.append(g)
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        out = out.sort_values("date").copy()
+        out["price"] = out["price"].rolling(window=30, min_periods=1).mean()
+        out["plot_date"] = out["date"]
+        out["plot_label"] = out["plot_date"].dt.strftime("%Y-%m-%d")
         return out
 
-    return tmp
+    if granularity == "Monthly":
+        out["plot_date"] = out["date"].dt.to_period("M").dt.to_timestamp()
+    elif granularity == "Annual":
+        out["plot_date"] = out["date"].dt.to_period("Y").dt.to_timestamp()
+    else:
+        out["plot_date"] = out["date"]
+
+    agg_cols = group_cols + ["plot_date"]
+    aggregated = out.groupby(agg_cols, as_index=False).agg(price=("price", "mean"))
+    if granularity == "Monthly":
+        aggregated["plot_label"] = aggregated["plot_date"].dt.strftime("%b-%Y")
+    elif granularity == "Annual":
+        aggregated["plot_label"] = aggregated["plot_date"].dt.year.astype(str)
+    else:
+        aggregated["plot_label"] = aggregated["plot_date"].dt.strftime("%Y-%m-%d")
+    return aggregated.sort_values("plot_date").reset_index(drop=True)
 
 
-def build_price_chart(df: pd.DataFrame, granularity: str, title_y: str, color_field: str | None = None, color_scale=None):
-    if df.empty:
+def build_actuals_chart(actuals: pd.DataFrame, granularity: str):
+    plot = apply_granularity(actuals, granularity)
+    if plot.empty:
         return None
 
     if granularity == "Annual":
-        x_enc = alt.X("period_label:N", title=None, sort=sorted(df["period_label"].unique().tolist()), axis=alt.Axis(labelAngle=0))
+        x_enc = alt.X("plot_label:N", title=None, sort=plot["plot_label"].tolist(), axis=alt.Axis(labelAngle=0))
     else:
-        x_enc = alt.X("period:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0))
+        x_enc = alt.X("plot_date:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0))
 
-    tooltip = [
-        alt.Tooltip("period_label:N", title="Period"),
-        alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
-        alt.Tooltip("volume_traded_mwh:Q", title="Volume MWh", format=",.0f"),
-    ]
-
-    if color_field and color_field in df.columns:
-        tooltip.insert(1, alt.Tooltip(f"{color_field}:N", title=color_field.replace("_", " ").title()))
-        chart = (
-            alt.Chart(df)
-            .mark_line(point=True, strokeWidth=2.5)
-            .encode(
-                x=x_enc,
-                y=alt.Y("price:Q", title=title_y),
-                color=alt.Color(f"{color_field}:N", title="Product", scale=color_scale),
-                tooltip=tooltip,
-            )
+    chart = (
+        alt.Chart(plot)
+        .mark_line(point=True, strokeWidth=2.5, color=BLUE_PRICE)
+        .encode(
+            x=x_enc,
+            y=alt.Y("price:Q", title="€/MWh"),
+            tooltip=[
+                alt.Tooltip("plot_label:N", title="Period"),
+                alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
+                alt.Tooltip("product:N", title="Product"),
+            ],
         )
-    else:
-        chart = (
-            alt.Chart(df)
-            .mark_line(point=True, strokeWidth=2.5, color=BLUE_PRICE)
-            .encode(
-                x=x_enc,
-                y=alt.Y("price:Q", title=title_y),
-                tooltip=tooltip,
-            )
-        )
-
+    )
     return apply_common_chart_style(chart, height=380)
 
 
-def render_actuals_section(actuals_f: pd.DataFrame):
-    st.subheader("Historical actuals - GDAES D+1 Reference Price")
-    granularity = st.radio(
-        "Actuals granularity",
-        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
-        index=1,
-        horizontal=True,
-        key="actuals_granularity",
-    )
-    plot_df = aggregate_price_series(actuals_f, granularity, group_cols=["product"])
-    c = build_price_chart(plot_df, granularity, "Reference Price €/MWh")
-    if c is None:
-        st.warning("No GDAES_D+1 Reference Price data found.")
+def build_forwards_chart(forwards: pd.DataFrame, granularity: str):
+    plot = apply_granularity(forwards, granularity)
+    if plot.empty:
+        return None
+
+    if granularity == "Annual":
+        x_enc = alt.X("plot_label:N", title=None, sort=sorted(plot["plot_label"].unique().tolist()), axis=alt.Axis(labelAngle=0))
     else:
-        st.altair_chart(c, use_container_width=True)
+        x_enc = alt.X("plot_date:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0))
 
-    with st.expander("Show actuals data"):
-        st.dataframe(actuals_f.sort_values("trading_day", ascending=False), use_container_width=True, hide_index=True)
-
-
-def render_forwards_section(forwards_f: pd.DataFrame):
-    st.subheader("Forward prices - GYES Y+1 and Y+2")
-    st.caption("The chart uses EOD Price when available; otherwise Last Price; otherwise Reference Price.")
-    granularity = st.radio(
-        "Forwards granularity",
-        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
-        index=1,
-        horizontal=True,
-        key="forwards_granularity",
+    chart = (
+        alt.Chart(plot)
+        .mark_line(point=True, strokeWidth=2.5)
+        .encode(
+            x=x_enc,
+            y=alt.Y("price:Q", title="€/MWh"),
+            color=alt.Color("product:N", title="Product", scale=alt.Scale(range=[YELLOW_DARK, BLUE_PRICE, CORP_GREEN])),
+            tooltip=[
+                alt.Tooltip("plot_label:N", title="Period"),
+                alt.Tooltip("product:N", title="Product"),
+                alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
+            ],
+        )
     )
-    plot_df = aggregate_price_series(forwards_f, granularity, group_cols=["product"])
-    color_scale = alt.Scale(domain=["GYES_Y+1", "GYES_Y+2"], range=[YELLOW_DARK, BLUE_PRICE])
-    c = build_price_chart(plot_df, granularity, "Price €/MWh", color_field="product", color_scale=color_scale)
-    if c is None:
-        st.warning("No GYES_Y+1 / GYES_Y+2 data found.")
-    else:
-        st.altair_chart(c, use_container_width=True)
+    return apply_common_chart_style(chart, height=380)
 
-    with st.expander("Show forward data"):
-        st.dataframe(forwards_f.sort_values(["trading_day", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
 # =========================================================
 # PAGE
 # =========================================================
@@ -639,84 +789,151 @@ st.caption(
 
 section_header("MIBGAS market data")
 
-refresh_col, status_col = st.columns([1, 4])
-with refresh_col:
+col_refresh, col_status = st.columns([1.1, 5])
+with col_refresh:
     if st.button("Refresh MIBGAS SFTP data"):
-        load_live_2026.clear()
-        load_local_history.clear()
+        try:
+            load_sftp_2026_data.clear()
+            list_remote_files_for_year.clear()
+        except Exception:
+            pass
         st.rerun()
 
-raw, local_log, live_msg, sftp_log = load_all_data()
-with status_col:
-    st.caption(live_msg)
-
-if not local_log.empty:
-    errors = local_log[local_log["status"] == "ERROR"]
-    if not errors.empty:
-        with st.expander("Local file read warnings"):
-            st.dataframe(errors, use_container_width=True, hide_index=True)
+raw, live_status = load_all_raw_data()
+with col_status:
+    st.caption(live_status)
 
 if raw.empty:
-    st.warning("No MIBGAS data found. Check that files are uploaded as `data/MIBGAS_Data_2021.xlsx` ... `data/MIBGAS_Data_2025.xlsx`.")
+    st.warning("No MIBGAS data found. Upload files named `MIBGAS_Data_2021.xlsx` ... `MIBGAS_Data_2025.xlsx` to `/data`.")
+
+    with st.expander("Diagnostics"):
+        st.write("Local read errors:")
+        st.write(st.session_state.get("mibgas_local_read_errors", []))
+        st.write("SFTP checked dirs:")
+        st.write(st.session_state.get("mibgas_sftp_checked_dirs", []))
+        st.write("SFTP list errors:")
+        st.write(st.session_state.get("mibgas_sftp_list_errors", []))
+        st.write("SFTP read errors:")
+        st.write(st.session_state.get("mibgas_sftp_read_errors", []))
     st.stop()
 
-actuals = make_actuals(raw)
-forwards = make_forwards(raw)
+actuals = build_actuals(raw)
+forwards = build_forwards(raw)
 
-min_date = raw["trading_day"].min().date()
-max_date = raw["trading_day"].max().date()
+all_dates = []
+if not actuals.empty:
+    all_dates.extend([actuals["date"].min(), actuals["date"].max()])
+if not forwards.empty:
+    all_dates.extend([forwards["date"].min(), forwards["date"].max()])
+
+if not all_dates:
+    st.warning("The files were read, but no GDAES_D+1 actuals or GYES_Y+1/Y+2 forwards were found.")
+    st.dataframe(raw.head(200), use_container_width=True, hide_index=True)
+    st.stop()
+
+min_date = pd.to_datetime(min(all_dates)).date()
+max_date = pd.to_datetime(max(all_dates)).date()
+
 col1, col2 = st.columns(2)
 with col1:
     start_date = st.date_input("Start date", value=min_date, min_value=min_date, max_value=max_date)
 with col2:
     end_date = st.date_input("End date", value=max_date, min_value=min_date, max_value=max_date)
 
-actuals_f = actuals[(actuals["trading_day"].dt.date >= start_date) & (actuals["trading_day"].dt.date <= end_date)] if not actuals.empty else actuals
-forwards_f = forwards[(forwards["trading_day"].dt.date >= start_date) & (forwards["trading_day"].dt.date <= end_date)] if not forwards.empty else forwards
+actuals_f = actuals[(actuals["date"].dt.date >= start_date) & (actuals["date"].dt.date <= end_date)].copy()
+forwards_f = forwards[(forwards["date"].dt.date >= start_date) & (forwards["date"].dt.date <= end_date)].copy()
 
-if actuals_f.empty and forwards_f.empty:
-    st.warning("Files were read, but no GDAES_D+1 actuals or GYES_Y+1/Y+2 forwards were found for the selected period.")
+latest_actual = actuals_f.sort_values("date").iloc[-1] if not actuals_f.empty else None
+latest_y1 = forwards_f[forwards_f["product"].str.upper() == "GYES_Y+1"].sort_values("date").iloc[-1] if not forwards_f[forwards_f["product"].str.upper() == "GYES_Y+1"].empty else None
+latest_y2 = forwards_f[forwards_f["product"].str.upper() == "GYES_Y+2"].sort_values("date").iloc[-1] if not forwards_f[forwards_f["product"].str.upper() == "GYES_Y+2"].empty else None
 
-k1, k2, k3, k4 = st.columns(4)
-if not actuals_f.empty:
-    latest_a = actuals_f.sort_values("trading_day").iloc[-1]
-    k1.metric("Latest GDAES D+1", f"{latest_a['price']:,.2f} €/MWh")
-    k2.metric("Latest actual date", latest_a["trading_day"].strftime("%Y-%m-%d"))
-else:
-    k1.metric("Latest GDAES D+1", "-")
-    k2.metric("Latest actual date", "-")
-
-if not forwards_f.empty:
-    latest_f_date = forwards_f["trading_day"].max()
-    latest_forwards = forwards_f[forwards_f["trading_day"] == latest_f_date]
-    y1 = latest_forwards.loc[latest_forwards["product"] == "GYES_Y+1", "price"]
-    y2 = latest_forwards.loc[latest_forwards["product"] == "GYES_Y+2", "price"]
-    k3.metric("Latest GYES Y+1", f"{float(y1.iloc[-1]):,.2f} €/MWh" if not y1.empty else "-")
-    k4.metric("Latest GYES Y+2", f"{float(y2.iloc[-1]):,.2f} €/MWh" if not y2.empty else "-")
-else:
-    k3.metric("Latest GYES Y+1", "-")
-    k4.metric("Latest GYES Y+2", "-")
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1.metric("Latest GDAES D+1", f"{format_metric(latest_actual['price'] if latest_actual is not None else None, ' €/MWh')}")
+kpi2.metric("Latest actual date", latest_actual["date"].strftime("%Y-%m-%d") if latest_actual is not None else "-")
+kpi3.metric("Latest GYES Y+1", f"{format_metric(latest_y1['price'] if latest_y1 is not None else None, ' €/MWh')}")
+kpi4.metric("Latest GYES Y+2", f"{format_metric(latest_y2['price'] if latest_y2 is not None else None, ' €/MWh')}")
 
 st.markdown("---")
 
-# Requested layout: one actuals chart, then one forwards chart underneath.
-render_actuals_section(actuals_f)
-render_forwards_section(forwards_f)
+# Main actuals chart
+st.subheader("Actuals - GDAES D+1 Daily Reference Price")
+g1_col, _ = st.columns([1, 3])
+with g1_col:
+    gran_actuals = st.radio(
+        "Actuals granularity",
+        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
+        index=0,
+        horizontal=False,
+    )
+chart = build_actuals_chart(actuals_f, gran_actuals)
+if chart is None:
+    st.warning("No GDAES_D+1 actual data available for the selected period.")
+else:
+    st.altair_chart(chart, use_container_width=True)
 
-tab_raw, tab_diagnostics = st.tabs(["Raw data", "Diagnostics"])
+# Main forwards chart
+st.subheader("Forwards - GYES Y+1 / Y+2 EOD Price")
+g2_col, _ = st.columns([1, 3])
+with g2_col:
+    gran_forwards = st.radio(
+        "Forwards granularity",
+        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
+        index=0,
+        horizontal=False,
+    )
+chart = build_forwards_chart(forwards_f, gran_forwards)
+if chart is None:
+    st.warning("No GYES_Y+1 / GYES_Y+2 forward data available for the selected period.")
+else:
+    st.altair_chart(chart, use_container_width=True)
 
-with tab_raw:
+# Data tabs
+raw_tab, actuals_tab, forwards_tab, sftp_tab, diagnostics_tab = st.tabs([
+    "Raw data", "Actuals data", "Forwards data", "SFTP files", "Diagnostics"
+])
+
+with raw_tab:
     st.dataframe(raw.sort_values(["trading_day", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
-    csv = raw.to_csv(index=False).encode("utf-8")
-    st.download_button("Download combined MIBGAS data", csv, "mibgas_combined.csv", "text/csv")
 
-with tab_diagnostics:
-    st.write("Local files loaded from `/data`:")
-    st.dataframe(local_log, use_container_width=True, hide_index=True)
-    st.write("SFTP 2026 load status:")
-    st.write(live_msg)
-    if not sftp_log.empty:
-        st.dataframe(sftp_log, use_container_width=True, hide_index=True)
-    st.write("Secrets expected in Streamlit Cloud → App → Settings → Secrets:")
-    secrets_example = 'MIBGAS_SFTP_HOST = "secureftpbucket.omie.es"\nMIBGAS_SFTP_PORT = 22\nMIBGAS_SFTP_USER = "m.moreno"\nMIBGAS_SFTP_BASE_PATH = "/MIBGAS"\n\nMIBGAS_SFTP_KEY = """\n-----BEGIN OPENSSH PRIVATE KEY-----\nPASTE_FULL_GASkey_CONTENT_HERE\n-----END OPENSSH PRIVATE KEY-----\n"""'
-    st.code(secrets_example, language="toml")
+with actuals_tab:
+    st.dataframe(actuals_f.sort_values("date", ascending=False), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download actuals CSV",
+        actuals_f.to_csv(index=False).encode("utf-8"),
+        file_name="mibgas_gdaes_d1_actuals.csv",
+        mime="text/csv",
+    )
+
+with forwards_tab:
+    st.dataframe(forwards_f.sort_values(["date", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download forwards CSV",
+        forwards_f.to_csv(index=False).encode("utf-8"),
+        file_name="mibgas_gyes_y1_y2_forwards.csv",
+        mime="text/csv",
+    )
+
+with sftp_tab:
+    st.write("Remote files detected for 2026:")
+    try:
+        remote_files = list_remote_files_for_year(LIVE_YEAR)
+        st.dataframe(remote_files, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"Could not list 2026 SFTP files: {e}")
+
+with diagnostics_tab:
+    st.write("Local read errors:")
+    st.write(st.session_state.get("mibgas_local_read_errors", []))
+
+    st.write("SFTP checked directories:")
+    st.write(st.session_state.get("mibgas_sftp_checked_dirs", []))
+
+    st.write("SFTP list errors:")
+    st.write(st.session_state.get("mibgas_sftp_list_errors", []))
+
+    st.write("SFTP read errors:")
+    st.write(st.session_state.get("mibgas_sftp_read_errors", []))
+
+    st.write("Products found:")
+    if "product" in raw.columns:
+        st.dataframe(pd.DataFrame({"product": sorted(raw["product"].dropna().astype(str).unique().tolist())}), use_container_width=True, hide_index=True)
