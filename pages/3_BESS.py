@@ -1,748 +1,929 @@
-
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import os
+import smtplib
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
-import calendar
+from zoneinfo import ZoneInfo
 
-import altair as alt
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pulp
+import requests
 import streamlit as st
+from dotenv import load_dotenv
+from matplotlib.backends.backend_pdf import PdfPages
 
-
-st.set_page_config(page_title="BESS", layout="wide")
-
-st.markdown(
-    """
-    <style>
-    html, body, [class*="css"] {
-        font-size: 100% !important;
-    }
-    .stApp, .stMarkdown, .stText, .stDataFrame, .stSelectbox, .stDateInput,
-    .stButton, .stNumberInput, .stTextInput, .stCaption, label, p, span, div {
-        font-size: 100% !important;
-    }
-    h1, h2, h3 {
-        font-size: 100% !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("BESS Optimisation")
-
-st.markdown(
-    """
-    <style>
-    .section-hero {
-        padding: 12px 16px;
-        border-radius: 14px;
-        margin: 14px 0 10px 0;
-        font-weight: 800;
-        font-size: 1.06rem;
-        color: white;
-        box-shadow: 0 8px 24px rgba(31, 78, 121, 0.12);
-        border: 1px solid rgba(255,255,255,0.18);
-        background: linear-gradient(90deg, #0b9f85 0%, #10b981 45%, #55c8b0 75%, #b7e2d0 100%);
-    }
-    .section-data {
-        padding: 8px 12px;
-        border-left: 4px solid #10b981;
-        background: linear-gradient(90deg, #effaf6 0%, #ffffff 100%);
-        border-radius: 8px;
-        margin: 18px 0 8px 0;
-        font-weight: 650;
-        color: #0f5132;
-    }
-    div[data-testid="stMetric"] {
-        background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
-        border: 1px solid #dbe7f3;
-        border-radius: 14px;
-        padding: 10px 12px;
-        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
-    }
-    div[data-testid="stMetricLabel"] {
-        font-weight: 700;
-    }
-    div[data-testid="stMetricValue"] {
-        color: #0b6b5f;
-    }
-    div[data-testid="stDataFrame"] {
-        border-radius: 12px;
-        overflow: hidden;
-        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.03);
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-def hero_header(title: str) -> None:
-    st.markdown(f'<div class="section-hero">{title}</div>', unsafe_allow_html=True)
-
-def data_header(title: str) -> None:
-    st.markdown(f'<div class="section-data">{title}</div>', unsafe_allow_html=True)
-
-def bold_label(text: str) -> None:
-    st.markdown(f"**{text}**")
-
-def style_total_rows(df: pd.DataFrame):
-    def highlight(row):
-        is_total = False
-        for col in ["month", "Month", "Year", "year"]:
-            if col in row.index and str(row[col]).strip().upper() == "TOTAL":
-                is_total = True
-        base = []
-        for _ in row.index:
-            if is_total:
-                base.append("font-weight: 700; background-color: #eef4fb;")
-            else:
-                base.append("")
-        return base
-
-    return (
-        df.style
-        .apply(highlight, axis=1)
-        .set_table_styles(
-            [
-                {
-                    "selector": "thead th",
-                    "props": [
-                        ("background", "#e8f7f1"),
-                        ("color", "#0b6b5f"),
-                        ("font-weight", "700"),
-                        ("border-bottom", "1px solid #cbd5e1"),
-                        ("padding", "8px 10px"),
-                    ],
-                },
-                {
-                    "selector": "tbody tr:nth-child(even)",
-                    "props": [("background-color", "#fbfdff")],
-                },
-                {
-                    "selector": "tbody td",
-                    "props": [("border-color", "#e5e7eb"), ("padding", "7px 10px")],
-                },
-            ]
-        )
-    )
-
-def metric_value_or_blank(x):
-    return "" if pd.isna(x) else f"{x:,.2f}"
-
-
-def draw_side_legend(items: list[tuple[str, str, str | None]]) -> None:
-    rows = []
-    for label, color, style in items:
-        symbol = '■'
-        if style == 'line':
-            symbol = '━━'
-        elif style == 'dashed':
-            symbol = '┅┅'
-        elif style == 'area':
-            symbol = '▉'
-        rows.append(f'<div style="display:flex; align-items:center; gap:8px; margin:4px 0;"><span style="color:{color}; font-weight:700; min-width:24px;">{symbol}</span><span>{label}</span></div>')
-    st.markdown(''.join(rows), unsafe_allow_html=True)
-
-if "bess_admin_password" in st.secrets:
-    pwd = st.text_input("Password", type="password")
-    if pwd != st.secrets["bess_admin_password"]:
-        st.stop()
-
+# =========================================================
+# CONFIG
+# =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+
 DATA_DIR = BASE_DIR / "data"
-FORWARD_DIR = BASE_DIR / "forward_curves"
+HISTORICAL_DIR = BASE_DIR / "historical_data"
+OUTPUT_DIR = BASE_DIR / "reports"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-def resolve_existing(*paths: Path) -> Path:
-    for path in paths:
-        if path.exists():
-            return path
-    return paths[0]
+MADRID_TZ = ZoneInfo("Europe/Madrid")
+LIVE_START_DATE = date(2026, 1, 1)
 
-PRICE_RAW_CSV_PATH = resolve_existing(
-    DATA_DIR / "hourly_avg_price_since2021.xlsx",
-    DATA_DIR / "historical_prices.xlsx",
-    BASE_DIR / "hourly_avg_price_since2021.xlsx",
-    BASE_DIR / "historical_prices.xlsx",
-    BASE_DIR / "historical_data" / "day_ahead_spain_spot_600_raw.csv",
-)
-DEFAULT_DATA_XLSX = resolve_existing(
-    DATA_DIR / "data.xlsx",
-    BASE_DIR / "data.xlsx",
-)
-DEFAULT_SOLAR_PROFILE_XLSX = resolve_existing(
-    DATA_DIR / "profile_production_1y_hourly.xlsx",
-    BASE_DIR / "profile_production_1y_hourly.xlsx",
-)
-DEFAULT_DEGRADATION_XLSX = resolve_existing(
-    DATA_DIR / "BESS degradation_SOH(%).xlsx",
-    BASE_DIR / "BESS degradation_SOH(%).xlsx",
-)
+HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
+HIST_SOLAR_FILE = DATA_DIR / "p48solar_since21.csv"
+HIST_WORKBOOK_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
+HIST_MIX_FILE = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
+HIST_INSTALLED_CAP_FILE = DATA_DIR / "installed_capacity_monthly.xlsx"
+DEMAND_RAW_FILE = HISTORICAL_DIR / "demand_p48_total_10027_raw.csv"
 
-FORWARD_PROVIDER_FILES = {
-    "Aurora": resolve_existing(
-        DATA_DIR / "Aurora Q1-26 central.xlsx",
-        BASE_DIR / "Aurora Q1-26 central.xlsx",
-        FORWARD_DIR / "Aurora Q1-26 central.xlsx",
-    ),
-    "Baringa": resolve_existing(
-        DATA_DIR / "Baringa nominal.xlsx",
-        FORWARD_DIR / "Baringa nominal.xlsx",
-    ),
+LOGO_CANDIDATES = [
+    DATA_DIR / "nexwell-power-.jpg",
+    DATA_DIR / "nexwell-power.jpg",
+    BASE_DIR / "Data" / "nexwell-power-.jpg",
+    BASE_DIR / "Data" / "nexwell-power.jpg",
+    Path("/mnt/data/nexwell-power-.jpg"),
+    Path("/mnt/data/ghostwriter_images/context/6d7e5c15-89e2-5173-8381-e2b0a0d78467.jpg"),
+]
+
+PRICE_INDICATOR_ID = 600
+SOLAR_P48_INDICATOR_ID = 84
+DEMAND_INDICATOR_ID = 10027
+
+CORP_GREEN_DARK = "#0F766E"
+CORP_GREEN = "#10B981"
+CORP_GREY = "#4B5563"
+LIGHT_GREY = "#F3F4F6"
+
+YEAR_COLORS = ["#1D4ED8", "#059669", "#D97706", "#7C3AED", "#DC2626"]
+
+LOCAL_MIX_TECH_MAP = {
+    "Hidráulica": "Hydro",
+    "Hidroeólica": "Other renewables",
+    "Turbinación bombeo": "Pumped hydro",
+    "Nuclear": "Nuclear",
+    "Carbón": "Coal",
+    "Fuel + Gas": "Fuel + Gas",
+    "Turbina de vapor": "Steam turbine",
+    "Ciclo combinado": "CCGT",
+    "Eólica": "Wind",
+    "Solar fotovoltaica": "Solar PV",
+    "Solar térmica": "Solar thermal",
+    "Otras renovables": "Other renewables",
+    "Cogeneración": "CHP",
+    "Residuos no renovables": "Other non-renewables",
+    "Residuos renovables": "Biomass",
+    "Biogás": "Biogas",
+    "Biomasa": "Biomass",
 }
 
+TECH_ORDER = [
+    "CCGT", "Hydro", "Pumped hydro", "Nuclear", "Solar PV", "Solar thermal",
+    "Wind", "CHP", "Biomass", "Biogas", "Other renewables", "Coal",
+    "Fuel + Gas", "Steam turbine", "Other non-renewables"
+]
+
+REE_API_BASE = "https://apidatos.ree.es/es/datos"
+REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+
+# =========================================================
+# STREAMLIT PAGE
+# =========================================================
+st.set_page_config(page_title="Monthly YTD Email Report", layout="wide")
+st.markdown(
+    """
+    <style>
+    h1 {font-size: 2rem !important;}
+    h2, h3 {font-size: 1.2rem !important;}
+    .stDataFrame td, .stDataFrame th {font-size: 13px !important;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.title("Nexwell Power - Monthly YTD Email Report")
+
+if "email_admin_password" in st.secrets:
+    pwd = st.text_input("Password", type="password")
+    if pwd != st.secrets["email_admin_password"]:
+        st.stop()
 
 # =========================================================
 # HELPERS
 # =========================================================
-def is_leap_year(year: int) -> bool:
-    return calendar.isleap(year)
+def now_madrid() -> datetime:
+    return datetime.now(MADRID_TZ)
 
 
-def hours_in_year(year: int) -> int:
-    return 8784 if is_leap_year(year) else 8760
+def parse_emails(raw: str) -> list[str]:
+    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
 
 
-def make_year_hour_index(year: int) -> pd.DataFrame:
-    idx = pd.date_range(
-        start=f"{year}-01-01 00:00:00",
-        end=f"{year}-12-31 23:00:00",
-        freq="h",
-    )
-    df = pd.DataFrame({"timestamp": idx})
-    df["Date"] = df["timestamp"].dt.date
-    df["Hour"] = df["timestamp"].dt.hour + 1
-    df["year"] = year
-    df["hour_of_year"] = np.arange(1, len(df) + 1)
+def fmt_num(x, decimals=2, suffix="") -> str:
+    if x is None or pd.isna(x):
+        return "-"
+    return f"{x:,.{decimals}f}{suffix}"
+
+
+def fmt_pct(x, decimals=1) -> str:
+    if x is None or pd.isna(x):
+        return "-"
+    return f"{x:.{decimals}%}"
+
+
+def pct_change(current, previous):
+    if previous is None or pd.isna(previous) or previous == 0 or pd.isna(current):
+        return pd.NA
+    return current / previous - 1
+
+
+def value_change(current, previous):
+    if pd.isna(current) or pd.isna(previous):
+        return pd.NA
+    return current - previous
+
+
+def period_filter(df: pd.DataFrame, start: date, end: date) -> pd.Series:
+    """
+    Robust date filter. Some loaders can return an empty frame or a frame whose
+    datetime column is object/string typed. Convert locally so Streamlit does
+    not crash with: Can only use .dt accessor with datetimelike values.
+    """
+    if df is None or df.empty or "datetime" not in df.columns:
+        return pd.Series(False, index=df.index if df is not None else None)
+
+    dt = pd.to_datetime(df["datetime"], errors="coerce")
+    return (dt.dt.date >= start) & (dt.dt.date <= end)
+
+
+def month_end_day(year: int, month: int) -> int:
+    return int((pd.Timestamp(date(year, month, 1)) + pd.offsets.MonthEnd(0)).day)
+
+
+def month_window(year: int, month: int, cutoff_month: int, cutoff_day: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    if month < cutoff_month:
+        end = date(year, month, month_end_day(year, month))
+    elif month == cutoff_month:
+        end = date(year, month, min(cutoff_day, month_end_day(year, month)))
+    else:
+        end = date(year, month, month_end_day(year, month))
+    return start, end
+
+
+def find_logo_path() -> Path | None:
+    for p in LOGO_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def image_to_b64(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("utf-8")
+
+
+def df_to_html_table(df: pd.DataFrame, pct_cols: list[str] | None = None) -> str:
+    pct_cols = pct_cols or []
+    out = df.copy()
+    for c in out.columns:
+        if c in pct_cols:
+            out[c] = out[c].map(lambda v: "" if pd.isna(v) else f"{v:.1%}")
+        elif pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].map(lambda v: "" if pd.isna(v) else f"{v:,.2f}")
+    css = """
+    <style>
+    table.email-table{border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;}
+    table.email-table th{background:#4B5563;color:white;border:1px solid #d1d5db;padding:7px;text-align:center;}
+    table.email-table td{border:1px solid #e5e7eb;padding:7px;text-align:center;}
+    </style>
+    """
+    return css + out.to_html(index=False, classes="email-table", border=0, escape=False)
+
+
+def metric_cards_html(items: list[tuple[str, str, str | None]]) -> str:
+    cards = []
+    for title, value, delta in items:
+        delta_html = f'<div style="font-size:12px;color:#475569;margin-top:4px;">{delta}</div>' if delta else ""
+        cards.append(f"""
+        <div style="flex:1 1 180px;min-width:180px;border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#f8fafc;">
+          <div style="font-size:12px;color:#475569;margin-bottom:5px;">{title}</div>
+          <div style="font-size:19px;font-weight:700;color:#111827;">{value}</div>
+          {delta_html}
+        </div>
+        """)
+    return '<div style="display:flex;gap:10px;flex-wrap:wrap;">' + ''.join(cards) + '</div>'
+
+
+def fig_to_b64(fig) -> str:
+    buf = BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+def year_color_map(years: list[int]) -> dict[int, str]:
+    years = sorted(set(years))
+    return {y: YEAR_COLORS[i % len(YEAR_COLORS)] for i, y in enumerate(years)}
+
+
+def _empty_df(columns: list[str]) -> pd.DataFrame:
+    df = pd.DataFrame(columns=columns)
+    if "datetime" in columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     return df
 
 
-def standardize_price_history_from_day_ahead(raw_csv_path: Path) -> pd.DataFrame:
-    if not raw_csv_path.exists():
-        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
+# =========================================================
+# HISTORICAL LOADERS
+# =========================================================
+def parse_mixed_date(value):
+    if pd.isna(value):
+        return pd.NaT
+    s = str(value).strip()
+    if not s:
+        return pd.NaT
+    try:
+        ts = pd.to_datetime(s, utc=True, errors="raise")
+        return ts.tz_convert("Europe/Madrid").tz_localize(None)
+    except Exception:
+        pass
+    try:
+        return pd.to_datetime(s, dayfirst=True, errors="raise")
+    except Exception:
+        return pd.NaT
 
-    if raw_csv_path.suffix.lower() in {".xlsx", ".xls"}:
+
+@st.cache_data(show_spinner=False)
+def load_historical_prices() -> pd.DataFrame:
+    if not HIST_PRICES_FILE.exists():
+        return _empty_df(["datetime", "price"])
+    try:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name="prices_hourly_avg")
+    except Exception:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name=0)
+    if "price" not in df.columns and "value" in df.columns:
+        df = df.rename(columns={"value": "price"})
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    return df.dropna(subset=["datetime", "price"])[["datetime", "price"]].sort_values("datetime").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_historical_solar() -> pd.DataFrame:
+    if HIST_WORKBOOK_FILE.exists():
         try:
-            xls = pd.ExcelFile(raw_csv_path)
-            sheet_name = "prices_hourly_avg" if "prices_hourly_avg" in xls.sheet_names else xls.sheet_names[0]
-            df = pd.read_excel(raw_csv_path, sheet_name=sheet_name)
+            df = pd.read_excel(HIST_WORKBOOK_FILE, sheet_name="solar_hourly_best")
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df["solar_best_mw"] = pd.to_numeric(df["solar_best_mw"], errors="coerce")
+            if "solar_source" not in df.columns:
+                df["solar_source"] = "Historical workbook"
+            return df.dropna(subset=["datetime", "solar_best_mw"])[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
         except Exception:
-            df = pd.read_excel(raw_csv_path)
+            pass
+    if not HIST_SOLAR_FILE.exists():
+        return _empty_df(["datetime", "solar_best_mw", "solar_source"])
+    df = pd.read_csv(HIST_SOLAR_FILE)
+    if "solar_best_mw" not in df.columns and "value" in df.columns:
+        df = df.rename(columns={"value": "solar_best_mw"})
+    if "solar_source" not in df.columns:
+        df["solar_source"] = "Historical file"
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["solar_best_mw"] = pd.to_numeric(df["solar_best_mw"], errors="coerce")
+    return df.dropna(subset=["datetime", "solar_best_mw"])[["datetime", "solar_best_mw", "solar_source"]].sort_values("datetime").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_generation_mix_daily() -> pd.DataFrame:
+    if not HIST_MIX_FILE.exists():
+        return _empty_df(["datetime", "technology", "energy_mwh", "data_source"])
+    raw = pd.read_excel(HIST_MIX_FILE, sheet_name="data", header=None)
+    date_values = raw.iloc[4, 1:].tolist()
+    dates = []
+    for v in date_values:
+        dt = pd.to_datetime(v, utc=True, errors="coerce")
+        if pd.notna(dt):
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None).normalize()
+        else:
+            dt = parse_mixed_date(v)
+            if pd.notna(dt):
+                dt = pd.Timestamp(dt).normalize()
+        dates.append(dt)
+    records = []
+    for _, row in raw.iloc[5:19, :].iterrows():
+        tech_raw = str(row.iloc[0]).strip()
+        tech = LOCAL_MIX_TECH_MAP.get(tech_raw, tech_raw)
+        if tech.lower().startswith("generación total") or tech.lower().startswith("generacion total"):
+            continue
+        vals = pd.to_numeric(row.iloc[1:], errors="coerce")
+        for dt, val in zip(dates, vals):
+            if pd.notna(dt) and pd.notna(val):
+                records.append({
+                    "datetime": pd.Timestamp(dt).normalize(),
+                    "technology": tech,
+                    "energy_mwh": float(val) * 1000.0,
+                    "data_source": "Historical file",
+                })
+    out = pd.DataFrame(records)
+    if out.empty:
+        return _empty_df(["datetime", "technology", "energy_mwh", "data_source"])
+    return out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_installed_capacity_monthly() -> pd.DataFrame:
+    if not HIST_INSTALLED_CAP_FILE.exists():
+        return _empty_df(["datetime", "technology", "capacity_mw"])
+    raw = pd.read_excel(HIST_INSTALLED_CAP_FILE, sheet_name="data", header=None)
+    dates = [parse_mixed_date(v) for v in raw.iloc[4, 1:].tolist()]
+    records = []
+    for _, row in raw.iloc[5:19, :].iterrows():
+        tech_raw = str(row.iloc[0]).strip()
+        tech = LOCAL_MIX_TECH_MAP.get(tech_raw, tech_raw)
+        for col_idx, dt in enumerate(dates, start=1):
+            if pd.isna(dt):
+                continue
+            val = pd.to_numeric(row.iloc[col_idx], errors="coerce")
+            if pd.notna(val):
+                records.append({
+                    "datetime": pd.Timestamp(dt).to_period("M").to_timestamp(),
+                    "technology": tech,
+                    "capacity_mw": float(val),
+                })
+    out = pd.DataFrame(records)
+    if out.empty:
+        return _empty_df(["datetime", "technology", "capacity_mw"])
+    return out.groupby(["datetime", "technology"], as_index=False)["capacity_mw"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_demand_raw() -> pd.DataFrame:
+    if not DEMAND_RAW_FILE.exists():
+        return _empty_df(["datetime", "demand_mwh"])
+    df = pd.read_csv(DEMAND_RAW_FILE)
+    if "datetime" not in df.columns:
+        return _empty_df(["datetime", "demand_mwh"])
+    value_col = "value" if "value" in df.columns else ("demand_mw" if "demand_mw" in df.columns else None)
+    if value_col is None:
+        return _empty_df(["datetime", "demand_mwh"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["datetime", value_col]).sort_values("datetime")
+    diffs = df["datetime"].diff().dt.total_seconds().div(3600).dropna()
+    interval_h = 0.25 if not diffs.empty and diffs.median() <= 0.30 else 1.0
+    df["demand_mwh"] = df[value_col] * interval_h
+    df["datetime"] = df["datetime"].dt.floor("h")
+    return df.groupby("datetime", as_index=False)["demand_mwh"].sum().sort_values("datetime").reset_index(drop=True)
+
+
+# =========================================================
+# ESIOS / REE LIVE HELPERS
+# =========================================================
+def require_esios_token() -> str | None:
+    return (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip() or None
+
+
+def build_headers(token: str) -> dict:
+    return {
+        "Accept": "application/json; application/vnd.esios-api-v1+json",
+        "Content-Type": "application/json",
+        "x-api-key": token,
+    }
+
+
+def parse_esios_indicator(raw_json: dict, source_name: str) -> pd.DataFrame:
+    values = raw_json.get("indicator", {}).get("values", [])
+    if not values:
+        return _empty_df(["datetime", "value", "source", "geo_name", "geo_id"])
+    df = pd.DataFrame(values)
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+    if (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
     else:
-        df = pd.read_csv(raw_csv_path)
-
-    if df.empty:
-        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
-
-    col_map = {str(c).lower().strip(): c for c in df.columns}
-    dt_col = col_map.get("datetime")
-    value_col = col_map.get("value") or col_map.get("price") or col_map.get("price_eur_mwh")
-
-    if dt_col is None or value_col is None:
-        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
-
-    df["datetime"] = pd.to_datetime(df[dt_col], errors="coerce")
-    df["value"] = pd.to_numeric(df[value_col], errors="coerce")
-    df = df.dropna(subset=["datetime", "value"]).copy()
-    if df.empty:
-        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
-
-    df = df.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").copy()
-    df["timestamp"] = df["datetime"].dt.floor("h")
-    hourly = (
-        df.groupby("timestamp", as_index=False)["value"]
-        .mean()
-        .rename(columns={"value": "price"})
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-
-    hourly["Date"] = hourly["timestamp"].dt.date
-    hourly["Hour"] = hourly["timestamp"].dt.hour + 1
-    hourly["year"] = hourly["timestamp"].dt.year
-    hourly["hour_of_year"] = hourly.groupby("year").cumcount() + 1
-    return hourly
+        geo = df["geo_name"].astype(str).str.strip().str.lower()
+        if (geo == "españa").any():
+            df = df[geo == "españa"].copy()
+        elif (geo == "espana").any():
+            df = df[geo == "espana"].copy()
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+    else:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    df["datetime"] = dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["source"] = source_name
+    return df.dropna(subset=["datetime", "value"])[["datetime", "value", "source", "geo_name", "geo_id"]].sort_values("datetime")
 
 
-def load_default_data_xlsx(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame(columns=["Date", "Hour", "omie_venta", "omie_compra", "generacion", "consumo"])
-
-    df = pd.read_excel(path, sheet_name=0)
-    if df.empty:
-        return pd.DataFrame(columns=["Date", "Hour", "omie_venta", "omie_compra", "generacion", "consumo"])
-
-    rename_map = {}
-    cols = list(df.columns)
-    if len(cols) >= 6:
-        rename_map = {
-            cols[0]: "Date",
-            cols[1]: "Hour",
-            cols[2]: "omie_venta",
-            cols[3]: "omie_compra",
-            cols[4]: "generacion",
-            cols[5]: "consumo",
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_esios_range(indicator_id: int, start_day: date, end_day: date, token: str) -> pd.DataFrame:
+    if start_day > end_day:
+        return _empty_df(["datetime", "value"])
+    frames = []
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    chunk_start = start_day
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=13))
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        params = {
+            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_trunc": "quarter_hour" if chunk_start >= date(2025, 10, 1) else "hour",
         }
-    df = df.rename(columns=rename_map)
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    for c in ["Hour", "omie_venta", "omie_compra", "generacion", "consumo"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["Date", "Hour"]).copy()
-    df["year"] = df["Date"].dt.year
-    df["hour_of_year"] = df.groupby("year").cumcount() + 1
-    return df
-
-
-def load_default_solar_profile(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Default solar profile not found: {path}")
-
-    df = pd.read_excel(path)
-    if df.empty:
-        raise ValueError("Default solar profile is empty.")
-
-    col_map = {c.lower().strip(): c for c in df.columns}
-    gen_col = None
-    for candidate in ["generation", "generacion", "gen"]:
-        if candidate in col_map:
-            gen_col = col_map[candidate]
-            break
-
-    if gen_col is None:
-        raise ValueError("Default solar profile must contain generation/generacion/gen column.")
-
-    out = pd.DataFrame({"generation": pd.to_numeric(df[gen_col], errors="coerce").fillna(0.0)})
-    out["hour_of_year"] = np.arange(1, len(out) + 1)
-    return out
+        try:
+            resp = requests.get(url, headers=build_headers(token), params=params, timeout=(15, 90))
+            resp.raise_for_status()
+            parsed = parse_esios_indicator(resp.json(), f"esios_{indicator_id}")
+            if not parsed.empty:
+                frames.append(parsed)
+        except Exception:
+            pass
+        chunk_start = chunk_end + timedelta(days=1)
+    if not frames:
+        return _empty_df(["datetime", "value"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime")
 
 
-def load_degradation_profile(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame(columns=["year", "soh"])
-
-    df = pd.read_excel(path)
-    if df.empty:
-        return pd.DataFrame(columns=["year", "soh"])
-
-    col_map = {c.lower().strip(): c for c in df.columns}
-    year_col = None
-    soh_col = None
-
-    for candidate in ["year"]:
-        if candidate in col_map:
-            year_col = col_map[candidate]
-            break
-
-    for candidate in ["soh(%)", "soh", "state of health", "state_of_health"]:
-        if candidate in col_map:
-            soh_col = col_map[candidate]
-            break
-
-    if year_col is None or soh_col is None:
-        raise ValueError("Degradation file must contain columns year and SOH(%).")
-
-    out = df[[year_col, soh_col]].copy()
-    out.columns = ["year", "soh"]
-    out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
-    out["soh"] = pd.to_numeric(out["soh"], errors="coerce")
-    out = out.dropna(subset=["year", "soh"]).copy()
-
-    # If values are in 0-100 convert to 0-1
-    if out["soh"].max() > 1.5:
-        out["soh"] = out["soh"] / 100.0
-
-    return out.sort_values("year").reset_index(drop=True)
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_ree_widget(category: str, widget: str, start_day: date, end_day: date, time_trunc: str = "day") -> dict:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": time_trunc,
+        **REE_PENINSULAR_PARAMS,
+    }
+    url = f"{REE_API_BASE}/{category}/{widget}"
+    resp = requests.get(url, params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def normalize_generation_upload(uploaded_file, target_years: list[int], scale_factor: float = 1.0) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_file)
-    if df.empty:
-        raise ValueError("Uploaded generation file is empty.")
-
-    col_map = {c.lower().strip(): c for c in df.columns}
-    gen_col = None
-
-    for candidate in ["generation", "generacion", "gen"]:
-        if candidate in col_map:
-            gen_col = col_map[candidate]
-            break
-
-    if gen_col is None:
-        raise ValueError("Generation file must contain a column named generation, generacion, or gen.")
-
-    date_col = col_map.get("date")
-    hour_col = col_map.get("hour")
-
-    if date_col and hour_col:
-        tmp = df[[date_col, hour_col, gen_col]].copy()
-        tmp.columns = ["Date", "Hour", "generation"]
-        tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
-        tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
-        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0) * scale_factor
-        tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
-        tmp["year"] = tmp["Date"].dt.year
-        tmp["hour_of_year"] = tmp.groupby("year").cumcount() + 1
-        source_year = sorted(tmp["year"].dropna().unique().tolist())[0]
-        base = tmp[tmp["year"] == source_year][["hour_of_year", "generation"]].copy()
-    else:
-        tmp = df[[gen_col]].copy()
-        tmp.columns = ["generation"]
-        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0) * scale_factor
-        base = tmp.reset_index(drop=True).copy()
-        base["hour_of_year"] = np.arange(1, len(base) + 1)
-
+def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
     rows = []
-    for year in target_years:
-        h = hours_in_year(year)
-        year_idx = make_year_hour_index(year)
-        year_base = base.iloc[:h].copy()
-
-        if len(year_base) < h:
-            year_base = year_base.reindex(range(h)).fillna(0.0)
-            year_base["hour_of_year"] = np.arange(1, h + 1)
-
-        merged = year_idx.merge(year_base[["hour_of_year", "generation"]], on="hour_of_year", how="left")
-        merged["generation"] = merged["generation"].fillna(0.0)
-        rows.append(merged[["timestamp", "Date", "Hour", "year", "generation"]])
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_template_generation_excel(example_path: Path) -> bytes:
-    if example_path.exists():
-        return example_path.read_bytes()
-
-    idx = make_year_hour_index(2025)
-    out = idx[["Hour"]].copy()
-    out["generacion"] = ""
-
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        out.to_excel(writer, index=False, sheet_name="generation_template")
-    bio.seek(0)
-    return bio.getvalue()
-
-
-def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Forward price file not found: {path}")
-
-    df = pd.read_excel(path)
-    if df.empty:
-        raise ValueError("Forward price file is empty.")
-
-    col_map = {c.lower().strip(): c for c in df.columns}
-    date_col = None
-    hour_col = None
-    price_col = None
-    sell_col = None
-    buy_col = None
-
-    for candidate in ["date", "dia"]:
-        if candidate in col_map:
-            date_col = col_map[candidate]
-            break
-
-    for candidate in ["hour", "hora"]:
-        if candidate in col_map:
-            hour_col = col_map[candidate]
-            break
-
-    for candidate in ["price", "precio", "market_price"]:
-        if candidate in col_map:
-            price_col = col_map[candidate]
-            break
-
-    for candidate in ["omie_venta", "sell", "venta"]:
-        if candidate in col_map:
-            sell_col = col_map[candidate]
-            break
-
-    for candidate in ["omie_compra", "buy", "compra"]:
-        if candidate in col_map:
-            buy_col = col_map[candidate]
-            break
-
-    if date_col is None or hour_col is None:
-        raise ValueError("Forward price file must contain dia/date and hora/hour columns.")
-
-    keep = [date_col, hour_col]
-    if price_col is not None:
-        keep.append(price_col)
-    else:
-        if sell_col is None:
-            raise ValueError("Forward price file must contain omie_venta or price.")
-        keep.append(sell_col)
-        if buy_col is not None:
-            keep.append(buy_col)
-
-    tmp = df[keep].copy()
-    rename_map = {date_col: "Date", hour_col: "Hour"}
-    if price_col is not None:
-        rename_map[price_col] = "price"
-    else:
-        rename_map[sell_col] = "omie_venta"
-        if buy_col is not None:
-            rename_map[buy_col] = "omie_compra"
-
-    tmp = tmp.rename(columns=rename_map)
-    tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
-    tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
-    tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
-    tmp["year"] = tmp["Date"].dt.year
-
-    if "price" in tmp.columns:
-        tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
-        tmp["omie_venta"] = tmp["price"]
-        tmp["omie_compra"] = tmp["price"]
-        tmp = tmp.drop(columns=["price"])
-    else:
-        tmp["omie_venta"] = pd.to_numeric(tmp["omie_venta"], errors="coerce")
-        if "omie_compra" not in tmp.columns:
-            tmp["omie_compra"] = tmp["omie_venta"]
-        else:
-            tmp["omie_compra"] = pd.to_numeric(tmp["omie_compra"], errors="coerce").fillna(tmp["omie_venta"])
-
-    tmp["timestamp"] = pd.to_datetime(tmp["Date"]) + pd.to_timedelta(tmp["Hour"] - 1, unit="h")
-    tmp = tmp.sort_values("timestamp").reset_index(drop=True)
-    return tmp[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]]
-
-
-def choose_historical_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) -> pd.DataFrame:
-    if price_hourly.empty:
-        raise ValueError("No hourly electricity price history found from Day Ahead.")
-
-    available_years = sorted(price_hourly["year"].unique().tolist())
-    src_year = target_year if target_year in available_years else max(available_years)
-
-    src = price_hourly[price_hourly["year"] == src_year].copy()
-    src = src.sort_values("timestamp").reset_index(drop=True)
-    src["hour_of_year"] = np.arange(1, len(src) + 1)
-
-    target_idx = make_year_hour_index(target_year)
-    src_needed = src[["hour_of_year", "price"]].copy()
-
-    max_h = len(target_idx)
-    if len(src_needed) < max_h:
-        src_needed = src_needed.reindex(range(max_h))
-        src_needed["hour_of_year"] = np.arange(1, max_h + 1)
-        src_needed["price"] = src_needed["price"].ffill().bfill()
-
-    merged = target_idx.merge(src_needed[["hour_of_year", "price"]], on="hour_of_year", how="left")
-    merged["price"] = merged["price"].ffill().bfill()
-    merged["omie_venta"] = merged["price"]
-    merged["omie_compra"] = merged["price"]
-    return merged[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]]
-
-
-def build_generic_vectors(default_data: pd.DataFrame, target_years: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if default_data.empty:
-        gen_all = []
-        load_all = []
-        for year in target_years:
-            idx = make_year_hour_index(year)
-            gen = idx[["timestamp", "Date", "Hour", "year"]].copy()
-            gen["generation"] = 0.0
-            load = idx[["timestamp", "Date", "Hour", "year"]].copy()
-            load["consumption"] = 0.0
-            gen_all.append(gen)
-            load_all.append(load)
-        return pd.concat(gen_all, ignore_index=True), pd.concat(load_all, ignore_index=True)
-
-    source_year = sorted(default_data["year"].unique().tolist())[0]
-    base = default_data[default_data["year"] == source_year].copy().sort_values("hour_of_year")
-    base = base[["hour_of_year", "generacion", "consumo"]].copy()
-
-    gen_rows = []
-    load_rows = []
-
-    for year in target_years:
-        idx = make_year_hour_index(year)
-        tmp = idx.merge(base, on="hour_of_year", how="left")
-        tmp["generacion"] = tmp["generacion"].fillna(0.0)
-        tmp["consumo"] = tmp["consumo"].fillna(0.0)
-
-        gen = tmp[["timestamp", "Date", "Hour", "year", "generacion"]].rename(columns={"generacion": "generation"})
-        load = tmp[["timestamp", "Date", "Hour", "year", "consumo"]].rename(columns={"consumo": "consumption"})
-        gen_rows.append(gen)
-        load_rows.append(load)
-
-    return pd.concat(gen_rows, ignore_index=True), pd.concat(load_rows, ignore_index=True)
-
-
-def build_default_solar_generation(target_years: list[int], bess_mw: float, default_solar_profile: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for year in target_years:
-        idx = make_year_hour_index(year)
-        h = len(idx)
-        base = default_solar_profile.iloc[:h].copy()
-
-        if len(base) < h:
-            base = base.reindex(range(h)).fillna(0.0)
-            base["hour_of_year"] = np.arange(1, h + 1)
-
-        merged = idx.merge(base[["hour_of_year", "generation"]], on="hour_of_year", how="left")
-        merged["generation"] = merged["generation"].fillna(0.0) * bess_mw
-        rows.append(merged[["timestamp", "Date", "Hour", "year", "generation"]])
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_price_dataset_for_years(
-    years: list[int],
-    historical_prices: pd.DataFrame,
-    forward_prices: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    hist_years = sorted(historical_prices["year"].unique().tolist()) if not historical_prices.empty else []
-    max_hist_year = max(hist_years) if hist_years else None
-
-    rows = []
-    for year in years:
-        if max_hist_year is not None and year <= max_hist_year:
-            rows.append(choose_historical_price_profile_for_year(historical_prices, year))
-        else:
-            if forward_prices is None or forward_prices.empty:
-                raise ValueError(f"Year {year} requires a forward price curve.")
-            year_df = forward_prices[forward_prices["year"] == year].copy()
-            if year_df.empty:
-                raise ValueError(f"Forward curve does not contain year {year}.")
-            expected_h = hours_in_year(year)
-            if len(year_df) < expected_h:
-                raise ValueError(f"Forward curve for year {year} has {len(year_df)} rows; expected at least {expected_h}.")
-            year_df = year_df.sort_values("timestamp").head(expected_h).copy()
-            rows.append(year_df[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]])
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_dataset(
-    years: list[int],
-    mode: str,
-    historical_prices: pd.DataFrame,
-    default_data: pd.DataFrame,
-    default_solar_profile: pd.DataFrame,
-    bess_mw: float,
-    uploaded_generation_file=None,
-    forward_prices: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    prices = build_price_dataset_for_years(
-        years=years,
-        historical_prices=historical_prices,
-        forward_prices=forward_prices,
-    )
-
-    default_gen, default_load = build_generic_vectors(default_data, years)
-
-    if mode in ["BESS with demand", "BESS without demand"]:
-        if uploaded_generation_file is not None:
-            generation_df = normalize_generation_upload(uploaded_generation_file, years, scale_factor=bess_mw)
-        else:
-            generation_df = build_default_solar_generation(years, bess_mw, default_solar_profile)
-    else:
-        generation_df = default_gen.copy()
-        generation_df["generation"] = 0.0
-
-    load_df = default_load.copy()
-
-    df = prices.merge(generation_df[["timestamp", "generation"]], on="timestamp", how="left")
-    df = df.merge(load_df[["timestamp", "consumption"]], on="timestamp", how="left")
-
-    df["generation"] = df["generation"].fillna(0.0)
-    df["consumption"] = df["consumption"].fillna(0.0)
-
-    if mode == "Standalone BESS":
-        df["omie_compra"] = df["omie_venta"]
-        df["generation"] = 0.0
-        df["consumption"] = 0.0
-
-    elif mode == "BESS with demand":
-        df["omie_compra"] = df["omie_venta"]
-
-    elif mode == "BESS without demand":
-        df["omie_compra"] = 1000.0
-        df["consumption"] = 0.0
-
-    else:
-        raise ValueError("Unknown mode selected.")
-
-    df = df.rename(columns={"Date": "dia", "Hour": "hora", "generation": "generacion", "consumption": "consumo"})
-    return df[["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"]].copy()
-
-
-def build_effective_capacity_table(
-    years: list[int],
-    base_capacity_mwh: float,
-    use_degradation: bool,
-    degradation_df: pd.DataFrame,
-    max_historical_year: int | None,
-) -> pd.DataFrame:
-    rows = []
-    soh_map = {}
-    if not degradation_df.empty:
-        soh_map = dict(zip(degradation_df["year"].astype(int), degradation_df["soh"]))
-
-    for year in years:
-        soh = 1.0
-        degraded = False
-        if use_degradation and max_historical_year is not None and year > max_historical_year:
-            degraded = True
-            if year in soh_map:
-                soh = float(soh_map[year])
-            elif soh_map:
-                eligible = [y for y in soh_map.keys() if y <= year]
-                if eligible:
-                    soh = float(soh_map[max(eligible)])
-                else:
-                    soh = 1.0
-        effective_capacity = base_capacity_mwh * soh
-        rows.append(
-            {
-                "year": year,
-                "SOH": soh,
-                "effective_capacity_mwh": effective_capacity,
-                "status": "degraded" if degraded else "undegraded",
-            }
-        )
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
+            rows.append({
+                "datetime": dt,
+                "title": str(title).strip(),
+                value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
+            })
     return pd.DataFrame(rows)
 
 
-def optimize_day_pulp(
-    df_day: pd.DataFrame,
-    capacity_mwh: float,
-    power_mw: float,
+def normalize_ree_energy_to_mwh(series: pd.Series) -> pd.Series:
+    vals = pd.to_numeric(series, errors="coerce")
+    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
+    if pd.notna(max_abs) and max_abs < 10000:
+        return vals * 1000.0
+    return vals
+
+
+def _postprocess_ree_mix_df(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    if df.empty:
+        return _empty_df(["datetime", "technology", "energy_mwh", "data_source"])
+    if freq == "month":
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    else:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
+    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+    df["energy_mwh"] = normalize_ree_energy_to_mwh(df["value"])
+    df["data_source"] = "REE API"
+    df = df.dropna(subset=["datetime", "technology", "energy_mwh"]).copy()
+    df = df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum()
+    return df.sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_mix_daily_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return _empty_df(["datetime", "technology", "energy_mwh", "data_source"])
+    try:
+        payload = fetch_ree_widget("generacion", "estructura-generacion", start_day, end_day, time_trunc="day")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return _empty_df(["datetime", "technology", "energy_mwh", "data_source"])
+    return _postprocess_ree_mix_df(df, freq="day")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_demand_monthly_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return _empty_df(["datetime", "demand_mwh"])
+    try:
+        payload = fetch_ree_widget("demanda", "ire-general", start_day, end_day, time_trunc="month")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return _empty_df(["datetime", "demand_mwh"])
+    if df.empty:
+        return _empty_df(["datetime", "demand_mwh"])
+    df["title_norm"] = df["title"].astype(str).str.strip().str.lower()
+    preferred = df[df["title_norm"].str.contains("real", na=False)].copy()
+    if preferred.empty:
+        preferred = df.copy()
+    preferred["datetime"] = pd.to_datetime(preferred["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    preferred["demand_mwh"] = pd.to_numeric(preferred["value"], errors="coerce") * 1000.0
+    preferred = preferred.dropna(subset=["datetime", "demand_mwh"]).copy()
+    return preferred.groupby("datetime", as_index=False)["demand_mwh"].sum().sort_values("datetime").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return _empty_df(["datetime", "technology", "capacity_mw"])
+    try:
+        payload = fetch_ree_widget("generacion", "potencia-instalada", start_day, end_day, time_trunc="month")
+        df = parse_ree_included_series(payload, value_field="value")
+    except Exception:
+        return _empty_df(["datetime", "technology", "capacity_mw"])
+    if df.empty:
+        return _empty_df(["datetime", "technology", "capacity_mw"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+    df["capacity_mw"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
+    return df.groupby(["datetime", "technology"], as_index=False)["capacity_mw"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+def append_live_price_solar_demand(
+    price_hourly: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    demand_hourly: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+    token: str | None,
+):
+    if not token or end_day < LIVE_START_DATE:
+        return price_hourly, solar_hourly, demand_hourly
+    live_start = max(start_day, LIVE_START_DATE)
+
+    raw_price = fetch_esios_range(PRICE_INDICATOR_ID, live_start, end_day, token)
+    if not raw_price.empty:
+        lp = raw_price.copy()
+        lp["datetime"] = lp["datetime"].dt.floor("h")
+        lp = lp.groupby("datetime", as_index=False)["value"].mean().rename(columns={"value": "price"})
+        price_hourly = pd.concat([price_hourly[~price_hourly["datetime"].isin(lp["datetime"])], lp], ignore_index=True)
+
+    raw_solar = fetch_esios_range(SOLAR_P48_INDICATOR_ID, live_start, end_day, token)
+    if not raw_solar.empty:
+        ls = raw_solar.copy()
+        ls["datetime"] = ls["datetime"].dt.floor("h")
+        ls = ls.groupby("datetime", as_index=False)["value"].mean().rename(columns={"value": "solar_best_mw"})
+        ls["solar_source"] = "ESIOS P48"
+        solar_hourly = pd.concat([solar_hourly[~solar_hourly["datetime"].isin(ls["datetime"])], ls], ignore_index=True)
+
+    raw_demand = fetch_esios_range(DEMAND_INDICATOR_ID, live_start, end_day, token)
+    if not raw_demand.empty:
+        ld = raw_demand.copy().sort_values("datetime")
+        diffs = ld["datetime"].diff().dt.total_seconds().div(3600).dropna()
+        interval_h = 0.25 if not diffs.empty and diffs.median() <= 0.30 else 1.0
+        ld["demand_mwh"] = pd.to_numeric(ld["value"], errors="coerce") * interval_h
+        ld["datetime"] = ld["datetime"].dt.floor("h")
+        ld = ld.groupby("datetime", as_index=False)["demand_mwh"].sum()
+        demand_hourly = pd.concat([demand_hourly[~demand_hourly["datetime"].isin(ld["datetime"])], ld], ignore_index=True)
+
+    return (
+        price_hourly.sort_values("datetime").reset_index(drop=True),
+        solar_hourly.sort_values("datetime").reset_index(drop=True),
+        demand_hourly.sort_values("datetime").reset_index(drop=True),
+    )
+
+
+def append_live_mix_capacity(mix_daily: pd.DataFrame, capacity_monthly: pd.DataFrame, current_window_start: date, current_window_end: date):
+    live_mix = load_live_mix_daily_from_ree(current_window_start, current_window_end)
+    if not live_mix.empty:
+        mix_daily = pd.concat([
+            mix_daily[~mix_daily["datetime"].isin(live_mix["datetime"].unique())],
+            live_mix,
+        ], ignore_index=True)
+        mix_daily = mix_daily.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+    live_capacity = load_live_installed_capacity_from_ree(current_window_start, current_window_end)
+    if not live_capacity.empty:
+        capacity_monthly = pd.concat([
+            capacity_monthly[~capacity_monthly[["datetime", "technology"]].apply(tuple, axis=1).isin(live_capacity[["datetime", "technology"]].apply(tuple, axis=1))],
+            live_capacity,
+        ], ignore_index=True)
+        capacity_monthly = capacity_monthly.groupby(["datetime", "technology"], as_index=False)["capacity_mw"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+    live_demand_monthly = load_live_demand_monthly_from_ree(current_window_start, current_window_end)
+    return mix_daily, capacity_monthly, live_demand_monthly
+
+
+# =========================================================
+# METRICS / TABLES
+# =========================================================
+@dataclass
+class PeriodWindow:
+    label: str
+    year: int
+    start: date
+    end: date
+
+
+def compute_price_solar_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, window: PeriodWindow) -> dict:
+    p = price_hourly[period_filter(price_hourly, window.start, window.end)].copy()
+    s = solar_hourly[period_filter(solar_hourly, window.start, window.end)].copy()
+    merged = p.merge(s[["datetime", "solar_best_mw"]], on="datetime", how="left") if not p.empty else pd.DataFrame()
+    if not merged.empty:
+        merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+        solar_positive = merged[merged["solar_best_mw"] > 0].copy()
+        solar_uncurtailed_mwh = merged["solar_best_mw"].sum()
+        uncurtailed_value = (merged["price"] * merged["solar_best_mw"]).sum()
+        curtailed_mw = merged["solar_best_mw"].where(merged["price"] > 0, 0.0)
+        curtailed_mwh = curtailed_mw.sum()
+        curtailed_value = (merged["price"].clip(lower=0) * curtailed_mw).sum()
+    else:
+        solar_positive = pd.DataFrame()
+        solar_uncurtailed_mwh = curtailed_mwh = uncurtailed_value = curtailed_value = 0.0
+    avg_price = p["price"].mean() if not p.empty else pd.NA
+    captured_unc = uncurtailed_value / solar_uncurtailed_mwh if solar_uncurtailed_mwh > 0 else pd.NA
+    captured_cur = curtailed_value / curtailed_mwh if curtailed_mwh > 0 else pd.NA
+    return {
+        "Period": window.label,
+        "Avg spot (€/MWh)": avg_price,
+        "Captured solar uncurtailed (€/MWh)": captured_unc,
+        "Captured solar curtailed (€/MWh)": captured_cur,
+        "Solar generation (GWh)": solar_uncurtailed_mwh / 1000.0,
+        "Economic curtailment (GWh)": max(solar_uncurtailed_mwh - curtailed_mwh, 0) / 1000.0,
+        "Economic curtailment (%)": (max(solar_uncurtailed_mwh - curtailed_mwh, 0) / solar_uncurtailed_mwh) if solar_uncurtailed_mwh > 0 else pd.NA,
+        "Negative / zero hours": int((p["price"] <= 0).sum()) if not p.empty else 0,
+        "Negative / zero hours (%)": ((p["price"] <= 0).mean()) if not p.empty else pd.NA,
+        "Negative / zero solar hours": int(((merged["price"] <= 0) & (merged["solar_best_mw"] > 0)).sum()) if not merged.empty else 0,
+        "Negative / zero solar hours (%)": (((merged["price"] <= 0) & (merged["solar_best_mw"] > 0)).mean()) if not merged.empty else pd.NA,
+        "Capture rate uncurtailed (%)": captured_unc / avg_price if pd.notna(avg_price) and avg_price != 0 and pd.notna(captured_unc) else pd.NA,
+        "Capture rate curtailed (%)": captured_cur / avg_price if pd.notna(avg_price) and avg_price != 0 and pd.notna(captured_cur) else pd.NA,
+    }
+
+
+def build_ytd_metrics_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+    cur = compute_price_solar_metrics(price_hourly, solar_hourly, current)
+    prev = compute_price_solar_metrics(price_hourly, solar_hourly, previous)
+    metrics = [
+        ("Avg spot", "Avg spot (€/MWh)", "€/MWh", "diff"),
+        ("Captured solar uncurtailed", "Captured solar uncurtailed (€/MWh)", "€/MWh", "diff"),
+        ("Captured solar curtailed", "Captured solar curtailed (€/MWh)", "€/MWh", "diff"),
+        ("Solar generation", "Solar generation (GWh)", "GWh", "pct"),
+        ("Economic curtailment", "Economic curtailment (GWh)", "GWh", "pct"),
+        ("Economic curtailment", "Economic curtailment (%)", "%", "diff_pct_pts"),
+        ("Negative / zero hours", "Negative / zero hours", "h", "diff"),
+        ("Negative / zero hours", "Negative / zero hours (%)", "%", "diff_pct_pts"),
+        ("Negative / zero solar hours", "Negative / zero solar hours", "h", "diff"),
+        ("Negative / zero solar hours", "Negative / zero solar hours (%)", "%", "diff_pct_pts"),
+        ("Capture rate uncurtailed", "Capture rate uncurtailed (%)", "%", "diff_pct_pts"),
+        ("Capture rate curtailed", "Capture rate curtailed (%)", "%", "diff_pct_pts"),
+    ]
+    rows = []
+    for label, key, unit, mode in metrics:
+        cv, pv = cur.get(key), prev.get(key)
+        rows.append({
+            "Metric": label,
+            f"YTD {current.year}": cv,
+            f"YTD {previous.year}": pv,
+            "Abs. change": value_change(cv, pv),
+            "% change": pct_change(cv, pv) if mode == "pct" else pd.NA,
+            "Unit": unit,
+        })
+    return pd.DataFrame(rows)
+
+
+def _daily_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    p = price_hourly[period_filter(price_hourly, start, end)].copy()
+    s = solar_hourly[period_filter(solar_hourly, start, end)].copy()
+    if p.empty:
+        return _empty_df(["date", "spot", "captured_unc", "captured_cur", "solar_gwh"])
+    merged = p.merge(s[["datetime", "solar_best_mw"]], on="datetime", how="left")
+    merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+    merged["date"] = merged["datetime"].dt.date
+    merged["positive_solar_mw"] = merged["solar_best_mw"].where(merged["price"] > 0, 0.0)
+
+    def _calc(grp: pd.DataFrame) -> pd.Series:
+        solar = grp["solar_best_mw"].sum()
+        solar_pos = grp["positive_solar_mw"].sum()
+        return pd.Series({
+            "spot": grp["price"].mean(),
+            "captured_unc": (grp["price"] * grp["solar_best_mw"]).sum() / solar if solar > 0 else pd.NA,
+            "captured_cur": (grp["price"].clip(lower=0) * grp["positive_solar_mw"]).sum() / solar_pos if solar_pos > 0 else pd.NA,
+            "solar_gwh": solar / 1000.0,
+            "negative_hours": int((grp["price"] <= 0).sum()),
+            "hours": int(len(grp)),
+        })
+
+    out = merged.groupby("date").apply(_calc).reset_index()
+    out["year"] = pd.to_datetime(out["date"]).dt.year
+    out["day_index"] = (pd.to_datetime(out["date"]) - pd.to_datetime(out["year"].astype(str) + "-01-01")).dt.days + 1
+    out["plot_date"] = pd.to_datetime("2000-01-01") + pd.to_timedelta(out["day_index"] - 1, unit="D")
+    return out
+
+
+def build_daily_price_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+    cur = _daily_agg(price_hourly, solar_hourly, current.start, current.end)
+    prev = _daily_agg(price_hourly, solar_hourly, previous.start, previous.end)
+    out = pd.concat([cur, prev], ignore_index=True)
+    if out.empty:
+        return out
+    out["Date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    return out[["Date", "year", "spot", "captured_unc", "captured_cur", "solar_gwh", "negative_hours", "hours"]].rename(columns={
+        "year": "Year",
+        "spot": "Avg spot (€/MWh)",
+        "captured_unc": "Captured uncurtailed (€/MWh)",
+        "captured_cur": "Captured curtailed (€/MWh)",
+        "solar_gwh": "Solar generation (GWh)",
+        "negative_hours": "Negative / zero hours",
+        "hours": "Hours",
+    })
+
+
+def build_monthly_price_solar_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, years: list[int], cutoff_month: int, cutoff_day: int) -> pd.DataFrame:
+    rows = []
+    for y in years:
+        y_cutoff_day = cutoff_day if y == max(years) else min(cutoff_day, month_end_day(y, cutoff_month))
+        for m in range(1, cutoff_month + 1):
+            start, end = month_window(y, m, cutoff_month, y_cutoff_day)
+            metrics = compute_price_solar_metrics(price_hourly, solar_hourly, PeriodWindow(f"{y}-{m:02d}", y, start, end))
+            rows.append({
+                "Year": y,
+                "Month": pd.Timestamp(start).strftime("%b"),
+                "Avg spot (€/MWh)": metrics["Avg spot (€/MWh)"],
+                "Captured uncurtailed (€/MWh)": metrics["Captured solar uncurtailed (€/MWh)"],
+                "Captured curtailed (€/MWh)": metrics["Captured solar curtailed (€/MWh)"],
+                "Solar generation (GWh)": metrics["Solar generation (GWh)"],
+                "Negative / zero hours": metrics["Negative / zero hours"],
+                "Negative / zero hours (%)": metrics["Negative / zero hours (%)"],
+                "Negative / zero solar hours": metrics["Negative / zero solar hours"],
+                "Negative / zero solar hours (%)": metrics["Negative / zero solar hours (%)"],
+                "Economic curtailment (%)": metrics["Economic curtailment (%)"],
+            })
+    return pd.DataFrame(rows)
+
+
+def build_negative_hours_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, years: list[int], cutoff_month: int, cutoff_day: int) -> pd.DataFrame:
+    monthly = build_monthly_price_solar_table(price_hourly, solar_hourly, years, cutoff_month, cutoff_day)
+    if monthly.empty:
+        return monthly
+    return monthly[[
+        "Year", "Month", "Negative / zero hours", "Negative / zero hours (%)",
+        "Negative / zero solar hours", "Negative / zero solar hours (%)"
+    ]].copy()
+
+
+def build_mix_ytd_table(mix_daily: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+    if mix_daily.empty:
+        return pd.DataFrame()
+    rows = []
+    for tech in TECH_ORDER:
+        cur = mix_daily[(mix_daily["technology"] == tech) & period_filter(mix_daily, current.start, current.end)]["energy_mwh"].sum() / 1000.0
+        prev = mix_daily[(mix_daily["technology"] == tech) & period_filter(mix_daily, previous.start, previous.end)]["energy_mwh"].sum() / 1000.0
+        if cur == 0 and prev == 0:
+            continue
+        rows.append({
+            "Technology": tech,
+            f"YTD {current.year} (GWh)": cur,
+            f"YTD {previous.year} (GWh)": prev,
+            "Abs. change (GWh)": cur - prev,
+            "% change": pct_change(cur, prev),
+        })
+    out = pd.DataFrame(rows)
+    return out.sort_values(f"YTD {current.year} (GWh)", ascending=False).reset_index(drop=True) if not out.empty else out
+
+
+def build_demand_ytd_table(demand_hourly: pd.DataFrame, live_demand_monthly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+    cur = demand_hourly[period_filter(demand_hourly, current.start, current.end)]["demand_mwh"].sum() / 1000.0 if not demand_hourly.empty else 0.0
+    prev = demand_hourly[period_filter(demand_hourly, previous.start, previous.end)]["demand_mwh"].sum() / 1000.0 if not demand_hourly.empty else 0.0
+
+    if current.year >= LIVE_START_DATE.year and not live_demand_monthly.empty:
+        cur_monthly = live_demand_monthly[
+            (live_demand_monthly["datetime"].dt.year == current.year) &
+            (live_demand_monthly["datetime"].dt.month <= current.end.month)
+        ]["demand_mwh"].sum() / 1000.0
+        if cur_monthly > 0:
+            cur = cur_monthly
+
+    return pd.DataFrame([{
+        "Metric": "Demand",
+        f"YTD {current.year} (GWh)": cur,
+        f"YTD {previous.year} (GWh)": prev,
+        "Abs. change (GWh)": cur - prev,
+        "% change": pct_change(cur, prev),
+    }])
+
+
+def build_capacity_table(capacity_monthly: pd.DataFrame, current_month: pd.Timestamp, previous_month: pd.Timestamp) -> pd.DataFrame:
+    if capacity_monthly.empty:
+        return pd.DataFrame()
+    cur = capacity_monthly[capacity_monthly["datetime"] <= current_month.to_period("M").to_timestamp()].copy()
+    prev = capacity_monthly[capacity_monthly["datetime"] <= previous_month.to_period("M").to_timestamp()].copy()
+    if cur.empty or prev.empty:
+        return pd.DataFrame()
+    cur_latest = cur["datetime"].max()
+    prev_latest = prev["datetime"].max()
+    rows = []
+    for tech in TECH_ORDER:
+        cv = cur[(cur["datetime"] == cur_latest) & (cur["technology"] == tech)]["capacity_mw"].sum()
+        pv = prev[(prev["datetime"] == prev_latest) & (prev["technology"] == tech)]["capacity_mw"].sum()
+        if cv == 0 and pv == 0:
+            continue
+        rows.append({
+            "Technology": tech,
+            f"Latest {cur_latest.strftime('%b-%Y')} (MW)": cv,
+            f"Latest {prev_latest.strftime('%b-%Y')} (MW)": pv,
+            "Abs. change (MW)": cv - pv,
+            "% change": pct_change(cv, pv),
+        })
+    return pd.DataFrame(rows).sort_values(f"Latest {cur_latest.strftime('%b-%Y')} (MW)", ascending=False)
+
+
+def build_duck_curve_df(demand_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+    rows = []
+    for window in [previous, current]:
+        d = demand_hourly[period_filter(demand_hourly, window.start, window.end)].copy()
+        s = solar_hourly[period_filter(solar_hourly, window.start, window.end)].copy()
+
+        if d.empty:
+            continue
+
+        d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+        d = d.dropna(subset=["datetime"]).copy()
+        if d.empty:
+            continue
+
+        d["hour"] = d["datetime"].dt.hour
+        d_prof = d.groupby("hour", as_index=False)["demand_mwh"].mean()
+
+        if not s.empty:
+            s["datetime"] = pd.to_datetime(s["datetime"], errors="coerce")
+            s = s.dropna(subset=["datetime"]).copy()
+
+        if not s.empty:
+            s["hour"] = s["datetime"].dt.hour
+            s_prof = s.groupby("hour", as_index=False)["solar_best_mw"].mean()
+        else:
+            s_prof = pd.DataFrame({"hour": range(24), "solar_best_mw": [0.0] * 24})
+
+        merged = pd.DataFrame({"hour": range(24)}).merge(d_prof, on="hour", how="left").merge(s_prof, on="hour", how="left")
+        merged["demand_mwh"] = merged["demand_mwh"].fillna(0.0)
+        merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
+        merged["net_load_mw"] = merged["demand_mwh"] - merged["solar_best_mw"]
+        merged["year"] = window.year
+        rows.append(merged)
+
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+
+# =========================================================
+# BESS REVENUE - aligned with BESS tab standalone logic
+# =========================================================
+def optimize_standalone_bess_day(
+    prices: list[float],
+    bess_mw: float,
+    duration_h: float,
     eta_ch: float = 1.0,
-    eta_dis: float = 1.0,
+    eta_dis: float = 0.85,
     cycle_limit_factor: float = 1.0,
-) -> tuple[pd.DataFrame, dict]:
-    df_day = df_day.sort_values("hora").reset_index(drop=True).copy()
-    n = len(df_day)
+) -> dict:
+    """
+    Standalone DA arbitrage optimizer aligned with the BESS tab logic:
+    - generation = 0
+    - demand = 0
+    - omie_compra = omie_venta
+    - revenue is divided by MWnom in the monthly/yearly report.
+    """
+    prices = [float(p) for p in prices if pd.notna(p)]
+    n = len(prices)
+    if n == 0 or bess_mw <= 0 or duration_h <= 0:
+        return {
+            "revenue_eur": 0.0,
+            "charged_mwh": 0.0,
+            "discharged_mwh": 0.0,
+            "avg_buy_price": np.nan,
+            "avg_sell_price": np.nan,
+        }
 
-    omie_sell = df_day["omie_venta"].astype(float).tolist()
-    omie_buy = df_day["omie_compra"].astype(float).tolist()
-    gen = df_day["generacion"].astype(float).tolist()
-    load = df_day["consumo"].astype(float).tolist()
+    capacity_mwh = bess_mw * duration_h
+    power_mw = bess_mw
+    max_grid_flow = max(power_mw, 1e-9)
 
-    max_power = power_mw
-    # Export / import gate is capped at the BESS inverter power.
-    # This keeps g_to_grid + batt_for_sell within BESS size * c-rate.
-    max_grid_flow = max(max_power, 1e-9)
-
-    model = pulp.LpProblem("bess_daily_optimization", pulp.LpMaximize)
-
-    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
-    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
-    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
+    model = pulp.LpProblem("monthly_report_standalone_bess", pulp.LpMaximize)
     grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
-    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
     batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
-    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
     soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
     is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
     is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
@@ -751,954 +932,743 @@ def optimize_day_pulp(
     model += soc[n] == 0.0
 
     for t in range(n):
-        model += g_to_batt[t] + grid_charge[t] <= max_power * is_charging[t]
-        model += batt_for_load[t] + batt_for_sell[t] <= max_power * (1 - is_charging[t])
-
-        model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
-        model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
-
-        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == gen[t]
-        model += load[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
-
-        model += soc[t + 1] == (
-            soc[t]
-            + eta_ch * (g_to_batt[t] + grid_charge[t])
-            - (1 / eta_dis) * (batt_for_load[t] + batt_for_sell[t])
-        )
+        model += grid_charge[t] <= power_mw * is_charging[t]
+        model += batt_for_sell[t] <= power_mw * (1 - is_charging[t])
+        model += batt_for_sell[t] <= max_grid_flow * is_export[t]
+        model += grid_charge[t] <= max_grid_flow * (1 - is_export[t])
+        model += soc[t + 1] == soc[t] + eta_ch * grid_charge[t] - (1 / max(eta_dis, 1e-9)) * batt_for_sell[t]
         model += soc[t] <= capacity_mwh
 
     model += soc[n] <= capacity_mwh
+    model += pulp.lpSum(grid_charge[t] for t in range(n)) <= cycle_limit_factor * capacity_mwh / max(eta_ch, 1e-9)
+    model += pulp.lpSum(batt_for_sell[t] for t in range(n)) <= pulp.lpSum(grid_charge[t] for t in range(n))
 
-    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= cycle_limit_factor * capacity_mwh / max(eta_ch, 1e-9)
-    model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(
-        g_to_batt[t] + grid_charge[t] for t in range(n)
-    )
-
-    # Economic objective aligned with the original Julia model:
-    # PV charged into the battery is not penalised in the objective.
-    # Only explicit grid purchases / grid charging are costs.
     model += pulp.lpSum(
-        g_to_grid[t] * omie_sell[t]
-        + batt_for_sell[t] * omie_sell[t]
-        - grid_purchase[t] * omie_buy[t]
-        - grid_charge[t] * omie_buy[t]
+        batt_for_sell[t] * prices[t] - grid_charge[t] * prices[t]
         for t in range(n)
     )
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     model.solve(solver)
 
-    def vals(var_dict):
-        return [pulp.value(var_dict[i]) if pulp.value(var_dict[i]) is not None else 0.0 for i in range(n)]
-
-    res = pd.DataFrame(
-        {
-            "Date": df_day["dia"].values,
-            "Hour": df_day["hora"].values,
-            "omie_venta": omie_sell,
-            "omie_compra": omie_buy,
-            "generacion": gen,
-            "consumo": load,
-            "g_to_grid": vals(g_to_grid),
-            "g_to_batt": vals(g_to_batt),
-            "g_to_self": vals(g_to_self),
-            "grid_charge": vals(grid_charge),
-            "batt_for_load": vals(batt_for_load),
-            "batt_for_sell": vals(batt_for_sell),
-            "grid_purchase": vals(grid_purchase),
-            "soc": [pulp.value(soc[i + 1]) if pulp.value(soc[i + 1]) is not None else 0.0 for i in range(n)],
+    if pulp.LpStatus[model.status] != "Optimal":
+        return {
+            "revenue_eur": 0.0,
+            "charged_mwh": 0.0,
+            "discharged_mwh": 0.0,
+            "avg_buy_price": np.nan,
+            "avg_sell_price": np.nan,
         }
-    )
 
-    # Revenue BESS includes the opportunity cost of charging from PV
-    # and the explicit purchase cost of charging from grid.
-    res["Revenue BESS (€)"] = (
-        -res["g_to_batt"] * res["omie_venta"]
-        -res["grid_charge"] * res["omie_compra"]
-        +res["batt_for_sell"] * res["omie_venta"]
-    )
-    res["hybrid profile (MWh)"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
-    res["charge_mwh"] = res["g_to_batt"] + res["grid_charge"]
-    res["discharge_mwh"] = res["batt_for_sell"]
+    charge = np.array([pulp.value(grid_charge[t]) or 0.0 for t in range(n)], dtype=float)
+    discharge = np.array([pulp.value(batt_for_sell[t]) or 0.0 for t in range(n)], dtype=float)
+    price_arr = np.array(prices, dtype=float)
 
-    total_cost = (
-        (res["grid_purchase"] * res["omie_compra"]).sum()
-        + (res["grid_charge"] * res["omie_compra"] / max(eta_ch, 1e-9)).sum()
-        - (res["g_to_grid"] * res["omie_venta"]).sum()
-        - (res["batt_for_sell"] * res["omie_venta"]).sum()
-    )
+    revenue = float((discharge * price_arr).sum() - (charge * price_arr).sum())
+    charged_mwh = float(charge.sum())
+    discharged_mwh = float(discharge.sum())
+    buy_price = float((charge * price_arr).sum() / charged_mwh) if charged_mwh > 0 else np.nan
+    sell_price = float((discharge * price_arr).sum() / discharged_mwh) if discharged_mwh > 0 else np.nan
 
-    stats = {
-        "total_cost": float(total_cost),
-        "total_sold": float(res["g_to_grid"].sum() + res["batt_for_sell"].sum()),
-        "total_bought": float(res["grid_purchase"].sum()),
-        "total_charged": float(res["charge_mwh"].sum()),
-        "total_discharged": float((res["batt_for_load"] + res["batt_for_sell"]).sum()),
-        "revenue_bess": float(res["Revenue BESS (€)"].sum()),
-        "hybrid_profile_mwh": float(res["hybrid profile (MWh)"].sum()),
+    return {
+        "revenue_eur": revenue,
+        "charged_mwh": charged_mwh,
+        "discharged_mwh": discharged_mwh,
+        "avg_buy_price": buy_price,
+        "avg_sell_price": sell_price,
     }
 
-    return res, stats
 
-
-def run_optimization(
-    data_df: pd.DataFrame,
+def build_bess_revenue_monthly_table(
+    price_hourly: pd.DataFrame,
     years: list[int],
-    capacity_table: pd.DataFrame,
-    power_mw: float,
+    cutoff_month: int,
+    cutoff_day: int,
+    bess_mw: float,
+    duration_h: float,
     eta_ch: float,
     eta_dis: float,
     cycle_limit_factor: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    results_all = []
-    stats_all = []
+) -> pd.DataFrame:
+    if price_hourly.empty:
+        return pd.DataFrame()
 
-    data_df = data_df.copy()
-    data_df["dia"] = pd.to_datetime(data_df["dia"]).dt.date
-    capacity_map = dict(zip(capacity_table["year"], capacity_table["effective_capacity_mwh"]))
-    status_map = dict(zip(capacity_table["year"], capacity_table["status"]))
-    soh_map = dict(zip(capacity_table["year"], capacity_table["SOH"]))
+    p = price_hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"]).copy()
+    if p.empty:
+        return pd.DataFrame()
 
-    for year in years:
-        df_year = data_df[data_df["year"] == year].copy()
-        if df_year.empty:
-            continue
-
-        year_capacity = float(capacity_map.get(year, 0.0))
-        year_status = status_map.get(year, "undegraded")
-        year_soh = float(soh_map.get(year, 1.0))
-
-        for day, df_day in df_year.groupby("dia"):
-            res, stats = optimize_day_pulp(
-                df_day=df_day,
-                capacity_mwh=year_capacity,
-                power_mw=power_mw,
-                eta_ch=eta_ch,
-                eta_dis=eta_dis,
-                cycle_limit_factor=cycle_limit_factor,
-            )
-            res["Year"] = year
-            res["effective_capacity_mwh"] = year_capacity
-            res["SOH"] = year_soh
-            res["degradation_status"] = year_status
-            results_all.append(res)
-
-            stats_all.append(
-                {
+    daily_rows = []
+    for y in years:
+        y_cutoff_day = cutoff_day if y == max(years) else min(cutoff_day, month_end_day(y, cutoff_month))
+        for m in range(1, cutoff_month + 1):
+            start, end = month_window(y, m, cutoff_month, y_cutoff_day)
+            df_m = p[period_filter(p, start, end)].copy()
+            if df_m.empty:
+                continue
+            df_m["day"] = df_m["datetime"].dt.date
+            for day, grp in df_m.groupby("day"):
+                res = optimize_standalone_bess_day(
+                    prices=grp.sort_values("datetime")["price"].tolist(),
+                    bess_mw=bess_mw,
+                    duration_h=duration_h,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    cycle_limit_factor=cycle_limit_factor,
+                )
+                daily_rows.append({
                     "Date": day,
-                    "Year": year,
-                    "total_cost": stats["total_cost"],
-                    "total_sold": stats["total_sold"],
-                    "total_bought": stats["total_bought"],
-                    "total_charged": stats["total_charged"],
-                    "total_discharged": stats["total_discharged"],
-                    "Revenue BESS (€)": stats["revenue_bess"],
-                    "hybrid profile (MWh)": stats["hybrid_profile_mwh"],
-                    "effective_capacity_mwh": year_capacity,
-                    "SOH": year_soh,
-                    "degradation_status": year_status,
-                }
-            )
+                    "Year": y,
+                    "month": pd.Timestamp(day).strftime("%Y-%m"),
+                    "Revenue_BESS_EUR": res["revenue_eur"],
+                    "Charge_MWh": res["charged_mwh"],
+                    "Discharge_MWh": res["discharged_mwh"],
+                    "Buy_Value_EUR": res["charged_mwh"] * (res["avg_buy_price"] if pd.notna(res["avg_buy_price"]) else 0.0),
+                    "Sell_Value_EUR": res["discharged_mwh"] * (res["avg_sell_price"] if pd.notna(res["avg_sell_price"]) else 0.0),
+                })
 
-    dispatch = pd.concat(results_all, ignore_index=True) if results_all else pd.DataFrame()
-    stats = pd.DataFrame(stats_all)
-    return dispatch, stats
+    daily = pd.DataFrame(daily_rows)
+    if daily.empty:
+        return pd.DataFrame()
 
-
-def build_variable_definitions() -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "variable": [
-                "g_to_grid",
-                "g_to_batt",
-                "g_to_self",
-                "grid_charge",
-                "batt_for_load",
-                "batt_for_sell",
-                "grid_purchase",
-                "soc",
-                "Revenue BESS (€)",
-                "hybrid profile (MWh)",
-            ],
-            "definition_english": [
-                "PV energy injected into the grid.",
-                "PV generation sent to the BESS.",
-                "PV generation used to satisfy on-site demand, if any (BTM cases).",
-                "Battery charging energy imported from the grid.",
-                "Battery discharge used to satisfy on-site demand (BTM cases).",
-                "Battery discharge exported to the market / grid.",
-                "Spot market energy purchased to satisfy on-site demand.",
-                "State of charge.",
-                "BESS revenue calculated as -g_to_batt*omie_venta - grid_charge*omie_compra + batt_for_sell*omie_venta.",
-                "Hybrid exported profile calculated as g_to_grid - grid_charge + batt_for_sell.",
-            ],
-        }
-    )
-
-
-def make_results_excel(
-    dispatch: pd.DataFrame,
-    stats: pd.DataFrame,
-    data_used: pd.DataFrame,
-    inputs_used: pd.DataFrame,
-    variable_definitions: pd.DataFrame,
-    monthly_summary: pd.DataFrame,
-    capacity_table: pd.DataFrame,
-) -> bytes:
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        dispatch.to_excel(writer, index=False, sheet_name="dispatch")
-        stats.to_excel(writer, index=False, sheet_name="stats")
-        monthly_summary.to_excel(writer, index=False, sheet_name="monthly_summary")
-        capacity_table.to_excel(writer, index=False, sheet_name="capacity_by_year")
-        data_used.to_excel(writer, index=False, sheet_name="data_used")
-        inputs_used.to_excel(writer, index=False, sheet_name="inputs_used")
-        variable_definitions.to_excel(writer, index=False, sheet_name="variable_definitions")
-    bio.seek(0)
-    return bio.getvalue()
-
-
-def add_derived_dispatch_columns(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFrame:
-    out = dispatch.copy()
-    out["timestamp"] = pd.to_datetime(out["Date"]) + pd.to_timedelta(out["Hour"] - 1, unit="h")
-    out["month"] = pd.to_datetime(out["Date"]).dt.to_period("M").astype(str)
-    out["Revenue BESS €/MW"] = np.where(bess_mw > 0, out["Revenue BESS (€)"] / bess_mw, np.nan)
-
-    out["solar_revenue"] = out["generacion"] * out["omie_venta"]
-    out["hybrid_revenue"] = out["hybrid profile (MWh)"] * out["omie_venta"]
-    out["charge_mwh"] = out["g_to_batt"] + out["grid_charge"]
-    out["discharge_mwh"] = out["batt_for_sell"]
-    return out
-
-
-def build_monthly_summary(dispatch: pd.DataFrame, bess_mw: float, eta_dis: float, mode: str) -> pd.DataFrame:
-    df = add_derived_dispatch_columns(dispatch, bess_mw)
-    df["month_days"] = pd.to_datetime(df["Date"]).dt.to_period("M").dt.days_in_month
-    df["charge_cost_eur"] = df["g_to_batt"] * df["omie_venta"] + df["grid_charge"] * df["omie_compra"]
-    df["sell_revenue_eur"] = df["batt_for_sell"] * df["omie_venta"]
-
-    grouped = (
-        df.groupby(["Year", "month"], as_index=False)
-        .agg(
-            Revenue_BESS_EUR=("Revenue BESS (€)", "sum"),
-            Hybrid_Profile_MWh=("hybrid profile (MWh)", "sum"),
-            Solar_Generation_MWh=("generacion", "sum"),
-            Solar_Revenue_EUR=("solar_revenue", "sum"),
-            Hybrid_Revenue_EUR=("hybrid_revenue", "sum"),
-            Avg_Effective_Capacity_MWh=("effective_capacity_mwh", "mean"),
-            Avg_SOH=("SOH", "mean"),
-            Charge_MWh=("charge_mwh", "sum"),
-            Discharge_MWh=("discharge_mwh", "sum"),
-            Avg_Buy_Price_EUR=("charge_cost_eur", "sum"),
-            Avg_Sell_Price_EUR=("sell_revenue_eur", "sum"),
-            Days=("Date", lambda s: pd.to_datetime(s).dt.date.nunique()),
-        )
-    )
-    grouped["Revenue BESS €/MW"] = np.where(bess_mw > 0, grouped["Revenue_BESS_EUR"] / bess_mw, np.nan)
-    grouped["Captured Solar (€/MWh)"] = np.where(
-        grouped["Solar_Generation_MWh"] != 0,
-        grouped["Solar_Revenue_EUR"] / grouped["Solar_Generation_MWh"],
-        np.nan,
-    )
-    grouped["Captured Hybrid (€/MWh)"] = np.where(
-        grouped["Hybrid_Profile_MWh"] != 0,
-        grouped["Hybrid_Revenue_EUR"] / grouped["Hybrid_Profile_MWh"],
-        np.nan,
-    )
-    grouped["Avg buy price (€/MWh)"] = np.where(grouped["Charge_MWh"] != 0, grouped["Avg_Buy_Price_EUR"] / grouped["Charge_MWh"], np.nan)
-    grouped["Avg sell price (€/MWh)"] = np.where(grouped["Discharge_MWh"] != 0, grouped["Avg_Sell_Price_EUR"] / grouped["Discharge_MWh"], np.nan)
-    grouped["Captured spread (€/MWh)"] = grouped["Avg sell price (€/MWh)"] - grouped["Avg buy price (€/MWh)"]
-    grouped["Cycles/day avg"] = np.where(
-        (grouped["Days"] > 0) & (grouped["Avg_Effective_Capacity_MWh"] > 0),
-        grouped["Discharge_MWh"] / max(eta_dis, 1e-9) / grouped["Avg_Effective_Capacity_MWh"] / grouped["Days"],
-        np.nan,
-    )
-
-    yearly = (
-        grouped.groupby("Year", as_index=False)
+    monthly = (
+        daily.groupby(["Year", "month"], as_index=False)
         .agg(
             Revenue_BESS_EUR=("Revenue_BESS_EUR", "sum"),
-            Hybrid_Profile_MWh=("Hybrid_Profile_MWh", "sum"),
-            Solar_Generation_MWh=("Solar_Generation_MWh", "sum"),
-            Solar_Revenue_EUR=("Solar_Revenue_EUR", "sum"),
-            Hybrid_Revenue_EUR=("Hybrid_Revenue_EUR", "sum"),
-            Avg_Effective_Capacity_MWh=("Avg_Effective_Capacity_MWh", "mean"),
-            Avg_SOH=("Avg_SOH", "mean"),
             Charge_MWh=("Charge_MWh", "sum"),
             Discharge_MWh=("Discharge_MWh", "sum"),
-            Charge_Cost_EUR=("Avg_Buy_Price_EUR", "sum"),
-            Sell_Revenue_EUR=("Avg_Sell_Price_EUR", "sum"),
+            Buy_Value_EUR=("Buy_Value_EUR", "sum"),
+            Sell_Value_EUR=("Sell_Value_EUR", "sum"),
+            Days=("Date", "nunique"),
+        )
+    )
+    monthly["Revenue BESS €/MW"] = np.where(bess_mw > 0, monthly["Revenue_BESS_EUR"] / bess_mw, np.nan)
+    monthly["Avg buy price (€/MWh)"] = np.where(monthly["Charge_MWh"] > 0, monthly["Buy_Value_EUR"] / monthly["Charge_MWh"], np.nan)
+    monthly["Avg sell price (€/MWh)"] = np.where(monthly["Discharge_MWh"] > 0, monthly["Sell_Value_EUR"] / monthly["Discharge_MWh"], np.nan)
+    monthly["Captured spread (€/MWh)"] = monthly["Avg sell price (€/MWh)"] - monthly["Avg buy price (€/MWh)"]
+    monthly["Cycles/day avg"] = np.where(
+        (monthly["Days"] > 0) & (bess_mw * duration_h > 0),
+        monthly["Discharge_MWh"] / max(eta_dis, 1e-9) / (bess_mw * duration_h) / monthly["Days"],
+        np.nan,
+    )
+
+    total = (
+        monthly.groupby("Year", as_index=False)
+        .agg(
+            Revenue_BESS_EUR=("Revenue_BESS_EUR", "sum"),
+            Charge_MWh=("Charge_MWh", "sum"),
+            Discharge_MWh=("Discharge_MWh", "sum"),
+            Buy_Value_EUR=("Buy_Value_EUR", "sum"),
+            Sell_Value_EUR=("Sell_Value_EUR", "sum"),
             Days=("Days", "sum"),
         )
     )
-    yearly["month"] = "TOTAL"
-    yearly["Revenue BESS €/MW"] = np.where(bess_mw > 0, yearly["Revenue_BESS_EUR"] / bess_mw, np.nan)
-    yearly["Captured Solar (€/MWh)"] = np.where(yearly["Solar_Generation_MWh"] != 0, yearly["Solar_Revenue_EUR"] / yearly["Solar_Generation_MWh"], np.nan)
-    yearly["Captured Hybrid (€/MWh)"] = np.where(yearly["Hybrid_Profile_MWh"] != 0, yearly["Hybrid_Revenue_EUR"] / yearly["Hybrid_Profile_MWh"], np.nan)
-    yearly["Avg buy price (€/MWh)"] = np.where(yearly["Charge_MWh"] != 0, yearly["Charge_Cost_EUR"] / yearly["Charge_MWh"], np.nan)
-    yearly["Avg sell price (€/MWh)"] = np.where(yearly["Discharge_MWh"] != 0, yearly["Sell_Revenue_EUR"] / yearly["Discharge_MWh"], np.nan)
-    yearly["Captured spread (€/MWh)"] = yearly["Avg sell price (€/MWh)"] - yearly["Avg buy price (€/MWh)"]
-    yearly["Cycles/day avg"] = np.where(
-        (yearly["Days"] > 0) & (yearly["Avg_Effective_Capacity_MWh"] > 0),
-        yearly["Discharge_MWh"] / max(eta_dis, 1e-9) / yearly["Avg_Effective_Capacity_MWh"] / yearly["Days"],
+    total["month"] = "TOTAL"
+    total["Revenue BESS €/MW"] = np.where(bess_mw > 0, total["Revenue_BESS_EUR"] / bess_mw, np.nan)
+    total["Avg buy price (€/MWh)"] = np.where(total["Charge_MWh"] > 0, total["Buy_Value_EUR"] / total["Charge_MWh"], np.nan)
+    total["Avg sell price (€/MWh)"] = np.where(total["Discharge_MWh"] > 0, total["Sell_Value_EUR"] / total["Discharge_MWh"], np.nan)
+    total["Captured spread (€/MWh)"] = total["Avg sell price (€/MWh)"] - total["Avg buy price (€/MWh)"]
+    total["Cycles/day avg"] = np.where(
+        (total["Days"] > 0) & (bess_mw * duration_h > 0),
+        total["Discharge_MWh"] / max(eta_dis, 1e-9) / (bess_mw * duration_h) / total["Days"],
         np.nan,
     )
-    out = pd.concat([grouped, yearly], ignore_index=True, sort=False)
 
-    if mode == "Standalone BESS":
-        out["Captured Solar (€/MWh)"] = np.nan
-        out["Captured Hybrid (€/MWh)"] = np.nan
-
-    return out
-
-
-def compute_period_capture_metrics(df_period: pd.DataFrame) -> tuple[float, float]:
-    solar_gen = df_period["generacion"].sum()
-    solar_revenue = (df_period["generacion"] * df_period["omie_venta"]).sum()
-    hybrid_mwh = df_period["hybrid profile (MWh)"].sum()
-    hybrid_revenue = (df_period["hybrid profile (MWh)"] * df_period["omie_venta"]).sum()
-
-    captured_solar = solar_revenue / solar_gen if solar_gen != 0 else np.nan
-    captured_hybrid = hybrid_revenue / hybrid_mwh if hybrid_mwh != 0 else np.nan
-    return captured_solar, captured_hybrid
+    out = pd.concat([monthly, total], ignore_index=True, sort=False)
+    return out[[
+        "Year", "month", "Revenue BESS €/MW", "Revenue_BESS_EUR",
+        "Cycles/day avg", "Charge_MWh", "Discharge_MWh",
+        "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)",
+    ]].sort_values(["Year", "month"]).reset_index(drop=True)
 
 
-
-def build_avg_24h_dispatch_chart(df_period: pd.DataFrame) -> alt.Chart:
-    chart_df = (
-        df_period.groupby("Hour", as_index=False)
-        .agg(
-            charge=("charge_mwh", "mean"),
-            discharge=("discharge_mwh", "mean"),
-            omie_venta=("omie_venta", "mean"),
-        )
-    )
-
-    bars = pd.concat(
-        [
-            chart_df[["Hour", "charge"]].rename(columns={"charge": "mwh"}).assign(series="Charge"),
-            chart_df[["Hour", "discharge"]].rename(columns={"discharge": "mwh"}).assign(series="Discharge"),
-        ],
-        ignore_index=True,
-    )
-
-    bars_chart = (
-        alt.Chart(bars)
-        .mark_bar(opacity=0.85)
-        .encode(
-            x=alt.X("Hour:O", title="Hour"),
-            y=alt.Y("mwh:Q", title="Charge / Discharge (MWh)"),
-            xOffset="series:N",
-            color=alt.Color(
-                "series:N",
-                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#2e8b57", "#c0392b"]),
-                legend=alt.Legend(title=None),
-            ),
-            tooltip=["Hour", "series", alt.Tooltip("mwh:Q", format=",.3f")],
-        )
-    )
-
-    price_chart = (
-        alt.Chart(chart_df)
-        .mark_line(strokeWidth=2, strokeDash=[6, 4], color="#1f4e79")
-        .encode(
-            x=alt.X("Hour:O"),
-            y=alt.Y("omie_venta:Q", title="OMIE sell price (€/MWh)"),
-            tooltip=["Hour", alt.Tooltip("omie_venta:Q", format=",.2f")],
-        )
-    )
-
-    return alt.layer(bars_chart, price_chart).resolve_scale(y="independent").properties(height=380)
-
-
-def build_daily_dispatch_chart(df_day: pd.DataFrame) -> alt.Chart:
-    chart_df = df_day.sort_values("Hour").copy()
-
-    bars = pd.concat(
-        [
-            chart_df[["Hour", "charge_mwh"]].rename(columns={"charge_mwh": "mwh"}).assign(series="Charge"),
-            chart_df[["Hour", "discharge_mwh"]].rename(columns={"discharge_mwh": "mwh"}).assign(series="Discharge"),
-        ],
-        ignore_index=True,
-    )
-
-    bars_chart = (
-        alt.Chart(bars)
-        .mark_bar(opacity=0.85)
-        .encode(
-            x=alt.X("Hour:O", title="Hour"),
-            y=alt.Y("mwh:Q", title="Charge / Discharge (MWh)"),
-            xOffset="series:N",
-            color=alt.Color(
-                "series:N",
-                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#2e8b57", "#c0392b"]),
-                legend=alt.Legend(title=None),
-            ),
-            tooltip=["Hour", "series", alt.Tooltip("mwh:Q", format=",.3f")],
-        )
-    )
-
-    price_chart = (
-        alt.Chart(chart_df)
-        .mark_line(strokeWidth=2, strokeDash=[6, 4], color="#1f4e79")
-        .encode(
-            x=alt.X("Hour:O"),
-            y=alt.Y("omie_venta:Q", title="OMIE sell price (€/MWh)"),
-            tooltip=["Hour", alt.Tooltip("omie_venta:Q", format=",.2f")],
-        )
-    )
-
-    return alt.layer(bars_chart, price_chart).resolve_scale(y="independent").properties(height=380)
-
-def build_capacity_chart(capacity_table: pd.DataFrame) -> alt.Chart:
-    df = capacity_table.copy()
-    return (
-        alt.Chart(df)
-        .mark_bar()
-        .encode(
-            x=alt.X("year:O", title="Year"),
-            y=alt.Y("effective_capacity_mwh:Q", title="Effective storage capacity (MWh)"),
-            tooltip=["year", "SOH", "effective_capacity_mwh", "status"],
-            color=alt.Color("status:N", title="Status"),
-        )
-        .properties(height=320)
-    )
-
-
-# =========================================================
-# LOAD BASE DATA
-# =========================================================
-try:
-    historical_prices = standardize_price_history_from_day_ahead(PRICE_RAW_CSV_PATH)
-    default_data = load_default_data_xlsx(DEFAULT_DATA_XLSX)
-    default_solar_profile = load_default_solar_profile(DEFAULT_SOLAR_PROFILE_XLSX)
-    degradation_profile = load_degradation_profile(DEFAULT_DEGRADATION_XLSX)
-except Exception as e:
-    st.error(f"Error loading base data: {e}")
-    st.stop()
-
-available_hist_years = sorted(historical_prices["year"].unique().tolist()) if not historical_prices.empty else []
-max_hist_year = max(available_hist_years) if available_hist_years else None
-
-if not available_hist_years:
-    st.error("No historical prices found. Please run the Day Ahead module first so that historical_data/day_ahead_spain_spot_600_raw.csv is created.")
-    st.stop()
-
-for key, default in {
-    "dispatch": None,
-    "stats": None,
-    "data_used": None,
-    "monthly_summary": None,
-    "inputs_used": None,
-    "variable_definitions": None,
-    "bess_mw_result": None,
-    "capacity_table": None,
-    "mode_result": None,
-    "eta_dis_result": None,
-    "cycle_limit_label": None,
-    "xlsx_bytes": None,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-# =========================================================
-# UI
-# =========================================================
-left, right = st.columns([1.15, 1.45])
-
-with left:
-    mode = st.selectbox(
-        "Analysis mode",
-        ["Standalone BESS", "BESS with demand", "BESS without demand"],
-        index=0,
-    )
-
-    use_forward_prices = st.checkbox("Add forward prices (nominal)", value=False)
-    forward_provider = None
-    forward_prices = None
-    provider_available_years = []
-    valid_forward_pwd = False
-    provider_pwd = ""
-
-    if use_forward_prices:
-        provider_pwd = st.text_input("Forward prices password", type="password")
-        valid_forward_pwd = ("forward_prices_password" in st.secrets and provider_pwd == st.secrets["forward_prices_password"])
-
-        if valid_forward_pwd:
-            available_providers = [name for name, path in FORWARD_PROVIDER_FILES.items() if path.exists()]
-            if not available_providers:
-                st.error("No forward price files were found in the repo.")
-            else:
-                forward_provider = st.selectbox("Forward provider", available_providers, index=0)
-                provider_path = FORWARD_PROVIDER_FILES[forward_provider]
-                forward_prices = normalize_provider_forward_price_file(provider_path)
-                provider_available_years = sorted(forward_prices["year"].unique().tolist())
-        else:
-            st.warning("Enter the correct password to unlock forward nominal prices from the repo.")
-
-    all_available_years = sorted(set(available_hist_years + provider_available_years))
-    if not all_available_years:
-        all_available_years = available_hist_years
-
-    if len(all_available_years) == 1:
-        year_start = year_end = all_available_years[0]
-    else:
-        year_start, year_end = st.select_slider(
-            "Analysis years",
-            options=all_available_years,
-            value=(all_available_years[0], all_available_years[-1]),
-        )
-
-    years = [y for y in all_available_years if year_start <= y <= year_end]
-
-    base_capacity_mwh = st.number_input("BESS size (MWh)", min_value=0.1, value=4.0, step=0.1)
-    c_rate = st.number_input("C-rate", min_value=0.01, value=0.25, step=0.01, format="%.4f")
-    bess_mw = base_capacity_mwh * c_rate
-    st.caption(f"Equivalent BESS power: {bess_mw:,.3f} MW")
-
-    assume_degradation = st.radio("Assume degradation", ["No", "Yes"], horizontal=True, index=0)
-    use_degradation = assume_degradation == "Yes"
-
-    eta_ch = st.number_input("Charging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.001, format="%.3f")
-    eta_dis = st.number_input("Discharging efficiency", min_value=0.01, max_value=1.0, value=0.93, step=0.001, format="%.3f")
-    st.caption(f"Round-trip-efficiency equivalent = {eta_ch:.2%} × {eta_dis:.2%} = {(eta_ch * eta_dis):.2%}")
-
-    cycle_limit_option = st.radio(
-        "Cycles/day setting",
-        ["Limit 1 cycle/day", "No limit cycles/day"],
-        index=0,
-        horizontal=True,
-    )
-    cycle_limit_factor = 1.0 if cycle_limit_option == "Limit 1 cycle/day" else 5.0
-
-    st.markdown("### Generation profile")
-    use_uploaded_generation = st.checkbox("Upload a custom yearly generation profile", value=False)
-    uploaded_generation = None
-    if use_uploaded_generation:
-        uploaded_generation = st.file_uploader(
-            "Upload generation Excel",
-            type=["xlsx"],
-            help="Use the downloaded example structure. Values are assumed to be for a 1 MW solar plant and are automatically scaled to the equivalent BESS MW.",
-            key="generation_upload",
-        )
-
-    template_bytes = build_template_generation_excel(DEFAULT_SOLAR_PROFILE_XLSX)
-    st.download_button(
-        "Download generation template",
-        data=template_bytes,
-        file_name="profile_production_1y_hourly_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    run_button = st.button("Run optimisation", type="primary")
-
-with right:
-    st.markdown("### Price sourcing")
-    st.info("Historical years use the hourly prices generated and stored by the Day Ahead module in historical_data/day_ahead_spain_spot_600_raw.csv.")
-    st.info("If unlocked, forward years use nominal hourly prices stored in the repo and selected by provider (Aurora or Baringa).")
-
-    st.markdown("### Scenario rules")
-    if mode == "Standalone BESS":
-        st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
-    elif mode == "BESS with demand":
-        st.info("omie_venta = price, omie_compra = same price, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
-    else:
-        st.info("omie_venta = price, omie_compra = 1000, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 €/MWh is intentionally unattractive.")
-
-    st.markdown("### Degradation logic")
-    st.info("If degradation is enabled, effective storage capacity for forward years is adjusted as: BESS size (MWh) × SOH(%). BESS power (MW) remains constant.")
-    if DEFAULT_DEGRADATION_XLSX.exists():
-        st.success("Degradation file found in the repo.")
-    else:
-        st.warning("Degradation file not found. Future years will stay undegraded unless the file is added.")
-
-# =========================================================
-# RUN
-# =========================================================
-if run_button:
-    if not years:
-        st.error("Select at least one historical and/or forward year.")
-        st.stop()
-
-    if use_forward_prices:
-        if not valid_forward_pwd:
-            st.error("Forward prices were selected but the password is missing or incorrect.")
-            st.stop()
-        if forward_prices is None or forward_provider is None:
-            st.error("No forward provider data is available.")
-            st.stop()
-
-    forward_years_selected = [y for y in years if max_hist_year is not None and y > max_hist_year]
-    if forward_years_selected and forward_prices is None:
-        st.error("Your selected year range includes forward years, but no forward price curve is unlocked.")
-        st.stop()
-
-    if use_uploaded_generation and uploaded_generation is None:
-        st.error("Upload a generation Excel file or untick the custom generation option.")
-        st.stop()
-
-    try:
-        with st.spinner("Building hourly dataset..."):
-            data_used = build_dataset(
-                years=years,
-                mode=mode,
-                historical_prices=historical_prices,
-                default_data=default_data,
-                default_solar_profile=default_solar_profile,
-                bess_mw=bess_mw,
-                uploaded_generation_file=uploaded_generation,
-                forward_prices=forward_prices,
-            )
-
-        capacity_table = build_effective_capacity_table(
+def build_bess_duration_comparison(
+    price_hourly: pd.DataFrame,
+    years: list[int],
+    cutoff_month: int,
+    cutoff_day: int,
+    bess_mw: float,
+    eta_ch: float,
+    eta_dis: float,
+    cycle_limit_factor: float,
+) -> pd.DataFrame:
+    rows = []
+    for duration in [1.0, 2.0, 4.0]:
+        tbl = build_bess_revenue_monthly_table(
+            price_hourly=price_hourly,
             years=years,
-            base_capacity_mwh=base_capacity_mwh,
-            use_degradation=use_degradation,
-            degradation_df=degradation_profile,
-            max_historical_year=max_hist_year,
+            cutoff_month=cutoff_month,
+            cutoff_day=cutoff_day,
+            bess_mw=bess_mw,
+            duration_h=duration,
+            eta_ch=eta_ch,
+            eta_dis=eta_dis,
+            cycle_limit_factor=cycle_limit_factor,
         )
+        if tbl.empty:
+            continue
+        totals = tbl[tbl["month"] == "TOTAL"].copy()
+        totals["Duration"] = f"{int(duration)}h"
+        rows.append(totals[["Year", "Duration", "Revenue BESS €/MW", "Cycles/day avg", "Captured spread (€/MWh)"]])
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
-        with st.spinner("Running daily optimisation..."):
-            dispatch, stats = run_optimization(
-                data_df=data_used,
-                years=years,
-                capacity_table=capacity_table,
-                power_mw=bess_mw,
-                eta_ch=eta_ch,
-                eta_dis=eta_dis,
-                cycle_limit_factor=cycle_limit_factor,
-            )
 
-        if dispatch.empty:
-            st.warning("No optimisation results were produced.")
-            st.stop()
-
-        dispatch = add_derived_dispatch_columns(dispatch, bess_mw)
-        monthly_summary = build_monthly_summary(dispatch, bess_mw, eta_dis, mode)
-        variable_definitions = build_variable_definitions()
-
-        inputs_used = pd.DataFrame(
-            {
-                "parameter": [
-                    "mode",
-                    "analysis_year_start",
-                    "analysis_year_end",
-                    "forward_provider",
-                    "forward_prices_type",
-                    "base_capacity_mwh",
-                    "c_rate",
-                    "bess_mw_constant",
-                    "eta_ch",
-                    "eta_dis",
-                    "cycles_day_setting",
-                    "cycles_day_factor",
-                    "assume_degradation",
-                    "degradation_status_output",
-                    "uploaded_generation",
-                    "default_generation_profile",
-                    "degradation_file",
-                ],
-                "value": [
-                    mode,
-                    year_start,
-                    year_end,
-                    forward_provider if forward_provider is not None else "",
-                    "nominal" if use_forward_prices else "",
-                    base_capacity_mwh,
-                    c_rate,
-                    bess_mw,
-                    eta_ch,
-                    eta_dis,
-                    cycle_limit_option,
-                    cycle_limit_factor,
-                    "yes" if use_degradation else "no",
-                    "degraded for forward years only" if use_degradation else "undegraded",
-                    "yes" if uploaded_generation is not None else "no",
-                    DEFAULT_SOLAR_PROFILE_XLSX.name if DEFAULT_SOLAR_PROFILE_XLSX.exists() else "not found",
-                    DEFAULT_DEGRADATION_XLSX.name if DEFAULT_DEGRADATION_XLSX.exists() else "not found",
-                ],
-            }
+def chart_bess_revenue(bess_table: pd.DataFrame, duration_label: str = "4h") -> str | None:
+    if bess_table.empty:
+        return None
+    plot = bess_table[bess_table["month"] != "TOTAL"].copy()
+    if plot.empty:
+        return None
+    plot["Month"] = pd.to_datetime(plot["month"], errors="coerce").dt.strftime("%b")
+    cmap = year_color_map(plot["Year"].unique().tolist())
+    fig, ax = plt.subplots(figsize=(10.8, 4.5))
+    for y, grp in plot.groupby("Year"):
+        grp = grp.copy()
+        grp["month_num"] = pd.to_datetime(grp["month"], errors="coerce").dt.month
+        grp = grp.sort_values("month_num")
+        ax.bar(
+            [f"{m}\n{y}" for m in grp["Month"]],
+            grp["Revenue BESS €/MW"] / 1000.0,
+            color=cmap[y],
+            alpha=0.85,
+            label=str(y),
         )
+    ax.set_title(f"Monthly DA BESS revenue ({duration_label}, standalone)")
+    ax.set_ylabel("k€/MWnom")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    return fig_to_b64(fig)
 
-        st.session_state.dispatch = dispatch
-        st.session_state.stats = stats
-        st.session_state.data_used = data_used
-        st.session_state.monthly_summary = monthly_summary
-        st.session_state.inputs_used = inputs_used
-        xlsx_bytes = make_results_excel(
-            dispatch=dispatch,
-            stats=stats,
-            data_used=data_used,
-            inputs_used=inputs_used,
-            variable_definitions=variable_definitions,
-            monthly_summary=monthly_summary,
-            capacity_table=capacity_table,
-        )
 
-        st.session_state.variable_definitions = variable_definitions
-        st.session_state.bess_mw_result = bess_mw
-        st.session_state.capacity_table = capacity_table
-        st.session_state.mode_result = mode
-        st.session_state.eta_dis_result = eta_dis
-        st.session_state.cycle_limit_label = cycle_limit_option
-        st.session_state.xlsx_bytes = xlsx_bytes
+def chart_bess_duration_totals(bess_duration_table: pd.DataFrame) -> str | None:
+    if bess_duration_table.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(10.5, 4.3))
+    labels = []
+    vals = []
+    colors = []
+    cmap = year_color_map(bess_duration_table["Year"].unique().tolist())
+    for _, row in bess_duration_table.sort_values(["Year", "Duration"]).iterrows():
+        labels.append(f"{row['Duration']}\n{int(row['Year'])}")
+        vals.append(row["Revenue BESS €/MW"] / 1000.0)
+        colors.append(cmap[int(row["Year"])])
+    ax.bar(labels, vals, color=colors, alpha=0.85)
+    ax.set_title("YTD DA BESS revenue by duration")
+    ax.set_ylabel("k€/MWnom")
+    ax.grid(axis="y", alpha=0.25)
+    return fig_to_b64(fig)
 
-    except Exception as e:
-        st.error(f"Optimization failed: {e}")
 
 # =========================================================
-# RESULTS
+# CHARTS
 # =========================================================
-if st.session_state.dispatch is not None:
-    dispatch = st.session_state.dispatch
-    stats = st.session_state.stats
-    data_used = st.session_state.data_used
-    monthly_summary = st.session_state.monthly_summary
-    inputs_used = st.session_state.inputs_used
-    variable_definitions = st.session_state.variable_definitions
-    bess_mw_result = st.session_state.bess_mw_result
-    capacity_table = st.session_state.capacity_table
-    mode_result = st.session_state.mode_result
-    eta_dis_result = st.session_state.eta_dis_result
-    xlsx_bytes = st.session_state.xlsx_bytes
-    cycle_limit_label = st.session_state.cycle_limit_label
+def chart_daily_spot_capture(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> str | None:
+    daily = pd.concat([
+        _daily_agg(price_hourly, solar_hourly, previous.start, previous.end),
+        _daily_agg(price_hourly, solar_hourly, current.start, current.end),
+    ], ignore_index=True)
+    if daily.empty:
+        return None
 
-    yearly_rollup = stats.groupby("Year", as_index=False).agg(
-        total_charged=("total_charged", "sum"),
-        total_discharged=("total_discharged", "sum"),
-        revenue_bess_eur=("Revenue BESS (€)", "sum"),
-    ) if not stats.empty else pd.DataFrame(columns=["Year", "total_charged", "total_discharged", "revenue_bess_eur"])
-    yearly_rollup["Revenue BESS (€/MW)"] = np.where(bess_mw_result > 0, yearly_rollup["revenue_bess_eur"] / bess_mw_result, np.nan)
+    years = sorted(daily["year"].unique().tolist())
+    cmap = year_color_map(years)
 
-    if len(yearly_rollup) > 1:
-        total_charged_display = yearly_rollup["total_charged"].mean()
-        total_discharged_display = yearly_rollup["total_discharged"].mean()
-        revenue_bess_display = yearly_rollup["Revenue BESS (€/MW)"].mean()
-        metrics_caption = "Average across selected years"
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    for y in years:
+        grp = daily[daily["year"] == y].sort_values("plot_date")
+        color = cmap[y]
+        ax.plot(grp["plot_date"], grp["spot"], color=color, linewidth=2.2, label=f"Spot {y}")
+        ax.plot(grp["plot_date"], grp["captured_unc"], color=color, linewidth=2.0, linestyle=":", label=f"Captured uncurtailed {y}")
+        ax.plot(grp["plot_date"], grp["captured_cur"], color=color, linewidth=2.0, linestyle="--", label=f"Captured curtailed {y}")
+    ax.set_title("Daily spot vs captured prices (YTD)")
+    ax.set_ylabel("€/MWh")
+    ax.grid(axis="y", alpha=0.25)
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8)
+    return fig_to_b64(fig)
+
+
+def chart_monthly_negative_share(neg_table: pd.DataFrame) -> str | None:
+    if neg_table.empty:
+        return None
+    cmap = year_color_map(neg_table["Year"].unique().tolist())
+    fig, ax = plt.subplots(figsize=(10.5, 4.2))
+    for y, grp in neg_table.groupby("Year"):
+        grp = grp.copy()
+        grp["Month_num"] = pd.to_datetime(grp["Month"], format="%b", errors="coerce").dt.month
+        grp = grp.sort_values("Month_num")
+        ax.plot(grp["Month"], grp["Negative / zero hours (%)"] * 100, marker="o", linewidth=2.2, color=cmap[y], label=f"{y}")
+    ax.set_title("Monthly share of zero / negative price hours")
+    ax.set_ylabel("% of hours")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    return fig_to_b64(fig)
+
+
+def chart_solar_curtailment(monthly: pd.DataFrame) -> str | None:
+    if monthly.empty:
+        return None
+    cmap = year_color_map(monthly["Year"].unique().tolist())
+    fig, ax = plt.subplots(figsize=(10.5, 4.2))
+    for y, grp in monthly.groupby("Year"):
+        ax.plot(grp["Month"], grp["Economic curtailment (%)"] * 100, marker="o", linewidth=2.2, color=cmap[y], label=str(y))
+    ax.set_title("Monthly economic curtailment")
+    ax.set_ylabel("%")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    return fig_to_b64(fig)
+
+
+def chart_mix(mix_table: pd.DataFrame, current_year: int, previous_year: int) -> str | None:
+    if mix_table.empty:
+        return None
+    cur_col = f"YTD {current_year} (GWh)"
+    prev_col = f"YTD {previous_year} (GWh)"
+    plot = mix_table.head(12).copy().sort_values(cur_col)
+    y = range(len(plot))
+    fig, ax = plt.subplots(figsize=(10.8, 5.2))
+    ax.barh([i - 0.18 for i in y], plot[prev_col], height=0.35, label=str(previous_year), alpha=0.7)
+    ax.barh([i + 0.18 for i in y], plot[cur_col], height=0.35, label=str(current_year), alpha=0.9)
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(plot["Technology"])
+    ax.set_xlabel("GWh")
+    ax.set_title("YTD energy mix comparison")
+    ax.grid(axis="x", alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    return fig_to_b64(fig)
+
+
+def chart_duck_curve(duck_df: pd.DataFrame) -> str | None:
+    if duck_df.empty:
+        return None
+    years = sorted(duck_df["year"].unique().tolist())
+    cmap = year_color_map(years)
+    fig, ax = plt.subplots(figsize=(10.8, 4.8))
+    for y in years:
+        grp = duck_df[duck_df["year"] == y].sort_values("hour")
+        color = cmap[y]
+        ax.plot(grp["hour"], grp["demand_mwh"], color=color, linewidth=2.2, label=f"Demand {y}")
+        ax.plot(grp["hour"], grp["net_load_mw"], color=color, linewidth=2.0, linestyle="--", label=f"Net load {y}")
+    ax.set_title("Duck curve (average hourly demand vs net load, YTD)")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("MW / MWh")
+    ax.set_xticks(range(0, 24, 2))
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=8)
+    return fig_to_b64(fig)
+
+
+# =========================================================
+# PDF GENERATION
+# =========================================================
+def _format_df_for_pdf(df: pd.DataFrame, pct_cols: list[str] | None = None, max_rows: int = 30) -> pd.DataFrame:
+    pct_cols = pct_cols or []
+    tmp = df.head(max_rows).copy()
+    for c in tmp.columns:
+        if c in pct_cols:
+            tmp[c] = tmp[c].map(lambda v: "" if pd.isna(v) else f"{v:.1%}")
+        elif pd.api.types.is_numeric_dtype(tmp[c]):
+            tmp[c] = tmp[c].map(lambda v: "" if pd.isna(v) else f"{v:,.2f}")
+    return tmp.astype(str)
+
+
+def _add_logo_stamp(fig, logo_path: Path | None):
+    if not logo_path or not logo_path.exists():
+        return
+    try:
+        img = plt.imread(str(logo_path))
+        logo_ax = fig.add_axes([0.83, 0.88, 0.13, 0.09])
+        logo_ax.imshow(img)
+        logo_ax.axis("off")
+    except Exception:
+        pass
+
+
+def _add_title_page(pdf: PdfPages, logo_path: Path | None, title: str, subtitle: str):
+    fig = plt.figure(figsize=(11.69, 8.27))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    _add_logo_stamp(fig, logo_path)
+    if logo_path and logo_path.exists():
+        try:
+            img = plt.imread(str(logo_path))
+            logo_ax = fig.add_axes([0.36, 0.60, 0.28, 0.24])
+            logo_ax.imshow(img)
+            logo_ax.axis("off")
+        except Exception:
+            pass
+    ax.text(0.5, 0.50, title, ha="center", va="center", fontsize=22, fontweight="bold", color=CORP_GREEN_DARK, wrap=True)
+    ax.text(0.5, 0.42, subtitle, ha="center", va="center", fontsize=12, color="#374151", wrap=True)
+    ax.text(0.5, 0.08, f"Generated: {now_madrid().strftime('%Y-%m-%d %H:%M Madrid')}", ha="center", va="center", fontsize=9, color="#6B7280")
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _add_chart_page(pdf: PdfPages, logo_path: Path | None, caption: str, img_b64: str):
+    fig = plt.figure(figsize=(11.69, 8.27))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    _add_logo_stamp(fig, logo_path)
+    ax.text(0.5, 0.96, caption, ha="center", va="top", fontsize=16, fontweight="bold", color="#111827")
+    raw = base64.b64decode(img_b64)
+    img = plt.imread(BytesIO(raw), format="png")
+    img_ax = fig.add_axes([0.06, 0.10, 0.88, 0.78])
+    img_ax.imshow(img)
+    img_ax.axis("off")
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _add_table_page(pdf: PdfPages, logo_path: Path | None, title: str, df: pd.DataFrame, pct_cols: list[str] | None = None, max_rows: int = 30):
+    fig, ax = plt.subplots(figsize=(11.69, 8.27))
+    ax.axis("off")
+    _add_logo_stamp(fig, logo_path)
+    ax.set_title(title, fontsize=16, fontweight="bold", color="#111827", pad=18)
+    if df.empty:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", fontsize=12, color="#6B7280")
     else:
-        total_charged_display = yearly_rollup["total_charged"].iloc[0] if not yearly_rollup.empty else 0.0
-        total_discharged_display = yearly_rollup["total_discharged"].iloc[0] if not yearly_rollup.empty else 0.0
-        revenue_bess_display = yearly_rollup["Revenue BESS (€/MW)"].iloc[0] if not yearly_rollup.empty else 0.0
-        metrics_caption = f"Year {int(yearly_rollup['Year'].iloc[0])}" if not yearly_rollup.empty else ""
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total charged (MWh)", f"{total_charged_display:,.2f}")
-    c2.metric("Total discharged (MWh)", f"{total_discharged_display:,.2f}")
-    c3.metric("Revenue BESS (€/MW)", f"{revenue_bess_display:,.2f}")
-    if metrics_caption:
-        st.caption(metrics_caption)
-
-    hero_header("Monthly Revenue BESS (€/MW)")
-    monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
-    monthly_chart_df["label"] = monthly_chart_df["month"]
-    monthly_bar = alt.Chart(monthly_chart_df).mark_bar().encode(
-        x=alt.X("label:N", title="Month"),
-        y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
-        color=alt.Color("Year:N"),
-        tooltip=["Year", "month", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Avg_Effective_Capacity_MWh"],
-    ).properties(height=350)
-    st.altair_chart(monthly_bar, use_container_width=True)
-
-    yearly_total_df = monthly_summary[monthly_summary["month"] == "TOTAL"].copy()
-    if not yearly_total_df.empty:
-        yearly_total_df["label"] = yearly_total_df["Year"].astype(str) + " TOTAL"
-        yearly_bar = alt.Chart(yearly_total_df).mark_bar().encode(
-            x=alt.X("label:N", title="Year"),
-            y=alt.Y("Revenue BESS €/MW:Q", title="€/MW"),
-            color=alt.Color("Year:N"),
-            tooltip=["Year", "Revenue BESS €/MW", "Captured Solar (€/MWh)", "Captured Hybrid (€/MWh)", "Avg_Effective_Capacity_MWh"],
-        ).properties(height=280)
-        st.altair_chart(yearly_bar, use_container_width=True)
-
-    hero_header("Average 24h charge / discharge profile")
-    min_date = pd.to_datetime(dispatch["Date"]).min().date()
-    max_date = pd.to_datetime(dispatch["Date"]).max().date()
-    p1, p2 = st.columns(2)
-    with p1:
-        bold_label("Average profile start")
-        period_start = st.date_input("Average profile start", value=min_date, min_value=min_date, max_value=max_date, key="avg_profile_start", label_visibility="collapsed")
-    with p2:
-        bold_label("Average profile end")
-        period_end = st.date_input("Average profile end", value=max_date, min_value=min_date, max_value=max_date, key="avg_profile_end", label_visibility="collapsed")
-
-    if period_start > period_end:
-        st.error("Start date cannot be after end date.")
-    else:
-        period_mask = (pd.to_datetime(dispatch["Date"]).dt.date >= period_start) & (pd.to_datetime(dispatch["Date"]).dt.date <= period_end)
-        period_df = dispatch.loc[period_mask].copy()
-        if period_df.empty:
-            st.warning("No data found for the selected period.")
-        else:
-            avg_profile = period_df.groupby("Hour", as_index=False).agg(
-                g_to_batt=("g_to_batt", "mean"),
-                grid_charge=("grid_charge", "mean"),
-                discharge_mwh=("discharge_mwh", "mean"),
-                omie_venta=("omie_venta", "mean"),
-                generacion=("generacion", "mean"),
-                hybrid_profile_mwh=("hybrid profile (MWh)", "mean"),
-            )
-            avg_profile["charge_mwh"] = avg_profile["g_to_batt"] + avg_profile["grid_charge"]
-            import matplotlib.pyplot as plt
-            fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
-            ax_flow = ax_price.twinx()
-            x = avg_profile["Hour"].astype(int).values
-            ax_flow.bar(x - 0.18, avg_profile["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
-            ax_flow.bar(x - 0.18, avg_profile["grid_charge"], width=0.35, bottom=avg_profile["g_to_batt"], color="#8fd19e", alpha=0.95)
-            ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
-            if mode_result != "Standalone BESS":
-                ax_flow.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
-                ax_flow.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22)
-            ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
-            ax_price.set_xlabel("Hour")
-            ax_price.set_ylabel("OMIE (€/MWh)")
-            ax_flow.set_ylabel("Charge / Discharge / Solar / Hybrid (MWh)", labelpad=16)
-            ax_price.grid(axis="y", alpha=0.25)
-            ax_price.set_xticks(x)
-            fig.tight_layout(rect=[0, 0, 0.9, 1])
-            cplot, cbox = st.columns([5.3, 1.2])
-            with cplot:
-                st.pyplot(fig, use_container_width=True)
-            with cbox:
-                legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
-                if mode_result != "Standalone BESS":
-                    legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
-                draw_side_legend(legend_items)
-                if mode_result != "Standalone BESS":
-                    solar_cap, hybrid_cap = compute_period_capture_metrics(period_df)
-                    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-                    st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
-                    st.metric("Hybrid capture (€/MWh)", metric_value_or_blank(hybrid_cap))
-
-    hero_header("Selected day dispatch")
-    available_days = sorted(pd.to_datetime(dispatch["Date"]).dt.date.unique().tolist())
-    bold_label("Choose a day")
-    selected_day = st.selectbox("Choose a day", options=available_days, index=0, format_func=lambda d: d.strftime("%Y-%m-%d"), label_visibility="collapsed")
-    day_df = dispatch[pd.to_datetime(dispatch["Date"]).dt.date == selected_day].copy()
-    if day_df.empty:
-        st.warning("No data found for the selected day.")
-    else:
-        import matplotlib.pyplot as plt
-        day_df = day_df.sort_values("Hour").copy()
-        fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
-        ax_flow = ax_price.twinx()
-        x = day_df["Hour"].astype(int).values
-        ax_price.plot(x, day_df["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
-        ax_flow.bar(x - 0.18, day_df["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
-        ax_flow.bar(x - 0.18, day_df["grid_charge"], width=0.35, bottom=day_df["g_to_batt"], color="#8fd19e", alpha=0.95)
-        ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
-        if mode_result != "Standalone BESS":
-            ax_flow.plot(x, day_df["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
-            ax_flow.fill_between(x, day_df["hybrid profile (MWh)"], color="#facc15", alpha=0.22)
-        ax_price.set_xlabel("Hour")
-        ax_price.set_ylabel("OMIE (€/MWh)")
-        right_label = "Charge / Discharge (MWh)" if mode_result == "Standalone BESS" else "Charge / Discharge / Solar / Hybrid (MWh)"
-        ax_flow.set_ylabel(right_label, labelpad=16)
-        ax_price.grid(axis="y", alpha=0.25)
-        ax_price.set_xticks(x)
-        fig.tight_layout(rect=[0, 0, 0.9, 1])
-        dplot, dside = st.columns([5.3, 1.2])
-        with dplot:
-            st.pyplot(fig, use_container_width=True)
-        with dside:
-            legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
-            if mode_result != "Standalone BESS":
-                legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
-            draw_side_legend(legend_items)
-        if float(day_df["charge_mwh"].sum() + day_df["discharge_mwh"].sum()) <= 1e-9:
-            if mode_result == "BESS without demand":
-                solar_day = float(day_df["generacion"].sum()) if "generacion" in day_df.columns else 0.0
-                st.caption(
-                    f"No battery cycling on this selected day. In 'BESS without demand' the model sets omie_compra = 1000 €/MWh, so the battery usually only charges from solar. Solar available on this day: {solar_day:,.2f} MWh."
-                )
+        tmp = _format_df_for_pdf(df, pct_cols=pct_cols, max_rows=max_rows)
+        for c in tmp.columns:
+            tmp[c] = tmp[c].map(lambda x: x[:35] + "…" if len(str(x)) > 36 else x)
+        table = ax.table(cellText=tmp.values, colLabels=tmp.columns, cellLoc="center", loc="center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(7.0)
+        table.scale(1, 1.22)
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor("#D1D5DB")
+            cell.set_linewidth(0.4)
+            if row == 0:
+                cell.set_facecolor(CORP_GREY)
+                cell.set_text_props(color="white", weight="bold")
             else:
-                st.caption("No battery cycling on this selected day under the current price profile, solar profile and model constraints.")
+                cell.set_facecolor("#FFFFFF" if row % 2 else "#F9FAFB")
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
 
-    hero_header("Capacity by year")
-    st.altair_chart(build_capacity_chart(capacity_table), use_container_width=True)
-    st.dataframe(style_total_rows(capacity_table), use_container_width=True)
 
-    hero_header("Monthly captured prices")
-    base_cols = [
-        "Year",
-        "month",
-        "Revenue BESS €/MW",
-        "Cycles/day avg",
-        "Avg_Effective_Capacity_MWh",
-        "Avg_SOH",
-    ]
-    if mode_result == "Standalone BESS":
-        captured_cols = base_cols
+def build_pdf_report(
+    output_path: Path,
+    logo_path: Path | None,
+    title: str,
+    kpi_df: pd.DataFrame,
+    daily_table: pd.DataFrame,
+    monthly_table: pd.DataFrame,
+    neg_hours_table: pd.DataFrame,
+    mix_table: pd.DataFrame,
+    demand_table: pd.DataFrame,
+    capacity_table: pd.DataFrame,
+    bess_table: pd.DataFrame,
+    bess_duration_table: pd.DataFrame,
+    charts: dict[str, str | None],
+    current_year: int,
+    previous_year: int,
+) -> bytes:
+    subtitle = f"Monthly Day Ahead report with YTD focus. Comparison: {current_year} YTD versus {previous_year} YTD, same calendar cut-off."
+    with PdfPages(str(output_path)) as pdf:
+        _add_title_page(pdf, logo_path, title, subtitle)
+        _add_table_page(pdf, logo_path, "Executive YTD KPIs", kpi_df, pct_cols=["% change"], max_rows=16)
+        for caption, img_b64 in charts.items():
+            if img_b64:
+                _add_chart_page(pdf, logo_path, caption, img_b64)
+        _add_table_page(pdf, logo_path, "Daily spot and captured price table", daily_table, max_rows=40)
+        _add_table_page(pdf, logo_path, "Monthly price, solar and curtailment table", monthly_table, pct_cols=["Negative / zero hours (%)", "Negative / zero solar hours (%)", "Economic curtailment (%)"], max_rows=24)
+        _add_table_page(pdf, logo_path, "Negative / zero price hours table", neg_hours_table, pct_cols=["Negative / zero hours (%)", "Negative / zero solar hours (%)"], max_rows=24)
+        _add_table_page(pdf, logo_path, "YTD energy mix", mix_table, pct_cols=["% change"], max_rows=25)
+        _add_table_page(pdf, logo_path, "BESS monthly revenue", bess_table, max_rows=30)
+        _add_table_page(pdf, logo_path, "BESS YTD duration comparison", bess_duration_table, max_rows=12)
+        _add_table_page(pdf, logo_path, "YTD demand", demand_table, pct_cols=["% change"], max_rows=5)
+        _add_table_page(pdf, logo_path, "Installed capacity", capacity_table, pct_cols=["% change"], max_rows=25)
+    return output_path.read_bytes()
+
+
+# =========================================================
+# EMAIL SENDERS
+# =========================================================
+def send_via_webhook(to_list: list[str], cc_list: list[str], subject: str, html_body: str, pdf_bytes: bytes, pdf_filename: str) -> tuple[bool, str]:
+    url = st.secrets.get("mail_webhook_url", "")
+    token = st.secrets.get("mail_webhook_token", "")
+    if not url or not token:
+        return False, "Webhook secrets not configured."
+    payload = {
+        "token": token,
+        "to": to_list,
+        "cc": cc_list,
+        "subject": subject,
+        "html_body": html_body,
+        "attachments": [{
+            "filename": pdf_filename,
+            "content_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+            "mime_type": "application/pdf",
+        }],
+    }
+    resp = requests.post(url, json=payload, timeout=45)
+    if 200 <= resp.status_code < 300:
+        return True, "Email request sent successfully through webhook."
+    return False, f"Webhook returned {resp.status_code}: {resp.text}"
+
+
+def send_via_smtp(to_list: list[str], cc_list: list[str], subject: str, html_body: str, pdf_bytes: bytes, pdf_filename: str) -> tuple[bool, str]:
+    host = st.secrets.get("smtp_host", "")
+    user = st.secrets.get("smtp_user", "")
+    password = st.secrets.get("smtp_password", "")
+    sender = st.secrets.get("smtp_from", user)
+    port = int(st.secrets.get("smtp_port", 587))
+    if not host or not user or not password or not sender:
+        return False, "SMTP secrets not configured."
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject
+    msg.set_content("Please view this email in HTML format. The PDF report is attached.")
+    msg.add_alternative(html_body, subtype="html")
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename)
+    with smtplib.SMTP(host, port, timeout=45) as server:
+        server.starttls()
+        server.login(user, password)
+        server.send_message(msg)
+    return True, "Email sent successfully through SMTP."
+
+
+# =========================================================
+# APP FLOW
+# =========================================================
+price_hourly = load_historical_prices()
+solar_hourly = load_historical_solar()
+mix_daily = load_generation_mix_daily()
+demand_hourly = load_demand_raw()
+capacity_monthly = load_installed_capacity_monthly()
+
+if price_hourly.empty:
+    st.error(f"No price data found. Expected file: {HIST_PRICES_FILE}")
+    st.stop()
+
+latest_price_day = price_hourly["datetime"].dt.date.max()
+default_month = pd.Timestamp(latest_price_day).to_period("M").to_timestamp()
+
+col_a, col_b = st.columns(2)
+with col_a:
+    to_emails_raw = st.text_area("To", value=st.secrets.get("default_to", ""), height=80)
+with col_b:
+    cc_emails_raw = st.text_area("Cc", value=st.secrets.get("default_cc", ""), height=80)
+
+available_months = sorted(price_hourly["datetime"].dt.to_period("M").astype(str).unique().tolist())
+month_str = st.selectbox(
+    "Report month",
+    available_months,
+    index=available_months.index(default_month.strftime("%Y-%m")) if default_month.strftime("%Y-%m") in available_months else len(available_months) - 1,
+)
+report_month = pd.Timestamp(month_str)
+report_year = report_month.year
+previous_year = report_year - 1
+
+month_end = (report_month + pd.offsets.MonthEnd(0)).date()
+latest_in_month = price_hourly[price_hourly["datetime"].dt.to_period("M") == report_month.to_period("M")]["datetime"].dt.date.max()
+cutoff_day = min(month_end, latest_in_month) if pd.notna(latest_in_month) else month_end
+
+same_prev_day = min(cutoff_day.day, month_end_day(previous_year, report_month.month))
+current_window = PeriodWindow(f"YTD {report_year}", report_year, date(report_year, 1, 1), cutoff_day)
+previous_window = PeriodWindow(f"YTD {previous_year}", previous_year, date(previous_year, 1, 1), date(previous_year, report_month.month, same_prev_day))
+
+# Append live current-year data when needed.
+token = require_esios_token()
+price_hourly, solar_hourly, demand_hourly = append_live_price_solar_demand(price_hourly, solar_hourly, demand_hourly, current_window.start, current_window.end, token)
+mix_daily, capacity_monthly, live_demand_monthly = append_live_mix_capacity(mix_daily, capacity_monthly, current_window.start, current_window.end)
+
+subject = st.text_input("Subject", value=f"Nexwell Power - Monthly Day Ahead YTD report - {report_month.strftime('%b-%Y')}")
+intro_text = st.text_area(
+    "Intro text",
+    value=(
+        "Hi all,\n\n"
+        f"Please find below the monthly Day Ahead report for {report_month.strftime('%B %Y')}, "
+        f"focused on YTD performance versus {previous_year}. The full PDF report is attached.\n"
+    ),
+    height=110,
+)
+
+st.subheader("BESS revenue settings")
+bess_settings_cols = st.columns(5)
+with bess_settings_cols[0]:
+    bess_mw = st.number_input("BESS MWnom", min_value=0.1, value=float(st.secrets.get("default_bess_mw", 1.0)), step=0.1)
+with bess_settings_cols[1]:
+    bess_duration_h = st.number_input("Main duration (h)", min_value=0.5, value=float(st.secrets.get("default_bess_duration_h", 4.0)), step=0.5)
+with bess_settings_cols[2]:
+    bess_eta_ch = st.number_input("Charge efficiency", min_value=0.1, max_value=1.0, value=float(st.secrets.get("default_bess_eta_ch", 1.0)), step=0.01)
+with bess_settings_cols[3]:
+    bess_eta_dis = st.number_input("Discharge efficiency", min_value=0.1, max_value=1.0, value=float(st.secrets.get("default_bess_eta_dis", 0.85)), step=0.01)
+with bess_settings_cols[4]:
+    cycle_limit_factor = st.number_input("Cycles/day limit", min_value=0.1, max_value=3.0, value=float(st.secrets.get("default_bess_cycles_day", 1.0)), step=0.1)
+
+kpi_df = build_ytd_metrics_table(price_hourly, solar_hourly, current_window, previous_window)
+daily_table = build_daily_price_capture_table(price_hourly, solar_hourly, current_window, previous_window)
+monthly_table = build_monthly_price_solar_table(price_hourly, solar_hourly, [previous_year, report_year], report_month.month, cutoff_day.day)
+neg_hours_table = build_negative_hours_table(price_hourly, solar_hourly, [previous_year, report_year], report_month.month, cutoff_day.day)
+mix_table = build_mix_ytd_table(mix_daily, current_window, previous_window)
+demand_table = build_demand_ytd_table(demand_hourly, live_demand_monthly, current_window, previous_window)
+capacity_table = build_capacity_table(capacity_monthly, report_month, pd.Timestamp(date(previous_year, report_month.month, 1)))
+duck_df = build_duck_curve_df(demand_hourly, solar_hourly, current_window, previous_window)
+
+bess_table = build_bess_revenue_monthly_table(
+    price_hourly=price_hourly,
+    years=[previous_year, report_year],
+    cutoff_month=report_month.month,
+    cutoff_day=cutoff_day.day,
+    bess_mw=bess_mw,
+    duration_h=bess_duration_h,
+    eta_ch=bess_eta_ch,
+    eta_dis=bess_eta_dis,
+    cycle_limit_factor=cycle_limit_factor,
+)
+bess_duration_table = build_bess_duration_comparison(
+    price_hourly=price_hourly,
+    years=[previous_year, report_year],
+    cutoff_month=report_month.month,
+    cutoff_day=cutoff_day.day,
+    bess_mw=bess_mw,
+    eta_ch=bess_eta_ch,
+    eta_dis=bess_eta_dis,
+    cycle_limit_factor=cycle_limit_factor,
+)
+
+charts = {
+    "Daily spot and captured prices": chart_daily_spot_capture(price_hourly, solar_hourly, current_window, previous_window),
+    "Monthly negative / zero price share": chart_monthly_negative_share(neg_hours_table),
+    "Economic curtailment": chart_solar_curtailment(monthly_table),
+    "Duck curve": chart_duck_curve(duck_df),
+    "Energy mix": chart_mix(mix_table, report_year, previous_year),
+    "BESS monthly revenue": chart_bess_revenue(bess_table, duration_label=f"{bess_duration_h:g}h"),
+    "BESS revenue by duration": chart_bess_duration_totals(bess_duration_table),
+}
+
+logo_path = find_logo_path()
+logo_html = ""
+if logo_path:
+    logo_html = f'<div style="margin-bottom:12px;"><img src="data:image/jpeg;base64,{image_to_b64(logo_path)}" alt="Nexwell Power" style="width:210px;height:auto;"></div>'
+
+kpi_lookup = {row["Metric"] + "|" + row["Unit"]: row for _, row in kpi_df.iterrows()}
+cards = []
+for metric, unit, decimals in [
+    ("Avg spot", "€/MWh", 2),
+    ("Captured solar uncurtailed", "€/MWh", 2),
+    ("Captured solar curtailed", "€/MWh", 2),
+    ("Solar generation", "GWh", 1),
+    ("Negative / zero hours", "%", 1),
+    ("Economic curtailment", "%", 1),
+]:
+    key = metric + "|" + unit
+    if key in kpi_lookup:
+        row = kpi_lookup[key]
+        cur_val = row.get(f"YTD {report_year}")
+        prev_val = row.get(f"YTD {previous_year}")
+        if unit == "%":
+            value = fmt_pct(cur_val, decimals)
+            delta = f"vs {previous_year}: {fmt_pct(prev_val, decimals)}"
+        else:
+            value = fmt_num(cur_val, decimals, f" {unit}")
+            delta = f"vs {previous_year}: {fmt_num(prev_val, decimals, f' {unit}') }"
+        cards.append((metric, value, delta))
+
+if not bess_table.empty:
+    bess_totals = bess_table[bess_table["month"] == "TOTAL"].copy()
+    cur_bess = bess_totals[bess_totals["Year"] == report_year]["Revenue BESS €/MW"]
+    prev_bess = bess_totals[bess_totals["Year"] == previous_year]["Revenue BESS €/MW"]
+    if not cur_bess.empty:
+        prev_label = fmt_num(prev_bess.iloc[0] / 1000.0, 1, " k€/MW") if not prev_bess.empty else "-"
+        cards.append((f"BESS revenue {bess_duration_h:g}h", fmt_num(cur_bess.iloc[0] / 1000.0, 1, " k€/MW"), f"vs {previous_year}: {prev_label}"))
+
+chart_html = ""
+for title, img_b64 in charts.items():
+    if img_b64:
+        chart_html += f'<h3>{title}</h3><img src="data:image/png;base64,{img_b64}" style="max-width:100%;height:auto;border:1px solid #ddd;"><br><br>'
+
+email_html = f"""
+<html><body style="font-family:Arial,sans-serif;font-size:13px;color:#111827;">
+{logo_html}
+<p>{intro_text.replace(chr(10), '<br>')}</p>
+<p><strong>Cut-off:</strong> {current_window.end.strftime('%d-%b-%Y')}<br>
+<strong>Comparison cut-off:</strong> {previous_window.end.strftime('%d-%b-%Y')}</p>
+{metric_cards_html(cards)}<br>
+<h3>Executive YTD KPIs</h3>{df_to_html_table(kpi_df, pct_cols=['% change'])}<br>
+{chart_html}
+<h3>Daily spot and captured prices</h3>{df_to_html_table(daily_table)}<br>
+<h3>Monthly price, captured and curtailment table</h3>{df_to_html_table(monthly_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)', 'Economic curtailment (%)'])}<br>
+<h3>Negative / zero hours table</h3>{df_to_html_table(neg_hours_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)'])}<br>
+<h3>YTD energy mix</h3>{df_to_html_table(mix_table, pct_cols=['% change']) if not mix_table.empty else '<p>No energy mix data available.</p>'}<br>
+<h3>BESS monthly revenue</h3>{df_to_html_table(bess_table) if not bess_table.empty else '<p>No BESS revenue data available.</p>'}<br>
+<h3>BESS YTD duration comparison</h3>{df_to_html_table(bess_duration_table) if not bess_duration_table.empty else '<p>No BESS duration comparison available.</p>'}<br>
+<h3>YTD demand</h3>{df_to_html_table(demand_table, pct_cols=['% change']) if not demand_table.empty else '<p>No demand data available.</p>'}<br>
+<h3>Installed capacity</h3>{df_to_html_table(capacity_table, pct_cols=['% change']) if not capacity_table.empty else '<p>No installed capacity data available.</p>'}<br>
+<p>Best regards,</p>
+</body></html>
+"""
+
+pdf_filename = f"nexwell_power_monthly_ytd_report_{report_month.strftime('%Y_%m')}.pdf"
+pdf_path = OUTPUT_DIR / pdf_filename
+pdf_bytes = build_pdf_report(
+    pdf_path,
+    logo_path,
+    subject,
+    kpi_df,
+    daily_table,
+    monthly_table,
+    neg_hours_table,
+    mix_table,
+    demand_table,
+    capacity_table,
+    bess_table,
+    bess_duration_table,
+    charts,
+    report_year,
+    previous_year,
+)
+
+st.subheader("Preview")
+st.markdown(email_html, unsafe_allow_html=True)
+
+st.subheader("Quick tables")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**YTD energy mix**")
+    st.dataframe(mix_table, use_container_width=True)
+with col2:
+    st.markdown("**Negative / zero hours**")
+    st.dataframe(neg_hours_table, use_container_width=True)
+
+st.markdown("**BESS monthly revenue**")
+st.dataframe(bess_table, use_container_width=True)
+st.markdown("**BESS YTD duration comparison**")
+st.dataframe(bess_duration_table, use_container_width=True)
+
+st.subheader("PDF report")
+st.download_button("Download PDF report", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
+st.download_button("Download email HTML", data=email_html, file_name=f"email_body_{report_month.strftime('%Y_%m')}.html", mime="text/html")
+
+st.subheader("Recipients")
+st.dataframe(pd.DataFrame({"To": [", ".join(parse_emails(to_emails_raw))], "Cc": [", ".join(parse_emails(cc_emails_raw))], "Subject": [subject]}), use_container_width=True)
+
+send_method = st.radio("Send method", ["Webhook", "SMTP"], horizontal=True)
+if st.button("Send monthly report now"):
+    to_list = parse_emails(to_emails_raw)
+    cc_list = parse_emails(cc_emails_raw)
+    if not to_list:
+        st.error("Add at least one recipient in To.")
     else:
-        captured_cols = [
-            "Year",
-            "month",
-            "Captured Solar (€/MWh)",
-            "Captured Hybrid (€/MWh)",
-            "Revenue BESS €/MW",
-            "Cycles/day avg",
-            "Avg_Effective_Capacity_MWh",
-            "Avg_SOH",
-        ]
-    st.dataframe(style_total_rows(monthly_summary[captured_cols]), use_container_width=True)
+        try:
+            if send_method == "Webhook":
+                ok, msg = send_via_webhook(to_list, cc_list, subject, email_html, pdf_bytes, pdf_filename)
+            else:
+                ok, msg = send_via_smtp(to_list, cc_list, subject, email_html, pdf_bytes, pdf_filename)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+        except Exception as exc:
+            st.error(f"Send failed: {exc}")
 
-    hero_header("Monthly Revenue BESS (€/MW) detail")
-    revenue_detail_cols = ["Year", "month", "Revenue BESS €/MW", "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)"]
-    st.dataframe(style_total_rows(monthly_summary[revenue_detail_cols]), use_container_width=True)
-
-    data_header("Download / data tables")
-    st.caption("From this point downward, this section is mainly for validation, download and detailed data inspection.")
-    st.subheader("Daily stats")
-    st.dataframe(style_total_rows(stats), use_container_width=True)
-
-    st.subheader("Hourly dispatch")
-    dispatch_cols = [
-        "Date",
-        "Hour",
-        "Year",
-        "Revenue BESS (€)",
-        "Revenue BESS €/MW",
-        "hybrid profile (MWh)",
-        "charge_mwh",
-        "discharge_mwh",
-        "effective_capacity_mwh",
-        "SOH",
-        "degradation_status",
-        "omie_venta",
-        "omie_compra",
-        "generacion",
-        "consumo",
-        "g_to_grid",
-        "g_to_batt",
-        "g_to_self",
-        "grid_charge",
-        "batt_for_load",
-        "batt_for_sell",
-        "grid_purchase",
-        "soc",
-    ]
-    st.dataframe(style_total_rows(dispatch[dispatch_cols]), use_container_width=True)
-
-    st.subheader("Hourly dataset used")
-    st.dataframe(style_total_rows(data_used), use_container_width=True)
-
-    st.subheader("Variable definitions")
-    st.dataframe(style_total_rows(variable_definitions), use_container_width=True)
-
-    csv_bytes = dispatch[dispatch_cols].to_csv(index=False).encode("utf-8")
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "Download hourly optimisation CSV",
-            data=csv_bytes,
-            file_name=f"bess_optimisation_{run_ts}.csv",
-            mime="text/csv",
-        )
-    with dl2:
-        if xlsx_bytes is not None:
-            st.download_button(
-                "Download hourly optimisation XLSX",
-                data=xlsx_bytes,
-                file_name=f"bess_optimisation_{run_ts}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+st.info(
+    "This version includes daily spot vs captured charts/table, duck curve, negative-hours % table, BESS DA revenue based on the BESS-tab standalone optimization logic, logo stamp in the upper-right corner of the PDF, and REE live extensions for 2026 YTD energy mix / demand / installed capacity where available."
+)
