@@ -1152,6 +1152,33 @@ def chart_bess_revenue(bess_table: pd.DataFrame, duration_label: str = "4h") -> 
     return fig_to_b64(fig)
 
 
+def chart_bess_spread_prices(bess_table: pd.DataFrame, duration_label: str = "4h") -> str | None:
+    if bess_table.empty:
+        return None
+    plot = bess_table[bess_table["month"] != "TOTAL"].copy()
+    if plot.empty:
+        return None
+    plot["month_dt"] = pd.to_datetime(plot["month"], errors="coerce")
+    plot = plot.dropna(subset=["month_dt"]).copy()
+    plot["Month"] = plot["month_dt"].dt.strftime("%b")
+    plot["month_num"] = plot["month_dt"].dt.month
+    years = sorted(plot["Year"].unique().tolist())
+    cmap = year_color_map(years)
+
+    fig, ax = plt.subplots(figsize=(11.0, 4.8))
+    for y in years:
+        grp = plot[plot["Year"] == y].sort_values("month_num")
+        color = cmap[y]
+        ax.plot(grp["Month"], grp["Avg buy price (€/MWh)"], color=color, linewidth=1.9, linestyle=":", marker="o", label=f"Buy {y}")
+        ax.plot(grp["Month"], grp["Avg sell price (€/MWh)"], color=color, linewidth=2.2, linestyle="-", marker="o", label=f"Sell {y}")
+        ax.plot(grp["Month"], grp["Captured spread (€/MWh)"], color=color, linewidth=2.0, linestyle="--", marker="o", label=f"Spread {y}")
+    ax.set_title(f"BESS buy / sell prices and spread ({duration_label}, standalone)")
+    ax.set_ylabel("€/MWh")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8)
+    return fig_to_b64(fig)
+
+
 def chart_bess_duration_totals(bess_duration_table: pd.DataFrame) -> str | None:
     if bess_duration_table.empty:
         return None
@@ -1554,6 +1581,7 @@ charts = {
     "Duck curve": chart_duck_curve(duck_df),
     "Energy mix": chart_mix(mix_table, report_year, previous_year),
     "BESS monthly revenue": chart_bess_revenue(bess_table, duration_label=f"{bess_duration_h:g}h"),
+    "BESS buy / sell prices and spread": chart_bess_spread_prices(bess_table, duration_label=f"{bess_duration_h:g}h"),
     "BESS revenue by duration": chart_bess_duration_totals(bess_duration_table),
 }
 
@@ -1683,5 +1711,5 @@ if st.button("Send monthly report now"):
             st.error(f"Send failed: {exc}")
 
 st.info(
-    "This version includes weekly spot vs captured charts/table, a duck-curve style hourly price profile, bar chart economic curtailment based on P48, negative-hours % table, BESS DA revenue based on the BESS-tab standalone optimization logic, a logo stamp in the upper-right corner of the PDF, and REE live extensions for 2026 YTD energy mix / demand / installed capacity where available. The PDF contains charts only (no tables)."
+    "This version includes weekly spot vs captured charts/table, a duck-curve style hourly price profile, bar chart economic curtailment based on P48, negative-hours % table, BESS DA revenue based on the BESS-tab standalone optimization logic with monthly bars side by side by year, plus monthly buy price, sell price and spread charts. It also keeps the logo stamp in the upper-right corner of the PDF, REE live extensions for 2026 YTD energy mix / demand / installed capacity where available, and a charts-only PDF (no tables)."
 )
