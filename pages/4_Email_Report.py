@@ -15,12 +15,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import cm
-from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from matplotlib.backends.backend_pdf import PdfPages
 
 # =========================================================
 # CONFIG
@@ -620,9 +615,9 @@ def chart_mix(mix_table: pd.DataFrame, current_year: int, previous_year: int) ->
     return fig_to_b64(fig)
 
 # =========================================================
-# PDF GENERATION
+# PDF GENERATION - no external reportlab dependency
 # =========================================================
-def reportlab_table_from_df(df: pd.DataFrame, pct_cols: list[str] | None = None, max_rows: int = 30) -> Table:
+def _format_df_for_pdf(df: pd.DataFrame, pct_cols: list[str] | None = None, max_rows: int = 30) -> pd.DataFrame:
     pct_cols = pct_cols or []
     tmp = df.head(max_rows).copy()
     for c in tmp.columns:
@@ -630,64 +625,81 @@ def reportlab_table_from_df(df: pd.DataFrame, pct_cols: list[str] | None = None,
             tmp[c] = tmp[c].map(lambda v: "" if pd.isna(v) else f"{v:.1%}")
         elif pd.api.types.is_numeric_dtype(tmp[c]):
             tmp[c] = tmp[c].map(lambda v: "" if pd.isna(v) else f"{v:,.2f}")
-    data = [list(tmp.columns)] + tmp.astype(str).values.tolist()
-    table = Table(data, repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CORP_GREY)),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    return table
+    return tmp.astype(str)
 
 
-def image_flowable_from_b64(img_b64: str, width_cm: float = 24.0) -> Image:
+def _add_title_page(pdf: PdfPages, logo_path: Path | None, title: str, subtitle: str):
+    fig = plt.figure(figsize=(11.69, 8.27))  # A4 landscape
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    if logo_path and logo_path.exists():
+        try:
+            img = plt.imread(str(logo_path))
+            logo_ax = fig.add_axes([0.38, 0.62, 0.24, 0.24])
+            logo_ax.imshow(img)
+            logo_ax.axis("off")
+        except Exception:
+            pass
+    ax.text(0.5, 0.52, title, ha="center", va="center", fontsize=22, fontweight="bold", color=CORP_GREEN_DARK, wrap=True)
+    ax.text(0.5, 0.43, subtitle, ha="center", va="center", fontsize=12, color="#374151", wrap=True)
+    ax.text(0.5, 0.08, f"Generated: {now_madrid().strftime('%Y-%m-%d %H:%M Madrid')}", ha="center", va="center", fontsize=9, color="#6B7280")
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _add_chart_page(pdf: PdfPages, caption: str, img_b64: str):
+    fig = plt.figure(figsize=(11.69, 8.27))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    ax.text(0.5, 0.96, caption, ha="center", va="top", fontsize=16, fontweight="bold", color="#111827")
     raw = base64.b64decode(img_b64)
-    bio = BytesIO(raw)
-    img = Image(bio)
-    img.drawWidth = width_cm * cm
-    img.drawHeight = img.imageHeight * img.drawWidth / img.imageWidth
-    return img
+    img = plt.imread(BytesIO(raw), format="png")
+    img_ax = fig.add_axes([0.08, 0.10, 0.84, 0.78])
+    img_ax.imshow(img)
+    img_ax.axis("off")
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _add_table_page(pdf: PdfPages, title: str, df: pd.DataFrame, pct_cols: list[str] | None = None, max_rows: int = 30):
+    fig, ax = plt.subplots(figsize=(11.69, 8.27))
+    ax.axis("off")
+    ax.set_title(title, fontsize=16, fontweight="bold", color="#111827", pad=18)
+    if df.empty:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", fontsize=12, color="#6B7280")
+    else:
+        tmp = _format_df_for_pdf(df, pct_cols=pct_cols, max_rows=max_rows)
+        # Truncate very long labels to keep the PDF readable.
+        for c in tmp.columns:
+            tmp[c] = tmp[c].map(lambda x: x[:38] + "…" if len(str(x)) > 39 else x)
+        table = ax.table(cellText=tmp.values, colLabels=tmp.columns, cellLoc="center", loc="center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(7.2)
+        table.scale(1, 1.25)
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor("#D1D5DB")
+            cell.set_linewidth(0.4)
+            if row == 0:
+                cell.set_facecolor(CORP_GREY)
+                cell.set_text_props(color="white", weight="bold")
+            else:
+                cell.set_facecolor("#FFFFFF" if row % 2 else "#F9FAFB")
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
 
 
 def build_pdf_report(output_path: Path, logo_path: Path | None, title: str, kpi_df: pd.DataFrame, monthly_table: pd.DataFrame, mix_table: pd.DataFrame, demand_table: pd.DataFrame, capacity_table: pd.DataFrame, charts: dict[str, str | None], current_year: int, previous_year: int) -> bytes:
-    doc = SimpleDocTemplate(str(output_path), pagesize=landscape(A4), leftMargin=1.1*cm, rightMargin=1.1*cm, topMargin=1.0*cm, bottomMargin=1.0*cm)
-    styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=styles["Title"], fontSize=18, textColor=colors.HexColor(CORP_GREEN_DARK), alignment=TA_CENTER)
-    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#111827"), spaceBefore=8, spaceAfter=6)
-    body = ParagraphStyle("body", parent=styles["BodyText"], fontSize=8.5, leading=11)
-    story = []
-    if logo_path:
-        logo = Image(str(logo_path))
-        logo.drawWidth = 5.0 * cm
-        logo.drawHeight = logo.imageHeight * logo.drawWidth / logo.imageWidth
-        story.append(logo)
-    story.append(Paragraph(title, h1))
-    story.append(Paragraph(f"Monthly Day Ahead report with YTD focus. Comparison: {current_year} YTD versus {previous_year} YTD, same calendar cut-off.", body))
-    story.append(Spacer(1, 0.25*cm))
-    story.append(Paragraph("Executive YTD KPIs", h2))
-    story.append(reportlab_table_from_df(kpi_df, pct_cols=["% change"], max_rows=12))
-    for caption, img_b64 in charts.items():
-        if img_b64:
-            story.append(Spacer(1, 0.2*cm))
-            story.append(Paragraph(caption, h2))
-            story.append(image_flowable_from_b64(img_b64, width_cm=24.0))
-    story.append(PageBreak())
-    story.append(Paragraph("Monthly price, solar and curtailment table", h2))
-    story.append(reportlab_table_from_df(monthly_table, pct_cols=["Economic curtailment (%)"], max_rows=24))
-    story.append(Spacer(1, 0.25*cm))
-    story.append(Paragraph("YTD energy mix", h2))
-    story.append(reportlab_table_from_df(mix_table, pct_cols=["% change"], max_rows=20) if not mix_table.empty else Paragraph("No energy mix data available.", body))
-    story.append(Spacer(1, 0.25*cm))
-    story.append(Paragraph("YTD demand", h2))
-    story.append(reportlab_table_from_df(demand_table, pct_cols=["% change"], max_rows=5) if not demand_table.empty else Paragraph("No demand data available.", body))
-    story.append(Spacer(1, 0.25*cm))
-    story.append(Paragraph("Installed capacity", h2))
-    story.append(reportlab_table_from_df(capacity_table, pct_cols=["% change"], max_rows=20) if not capacity_table.empty else Paragraph("No installed capacity data available.", body))
-    doc.build(story)
+    subtitle = f"Monthly Day Ahead report with YTD focus. Comparison: {current_year} YTD versus {previous_year} YTD, same calendar cut-off."
+    with PdfPages(str(output_path)) as pdf:
+        _add_title_page(pdf, logo_path, title, subtitle)
+        _add_table_page(pdf, "Executive YTD KPIs", kpi_df, pct_cols=["% change"], max_rows=12)
+        for caption, img_b64 in charts.items():
+            if img_b64:
+                _add_chart_page(pdf, caption, img_b64)
+        _add_table_page(pdf, "Monthly price, solar and curtailment table", monthly_table, pct_cols=["Economic curtailment (%)"], max_rows=24)
+        _add_table_page(pdf, "YTD energy mix", mix_table, pct_cols=["% change"], max_rows=25)
+        _add_table_page(pdf, "YTD demand", demand_table, pct_cols=["% change"], max_rows=5)
+        _add_table_page(pdf, "Installed capacity", capacity_table, pct_cols=["% change"], max_rows=25)
     return output_path.read_bytes()
 
 # =========================================================
