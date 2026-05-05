@@ -146,7 +146,16 @@ def value_change(current, previous):
 
 
 def period_filter(df: pd.DataFrame, start: date, end: date) -> pd.Series:
-    return (df["datetime"].dt.date >= start) & (df["datetime"].dt.date <= end)
+    """
+    Robust date filter. Some loaders can return an empty frame or a frame whose
+    datetime column is object/string typed. Convert locally so Streamlit does
+    not crash with: Can only use .dt accessor with datetimelike values.
+    """
+    if df is None or df.empty or "datetime" not in df.columns:
+        return pd.Series(False, index=df.index if df is not None else None)
+
+    dt = pd.to_datetime(df["datetime"], errors="coerce")
+    return (dt.dt.date >= start) & (dt.dt.date <= end)
 
 
 def month_end_day(year: int, month: int) -> int:
@@ -222,7 +231,10 @@ def year_color_map(years: list[int]) -> dict[int, str]:
 
 
 def _empty_df(columns: list[str]) -> pd.DataFrame:
-    return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(columns=columns)
+    if "datetime" in columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    return df
 
 
 # =========================================================
