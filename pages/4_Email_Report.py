@@ -12,7 +12,9 @@ from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import pulp
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -731,14 +733,41 @@ def _daily_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: da
     return out
 
 
-def build_daily_price_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
-    cur = _daily_agg(price_hourly, solar_hourly, current.start, current.end)
-    prev = _daily_agg(price_hourly, solar_hourly, previous.start, previous.end)
+def _weekly_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    daily = _daily_agg(price_hourly, solar_hourly, start, end)
+    if daily.empty:
+        return _empty_df(["week_start", "spot", "captured_unc", "captured_cur", "solar_gwh", "negative_hours", "hours", "year", "week_index", "plot_date"])
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily = daily.dropna(subset=["date"]).copy()
+    daily["week_start"] = daily["date"] - pd.to_timedelta(daily["date"].dt.weekday, unit="D")
+
+    def _calc_week(grp: pd.DataFrame) -> pd.Series:
+        solar = grp["solar_gwh"].sum()
+        return pd.Series({
+            "spot": grp["spot"].mean(),
+            "captured_unc": (grp["captured_unc"] * grp["solar_gwh"]).sum() / solar if solar > 0 else pd.NA,
+            "captured_cur": (grp["captured_cur"] * grp["solar_gwh"]).sum() / solar if solar > 0 else pd.NA,
+            "solar_gwh": solar,
+            "negative_hours": grp["negative_hours"].sum(),
+            "hours": grp["hours"].sum(),
+        })
+
+    out = daily.groupby("week_start").apply(_calc_week).reset_index()
+    out["year"] = out["week_start"].dt.year
+    out["week_index"] = ((out["week_start"] - pd.to_datetime(out["year"].astype(str) + "-01-01")).dt.days // 7) + 1
+    out["plot_date"] = pd.to_datetime("2000-01-01") + pd.to_timedelta((out["week_index"] - 1) * 7, unit="D")
+    return out
+
+
+def build_weekly_price_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+    cur = _weekly_agg(price_hourly, solar_hourly, current.start, current.end)
+    prev = _weekly_agg(price_hourly, solar_hourly, previous.start, previous.end)
     out = pd.concat([cur, prev], ignore_index=True)
     if out.empty:
         return out
-    out["Date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
-    return out[["Date", "year", "spot", "captured_unc", "captured_cur", "solar_gwh", "negative_hours", "hours"]].rename(columns={
+    out["Week start"] = pd.to_datetime(out["week_start"]).dt.strftime("%Y-%m-%d")
+    out["Week"] = out["week_index"]
+    return out[["Week start", "Week", "year", "spot", "captured_unc", "captured_cur", "solar_gwh", "negative_hours", "hours"]].rename(columns={
         "year": "Year",
         "spot": "Avg spot (€/MWh)",
         "captured_unc": "Captured uncurtailed (€/MWh)",
@@ -848,65 +877,322 @@ def build_capacity_table(capacity_monthly: pd.DataFrame, current_month: pd.Times
     return pd.DataFrame(rows).sort_values(f"Latest {cur_latest.strftime('%b-%Y')} (MW)", ascending=False)
 
 
-def build_duck_curve_df(demand_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
+def build_duck_curve_df(price_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
     rows = []
     for window in [previous, current]:
-        d = demand_hourly[period_filter(demand_hourly, window.start, window.end)].copy()
-        s = solar_hourly[period_filter(solar_hourly, window.start, window.end)].copy()
-
-        if d.empty:
+        p = price_hourly[period_filter(price_hourly, window.start, window.end)].copy()
+        if p.empty:
             continue
-
-        d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
-        d = d.dropna(subset=["datetime"]).copy()
-        if d.empty:
+        p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+        p["price"] = pd.to_numeric(p["price"], errors="coerce")
+        p = p.dropna(subset=["datetime", "price"]).copy()
+        if p.empty:
             continue
-
-        d["hour"] = d["datetime"].dt.hour
-        d_prof = d.groupby("hour", as_index=False)["demand_mwh"].mean()
-
-        if not s.empty:
-            s["datetime"] = pd.to_datetime(s["datetime"], errors="coerce")
-            s = s.dropna(subset=["datetime"]).copy()
-
-        if not s.empty:
-            s["hour"] = s["datetime"].dt.hour
-            s_prof = s.groupby("hour", as_index=False)["solar_best_mw"].mean()
-        else:
-            s_prof = pd.DataFrame({"hour": range(24), "solar_best_mw": [0.0] * 24})
-
-        merged = pd.DataFrame({"hour": range(24)}).merge(d_prof, on="hour", how="left").merge(s_prof, on="hour", how="left")
-        merged["demand_mwh"] = merged["demand_mwh"].fillna(0.0)
-        merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
-        merged["net_load_mw"] = merged["demand_mwh"] - merged["solar_best_mw"]
-        merged["year"] = window.year
-        rows.append(merged)
-
+        p["hour"] = p["datetime"].dt.hour
+        prof = p.groupby("hour", as_index=False)["price"].mean().rename(columns={"price": "avg_price"})
+        prof = pd.DataFrame({"hour": range(24)}).merge(prof, on="hour", how="left")
+        prof["avg_price"] = prof["avg_price"].interpolate(limit_direction="both").fillna(0.0)
+        prof["year"] = window.year
+        rows.append(prof)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+
+# =========================================================
+# BESS REVENUE - aligned with BESS tab standalone logic
+# =========================================================
+def optimize_standalone_bess_day(
+    prices: list[float],
+    bess_mw: float,
+    duration_h: float,
+    eta_ch: float = 1.0,
+    eta_dis: float = 0.85,
+    cycle_limit_factor: float = 1.0,
+) -> dict:
+    """
+    Standalone DA arbitrage optimizer aligned with the BESS tab logic:
+    - generation = 0
+    - demand = 0
+    - omie_compra = omie_venta
+    - revenue is divided by MWnom in the monthly/yearly report.
+    """
+    prices = [float(p) for p in prices if pd.notna(p)]
+    n = len(prices)
+    if n == 0 or bess_mw <= 0 or duration_h <= 0:
+        return {
+            "revenue_eur": 0.0,
+            "charged_mwh": 0.0,
+            "discharged_mwh": 0.0,
+            "avg_buy_price": np.nan,
+            "avg_sell_price": np.nan,
+        }
+
+    capacity_mwh = bess_mw * duration_h
+    power_mw = bess_mw
+    max_grid_flow = max(power_mw, 1e-9)
+
+    model = pulp.LpProblem("monthly_report_standalone_bess", pulp.LpMaximize)
+    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
+    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
+    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
+    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
+    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
+
+    model += soc[0] == 0.0
+    model += soc[n] == 0.0
+
+    for t in range(n):
+        model += grid_charge[t] <= power_mw * is_charging[t]
+        model += batt_for_sell[t] <= power_mw * (1 - is_charging[t])
+        model += batt_for_sell[t] <= max_grid_flow * is_export[t]
+        model += grid_charge[t] <= max_grid_flow * (1 - is_export[t])
+        model += soc[t + 1] == soc[t] + eta_ch * grid_charge[t] - (1 / max(eta_dis, 1e-9)) * batt_for_sell[t]
+        model += soc[t] <= capacity_mwh
+
+    model += soc[n] <= capacity_mwh
+    model += pulp.lpSum(grid_charge[t] for t in range(n)) <= cycle_limit_factor * capacity_mwh / max(eta_ch, 1e-9)
+    model += pulp.lpSum(batt_for_sell[t] for t in range(n)) <= pulp.lpSum(grid_charge[t] for t in range(n))
+
+    model += pulp.lpSum(
+        batt_for_sell[t] * prices[t] - grid_charge[t] * prices[t]
+        for t in range(n)
+    )
+
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    model.solve(solver)
+
+    if pulp.LpStatus[model.status] != "Optimal":
+        return {
+            "revenue_eur": 0.0,
+            "charged_mwh": 0.0,
+            "discharged_mwh": 0.0,
+            "avg_buy_price": np.nan,
+            "avg_sell_price": np.nan,
+        }
+
+    charge = np.array([pulp.value(grid_charge[t]) or 0.0 for t in range(n)], dtype=float)
+    discharge = np.array([pulp.value(batt_for_sell[t]) or 0.0 for t in range(n)], dtype=float)
+    price_arr = np.array(prices, dtype=float)
+
+    revenue = float((discharge * price_arr).sum() - (charge * price_arr).sum())
+    charged_mwh = float(charge.sum())
+    discharged_mwh = float(discharge.sum())
+    buy_price = float((charge * price_arr).sum() / charged_mwh) if charged_mwh > 0 else np.nan
+    sell_price = float((discharge * price_arr).sum() / discharged_mwh) if discharged_mwh > 0 else np.nan
+
+    return {
+        "revenue_eur": revenue,
+        "charged_mwh": charged_mwh,
+        "discharged_mwh": discharged_mwh,
+        "avg_buy_price": buy_price,
+        "avg_sell_price": sell_price,
+    }
+
+
+def build_bess_revenue_monthly_table(
+    price_hourly: pd.DataFrame,
+    years: list[int],
+    cutoff_month: int,
+    cutoff_day: int,
+    bess_mw: float,
+    duration_h: float,
+    eta_ch: float,
+    eta_dis: float,
+    cycle_limit_factor: float,
+) -> pd.DataFrame:
+    if price_hourly.empty:
+        return pd.DataFrame()
+
+    p = price_hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"]).copy()
+    if p.empty:
+        return pd.DataFrame()
+
+    daily_rows = []
+    for y in years:
+        y_cutoff_day = cutoff_day if y == max(years) else min(cutoff_day, month_end_day(y, cutoff_month))
+        for m in range(1, cutoff_month + 1):
+            start, end = month_window(y, m, cutoff_month, y_cutoff_day)
+            df_m = p[period_filter(p, start, end)].copy()
+            if df_m.empty:
+                continue
+            df_m["day"] = df_m["datetime"].dt.date
+            for day, grp in df_m.groupby("day"):
+                res = optimize_standalone_bess_day(
+                    prices=grp.sort_values("datetime")["price"].tolist(),
+                    bess_mw=bess_mw,
+                    duration_h=duration_h,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    cycle_limit_factor=cycle_limit_factor,
+                )
+                daily_rows.append({
+                    "Date": day,
+                    "Year": y,
+                    "month": pd.Timestamp(day).strftime("%Y-%m"),
+                    "Revenue_BESS_EUR": res["revenue_eur"],
+                    "Charge_MWh": res["charged_mwh"],
+                    "Discharge_MWh": res["discharged_mwh"],
+                    "Buy_Value_EUR": res["charged_mwh"] * (res["avg_buy_price"] if pd.notna(res["avg_buy_price"]) else 0.0),
+                    "Sell_Value_EUR": res["discharged_mwh"] * (res["avg_sell_price"] if pd.notna(res["avg_sell_price"]) else 0.0),
+                })
+
+    daily = pd.DataFrame(daily_rows)
+    if daily.empty:
+        return pd.DataFrame()
+
+    monthly = (
+        daily.groupby(["Year", "month"], as_index=False)
+        .agg(
+            Revenue_BESS_EUR=("Revenue_BESS_EUR", "sum"),
+            Charge_MWh=("Charge_MWh", "sum"),
+            Discharge_MWh=("Discharge_MWh", "sum"),
+            Buy_Value_EUR=("Buy_Value_EUR", "sum"),
+            Sell_Value_EUR=("Sell_Value_EUR", "sum"),
+            Days=("Date", "nunique"),
+        )
+    )
+    monthly["Revenue BESS €/MW"] = np.where(bess_mw > 0, monthly["Revenue_BESS_EUR"] / bess_mw, np.nan)
+    monthly["Avg buy price (€/MWh)"] = np.where(monthly["Charge_MWh"] > 0, monthly["Buy_Value_EUR"] / monthly["Charge_MWh"], np.nan)
+    monthly["Avg sell price (€/MWh)"] = np.where(monthly["Discharge_MWh"] > 0, monthly["Sell_Value_EUR"] / monthly["Discharge_MWh"], np.nan)
+    monthly["Captured spread (€/MWh)"] = monthly["Avg sell price (€/MWh)"] - monthly["Avg buy price (€/MWh)"]
+    monthly["Cycles/day avg"] = np.where(
+        (monthly["Days"] > 0) & (bess_mw * duration_h > 0),
+        monthly["Discharge_MWh"] / max(eta_dis, 1e-9) / (bess_mw * duration_h) / monthly["Days"],
+        np.nan,
+    )
+
+    total = (
+        monthly.groupby("Year", as_index=False)
+        .agg(
+            Revenue_BESS_EUR=("Revenue_BESS_EUR", "sum"),
+            Charge_MWh=("Charge_MWh", "sum"),
+            Discharge_MWh=("Discharge_MWh", "sum"),
+            Buy_Value_EUR=("Buy_Value_EUR", "sum"),
+            Sell_Value_EUR=("Sell_Value_EUR", "sum"),
+            Days=("Days", "sum"),
+        )
+    )
+    total["month"] = "TOTAL"
+    total["Revenue BESS €/MW"] = np.where(bess_mw > 0, total["Revenue_BESS_EUR"] / bess_mw, np.nan)
+    total["Avg buy price (€/MWh)"] = np.where(total["Charge_MWh"] > 0, total["Buy_Value_EUR"] / total["Charge_MWh"], np.nan)
+    total["Avg sell price (€/MWh)"] = np.where(total["Discharge_MWh"] > 0, total["Sell_Value_EUR"] / total["Discharge_MWh"], np.nan)
+    total["Captured spread (€/MWh)"] = total["Avg sell price (€/MWh)"] - total["Avg buy price (€/MWh)"]
+    total["Cycles/day avg"] = np.where(
+        (total["Days"] > 0) & (bess_mw * duration_h > 0),
+        total["Discharge_MWh"] / max(eta_dis, 1e-9) / (bess_mw * duration_h) / total["Days"],
+        np.nan,
+    )
+
+    out = pd.concat([monthly, total], ignore_index=True, sort=False)
+    return out[[
+        "Year", "month", "Revenue BESS €/MW", "Revenue_BESS_EUR",
+        "Cycles/day avg", "Charge_MWh", "Discharge_MWh",
+        "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)",
+    ]].sort_values(["Year", "month"]).reset_index(drop=True)
+
+
+def build_bess_duration_comparison(
+    price_hourly: pd.DataFrame,
+    years: list[int],
+    cutoff_month: int,
+    cutoff_day: int,
+    bess_mw: float,
+    eta_ch: float,
+    eta_dis: float,
+    cycle_limit_factor: float,
+) -> pd.DataFrame:
+    rows = []
+    for duration in [1.0, 2.0, 4.0]:
+        tbl = build_bess_revenue_monthly_table(
+            price_hourly=price_hourly,
+            years=years,
+            cutoff_month=cutoff_month,
+            cutoff_day=cutoff_day,
+            bess_mw=bess_mw,
+            duration_h=duration,
+            eta_ch=eta_ch,
+            eta_dis=eta_dis,
+            cycle_limit_factor=cycle_limit_factor,
+        )
+        if tbl.empty:
+            continue
+        totals = tbl[tbl["month"] == "TOTAL"].copy()
+        totals["Duration"] = f"{int(duration)}h"
+        rows.append(totals[["Year", "Duration", "Revenue BESS €/MW", "Cycles/day avg", "Captured spread (€/MWh)"]])
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def chart_bess_revenue(bess_table: pd.DataFrame, duration_label: str = "4h") -> str | None:
+    if bess_table.empty:
+        return None
+    plot = bess_table[bess_table["month"] != "TOTAL"].copy()
+    if plot.empty:
+        return None
+    plot["Month"] = pd.to_datetime(plot["month"], errors="coerce").dt.strftime("%b")
+    cmap = year_color_map(plot["Year"].unique().tolist())
+    fig, ax = plt.subplots(figsize=(10.8, 4.5))
+    for y, grp in plot.groupby("Year"):
+        grp = grp.copy()
+        grp["month_num"] = pd.to_datetime(grp["month"], errors="coerce").dt.month
+        grp = grp.sort_values("month_num")
+        ax.bar(
+            [f"{m}\n{y}" for m in grp["Month"]],
+            grp["Revenue BESS €/MW"] / 1000.0,
+            color=cmap[y],
+            alpha=0.85,
+            label=str(y),
+        )
+    ax.set_title(f"Monthly DA BESS revenue ({duration_label}, standalone)")
+    ax.set_ylabel("k€/MWnom")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    return fig_to_b64(fig)
+
+
+def chart_bess_duration_totals(bess_duration_table: pd.DataFrame) -> str | None:
+    if bess_duration_table.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(10.5, 4.3))
+    labels = []
+    vals = []
+    colors = []
+    cmap = year_color_map(bess_duration_table["Year"].unique().tolist())
+    for _, row in bess_duration_table.sort_values(["Year", "Duration"]).iterrows():
+        labels.append(f"{row['Duration']}\n{int(row['Year'])}")
+        vals.append(row["Revenue BESS €/MW"] / 1000.0)
+        colors.append(cmap[int(row["Year"])])
+    ax.bar(labels, vals, color=colors, alpha=0.85)
+    ax.set_title("YTD DA BESS revenue by duration")
+    ax.set_ylabel("k€/MWnom")
+    ax.grid(axis="y", alpha=0.25)
+    return fig_to_b64(fig)
 
 
 # =========================================================
 # CHARTS
 # =========================================================
-def chart_daily_spot_capture(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> str | None:
-    daily = pd.concat([
-        _daily_agg(price_hourly, solar_hourly, previous.start, previous.end),
-        _daily_agg(price_hourly, solar_hourly, current.start, current.end),
+def chart_weekly_spot_capture(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> str | None:
+    weekly = pd.concat([
+        _weekly_agg(price_hourly, solar_hourly, previous.start, previous.end),
+        _weekly_agg(price_hourly, solar_hourly, current.start, current.end),
     ], ignore_index=True)
-    if daily.empty:
+    if weekly.empty:
         return None
 
-    years = sorted(daily["year"].unique().tolist())
+    years = sorted(weekly["year"].unique().tolist())
     cmap = year_color_map(years)
 
     fig, ax = plt.subplots(figsize=(11, 4.8))
     for y in years:
-        grp = daily[daily["year"] == y].sort_values("plot_date")
+        grp = weekly[weekly["year"] == y].sort_values("plot_date")
         color = cmap[y]
-        ax.plot(grp["plot_date"], grp["spot"], color=color, linewidth=2.2, label=f"Spot {y}")
+        ax.plot(grp["plot_date"], grp["spot"], color=color, linewidth=2.3, label=f"Spot {y}")
         ax.plot(grp["plot_date"], grp["captured_unc"], color=color, linewidth=2.0, linestyle=":", label=f"Captured uncurtailed {y}")
         ax.plot(grp["plot_date"], grp["captured_cur"], color=color, linewidth=2.0, linestyle="--", label=f"Captured curtailed {y}")
-    ax.set_title("Daily spot vs captured prices (YTD)")
+    ax.set_title("Weekly spot vs captured prices (YTD)")
     ax.set_ylabel("€/MWh")
     ax.grid(axis="y", alpha=0.25)
     ax.xaxis.set_major_locator(mdates.MonthLocator())
@@ -935,12 +1221,25 @@ def chart_monthly_negative_share(neg_table: pd.DataFrame) -> str | None:
 def chart_solar_curtailment(monthly: pd.DataFrame) -> str | None:
     if monthly.empty:
         return None
-    cmap = year_color_map(monthly["Year"].unique().tolist())
-    fig, ax = plt.subplots(figsize=(10.5, 4.2))
-    for y, grp in monthly.groupby("Year"):
-        ax.plot(grp["Month"], grp["Economic curtailment (%)"] * 100, marker="o", linewidth=2.2, color=cmap[y], label=str(y))
-    ax.set_title("Monthly economic curtailment")
-    ax.set_ylabel("%")
+    monthly = monthly.copy()
+    years = sorted(monthly["Year"].unique().tolist())
+    months = [m for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if m in monthly["Month"].tolist()]
+    cmap = year_color_map(years)
+    fig, ax = plt.subplots(figsize=(10.8, 4.5))
+    x = np.arange(len(months))
+    width = 0.36 if len(years) == 2 else max(0.22, 0.8 / max(len(years), 1))
+    offsets = np.linspace(-(len(years)-1)/2*width, (len(years)-1)/2*width, len(years)) if years else []
+    for i, y in enumerate(years):
+        grp = monthly[monthly["Year"] == y].copy()
+        vals = []
+        for m in months:
+            row = grp[grp["Month"] == m]
+            vals.append(float(row["Economic curtailment (%)"].iloc[0] * 100) if not row.empty and pd.notna(row["Economic curtailment (%)"].iloc[0]) else 0.0)
+        ax.bar(x + offsets[i], vals, width=width, color=cmap[y], alpha=0.85, label=str(y))
+    ax.set_title("Monthly economic curtailment based on P48")
+    ax.set_ylabel("% of P48 production")
+    ax.set_xticks(x)
+    ax.set_xticklabels(months)
     ax.grid(axis="y", alpha=0.25)
     ax.legend(loc="best", fontsize=8)
     return fig_to_b64(fig)
@@ -974,14 +1273,13 @@ def chart_duck_curve(duck_df: pd.DataFrame) -> str | None:
     for y in years:
         grp = duck_df[duck_df["year"] == y].sort_values("hour")
         color = cmap[y]
-        ax.plot(grp["hour"], grp["demand_mwh"], color=color, linewidth=2.2, label=f"Demand {y}")
-        ax.plot(grp["hour"], grp["net_load_mw"], color=color, linewidth=2.0, linestyle="--", label=f"Net load {y}")
-    ax.set_title("Duck curve (average hourly demand vs net load, YTD)")
+        ax.plot(grp["hour"], grp["avg_price"], color=color, linewidth=2.3, label=f"Avg hourly price {y}")
+    ax.set_title("Duck curve style profile based on average hourly prices (YTD)")
     ax.set_xlabel("Hour of day")
-    ax.set_ylabel("MW / MWh")
+    ax.set_ylabel("€/MWh")
     ax.set_xticks(range(0, 24, 2))
     ax.grid(axis="y", alpha=0.25)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=8)
+    ax.legend(loc="best", fontsize=8)
     return fig_to_b64(fig)
 
 
@@ -1078,12 +1376,14 @@ def build_pdf_report(
     logo_path: Path | None,
     title: str,
     kpi_df: pd.DataFrame,
-    daily_table: pd.DataFrame,
+    weekly_table: pd.DataFrame,
     monthly_table: pd.DataFrame,
     neg_hours_table: pd.DataFrame,
     mix_table: pd.DataFrame,
     demand_table: pd.DataFrame,
     capacity_table: pd.DataFrame,
+    bess_table: pd.DataFrame,
+    bess_duration_table: pd.DataFrame,
     charts: dict[str, str | None],
     current_year: int,
     previous_year: int,
@@ -1091,16 +1391,9 @@ def build_pdf_report(
     subtitle = f"Monthly Day Ahead report with YTD focus. Comparison: {current_year} YTD versus {previous_year} YTD, same calendar cut-off."
     with PdfPages(str(output_path)) as pdf:
         _add_title_page(pdf, logo_path, title, subtitle)
-        _add_table_page(pdf, logo_path, "Executive YTD KPIs", kpi_df, pct_cols=["% change"], max_rows=16)
         for caption, img_b64 in charts.items():
             if img_b64:
                 _add_chart_page(pdf, logo_path, caption, img_b64)
-        _add_table_page(pdf, logo_path, "Daily spot and captured price table", daily_table, max_rows=40)
-        _add_table_page(pdf, logo_path, "Monthly price, solar and curtailment table", monthly_table, pct_cols=["Negative / zero hours (%)", "Negative / zero solar hours (%)", "Economic curtailment (%)"], max_rows=24)
-        _add_table_page(pdf, logo_path, "Negative / zero price hours table", neg_hours_table, pct_cols=["Negative / zero hours (%)", "Negative / zero solar hours (%)"], max_rows=24)
-        _add_table_page(pdf, logo_path, "YTD energy mix", mix_table, pct_cols=["% change"], max_rows=25)
-        _add_table_page(pdf, logo_path, "YTD demand", demand_table, pct_cols=["% change"], max_rows=5)
-        _add_table_page(pdf, logo_path, "Installed capacity", capacity_table, pct_cols=["% change"], max_rows=25)
     return output_path.read_bytes()
 
 
@@ -1210,21 +1503,58 @@ intro_text = st.text_area(
     height=110,
 )
 
+st.subheader("BESS revenue settings")
+bess_settings_cols = st.columns(5)
+with bess_settings_cols[0]:
+    bess_mw = st.number_input("BESS MWnom", min_value=0.1, value=float(st.secrets.get("default_bess_mw", 1.0)), step=0.1)
+with bess_settings_cols[1]:
+    bess_duration_h = st.number_input("Main duration (h)", min_value=0.5, value=float(st.secrets.get("default_bess_duration_h", 4.0)), step=0.5)
+with bess_settings_cols[2]:
+    bess_eta_ch = st.number_input("Charge efficiency", min_value=0.1, max_value=1.0, value=float(st.secrets.get("default_bess_eta_ch", 1.0)), step=0.01)
+with bess_settings_cols[3]:
+    bess_eta_dis = st.number_input("Discharge efficiency", min_value=0.1, max_value=1.0, value=float(st.secrets.get("default_bess_eta_dis", 0.85)), step=0.01)
+with bess_settings_cols[4]:
+    cycle_limit_factor = st.number_input("Cycles/day limit", min_value=0.1, max_value=3.0, value=float(st.secrets.get("default_bess_cycles_day", 1.0)), step=0.1)
+
 kpi_df = build_ytd_metrics_table(price_hourly, solar_hourly, current_window, previous_window)
-daily_table = build_daily_price_capture_table(price_hourly, solar_hourly, current_window, previous_window)
+weekly_table = build_weekly_price_capture_table(price_hourly, solar_hourly, current_window, previous_window)
 monthly_table = build_monthly_price_solar_table(price_hourly, solar_hourly, [previous_year, report_year], report_month.month, cutoff_day.day)
 neg_hours_table = build_negative_hours_table(price_hourly, solar_hourly, [previous_year, report_year], report_month.month, cutoff_day.day)
 mix_table = build_mix_ytd_table(mix_daily, current_window, previous_window)
 demand_table = build_demand_ytd_table(demand_hourly, live_demand_monthly, current_window, previous_window)
 capacity_table = build_capacity_table(capacity_monthly, report_month, pd.Timestamp(date(previous_year, report_month.month, 1)))
-duck_df = build_duck_curve_df(demand_hourly, solar_hourly, current_window, previous_window)
+duck_df = build_duck_curve_df(price_hourly, current_window, previous_window)
+
+bess_table = build_bess_revenue_monthly_table(
+    price_hourly=price_hourly,
+    years=[previous_year, report_year],
+    cutoff_month=report_month.month,
+    cutoff_day=cutoff_day.day,
+    bess_mw=bess_mw,
+    duration_h=bess_duration_h,
+    eta_ch=bess_eta_ch,
+    eta_dis=bess_eta_dis,
+    cycle_limit_factor=cycle_limit_factor,
+)
+bess_duration_table = build_bess_duration_comparison(
+    price_hourly=price_hourly,
+    years=[previous_year, report_year],
+    cutoff_month=report_month.month,
+    cutoff_day=cutoff_day.day,
+    bess_mw=bess_mw,
+    eta_ch=bess_eta_ch,
+    eta_dis=bess_eta_dis,
+    cycle_limit_factor=cycle_limit_factor,
+)
 
 charts = {
-    "Daily spot and captured prices": chart_daily_spot_capture(price_hourly, solar_hourly, current_window, previous_window),
+    "Weekly spot and captured prices": chart_weekly_spot_capture(price_hourly, solar_hourly, current_window, previous_window),
     "Monthly negative / zero price share": chart_monthly_negative_share(neg_hours_table),
     "Economic curtailment": chart_solar_curtailment(monthly_table),
     "Duck curve": chart_duck_curve(duck_df),
     "Energy mix": chart_mix(mix_table, report_year, previous_year),
+    "BESS monthly revenue": chart_bess_revenue(bess_table, duration_label=f"{bess_duration_h:g}h"),
+    "BESS revenue by duration": chart_bess_duration_totals(bess_duration_table),
 }
 
 logo_path = find_logo_path()
@@ -1255,6 +1585,14 @@ for metric, unit, decimals in [
             delta = f"vs {previous_year}: {fmt_num(prev_val, decimals, f' {unit}') }"
         cards.append((metric, value, delta))
 
+if not bess_table.empty:
+    bess_totals = bess_table[bess_table["month"] == "TOTAL"].copy()
+    cur_bess = bess_totals[bess_totals["Year"] == report_year]["Revenue BESS €/MW"]
+    prev_bess = bess_totals[bess_totals["Year"] == previous_year]["Revenue BESS €/MW"]
+    if not cur_bess.empty:
+        prev_label = fmt_num(prev_bess.iloc[0] / 1000.0, 1, " k€/MW") if not prev_bess.empty else "-"
+        cards.append((f"BESS revenue {bess_duration_h:g}h", fmt_num(cur_bess.iloc[0] / 1000.0, 1, " k€/MW"), f"vs {previous_year}: {prev_label}"))
+
 chart_html = ""
 for title, img_b64 in charts.items():
     if img_b64:
@@ -1269,10 +1607,12 @@ email_html = f"""
 {metric_cards_html(cards)}<br>
 <h3>Executive YTD KPIs</h3>{df_to_html_table(kpi_df, pct_cols=['% change'])}<br>
 {chart_html}
-<h3>Daily spot and captured prices</h3>{df_to_html_table(daily_table)}<br>
+<h3>Weekly spot and captured prices</h3>{df_to_html_table(weekly_table)}<br>
 <h3>Monthly price, captured and curtailment table</h3>{df_to_html_table(monthly_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)', 'Economic curtailment (%)'])}<br>
 <h3>Negative / zero hours table</h3>{df_to_html_table(neg_hours_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)'])}<br>
 <h3>YTD energy mix</h3>{df_to_html_table(mix_table, pct_cols=['% change']) if not mix_table.empty else '<p>No energy mix data available.</p>'}<br>
+<h3>BESS monthly revenue</h3>{df_to_html_table(bess_table) if not bess_table.empty else '<p>No BESS revenue data available.</p>'}<br>
+<h3>BESS YTD duration comparison</h3>{df_to_html_table(bess_duration_table) if not bess_duration_table.empty else '<p>No BESS duration comparison available.</p>'}<br>
 <h3>YTD demand</h3>{df_to_html_table(demand_table, pct_cols=['% change']) if not demand_table.empty else '<p>No demand data available.</p>'}<br>
 <h3>Installed capacity</h3>{df_to_html_table(capacity_table, pct_cols=['% change']) if not capacity_table.empty else '<p>No installed capacity data available.</p>'}<br>
 <p>Best regards,</p>
@@ -1286,12 +1626,14 @@ pdf_bytes = build_pdf_report(
     logo_path,
     subject,
     kpi_df,
-    daily_table,
+    weekly_table,
     monthly_table,
     neg_hours_table,
     mix_table,
     demand_table,
     capacity_table,
+    bess_table,
+    bess_duration_table,
     charts,
     report_year,
     previous_year,
@@ -1308,6 +1650,11 @@ with col1:
 with col2:
     st.markdown("**Negative / zero hours**")
     st.dataframe(neg_hours_table, use_container_width=True)
+
+st.markdown("**BESS monthly revenue**")
+st.dataframe(bess_table, use_container_width=True)
+st.markdown("**BESS YTD duration comparison**")
+st.dataframe(bess_duration_table, use_container_width=True)
 
 st.subheader("PDF report")
 st.download_button("Download PDF report", data=pdf_bytes, file_name=pdf_filename, mime="application/pdf")
@@ -1336,5 +1683,5 @@ if st.button("Send monthly report now"):
             st.error(f"Send failed: {exc}")
 
 st.info(
-    "This version includes daily spot vs captured charts/table, duck curve, negative-hours % table, logo stamp in the upper-right corner of the PDF, and REE live extensions for 2026 YTD energy mix / demand / installed capacity where available."
+    "This version includes weekly spot vs captured charts/table, a duck-curve style hourly price profile, bar chart economic curtailment based on P48, negative-hours % table, BESS DA revenue based on the BESS-tab standalone optimization logic, a logo stamp in the upper-right corner of the PDF, and REE live extensions for 2026 YTD energy mix / demand / installed capacity where available. The PDF contains charts only (no tables)."
 )
