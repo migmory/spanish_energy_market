@@ -853,21 +853,35 @@ def build_duck_curve_df(demand_hourly: pd.DataFrame, solar_hourly: pd.DataFrame,
     for window in [previous, current]:
         d = demand_hourly[period_filter(demand_hourly, window.start, window.end)].copy()
         s = solar_hourly[period_filter(solar_hourly, window.start, window.end)].copy()
+
         if d.empty:
             continue
+
+        d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+        d = d.dropna(subset=["datetime"]).copy()
+        if d.empty:
+            continue
+
         d["hour"] = d["datetime"].dt.hour
         d_prof = d.groupby("hour", as_index=False)["demand_mwh"].mean()
+
+        if not s.empty:
+            s["datetime"] = pd.to_datetime(s["datetime"], errors="coerce")
+            s = s.dropna(subset=["datetime"]).copy()
+
         if not s.empty:
             s["hour"] = s["datetime"].dt.hour
             s_prof = s.groupby("hour", as_index=False)["solar_best_mw"].mean()
         else:
             s_prof = pd.DataFrame({"hour": range(24), "solar_best_mw": [0.0] * 24})
+
         merged = pd.DataFrame({"hour": range(24)}).merge(d_prof, on="hour", how="left").merge(s_prof, on="hour", how="left")
         merged["demand_mwh"] = merged["demand_mwh"].fillna(0.0)
         merged["solar_best_mw"] = merged["solar_best_mw"].fillna(0.0)
         merged["net_load_mw"] = merged["demand_mwh"] - merged["solar_best_mw"]
         merged["year"] = window.year
         rows.append(merged)
+
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
