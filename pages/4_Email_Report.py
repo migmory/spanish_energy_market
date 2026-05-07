@@ -209,13 +209,23 @@ def metric_cards_html(items: list[tuple[str, str, str | None]]) -> str:
     for title, value, delta in items:
         delta_html = f'<div style="font-size:12px;color:#475569;margin-top:4px;">{delta}</div>' if delta else ""
         cards.append(f"""
-        <div style="flex:1 1 180px;min-width:180px;border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#f8fafc;">
-          <div style="font-size:12px;color:#475569;margin-bottom:5px;">{title}</div>
-          <div style="font-size:19px;font-weight:700;color:#111827;">{value}</div>
+        <div style="flex:1 1 180px;min-width:180px;border:1px solid #dbe4ea;border-top:4px solid {CORP_GREEN};border-radius:14px;padding:14px;background:linear-gradient(180deg,#ffffff 0%,#f8fafc 100%);box-shadow:0 2px 8px rgba(15,23,42,0.05);">
+          <div style="font-size:12px;color:#475569;margin-bottom:5px;font-weight:600;">{title}</div>
+          <div style="font-size:20px;font-weight:700;color:#111827;">{value}</div>
           {delta_html}
         </div>
         """)
     return '<div style="display:flex;gap:10px;flex-wrap:wrap;">' + ''.join(cards) + '</div>'
+
+
+def section_header_html(title: str, icon: str = "") -> str:
+    icon_html = f'<span style="font-size:18px;margin-right:8px;">{icon}</span>' if icon else ''
+    return (
+        f'<div style="margin:20px 0 10px 0;padding:10px 14px;border-radius:12px;'
+        f'background:linear-gradient(90deg,#ecfdf5 0%,#f8fafc 100%);border:1px solid #d1fae5;'
+        f'display:flex;align-items:center;">{icon_html}'
+        f'<span style="font-size:17px;font-weight:700;color:#0f172a;">{title}</span></div>'
+    )
 
 
 def fig_to_b64(fig) -> str:
@@ -1163,19 +1173,39 @@ def chart_bess_spread_prices(bess_table: pd.DataFrame, duration_label: str = "4h
     plot["Month"] = plot["month_dt"].dt.strftime("%b")
     plot["month_num"] = plot["month_dt"].dt.month
     years = sorted(plot["Year"].unique().tolist())
+    months = sorted(plot["month_num"].unique().tolist())
+    month_labels = [pd.Timestamp(2000, m, 1).strftime("%b") for m in months]
     cmap = year_color_map(years)
 
-    fig, ax = plt.subplots(figsize=(11.0, 4.8))
+    fig, ax = plt.subplots(figsize=(11.2, 5.0))
+    x = np.arange(len(months))
+    width = 0.36 if len(years) == 2 else max(0.22, 0.8 / max(len(years), 1))
+    offsets = np.linspace(-(len(years)-1)/2*width, (len(years)-1)/2*width, len(years)) if years else []
+
+    # spread as bars
+    for i, y in enumerate(years):
+        grp = plot[plot["Year"] == y].copy()
+        spread_vals = []
+        for m in months:
+            row = grp[grp["month_num"] == m]
+            spread_vals.append(float(row["Captured spread (€/MWh)"].iloc[0]) if not row.empty and pd.notna(row["Captured spread (€/MWh)"].iloc[0]) else 0.0)
+        ax.bar(x + offsets[i], spread_vals, width=width, color=cmap[y], alpha=0.25, edgecolor=cmap[y], linewidth=1.0, label=f"Spread {y}")
+
+    # buy/sell as lines
     for y in years:
         grp = plot[plot["Year"] == y].sort_values("month_num")
         color = cmap[y]
-        ax.plot(grp["Month"], grp["Avg buy price (€/MWh)"], color=color, linewidth=1.9, linestyle=":", marker="o", label=f"Buy {y}")
-        ax.plot(grp["Month"], grp["Avg sell price (€/MWh)"], color=color, linewidth=2.2, linestyle="-", marker="o", label=f"Sell {y}")
-        ax.plot(grp["Month"], grp["Captured spread (€/MWh)"], color=color, linewidth=2.0, linestyle="--", marker="o", label=f"Spread {y}")
-    ax.set_title(f"BESS buy / sell prices and spread ({duration_label}, standalone)")
+        x_line = [months.index(m) for m in grp["month_num"]]
+        ax.plot(x_line, grp["Avg buy price (€/MWh)"], color=color, linewidth=1.9, linestyle=":", marker="o", label=f"Buy {y}")
+        ax.plot(x_line, grp["Avg sell price (€/MWh)"], color=color, linewidth=2.3, linestyle="-", marker="o", label=f"Sell {y}")
+
+    ax.set_title(f"BESS buy / sell prices and captured spread ({duration_label})", fontweight='bold')
     ax.set_ylabel("€/MWh")
-    ax.grid(axis="y", alpha=0.25)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(month_labels)
+    ax.grid(axis="y", alpha=0.22)
+    ax.spines[['top','right']].set_visible(False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncol=3, fontsize=8, frameon=False)
     return fig_to_b64(fig)
 
 
@@ -1307,6 +1337,47 @@ def chart_duck_curve(duck_df: pd.DataFrame) -> str | None:
     ax.set_xticks(range(0, 24, 2))
     ax.grid(axis="y", alpha=0.25)
     ax.legend(loc="best", fontsize=8)
+    return fig_to_b64(fig)
+
+
+
+def chart_price_heatmap(price_hourly: pd.DataFrame, year: int) -> str | None:
+    if price_hourly.empty:
+        return None
+    p = price_hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"]).copy()
+    p = p[p["datetime"].dt.year == year].copy()
+    if p.empty:
+        return None
+    p["doy"] = p["datetime"].dt.dayofyear
+    p["hour"] = p["datetime"].dt.hour
+    n_days = 366 if pd.Timestamp(year=year, month=12, day=31).dayofyear == 366 else 365
+    grid = np.full((24, n_days), np.nan)
+    agg = p.groupby(["hour", "doy"], as_index=False)["price"].mean()
+    for _, row in agg.iterrows():
+        h = int(row["hour"])
+        d = int(row["doy"]) - 1
+        if 0 <= h < 24 and 0 <= d < n_days:
+            grid[h, d] = float(row["price"])
+    if np.isfinite(grid).sum() == 0:
+        return None
+    vmin = np.nanpercentile(grid, 5)
+    vmax = np.nanpercentile(grid, 95)
+    fig, ax = plt.subplots(figsize=(12.0, 4.8))
+    im = ax.imshow(grid, aspect='auto', origin='lower', cmap='RdYlGn_r', vmin=vmin, vmax=vmax)
+    month_starts = [pd.Timestamp(year, m, 1).dayofyear - 1 for m in range(1, 13)]
+    month_labels = [pd.Timestamp(year, m, 1).strftime('%b') for m in range(1, 13)]
+    ax.set_xticks(month_starts)
+    ax.set_xticklabels(month_labels)
+    ax.set_yticks(range(0, 24, 2))
+    ax.set_yticklabels([str(h) for h in range(0, 24, 2)])
+    ax.set_xlabel('Day of year')
+    ax.set_ylabel('Hour of day')
+    ax.set_title(f'OMIE hourly price heatmap ({year})', fontweight='bold')
+    cbar = fig.colorbar(im, ax=ax, pad=0.01)
+    cbar.set_label('€/MWh')
     return fig_to_b64(fig)
 
 
@@ -1506,6 +1577,9 @@ report_month = pd.Timestamp(month_str)
 report_year = report_month.year
 previous_year = report_year - 1
 
+heatmap_year_options = sorted(price_hourly["datetime"].dt.year.dropna().astype(int).unique().tolist()) if not price_hourly.empty else [report_year]
+heatmap_year = st.selectbox("Heatmap year (OMIE hourly prices)", heatmap_year_options, index=heatmap_year_options.index(report_year) if report_year in heatmap_year_options else len(heatmap_year_options)-1)
+
 month_end = (report_month + pd.offsets.MonthEnd(0)).date()
 latest_in_month = price_hourly[price_hourly["datetime"].dt.to_period("M") == report_month.to_period("M")]["datetime"].dt.date.max()
 cutoff_day = min(month_end, latest_in_month) if pd.notna(latest_in_month) else month_end
@@ -1576,8 +1650,9 @@ bess_duration_table = build_bess_duration_comparison(
 
 charts = {
     "Weekly spot and captured prices": chart_weekly_spot_capture(price_hourly, solar_hourly, current_window, previous_window),
+    "OMIE hourly price heatmap": chart_price_heatmap(price_hourly, heatmap_year),
     "Monthly negative / zero price share": chart_monthly_negative_share(neg_hours_table),
-    "Economic curtailment": chart_solar_curtailment(monthly_table),
+    "Solar economic curtailment based on P48": chart_solar_curtailment(monthly_table),
     "Duck curve": chart_duck_curve(duck_df),
     "Energy mix": chart_mix(mix_table, report_year, previous_year),
     "BESS monthly revenue": chart_bess_revenue(bess_table, duration_label=f"{bess_duration_h:g}h"),
@@ -1627,23 +1702,28 @@ for title, img_b64 in charts.items():
         chart_html += f'<h3>{title}</h3><img src="data:image/png;base64,{img_b64}" style="max-width:100%;height:auto;border:1px solid #ddd;"><br><br>'
 
 email_html = f"""
-<html><body style="font-family:Arial,sans-serif;font-size:13px;color:#111827;">
+<html><body style="font-family:Arial,sans-serif;font-size:13px;color:#111827;background:#ffffff;">
+<div style="max-width:1100px;margin:0 auto;">
 {logo_html}
-<p>{intro_text.replace(chr(10), '<br>')}</p>
-<p><strong>Cut-off:</strong> {current_window.end.strftime('%d-%b-%Y')}<br>
-<strong>Comparison cut-off:</strong> {previous_window.end.strftime('%d-%b-%Y')}</p>
+<div style="padding:14px 16px;border:1px solid #e5e7eb;border-radius:14px;background:linear-gradient(90deg,#ffffff 0%,#f8fafc 100%);margin-bottom:14px;">
+<p style="margin:0 0 10px 0;">{intro_text.replace(chr(10), '<br>')}</p>
+<p style="margin:0;"><strong>Cut-off:</strong> {current_window.end.strftime('%d-%b-%Y')}<br>
+<strong>Comparison cut-off:</strong> {previous_window.end.strftime('%d-%b-%Y')}<br>
+<strong>Heatmap year:</strong> {heatmap_year}</p>
+</div>
 {metric_cards_html(cards)}<br>
-<h3>Executive YTD KPIs</h3>{df_to_html_table(kpi_df, pct_cols=['% change'])}<br>
-{chart_html}
-<h3>Weekly spot and captured prices</h3>{df_to_html_table(weekly_table)}<br>
-<h3>Monthly price, captured and curtailment table</h3>{df_to_html_table(monthly_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)', 'Economic curtailment (%)'])}<br>
-<h3>Negative / zero hours table</h3>{df_to_html_table(neg_hours_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)'])}<br>
-<h3>YTD energy mix</h3>{df_to_html_table(mix_table, pct_cols=['% change']) if not mix_table.empty else '<p>No energy mix data available.</p>'}<br>
-<h3>BESS monthly revenue</h3>{df_to_html_table(bess_table) if not bess_table.empty else '<p>No BESS revenue data available.</p>'}<br>
-<h3>BESS YTD duration comparison</h3>{df_to_html_table(bess_duration_table) if not bess_duration_table.empty else '<p>No BESS duration comparison available.</p>'}<br>
-<h3>YTD demand</h3>{df_to_html_table(demand_table, pct_cols=['% change']) if not demand_table.empty else '<p>No demand data available.</p>'}<br>
-<h3>Installed capacity</h3>{df_to_html_table(capacity_table, pct_cols=['% change']) if not capacity_table.empty else '<p>No installed capacity data available.</p>'}<br>
+{section_header_html('Executive YTD KPIs', '📊')}{df_to_html_table(kpi_df, pct_cols=['% change'])}<br>
+{section_header_html('Market and Day Ahead charts', '📈')}{chart_html}
+{section_header_html('Weekly spot and captured prices', '📅')}{df_to_html_table(weekly_table)}<br>
+{section_header_html('Solar captured prices and curtailment', '☀️')}{df_to_html_table(monthly_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)', 'Economic curtailment (%)'])}<br>
+{section_header_html('Negative / zero price hours', '⚠️')}{df_to_html_table(neg_hours_table, pct_cols=['Negative / zero hours (%)', 'Negative / zero solar hours (%)'])}<br>
+{section_header_html('Energy mix', '⚡')}{df_to_html_table(mix_table, pct_cols=['% change']) if not mix_table.empty else '<p>No energy mix data available.</p>'}<br>
+{section_header_html('BESS revenue and spreads', '🔋')}{df_to_html_table(bess_table) if not bess_table.empty else '<p>No BESS revenue data available.</p>'}<br>
+{section_header_html('BESS YTD duration comparison', '🔋')}{df_to_html_table(bess_duration_table) if not bess_duration_table.empty else '<p>No BESS duration comparison available.</p>'}<br>
+{section_header_html('Demand', '🏭')}{df_to_html_table(demand_table, pct_cols=['% change']) if not demand_table.empty else '<p>No demand data available.</p>'}<br>
+{section_header_html('Installed capacity', '🏗️')}{df_to_html_table(capacity_table, pct_cols=['% change']) if not capacity_table.empty else '<p>No installed capacity data available.</p>'}<br>
 <p>Best regards,</p>
+</div>
 </body></html>
 """
 
@@ -1711,5 +1791,5 @@ if st.button("Send monthly report now"):
             st.error(f"Send failed: {exc}")
 
 st.info(
-    "This version includes weekly spot vs captured charts/table, a duck-curve style hourly price profile, bar chart economic curtailment based on P48, negative-hours % table, BESS DA revenue based on the BESS-tab standalone optimization logic with monthly bars side by side by year, plus monthly buy price, sell price and spread charts. It also keeps the logo stamp in the upper-right corner of the PDF, REE live extensions for 2026 YTD energy mix / demand / installed capacity where available, and a charts-only PDF (no tables)."
+    "This version adds a more corporate email layout, clearer BESS and solar sections with icons, an OMIE hourly price heatmap for the selected year, negative-hours percentages, a duck-curve style hourly price profile, solar economic curtailment bars based on P48, and improved BESS visuals (monthly grouped revenue bars plus buy/sell/spread chart). The PDF remains charts-only and includes the Nexwell logo stamp."
 )
