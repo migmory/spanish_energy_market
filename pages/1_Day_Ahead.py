@@ -1844,53 +1844,87 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
 
 
 def build_hourly_price_heatmap_table(price_hourly: pd.DataFrame, year_sel: int) -> pd.DataFrame:
-    """Return 24 x 365/366 OMIE hourly price table for a selected year."""
-    cols = ["datetime", "date", "day_of_year", "month_num", "month_name", "hour", "price", "is_future"]
+    """Return a proper 24 x 365/366 OMIE hourly price grid for a selected year.
+
+    Important: this function keeps one column per calendar day and one row per hour.
+    The chart should use day_of_year as an ORDINAL x-axis, not a temporal x-axis,
+    otherwise Vega/Altair can render huge overlapping rectangles that look like
+    horizontal bands by hour rather than a real daily heatmap.
+    """
+    cols = [
+        "datetime",
+        "date",
+        "date_label",
+        "day_of_year",
+        "month_num",
+        "month_name",
+        "hour",
+        "price",
+        "is_missing",
+    ]
     if price_hourly.empty:
         return pd.DataFrame(columns=cols)
 
-    tmp = price_hourly[price_hourly["datetime"].dt.year == year_sel].copy()
+    tmp = price_hourly.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime", "price"])
+    tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
     if tmp.empty:
         return pd.DataFrame(columns=cols)
 
-    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
     tmp["date"] = tmp["datetime"].dt.normalize()
-    tmp["day_of_year"] = tmp["datetime"].dt.dayofyear
-    tmp["month_num"] = tmp["datetime"].dt.month
-    tmp["month_name"] = tmp["datetime"].dt.strftime("%b")
     tmp["hour"] = tmp["datetime"].dt.hour
-    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
-    tmp = tmp.dropna(subset=["datetime", "price"])
 
-    # Fill the full calendar grid so missing/future months appear as a light grey area.
+    # Full calendar grid: 365/366 days x 24 hours.
     full_days = pd.date_range(date(year_sel, 1, 1), date(year_sel, 12, 31), freq="D")
     full_grid = pd.MultiIndex.from_product(
         [full_days, range(24)],
         names=["date", "hour"],
     ).to_frame(index=False)
     full_grid["date"] = pd.to_datetime(full_grid["date"])
-    full_grid["day_of_year"] = full_grid["date"].dt.dayofyear
-    full_grid["month_num"] = full_grid["date"].dt.month
-    full_grid["month_name"] = full_grid["date"].dt.strftime("%b")
     full_grid["datetime"] = full_grid["date"] + pd.to_timedelta(full_grid["hour"], unit="h")
+    full_grid["date_label"] = full_grid["date"].dt.strftime("%Y-%m-%d")
+    full_grid["day_of_year"] = full_grid["date"].dt.dayofyear.astype(int)
+    full_grid["month_num"] = full_grid["date"].dt.month.astype(int)
+    full_grid["month_name"] = full_grid["date"].dt.strftime("%b")
 
+    # If there are duplicated hourly observations, average them before merging.
     hourly = (
         tmp.groupby(["date", "hour"], as_index=False)["price"]
         .mean()
         .sort_values(["date", "hour"])
     )
+
     out = full_grid.merge(hourly, on=["date", "hour"], how="left")
-    out["is_future"] = out["price"].isna()
+    out["is_missing"] = out["price"].isna()
     return out[cols]
 
 
+def _month_start_day_numbers(year_sel: int) -> list[int]:
+    """Day-of-year positions used as month tick marks on the heatmap x-axis."""
+    return [pd.Timestamp(year_sel, m, 1).dayofyear for m in range(1, 13)]
+
+
+def _month_label_expr(year_sel: int) -> str:
+    """Vega label expression that prints Jan/Feb/... at month-start day numbers."""
+    month_starts = _month_start_day_numbers(year_sel)
+    month_names = [datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]
+    parts = [f"datum.value == {d} ? '{name}'" for d, name in zip(month_starts, month_names)]
+    return " : ".join(parts) + " : ''"
+
+
 def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
-    """Altair heatmap: x = calendar date, y = hour, color = spot price.
+    """Altair heatmap: x = day of year, y = hour, color = spot price.
 
     Color convention requested:
       * strong red = very low prices
       * yellow/orange = medium prices
       * strong green = very high prices
+
+    The x-axis is ordinal day_of_year. This avoids the misleading rendering that
+    happens when mark_rect is plotted against a temporal axis without x2: cells
+    overlap and the chart can look like smooth horizontal bands.
     """
     plot = build_hourly_price_heatmap_table(price_hourly, year_sel)
     if plot.empty:
@@ -1900,37 +1934,57 @@ def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
     if valid_prices.empty:
         return None
 
-    p_low = min(float(valid_prices.quantile(0.02)), 0.0)
-    p_high = float(valid_prices.quantile(0.98))
+    # Use a robust scale: include real negatives if present, but avoid one outlier
+    # dominating the whole palette. Keep 0 as the low-price reference.
+    p_low = float(min(valid_prices.min(), valid_prices.quantile(0.01), 0.0))
+    p_high = float(max(valid_prices.quantile(0.99), 120.0))
     if p_high <= p_low:
         p_high = p_low + 1.0
-    p_mid_1 = p_low + (p_high - p_low) * 0.35
-    p_mid_2 = p_low + (p_high - p_low) * 0.60
-    p_mid_3 = p_low + (p_high - p_low) * 0.80
+
+    p_mid_1 = p_low + (p_high - p_low) * 0.30
+    p_mid_2 = p_low + (p_high - p_low) * 0.55
+    p_mid_3 = p_low + (p_high - p_low) * 0.78
+
+    month_starts = _month_start_day_numbers(year_sel)
+    label_expr = _month_label_expr(year_sel)
+
+    x_enc = alt.X(
+        "day_of_year:O",
+        title="Month",
+        sort=list(range(1, int(plot["day_of_year"].max()) + 1)),
+        axis=alt.Axis(
+            values=month_starts,
+            labelExpr=label_expr,
+            labelAngle=0,
+            grid=False,
+            ticks=True,
+            domain=True,
+        ),
+    )
+    y_enc = alt.Y(
+        "hour:O",
+        title="Time [hour]",
+        sort=list(range(24)),
+        axis=alt.Axis(values=list(range(0, 24, 2))),
+    )
 
     base = alt.Chart(plot)
 
-    rect_missing = base.transform_filter("datum.is_future").mark_rect(
+    rect_missing = base.transform_filter("datum.is_missing").mark_rect(
         fill="#F3F4F6",
         stroke="#F3F4F6",
     ).encode(
-        x=alt.X(
-            "date:T",
-            title="Month",
-            axis=alt.Axis(format="%b", tickCount="month", labelAngle=0, grid=False),
-            scale=alt.Scale(domain=[f"{year_sel}-01-01", f"{year_sel}-12-31"]),
-        ),
-        y=alt.Y("hour:O", title="Time [hour]", sort=list(range(24)), axis=alt.Axis(values=list(range(0, 24, 2)))),
+        x=x_enc,
+        y=y_enc,
+        tooltip=[
+            alt.Tooltip("date_label:N", title="Date"),
+            alt.Tooltip("hour:O", title="Hour"),
+        ],
     )
 
-    rect_prices = base.transform_filter("!datum.is_future").mark_rect().encode(
-        x=alt.X(
-            "date:T",
-            title="Month",
-            axis=alt.Axis(format="%b", tickCount="month", labelAngle=0, grid=False),
-            scale=alt.Scale(domain=[f"{year_sel}-01-01", f"{year_sel}-12-31"]),
-        ),
-        y=alt.Y("hour:O", title="Time [hour]", sort=list(range(24)), axis=alt.Axis(values=list(range(0, 24, 2)))),
+    rect_prices = base.transform_filter("!datum.is_missing").mark_rect().encode(
+        x=x_enc,
+        y=y_enc,
         color=alt.Color(
             "price:Q",
             title="Spot [€/MWh]",
