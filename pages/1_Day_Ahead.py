@@ -7,6 +7,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import altair as alt
+
+# Altair default limit is 5,000 rows.
+# The OMIE full-year hourly heatmap needs 8,760/8,784 rows.
+try:
+    alt.data_transformers.disable_max_rows()
+except Exception:
+    pass
 import pandas as pd
 import requests
 import streamlit as st
@@ -181,6 +188,10 @@ PRICE_HIGH_GREEN = "#16A34A"
 PRICE_HIGH_GREEN_DARK = "#006400"
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
 REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+
+# AEMET OpenData. Get a free API key from AEMET OpenData and place it in .env as AEMET_API_KEY=...
+AEMET_API_BASE = "https://opendata.aemet.es/opendata/api"
+AEMET_CACHE_FILE = DATA_DIR / "aemet_daily_cache.csv"
 
 # =========================================================
 # DISPLAY HELPERS
@@ -1135,6 +1146,326 @@ def build_negative_price_curves(price_hourly: pd.DataFrame, mode: str) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+# =========================================================
+# WEEKLY LOAD EVOLUTION / AEMET WEATHER ANOMALIES
+# =========================================================
+def normalize_ree_demand_to_mwh(series: pd.Series) -> pd.Series:
+    """REE demand widgets can come in GWh in some truncations; normalize to MWh."""
+    vals = pd.to_numeric(series, errors="coerce")
+    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
+    # Spanish daily demand is normally hundreds of GWh. If values are < 5,000,
+    # treat them as GWh and convert to MWh.
+    if pd.notna(max_abs) and max_abs < 5000:
+        return vals * 1000.0
+    return vals
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_ree_demand_daily_history(start_day: date, end_day: date) -> pd.DataFrame:
+    """Load daily peninsular demand from REE and return MWh per day.
+
+    This is used for weekly load evolution. It is independent from ESIOS and
+    therefore more robust for historical demand comparisons.
+    """
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "demand_mwh", "data_source"])
+
+    frames = []
+    y0, y1 = start_day.year, end_day.year
+    for year in range(y0, y1 + 1):
+        s_day = max(start_day, date(year, 1, 1))
+        e_day = min(end_day, date(year, 12, 31))
+        try:
+            payload = fetch_ree_widget("demanda", "ire-general", s_day, e_day, time_trunc="day")
+            df = parse_ree_included_series(payload, value_field="value")
+        except Exception:
+            df = pd.DataFrame(columns=["datetime", "title", "value"])
+
+        if df.empty:
+            continue
+
+        df["title_norm"] = df["title"].astype(str).str.strip().str.lower()
+        preferred = df[df["title_norm"].str.contains("real", na=False)].copy()
+        if preferred.empty:
+            preferred = df.copy()
+
+        preferred["datetime"] = pd.to_datetime(preferred["datetime"], errors="coerce").dt.normalize()
+        preferred["demand_mwh"] = normalize_ree_demand_to_mwh(preferred["value"])
+        preferred["data_source"] = "REE API"
+        preferred = preferred.dropna(subset=["datetime", "demand_mwh"]).copy()
+        if not preferred.empty:
+            frames.append(preferred[["datetime", "demand_mwh", "data_source"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "demand_mwh", "data_source"])
+
+    out = pd.concat(frames, ignore_index=True)
+    return (
+        out.groupby(["datetime", "data_source"], as_index=False)["demand_mwh"]
+        .sum()
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+def build_weekly_load_evolution(demand_daily: pd.DataFrame) -> pd.DataFrame:
+    cols = ["year", "week", "week_start", "weekly_load_gwh", "cum_load_gwh"]
+    if demand_daily.empty:
+        return pd.DataFrame(columns=cols)
+    tmp = demand_daily.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp["demand_mwh"] = pd.to_numeric(tmp["demand_mwh"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime", "demand_mwh"])
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+
+    iso = tmp["datetime"].dt.isocalendar()
+    tmp["year"] = iso["year"].astype(int)
+    tmp["week"] = iso["week"].astype(int)
+    tmp["week_start"] = tmp["datetime"].dt.to_period("W-SUN").dt.start_time
+    weekly = (
+        tmp.groupby(["year", "week", "week_start"], as_index=False)["demand_mwh"]
+        .sum()
+        .sort_values(["year", "week"])
+    )
+    weekly["weekly_load_gwh"] = weekly["demand_mwh"] / 1000.0
+    weekly["cum_load_gwh"] = weekly.groupby("year")["weekly_load_gwh"].cumsum()
+    return weekly[cols]
+
+
+def build_weekly_load_chart(weekly_load: pd.DataFrame, selected_years: list[int], cumulative: bool = False):
+    if weekly_load.empty or not selected_years:
+        return None
+    plot = weekly_load[weekly_load["year"].isin(selected_years)].copy()
+    if plot.empty:
+        return None
+    y_col = "cum_load_gwh" if cumulative else "weekly_load_gwh"
+    y_title = "Cumulative load (GWh)" if cumulative else "Weekly load (GWh)"
+    title = "Cumulative load evolution by ISO week" if cumulative else "Weekly load evolution by ISO week"
+    colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
+    years = sorted(plot["year"].unique().tolist())
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("week:O", sort=list(range(1, 54)), axis=alt.Axis(title="ISO week", labelAngle=0)),
+        y=alt.Y(f"{y_col}:Q", title=y_title),
+        color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=[str(y) for y in years], range=colors[:len(years)])),
+        detail="year:N",
+        tooltip=[
+            alt.Tooltip("year:N", title="Year"),
+            alt.Tooltip("week:O", title="ISO week"),
+            alt.Tooltip("week_start:T", title="Week start", format="%Y-%m-%d"),
+            alt.Tooltip(f"{y_col}:Q", title=y_title, format=",.1f"),
+        ],
+    ).properties(height=360, title=title)
+    return apply_common_chart_style(chart, height=360)
+
+
+def parse_spanish_decimal(value):
+    if pd.isna(value):
+        return pd.NA
+    s = str(value).strip().replace(",", ".")
+    if not s or s.lower() in {"nan", "none", "ip"}:
+        return pd.NA
+    try:
+        return float(s)
+    except Exception:
+        return pd.NA
+
+
+def get_aemet_token() -> str | None:
+    token = (os.getenv("AEMET_API_KEY") or os.getenv("AEMET_TOKEN") or "").strip()
+    return token or None
+
+
+def _aemet_indirect_get(endpoint: str, token: str) -> list[dict]:
+    """AEMET OpenData returns a first JSON with a 'datos' URL; fetch that URL."""
+    url = f"{AEMET_API_BASE}/{endpoint.lstrip('/')}"
+    first = requests.get(url, params={"api_key": token}, timeout=(15, 60))
+    first.raise_for_status()
+    meta = first.json()
+    datos_url = meta.get("datos")
+    if not datos_url:
+        return []
+    second = requests.get(datos_url, timeout=(15, 120))
+    second.raise_for_status()
+    payload = second.json()
+    return payload if isinstance(payload, list) else []
+
+
+def _read_aemet_cache() -> pd.DataFrame:
+    cols = ["fecha", "indicativo", "provincia", "nombre", "tmed", "hrMedia"]
+    if not AEMET_CACHE_FILE.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(AEMET_CACHE_FILE, dtype={"indicativo": str})
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+    return df[cols].dropna(subset=["fecha"]).copy()
+
+
+def _write_aemet_cache(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    out = df.copy()
+    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out = out.drop_duplicates(subset=["fecha", "indicativo"], keep="last")
+    AEMET_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(AEMET_CACHE_FILE, index=False)
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_aemet_daily_all_stations(start_day: date, end_day: date, token: str) -> pd.DataFrame:
+    """Fetch AEMET daily climatological data for all stations, with a CSV cache.
+
+    AEMET daily all-station requests are limited in practice, so this function
+    chunks the requested range in 10-day blocks and caches responses in /data.
+    """
+    cols = ["fecha", "indicativo", "provincia", "nombre", "tmed", "hrMedia"]
+    if start_day > end_day:
+        return pd.DataFrame(columns=cols)
+
+    cache = _read_aemet_cache()
+    available_dates = set(cache["fecha"].tolist()) if not cache.empty else set()
+    needed_dates = pd.date_range(start_day, end_day, freq="D").date.tolist()
+    missing_dates = [d for d in needed_dates if d not in available_dates]
+
+    frames = [cache] if not cache.empty else []
+    if missing_dates:
+        chunk_start = min(missing_dates)
+        while chunk_start <= end_day:
+            # Skip forward until the next missing day.
+            if chunk_start not in missing_dates:
+                chunk_start += timedelta(days=1)
+                continue
+            chunk_end = min(chunk_start + timedelta(days=9), end_day)
+            endpoint = (
+                "valores/climatologicos/diarios/datos/"
+                f"fechaini/{chunk_start.isoformat()}T00:00:00UTC/"
+                f"fechafin/{chunk_end.isoformat()}T23:59:59UTC/"
+                "todasestaciones"
+            )
+            try:
+                rows = _aemet_indirect_get(endpoint, token)
+                if rows:
+                    raw = pd.DataFrame(rows)
+                    df = pd.DataFrame()
+                    df["fecha"] = pd.to_datetime(raw.get("fecha"), errors="coerce").dt.date
+                    df["indicativo"] = raw.get("indicativo", pd.Series(dtype=str)).astype(str)
+                    df["provincia"] = raw.get("provincia", pd.Series(dtype=str)).astype(str)
+                    df["nombre"] = raw.get("nombre", pd.Series(dtype=str)).astype(str)
+                    df["tmed"] = raw.get("tmed", pd.Series(dtype=object)).map(parse_spanish_decimal)
+                    # AEMET field is usually hrMedia. Some old records may not include it.
+                    if "hrMedia" in raw.columns:
+                        df["hrMedia"] = raw["hrMedia"].map(parse_spanish_decimal)
+                    elif "hrmedia" in raw.columns:
+                        df["hrMedia"] = raw["hrmedia"].map(parse_spanish_decimal)
+                    else:
+                        df["hrMedia"] = pd.NA
+                    df = df.dropna(subset=["fecha", "indicativo"]).copy()
+                    frames.append(df[cols])
+            except Exception:
+                pass
+            sleep(0.35)
+            chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["fecha", "indicativo"], keep="last")
+    # Keep only requested range for return, but write full cache.
+    _write_aemet_cache(out[cols])
+    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce")
+    return out[(out["fecha"].dt.date >= start_day) & (out["fecha"].dt.date <= end_day)][cols].reset_index(drop=True)
+
+
+def build_aemet_weekly_anomalies(current_df: pd.DataFrame, baseline_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "week_start", "tmed_actual", "tmed_normal", "temperature_anomaly_c",
+        "humidity_actual", "humidity_normal", "humidity_anomaly_pp", "stations_count"
+    ]
+    if current_df.empty or baseline_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    cur = current_df.copy()
+    base = baseline_df.copy()
+    for df in [cur, base]:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        df["tmed"] = pd.to_numeric(df["tmed"], errors="coerce")
+        df["hrMedia"] = pd.to_numeric(df["hrMedia"], errors="coerce")
+        df["doy"] = df["fecha"].dt.dayofyear
+
+    # Spain-wide simple station average. For precision, this can later be replaced
+    # with area-weighted station interpolation, but this is robust for dashboard monitoring.
+    cur_daily = cur.groupby("fecha", as_index=False).agg(
+        tmed_actual=("tmed", "mean"),
+        humidity_actual=("hrMedia", "mean"),
+        stations_count=("indicativo", "nunique"),
+    )
+    cur_daily["doy"] = cur_daily["fecha"].dt.dayofyear
+
+    base_daily = base.groupby(["fecha", "doy"], as_index=False).agg(
+        tmed=("tmed", "mean"),
+        hrMedia=("hrMedia", "mean"),
+    )
+    normals = base_daily.groupby("doy", as_index=False).agg(
+        tmed_normal=("tmed", "mean"),
+        humidity_normal=("hrMedia", "mean"),
+    )
+
+    merged = cur_daily.merge(normals, on="doy", how="left")
+    merged["temperature_anomaly_c"] = merged["tmed_actual"] - merged["tmed_normal"]
+    merged["humidity_anomaly_pp"] = merged["humidity_actual"] - merged["humidity_normal"]
+    merged["week_start"] = merged["fecha"].dt.to_period("W-SUN").dt.start_time
+
+    weekly = merged.groupby("week_start", as_index=False).agg(
+        tmed_actual=("tmed_actual", "mean"),
+        tmed_normal=("tmed_normal", "mean"),
+        temperature_anomaly_c=("temperature_anomaly_c", "mean"),
+        humidity_actual=("humidity_actual", "mean"),
+        humidity_normal=("humidity_normal", "mean"),
+        humidity_anomaly_pp=("humidity_anomaly_pp", "mean"),
+        stations_count=("stations_count", "mean"),
+    )
+    return weekly[cols].sort_values("week_start").reset_index(drop=True)
+
+
+def build_aemet_anomaly_charts(anom_df: pd.DataFrame):
+    if anom_df.empty:
+        return None
+    temp = alt.Chart(anom_df).mark_line(point=True, strokeWidth=3, color="#DC2626").encode(
+        x=alt.X("week_start:T", title=None, axis=alt.Axis(format="%d-%b", labelAngle=0)),
+        y=alt.Y("temperature_anomaly_c:Q", title="Temp anomaly (°C)"),
+        tooltip=[
+            alt.Tooltip("week_start:T", title="Week", format="%Y-%m-%d"),
+            alt.Tooltip("temperature_anomaly_c:Q", title="Temperature anomaly °C", format=",.2f"),
+            alt.Tooltip("tmed_actual:Q", title="Actual tmed °C", format=",.2f"),
+            alt.Tooltip("tmed_normal:Q", title="Baseline tmed °C", format=",.2f"),
+            alt.Tooltip("stations_count:Q", title="Stations", format=",.0f"),
+        ],
+    ).properties(height=250, title="AEMET weekly temperature anomaly vs baseline")
+
+    hum = alt.Chart(anom_df.dropna(subset=["humidity_anomaly_pp"])).mark_line(point=True, strokeWidth=3, color=CORP_GREEN).encode(
+        x=alt.X("week_start:T", title=None, axis=alt.Axis(format="%d-%b", labelAngle=0)),
+        y=alt.Y("humidity_anomaly_pp:Q", title="Humidity anomaly (pp)"),
+        tooltip=[
+            alt.Tooltip("week_start:T", title="Week", format="%Y-%m-%d"),
+            alt.Tooltip("humidity_anomaly_pp:Q", title="Humidity anomaly pp", format=",.2f"),
+            alt.Tooltip("humidity_actual:Q", title="Actual humidity %", format=",.2f"),
+            alt.Tooltip("humidity_normal:Q", title="Baseline humidity %", format=",.2f"),
+            alt.Tooltip("stations_count:Q", title="Stations", format=",.0f"),
+        ],
+    ).properties(height=250, title="AEMET weekly relative humidity anomaly vs baseline")
+
+    zero_temp = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6B7280", strokeDash=[4, 4]).encode(y="y:Q")
+    temp = alt.layer(temp, zero_temp).resolve_scale(y="shared")
+    hum = alt.layer(hum, zero_temp).resolve_scale(y="shared")
+    return apply_common_chart_style(alt.vconcat(temp, hum, spacing=18), height=250)
+
+
 def build_energy_mix_period(mix_df: pd.DataFrame, granularity: str, year_sel: int | None = None, day_range: tuple[date, date] | None = None):
     if mix_df.empty:
         return pd.DataFrame()
@@ -1796,7 +2127,7 @@ def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[st
     ).properties(height=360)
     return apply_common_chart_style(chart, height=360)
 
-def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None) -> bytes:
+def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None, weekly_load_df: pd.DataFrame | None = None, aemet_anomalies_df: pd.DataFrame | None = None) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         price_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="prices_hourly")
@@ -1811,6 +2142,10 @@ def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame,
             zero_negative_hour_table.to_excel(writer, index=False, sheet_name="zero_neg_12x24")
         if demand_hourly is not None and not demand_hourly.empty:
             demand_hourly.sort_values("datetime").to_excel(writer, index=False, sheet_name="demand_hourly")
+        if weekly_load_df is not None and not weekly_load_df.empty:
+            weekly_load_df.sort_values(["year", "week"]).to_excel(writer, index=False, sheet_name="weekly_load")
+        if aemet_anomalies_df is not None and not aemet_anomalies_df.empty:
+            aemet_anomalies_df.sort_values("week_start").to_excel(writer, index=False, sheet_name="aemet_anomalies")
     output.seek(0)
     return output.getvalue()
 
@@ -2054,6 +2389,38 @@ try:
         if heat_chart is not None:
             st.altair_chart(heat_chart, use_container_width=True)
 
+
+    section_header("Weekly load evolution")
+    weekly_load_df = pd.DataFrame()
+    try:
+        demand_daily = load_ree_demand_daily_history(start_day, max_refresh_day())
+        weekly_load_df = build_weekly_load_evolution(demand_daily)
+        if weekly_load_df.empty:
+            st.info("No weekly demand data available from REE.")
+        else:
+            load_years = sorted(weekly_load_df["year"].unique().tolist())
+            default_load_years = load_years[-3:] if len(load_years) >= 3 else load_years
+            selected_load_years = st.multiselect(
+                "Years for weekly load evolution",
+                load_years,
+                default=default_load_years,
+                key="weekly_load_years",
+            )
+            cumulative_load = st.checkbox("Show cumulative load", value=False, key="weekly_load_cumulative")
+            weekly_chart = build_weekly_load_chart(weekly_load_df, selected_load_years, cumulative=cumulative_load)
+            if weekly_chart is not None:
+                st.altair_chart(weekly_chart, use_container_width=True)
+                st.caption("Load is built from REE daily peninsular demand and aggregated by ISO week.")
+            with st.expander("Show weekly load data", expanded=False):
+                st.dataframe(styled_df(weekly_load_df), use_container_width=True)
+    except Exception as exc:
+        st.warning(f"Weekly load evolution could not be loaded: {exc}")
+        weekly_load_df = pd.DataFrame()
+
+    # Weather anomalies intentionally disabled for now.
+    # AEMET API integration can be re-enabled once AEMET_API_KEY is available.
+    aemet_anomalies_df = pd.DataFrame()
+
     # Energy mix
     section_header("Energy mix")
     if mix_daily.empty:
@@ -2173,6 +2540,8 @@ try:
         curtailment_table=build_economic_curtailment_monthly(price_hourly, solar_hourly, sorted(price_hourly["datetime"].dt.year.unique().tolist())),
         zero_negative_hour_table=build_zero_negative_hour_table(price_hourly, int(price_hourly["datetime"].dt.year.max())) if not price_hourly.empty else pd.DataFrame(),
         demand_hourly=demand_hourly,
+        weekly_load_df=weekly_load_df if "weekly_load_df" in locals() else pd.DataFrame(),
+        aemet_anomalies_df=aemet_anomalies_df if "aemet_anomalies_df" in locals() else pd.DataFrame(),
     )
     st.download_button(
         label="Download Excel workbook",
