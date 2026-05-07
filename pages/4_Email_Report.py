@@ -743,17 +743,34 @@ def _daily_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: da
     return out
 
 
-def _weekly_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+def _weekly_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: date, end: date, target_year: int | None = None) -> pd.DataFrame:
+    """
+    Weekly values aligned to the report year.
+
+    Important: do not use Monday week_start.year as the year label, because the
+    first days of January can have a week_start in the previous calendar year.
+    That was creating an artificial 2024 legend entry and a long line from April
+    to December/January. The week_index below is anchored to Jan 1 of target_year.
+    """
+    target_year = target_year or start.year
+
     daily = _daily_agg(price_hourly, solar_hourly, start, end)
     if daily.empty:
         return _empty_df(["week_start", "spot", "captured_unc", "captured_cur", "solar_gwh", "negative_hours", "hours", "year", "week_index", "plot_date"])
+
     daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
     daily = daily.dropna(subset=["date"]).copy()
-    daily["week_start"] = daily["date"] - pd.to_timedelta(daily["date"].dt.weekday, unit="D")
+    if daily.empty:
+        return _empty_df(["week_start", "spot", "captured_unc", "captured_cur", "solar_gwh", "negative_hours", "hours", "year", "week_index", "plot_date"])
+
+    jan1 = pd.Timestamp(date(target_year, 1, 1))
+    daily["week_index"] = ((daily["date"] - jan1).dt.days // 7) + 1
+    daily = daily[daily["week_index"] >= 1].copy()
 
     def _calc_week(grp: pd.DataFrame) -> pd.Series:
         solar = grp["solar_gwh"].sum()
         return pd.Series({
+            "week_start": grp["date"].min(),
             "spot": grp["spot"].mean(),
             "captured_unc": (grp["captured_unc"] * grp["solar_gwh"]).sum() / solar if solar > 0 else pd.NA,
             "captured_cur": (grp["captured_cur"] * grp["solar_gwh"]).sum() / solar if solar > 0 else pd.NA,
@@ -762,16 +779,15 @@ def _weekly_agg(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, start: d
             "hours": grp["hours"].sum(),
         })
 
-    out = daily.groupby("week_start").apply(_calc_week).reset_index()
-    out["year"] = out["week_start"].dt.year
-    out["week_index"] = ((out["week_start"] - pd.to_datetime(out["year"].astype(str) + "-01-01")).dt.days // 7) + 1
+    out = daily.groupby("week_index").apply(_calc_week).reset_index()
+    out["year"] = target_year
     out["plot_date"] = pd.to_datetime("2000-01-01") + pd.to_timedelta((out["week_index"] - 1) * 7, unit="D")
     return out
 
 
 def build_weekly_price_capture_table(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> pd.DataFrame:
-    cur = _weekly_agg(price_hourly, solar_hourly, current.start, current.end)
-    prev = _weekly_agg(price_hourly, solar_hourly, previous.start, previous.end)
+    cur = _weekly_agg(price_hourly, solar_hourly, current.start, current.end, target_year=current.year)
+    prev = _weekly_agg(price_hourly, solar_hourly, previous.start, previous.end, target_year=previous.year)
     out = pd.concat([cur, prev], ignore_index=True)
     if out.empty:
         return out
@@ -1233,8 +1249,8 @@ def chart_bess_duration_totals(bess_duration_table: pd.DataFrame) -> str | None:
 # =========================================================
 def chart_weekly_spot_capture(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, current: PeriodWindow, previous: PeriodWindow) -> str | None:
     weekly = pd.concat([
-        _weekly_agg(price_hourly, solar_hourly, previous.start, previous.end),
-        _weekly_agg(price_hourly, solar_hourly, current.start, current.end),
+        _weekly_agg(price_hourly, solar_hourly, previous.start, previous.end, target_year=previous.year),
+        _weekly_agg(price_hourly, solar_hourly, current.start, current.end, target_year=current.year),
     ], ignore_index=True)
     if weekly.empty:
         return None
@@ -1249,7 +1265,7 @@ def chart_weekly_spot_capture(price_hourly: pd.DataFrame, solar_hourly: pd.DataF
         ax.plot(grp["plot_date"], grp["spot"], color=color, linewidth=2.3, label=f"Spot {y}")
         ax.plot(grp["plot_date"], grp["captured_unc"], color=color, linewidth=2.0, linestyle=":", label=f"Captured uncurtailed {y}")
         ax.plot(grp["plot_date"], grp["captured_cur"], color=color, linewidth=2.0, linestyle="--", label=f"Captured curtailed {y}")
-    ax.set_title("Weekly spot vs captured prices (YTD)")
+    ax.set_title(f"Weekly spot vs captured prices (YTD to {current.end.strftime('%d-%b')})")
     ax.set_ylabel("€/MWh")
     ax.grid(axis="y", alpha=0.25)
     ax.xaxis.set_major_locator(mdates.MonthLocator())
@@ -1342,8 +1358,14 @@ def chart_duck_curve(duck_df: pd.DataFrame) -> str | None:
 
 
 def chart_price_heatmap(price_hourly: pd.DataFrame, year: int) -> str | None:
+    """
+    24 x 365 (or 366) heatmap of hourly OMIE prices for the selected year,
+    styled closer to the reference shared by the user.
+    Rows = hour of day, columns = day of year.
+    """
     if price_hourly.empty:
         return None
+
     p = price_hourly.copy()
     p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
     p["price"] = pd.to_numeric(p["price"], errors="coerce")
@@ -1351,33 +1373,67 @@ def chart_price_heatmap(price_hourly: pd.DataFrame, year: int) -> str | None:
     p = p[p["datetime"].dt.year == year].copy()
     if p.empty:
         return None
+
     p["doy"] = p["datetime"].dt.dayofyear
     p["hour"] = p["datetime"].dt.hour
+
     n_days = 366 if pd.Timestamp(year=year, month=12, day=31).dayofyear == 366 else 365
     grid = np.full((24, n_days), np.nan)
+
+    # One average hourly OMIE price per hour x day cell.
     agg = p.groupby(["hour", "doy"], as_index=False)["price"].mean()
     for _, row in agg.iterrows():
         h = int(row["hour"])
         d = int(row["doy"]) - 1
         if 0 <= h < 24 and 0 <= d < n_days:
             grid[h, d] = float(row["price"])
+
     if np.isfinite(grid).sum() == 0:
         return None
-    vmin = np.nanpercentile(grid, 5)
-    vmax = np.nanpercentile(grid, 95)
-    fig, ax = plt.subplots(figsize=(12.0, 4.8))
-    im = ax.imshow(grid, aspect='auto', origin='lower', cmap='RdYlGn_r', vmin=vmin, vmax=vmax)
+
+    # Robust scale so extreme spikes do not dominate the chart.
+    finite_vals = grid[np.isfinite(grid)]
+    vmin = np.nanpercentile(finite_vals, 3)
+    vmax = np.nanpercentile(finite_vals, 97)
+    if vmin == vmax:
+        vmin = float(np.nanmin(finite_vals))
+        vmax = float(np.nanmax(finite_vals)) + 1e-6
+
+    fig, ax = plt.subplots(figsize=(12.4, 5.2))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+
+    # Style intentionally similar to the sample: dark purple -> orange -> light cream.
+    im = ax.imshow(
+        grid,
+        aspect='auto',
+        origin='upper',
+        cmap='magma',
+        interpolation='nearest',
+        vmin=vmin,
+        vmax=vmax,
+    )
+
     month_starts = [pd.Timestamp(year, m, 1).dayofyear - 1 for m in range(1, 13)]
     month_labels = [pd.Timestamp(year, m, 1).strftime('%b') for m in range(1, 13)]
     ax.set_xticks(month_starts)
     ax.set_xticklabels(month_labels)
-    ax.set_yticks(range(0, 24, 2))
-    ax.set_yticklabels([str(h) for h in range(0, 24, 2)])
-    ax.set_xlabel('Day of year')
-    ax.set_ylabel('Hour of day')
-    ax.set_title(f'OMIE hourly price heatmap ({year})', fontweight='bold')
-    cbar = fig.colorbar(im, ax=ax, pad=0.01)
-    cbar.set_label('€/MWh')
+
+    y_ticks = list(range(0, 24, 2))
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels([str(h) for h in y_ticks])
+
+    ax.set_xlabel('Month')
+    ax.set_ylabel('Time [hour]')
+    ax.set_title(f'OMIE hourly price heatmap | {year} | 24 x {n_days}', fontweight='bold', pad=10)
+
+    for spine in ['top', 'right']:
+        ax.spines[spine].set_visible(False)
+
+    cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.03)
+    cbar.set_label('Spot [€/MWh]')
+    cbar.outline.set_visible(False)
+
     return fig_to_b64(fig)
 
 
@@ -1650,7 +1706,7 @@ bess_duration_table = build_bess_duration_comparison(
 
 charts = {
     "Weekly spot and captured prices": chart_weekly_spot_capture(price_hourly, solar_hourly, current_window, previous_window),
-    "OMIE hourly price heatmap": chart_price_heatmap(price_hourly, heatmap_year),
+    "OMIE hourly price heatmap (24x365)": chart_price_heatmap(price_hourly, heatmap_year),
     "Monthly negative / zero price share": chart_monthly_negative_share(neg_hours_table),
     "Solar economic curtailment based on P48": chart_solar_curtailment(monthly_table),
     "Duck curve": chart_duck_curve(duck_df),
@@ -1708,6 +1764,8 @@ email_html = f"""
 <div style="padding:14px 16px;border:1px solid #e5e7eb;border-radius:14px;background:linear-gradient(90deg,#ffffff 0%,#f8fafc 100%);margin-bottom:14px;">
 <p style="margin:0 0 10px 0;">{intro_text.replace(chr(10), '<br>')}</p>
 <p style="margin:0;"><strong>Cut-off:</strong> {current_window.end.strftime('%d-%b-%Y')}<br>
+<strong>Report period:</strong> {current_window.start.strftime('%d-%b-%Y')} to {current_window.end.strftime('%d-%b-%Y')}<br>
+<strong>Comparison period:</strong> {previous_window.start.strftime('%d-%b-%Y')} to {previous_window.end.strftime('%d-%b-%Y')}<br>
 <strong>Comparison cut-off:</strong> {previous_window.end.strftime('%d-%b-%Y')}<br>
 <strong>Heatmap year:</strong> {heatmap_year}</p>
 </div>
@@ -1791,5 +1849,5 @@ if st.button("Send monthly report now"):
             st.error(f"Send failed: {exc}")
 
 st.info(
-    "This version adds a more corporate email layout, clearer BESS and solar sections with icons, an OMIE hourly price heatmap for the selected year, negative-hours percentages, a duck-curve style hourly price profile, solar economic curtailment bars based on P48, and improved BESS visuals (monthly grouped revenue bars plus buy/sell/spread chart). The PDF remains charts-only and includes the Nexwell logo stamp."
+    "This version adds a more corporate email layout, clearer BESS and solar sections with icons, a 24x365 OMIE hourly price heatmap for the selected year styled like the reference, negative-hours percentages, a duck-curve style hourly price profile, solar economic curtailment bars based on P48, and improved BESS visuals (monthly grouped revenue bars plus buy/sell/spread chart). The PDF remains charts-only and includes the Nexwell logo stamp."
 )
