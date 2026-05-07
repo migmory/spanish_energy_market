@@ -174,6 +174,11 @@ YELLOW_DARK = "#D97706"
 YELLOW_LIGHT = "#FBBF24"
 BLUE_PRICE = "#1D4ED8"
 GREEN_RENEWABLES = "#059669"
+PRICE_LOW_RED = "#DC2626"
+PRICE_MID_ORANGE = "#F97316"
+PRICE_MID_YELLOW = "#FDE047"
+PRICE_HIGH_GREEN = "#16A34A"
+PRICE_HIGH_GREEN_DARK = "#006400"
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
 REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
 
@@ -1506,6 +1511,117 @@ def build_monthly_main_chart(monthly_combo: pd.DataFrame):
     ) if "month" in monthly_combo.columns else monthly_combo.copy()
     return build_capture_price_chart(tmp, "Monthly")
 
+
+def build_hourly_price_heatmap_table(price_hourly: pd.DataFrame, year_sel: int) -> pd.DataFrame:
+    """Return 24 x 365/366 OMIE hourly price table for a selected year."""
+    cols = ["datetime", "date", "day_of_year", "month_num", "month_name", "hour", "price", "is_future"]
+    if price_hourly.empty:
+        return pd.DataFrame(columns=cols)
+
+    tmp = price_hourly[price_hourly["datetime"].dt.year == year_sel].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp["date"] = tmp["datetime"].dt.normalize()
+    tmp["day_of_year"] = tmp["datetime"].dt.dayofyear
+    tmp["month_num"] = tmp["datetime"].dt.month
+    tmp["month_name"] = tmp["datetime"].dt.strftime("%b")
+    tmp["hour"] = tmp["datetime"].dt.hour
+    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime", "price"])
+
+    # Fill the full calendar grid so missing/future months appear as a light grey area.
+    full_days = pd.date_range(date(year_sel, 1, 1), date(year_sel, 12, 31), freq="D")
+    full_grid = pd.MultiIndex.from_product(
+        [full_days, range(24)],
+        names=["date", "hour"],
+    ).to_frame(index=False)
+    full_grid["date"] = pd.to_datetime(full_grid["date"])
+    full_grid["day_of_year"] = full_grid["date"].dt.dayofyear
+    full_grid["month_num"] = full_grid["date"].dt.month
+    full_grid["month_name"] = full_grid["date"].dt.strftime("%b")
+    full_grid["datetime"] = full_grid["date"] + pd.to_timedelta(full_grid["hour"], unit="h")
+
+    hourly = (
+        tmp.groupby(["date", "hour"], as_index=False)["price"]
+        .mean()
+        .sort_values(["date", "hour"])
+    )
+    out = full_grid.merge(hourly, on=["date", "hour"], how="left")
+    out["is_future"] = out["price"].isna()
+    return out[cols]
+
+
+def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
+    """Altair heatmap: x = calendar date, y = hour, color = spot price.
+
+    Color convention requested:
+      * strong red = very low prices
+      * yellow/orange = medium prices
+      * strong green = very high prices
+    """
+    plot = build_hourly_price_heatmap_table(price_hourly, year_sel)
+    if plot.empty:
+        return None
+
+    valid_prices = plot["price"].dropna()
+    if valid_prices.empty:
+        return None
+
+    p_low = min(float(valid_prices.quantile(0.02)), 0.0)
+    p_high = float(valid_prices.quantile(0.98))
+    if p_high <= p_low:
+        p_high = p_low + 1.0
+    p_mid_1 = p_low + (p_high - p_low) * 0.35
+    p_mid_2 = p_low + (p_high - p_low) * 0.60
+    p_mid_3 = p_low + (p_high - p_low) * 0.80
+
+    base = alt.Chart(plot)
+
+    rect_missing = base.transform_filter("datum.is_future").mark_rect(
+        fill="#F3F4F6",
+        stroke="#F3F4F6",
+    ).encode(
+        x=alt.X(
+            "date:T",
+            title="Month",
+            axis=alt.Axis(format="%b", tickCount="month", labelAngle=0, grid=False),
+            scale=alt.Scale(domain=[f"{year_sel}-01-01", f"{year_sel}-12-31"]),
+        ),
+        y=alt.Y("hour:O", title="Time [hour]", sort=list(range(24)), axis=alt.Axis(values=list(range(0, 24, 2)))),
+    )
+
+    rect_prices = base.transform_filter("!datum.is_future").mark_rect().encode(
+        x=alt.X(
+            "date:T",
+            title="Month",
+            axis=alt.Axis(format="%b", tickCount="month", labelAngle=0, grid=False),
+            scale=alt.Scale(domain=[f"{year_sel}-01-01", f"{year_sel}-12-31"]),
+        ),
+        y=alt.Y("hour:O", title="Time [hour]", sort=list(range(24)), axis=alt.Axis(values=list(range(0, 24, 2)))),
+        color=alt.Color(
+            "price:Q",
+            title="Spot [€/MWh]",
+            scale=alt.Scale(
+                domain=[p_low, p_mid_1, p_mid_2, p_mid_3, p_high],
+                range=[PRICE_LOW_RED, PRICE_MID_ORANGE, PRICE_MID_YELLOW, PRICE_HIGH_GREEN, PRICE_HIGH_GREEN_DARK],
+                clamp=True,
+            ),
+            legend=alt.Legend(orient="right", title="Spot [€/MWh]"),
+        ),
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Datetime", format="%Y-%m-%d %H:%M"),
+            alt.Tooltip("price:Q", title="Spot €/MWh", format=",.2f"),
+        ],
+    )
+
+    chart = alt.layer(rect_missing, rect_prices).properties(
+        height=455,
+        title=f"OMIE hourly price heatmap | {year_sel} | 24 x 365",
+    )
+    return apply_common_chart_style(chart, height=455)
+
 def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     if negative_df.empty:
         return None
@@ -1513,11 +1629,11 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
     chart = alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
-        y=alt.Y("cum_count:Q", title=("Cumulative # hours" if mode == "Zero and negative prices" else "Cumulative # negative hours")),
+        y=alt.Y("cum_count:Q", title="Cumulative negative hours"),
         color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
         detail="year:N",
         tooltip=[alt.Tooltip("year:N", title="Year"), alt.Tooltip("month_name:N", title="Month"), alt.Tooltip("cum_count:Q", title="Cumulative count", format=",.0f")],
-    ).properties(height=330)
+    ).properties(height=330, title="Cumulative negative price hours")
     return apply_common_chart_style(chart, height=330)
 
 
@@ -1876,13 +1992,28 @@ try:
             st.altair_chart(apply_common_chart_style(profile_chart.properties(height=320), height=320), use_container_width=True)
             st.dataframe(styled_df(hourly_profile[["hour", "Average price (€/MWh)"]]), use_container_width=True)
 
+    section_header("OMIE hourly price heatmap (24x365)")
+    available_price_years = sorted(price_hourly["datetime"].dt.year.unique().tolist()) if not price_hourly.empty else []
+    price_heatmap_year = st.selectbox(
+        "Year for OMIE hourly price heatmap",
+        available_price_years,
+        index=len(available_price_years) - 1 if available_price_years else 0,
+        key="price_heatmap_year_select",
+    ) if available_price_years else None
+    if price_heatmap_year is not None:
+        price_heatmap = build_hourly_price_heatmap(price_hourly, int(price_heatmap_year))
+        if price_heatmap is not None:
+            st.altair_chart(price_heatmap, use_container_width=True)
+            st.caption("Color scale: strong red = very low spot price; yellow/orange = medium price; strong green = very high spot price. Future or missing hours are shown in light grey.")
+
     section_header("Negative prices")
-    neg_mode = st.radio("Series to display", ["Zero and negative prices", "Only negative prices"], horizontal=True)
+    neg_mode = "Only negative prices"
     negative_price_df = build_negative_price_curves(price_hourly, neg_mode)
     neg_chart = build_negative_price_chart(negative_price_df, neg_mode)
     if neg_chart is not None:
         st.altair_chart(neg_chart, use_container_width=True)
-    subtle_subsection("Negative prices data")
+        st.caption("This chart shows the cumulative number of negative-price hours by month.")
+    subtle_subsection("Cumulative negative price hours data")
     st.dataframe(styled_df(negative_price_df), use_container_width=True)
 
     section_header("Economic curtailment and zero / negative price occurrence")
