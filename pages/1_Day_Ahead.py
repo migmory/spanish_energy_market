@@ -2378,14 +2378,41 @@ def build_forward_market_chart(forward_df: pd.DataFrame):
     ).properties(height=360, title="EEX forward curve")
     return apply_common_chart_style(chart, height=360)
 
-def build_installed_capacity_additions_df(cap_df: pd.DataFrame, selected_techs: list[str]) -> pd.DataFrame:
-    """Return installed capacity as MW additions versus the first available month.
 
-    For each technology, the baseline is the first value within the selected date range.
-    addition_mw = current capacity_mw - first selected capacity_mw.
-    This makes the chart show capacity additions rather than absolute installed capacity.
+def capacity_period_start(dt: pd.Series, granularity: str) -> pd.Series:
+    """Return period start timestamps for installed-capacity aggregation."""
+    dt = pd.to_datetime(dt, errors="coerce")
+    if granularity == "Annual":
+        return dt.dt.to_period("Y").dt.to_timestamp()
+    if granularity == "Quarterly":
+        return dt.dt.to_period("Q").dt.to_timestamp()
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def capacity_period_label(dt: pd.Series, granularity: str) -> pd.Series:
+    """Readable labels for installed-capacity periods."""
+    dt = pd.to_datetime(dt, errors="coerce")
+    if granularity == "Annual":
+        return dt.dt.strftime("%Y")
+    if granularity == "Quarterly":
+        q = dt.dt.quarter.astype(str)
+        y = dt.dt.year.astype(str)
+        return "Q" + q + "-" + y
+    return dt.dt.strftime("%b-%y")
+
+
+def build_installed_capacity_period_df(
+    cap_df: pd.DataFrame,
+    selected_techs: list[str],
+    granularity: str = "Monthly",
+) -> pd.DataFrame:
+    """Aggregate installed capacity to the selected granularity.
+
+    For Monthly/Quarterly/Annual, capacity is a stock variable, so we keep the
+    last available value in the period for each technology rather than summing
+    all observations inside the period.
     """
-    cols = ["datetime", "technology", "capacity_mw", "baseline_capacity_mw", "addition_mw"]
+    cols = ["period", "technology", "capacity_mw"]
     if cap_df.empty or not selected_techs:
         return pd.DataFrame(columns=cols)
 
@@ -2399,118 +2426,191 @@ def build_installed_capacity_additions_df(cap_df: pd.DataFrame, selected_techs: 
     if plot.empty:
         return pd.DataFrame(columns=cols)
 
-    plot["datetime"] = plot["datetime"].dt.to_period("M").dt.to_timestamp()
-    plot = (
-        plot.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
-        .sum()
-        .sort_values(["technology", "datetime"])
+    plot["period"] = capacity_period_start(plot["datetime"], granularity)
+    plot = plot.sort_values(["technology", "period", "datetime"])
+    out = (
+        plot.groupby(["period", "technology"], as_index=False)
+        .tail(1)[["period", "technology", "capacity_mw"]]
+        .sort_values(["period", "technology"])
+        .reset_index(drop=True)
     )
+    return out
+
+
+def build_installed_capacity_additions_df(
+    cap_df: pd.DataFrame,
+    selected_techs: list[str],
+    granularity: str = "Monthly",
+) -> pd.DataFrame:
+    """Return cumulative MW additions versus the first selected period.
+
+    For each technology, the baseline is the first value within the selected
+    date range after applying the selected granularity.
+    """
+    cols = ["period", "technology", "capacity_mw", "baseline_capacity_mw", "addition_mw"]
+    plot = build_installed_capacity_period_df(cap_df, selected_techs, granularity)
+    if plot.empty:
+        return pd.DataFrame(columns=cols)
 
     baselines = (
-        plot.sort_values(["technology", "datetime"])
+        plot.sort_values(["technology", "period"])
         .groupby("technology", as_index=False)
         .first()[["technology", "capacity_mw"]]
         .rename(columns={"capacity_mw": "baseline_capacity_mw"})
     )
     plot = plot.merge(baselines, on="technology", how="left")
     plot["addition_mw"] = plot["capacity_mw"] - plot["baseline_capacity_mw"]
-    return plot[cols].sort_values(["datetime", "technology"]).reset_index(drop=True)
+    return plot[cols].sort_values(["period", "technology"]).reset_index(drop=True)
+
+
+def build_installed_capacity_bottom_up_df(
+    cap_df: pd.DataFrame,
+    selected_techs: list[str],
+    granularity: str = "Monthly",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build bottom-up chart data for additions.
+
+    Each column starts with the initial installed-capacity base and then stacks
+    cumulative additions by technology. This means the first column shows the
+    first selected capacity number and later columns show how that base grows.
+    """
+    add = build_installed_capacity_additions_df(cap_df, selected_techs, granularity)
+    if add.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    baseline_total = float(add.groupby("technology")["baseline_capacity_mw"].first().sum())
+    periods = add[["period"]].drop_duplicates().sort_values("period")
+
+    base_rows = periods.copy()
+    base_rows["technology"] = "Initial base"
+    base_rows["component_mw"] = baseline_total
+    base_rows["capacity_mw"] = baseline_total
+    base_rows["addition_mw"] = 0.0
+    base_rows["component_type"] = "Initial base"
+
+    add_rows = add.copy()
+    add_rows["component_mw"] = add_rows["addition_mw"]
+    add_rows["component_type"] = "Cumulative addition"
+
+    plot = pd.concat(
+        [
+            base_rows[["period", "technology", "component_mw", "capacity_mw", "addition_mw", "component_type"]],
+            add_rows[["period", "technology", "component_mw", "capacity_mw", "addition_mw", "component_type"]],
+        ],
+        ignore_index=True,
+    )
+    # Avoid tiny floating residuals and avoid drawing zero-height segments.
+    plot["component_mw"] = pd.to_numeric(plot["component_mw"], errors="coerce").fillna(0.0)
+    plot.loc[plot["component_mw"].abs() < 1e-6, "component_mw"] = 0.0
+
+    totals = (
+        add.groupby("period", as_index=False)
+        .agg(
+            total_installed_mw=("capacity_mw", "sum"),
+            total_additions_mw=("addition_mw", "sum"),
+        )
+        .sort_values("period")
+    )
+    totals["initial_base_mw"] = baseline_total
+    return plot, totals
 
 
 def build_installed_capacity_chart(
     cap_df: pd.DataFrame,
     selected_techs: list[str],
     view_mode: str = "Additions from initial base",
+    granularity: str = "Monthly",
 ):
     """Build installed-capacity chart.
 
-    Two views are available:
-    - Additions from initial base: stacked columns of cumulative MW additions vs
-      the first selected month. This answers: how many MW have been added since
-      the initial selected capacity base?
+    - Additions from initial base: bottom-up stacked columns. The first segment is
+      the initial selected base, and the coloured segments show cumulative MW
+      additions by technology on top of that base.
     - Total installed evolution: stacked columns of absolute installed capacity.
 
-    Labels show the monthly total so the figures are readable without hovering.
+    Labels show the total MW on top of each column.
     """
     if view_mode == "Total installed evolution":
-        cols = ["datetime", "technology", "capacity_mw"]
-        if cap_df.empty or not selected_techs:
-            return None
-        plot = cap_df[cap_df["technology"].isin(selected_techs)].copy()
+        plot = build_installed_capacity_period_df(cap_df, selected_techs, granularity)
         if plot.empty:
             return None
-        plot["datetime"] = pd.to_datetime(plot["datetime"], errors="coerce")
-        plot["capacity_mw"] = pd.to_numeric(plot["capacity_mw"], errors="coerce")
-        plot = plot.dropna(subset=cols).copy()
-        if plot.empty:
-            return None
-        plot["datetime"] = plot["datetime"].dt.to_period("M").dt.to_timestamp()
-        plot = (
-            plot.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
+        plot["period_label"] = capacity_period_label(plot["period"], granularity)
+        order = plot.sort_values("period")["period_label"].drop_duplicates().tolist()
+        totals = (
+            plot.groupby(["period", "period_label"], as_index=False)["capacity_mw"]
             .sum()
-            .sort_values(["datetime", "technology"])
+            .rename(columns={"capacity_mw": "total_installed_mw"})
+            .sort_values("period")
         )
-        y_col = "capacity_mw"
-        y_title = "Installed capacity (MW)"
-        chart_title = "Total installed capacity evolution"
-        tooltip_value_title = "Installed MW"
-    else:
-        plot = build_installed_capacity_additions_df(cap_df, selected_techs)
-        if plot.empty:
-            return None
-        y_col = "addition_mw"
-        y_title = "Capacity additions vs initial base (MW)"
-        chart_title = "Installed capacity additions from first selected month"
-        tooltip_value_title = "Addition MW"
 
-    plot["month_label"] = plot["datetime"].dt.strftime("%b-%y")
-    order = plot.sort_values("datetime")["month_label"].drop_duplicates().tolist()
+        bars = alt.Chart(plot).mark_bar(size=36).encode(
+            x=alt.X("period_label:N", sort=order, axis=alt.Axis(title=None, labelAngle=-35, labelPadding=8)),
+            y=alt.Y("capacity_mw:Q", title="Installed capacity (MW)", stack="zero"),
+            color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
+            tooltip=[
+                alt.Tooltip("period:T", title="Period", format="%Y-%m-%d"),
+                alt.Tooltip("technology:N", title="Technology"),
+                alt.Tooltip("capacity_mw:Q", title="Installed MW", format=",.0f"),
+            ],
+        )
 
-    monthly_totals = (
-        plot.groupby(["datetime", "month_label"], as_index=False)[y_col]
-        .sum()
-        .rename(columns={y_col: "monthly_total_mw"})
-        .sort_values("datetime")
-    )
+        labels = alt.Chart(totals).mark_text(
+            align="center", baseline="bottom", dy=-6, fontSize=12, fontWeight="bold", color="#111827"
+        ).encode(
+            x=alt.X("period_label:N", sort=order),
+            y=alt.Y("total_installed_mw:Q"),
+            text=alt.Text("total_installed_mw:Q", format=",.0f"),
+            tooltip=[alt.Tooltip("total_installed_mw:Q", title="Total installed MW", format=",.0f")],
+        )
+        chart_title = f"Total installed capacity evolution ({granularity.lower()})"
+        chart = alt.layer(bars, labels).properties(height=410, title=chart_title)
+        return apply_common_chart_style(chart, height=410)
 
-    bars = alt.Chart(plot).mark_bar(size=34).encode(
-        x=alt.X(
-            "month_label:N",
-            sort=order,
-            axis=alt.Axis(title=None, labelAngle=-35, labelPadding=8),
-        ),
-        y=alt.Y(f"{y_col}:Q", title=y_title, stack="zero"),
-        color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
+    plot, totals = build_installed_capacity_bottom_up_df(cap_df, selected_techs, granularity)
+    if plot.empty or totals.empty:
+        return None
+
+    plot["period_label"] = capacity_period_label(plot["period"], granularity)
+    totals["period_label"] = capacity_period_label(totals["period"], granularity)
+    order = totals.sort_values("period")["period_label"].drop_duplicates().tolist()
+
+    color_domain = ["Initial base"] + [t for t in selected_techs if t in plot["technology"].unique().tolist()]
+    color_range = ["#9CA3AF"] + TECH_COLOR_SCALE.to_dict().get("range", [])[: max(len(color_domain) - 1, 0)]
+
+    bars = alt.Chart(plot).mark_bar(size=36).encode(
+        x=alt.X("period_label:N", sort=order, axis=alt.Axis(title=None, labelAngle=-35, labelPadding=8)),
+        y=alt.Y("component_mw:Q", title="Initial base + cumulative additions (MW)", stack="zero"),
+        color=alt.Color("technology:N", title="Component", scale=alt.Scale(domain=color_domain, range=color_range)),
+        order=alt.Order("component_type:N", sort="descending"),
         tooltip=[
-            alt.Tooltip("datetime:T", title="Month", format="%b-%Y"),
-            alt.Tooltip("technology:N", title="Technology"),
-            alt.Tooltip(f"{y_col}:Q", title=tooltip_value_title, format=",.0f"),
+            alt.Tooltip("period:T", title="Period", format="%Y-%m-%d"),
+            alt.Tooltip("technology:N", title="Component"),
+            alt.Tooltip("component_mw:Q", title="Displayed MW", format=",.0f"),
+            alt.Tooltip("addition_mw:Q", title="Cumulative addition MW", format=",.0f"),
             alt.Tooltip("capacity_mw:Q", title="Current MW", format=",.0f"),
         ],
     )
 
-    labels = alt.Chart(monthly_totals).mark_text(
-        align="center",
-        baseline="bottom",
-        dy=-6,
-        fontSize=12,
-        fontWeight="bold",
-        color="#111827",
+    labels = alt.Chart(totals).mark_text(
+        align="center", baseline="bottom", dy=-6, fontSize=12, fontWeight="bold", color="#111827"
     ).encode(
-        x=alt.X("month_label:N", sort=order),
-        y=alt.Y("monthly_total_mw:Q"),
-        text=alt.Text("monthly_total_mw:Q", format=",.0f"),
+        x=alt.X("period_label:N", sort=order),
+        y=alt.Y("total_installed_mw:Q"),
+        text=alt.Text("total_installed_mw:Q", format=",.0f"),
         tooltip=[
-            alt.Tooltip("datetime:T", title="Month", format="%b-%Y"),
-            alt.Tooltip("monthly_total_mw:Q", title="Total MW", format=",.0f"),
+            alt.Tooltip("initial_base_mw:Q", title="Initial base MW", format=",.0f"),
+            alt.Tooltip("total_additions_mw:Q", title="Cumulative additions MW", format=",.0f"),
+            alt.Tooltip("total_installed_mw:Q", title="Total installed MW", format=",.0f"),
         ],
     )
 
-    # A zero line helps when additions include retirements / capacity reductions.
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6B7280", strokeWidth=1.2).encode(y="y:Q")
+    base_line = alt.Chart(totals).mark_rule(color="#6B7280", strokeDash=[5, 4], strokeWidth=1.4).encode(
+        y="initial_base_mw:Q"
+    )
 
-    chart = alt.layer(bars, labels, zero).properties(height=390, title=chart_title)
-    return apply_common_chart_style(chart, height=390)
+    chart_title = f"Installed capacity bottom-up: initial base + cumulative additions ({granularity.lower()})"
+    chart = alt.layer(bars, labels, base_line).properties(height=430, title=chart_title)
+    return apply_common_chart_style(chart, height=430)
 
 def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None, weekly_load_df: pd.DataFrame | None = None, aemet_anomalies_df: pd.DataFrame | None = None) -> bytes:
     output = BytesIO()
@@ -2954,43 +3054,53 @@ try:
             ["Additions from initial base", "Total installed evolution"],
             index=0,
             horizontal=True,
-            help="Additions are cumulative MW changes from the first selected month. Total installed evolution shows absolute installed MW.",
+            help="Additions shows a bottom-up bridge: initial base plus cumulative MW additions. Total installed evolution shows absolute installed MW.",
         )
-        cap_chart = build_installed_capacity_chart(cap_df_year, selected_techs, cap_view_mode)
+        cap_granularity = st.selectbox(
+            "Installed capacity granularity",
+            ["Monthly", "Quarterly", "Annual"],
+            index=0,
+            help="Capacity is a stock variable: for quarterly/annual views the chart keeps the last available capacity value in each period.",
+        )
+        cap_chart = build_installed_capacity_chart(cap_df_year, selected_techs, cap_view_mode, cap_granularity)
         if cap_chart is not None:
             st.altair_chart(cap_chart, use_container_width=True)
 
-        cap_summary = cap_df_year.groupby("datetime", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Total installed capacity (MW)"})
-        cap_renew = cap_df_year[cap_df_year["technology"].isin(RENEWABLE_TECHS)].groupby("datetime", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Renewable capacity (MW)"})
-        cap_table = cap_summary.merge(cap_renew, on="datetime", how="left")
-        cap_table["Renewable capacity (MW)"] = cap_table["Renewable capacity (MW)"].fillna(0.0)
-        cap_table = cap_table.sort_values("datetime").reset_index(drop=True)
-        if not cap_table.empty:
+        cap_period = build_installed_capacity_period_df(cap_df_year, selected_techs, cap_granularity)
+        if not cap_period.empty:
+            cap_summary = cap_period.groupby("period", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Total installed capacity (MW)"})
+            cap_renew = cap_period[cap_period["technology"].isin(RENEWABLE_TECHS)].groupby("period", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Renewable capacity (MW)"})
+            cap_table = cap_summary.merge(cap_renew, on="period", how="left")
+            cap_table["Renewable capacity (MW)"] = cap_table["Renewable capacity (MW)"].fillna(0.0)
+            cap_table = cap_table.sort_values("period").reset_index(drop=True)
             first_total = cap_table["Total installed capacity (MW)"].iloc[0]
             first_re = cap_table["Renewable capacity (MW)"].iloc[0]
             cap_table["Total capacity additions (MW)"] = cap_table["Total installed capacity (MW)"] - first_total
             cap_table["Renewable capacity additions (MW)"] = cap_table["Renewable capacity (MW)"] - first_re
+            cap_table["% Renewable capacity"] = cap_table["Renewable capacity (MW)"] / cap_table["Total installed capacity (MW)"]
+            cap_table["Period"] = capacity_period_label(cap_table["period"], cap_granularity)
+
+            subtle_subsection(f"Installed capacity {cap_granularity.lower()} summary")
+            if cap_view_mode == "Additions from initial base":
+                st.caption("Bottom-up view: the first column is the initial installed-capacity base. Later columns stack cumulative additions by technology on top of that base.")
+            else:
+                st.caption("Total installed evolution uses the last available capacity value within each selected period.")
+            st.dataframe(
+                styled_df(
+                    cap_table[[
+                        "Period",
+                        "Total capacity additions (MW)",
+                        "Renewable capacity additions (MW)",
+                        "Total installed capacity (MW)",
+                        "Renewable capacity (MW)",
+                        "% Renewable capacity",
+                    ]],
+                    pct_cols=["% Renewable capacity"],
+                ),
+                use_container_width=True,
+            )
         else:
-            cap_table["Total capacity additions (MW)"] = pd.NA
-            cap_table["Renewable capacity additions (MW)"] = pd.NA
-        cap_table["% Renewable capacity"] = cap_table["Renewable capacity (MW)"] / cap_table["Total installed capacity (MW)"]
-        cap_table["Month"] = cap_table["datetime"].dt.strftime("%b - %Y")
-        subtle_subsection("Installed capacity monthly summary")
-        st.caption("Additions are cumulative MW changes against the first month selected in the Installed capacity years filter; absolute installed MW is kept alongside for reference.")
-        st.dataframe(
-            styled_df(
-                cap_table[[
-                    "Month",
-                    "Total capacity additions (MW)",
-                    "Renewable capacity additions (MW)",
-                    "Total installed capacity (MW)",
-                    "Renewable capacity (MW)",
-                    "% Renewable capacity",
-                ]],
-                pct_cols=["% Renewable capacity"],
-            ),
-            use_container_width=True,
-        )
+            st.info("No installed capacity data available for the selected years / technologies.")
 
     # Raw 12x24 table download (kept at the end)
     if not heat_table.empty:
