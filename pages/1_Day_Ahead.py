@@ -2543,7 +2543,7 @@ def build_installed_capacity_chart(
                 title="Component",
                 scale=alt.Scale(
                     domain=["Initial base", "Addition", "Reduction"],
-                    range=["#9CA3AF", CORP_GREEN, PRICE_LOW_RED],
+                    range=["#9CA3AF", CORP_GREEN, PRICE_HIGH_RED],
                 ),
             ),
             tooltip=[
@@ -2744,63 +2744,7 @@ try:
 
 
 
-    section_header("Forward market - EEX")
-    st.caption(
-        "EEX Market Data Hub can be opened from here. For automated forward curves, use an EEX DataSource export/API subscription or upload the exported CSV/XLSX below."
-    )
-    eex_tab_hub, eex_tab_curve = st.tabs(["EEX Market Data Hub", "Forward curve data"])
-
-    with eex_tab_hub:
-        st.markdown(f"[Open EEX Market Data Hub]({EEX_MARKET_DATA_HUB_URL})")
-        st.caption("If the embedded page does not load, open the link above. Some EEX/MarketView pages block embedding for security reasons.")
-        try:
-            components.html(
-                f'<iframe src="{EEX_MARKET_DATA_HUB_URL}" width="100%" height="720" style="border:1px solid #E5E7EB; border-radius:10px;"></iframe>',
-                height=740,
-                scrolling=True,
-            )
-        except Exception:
-            st.info("The EEX page could not be embedded. Use the link above instead.")
-
-    with eex_tab_curve:
-        st.markdown(
-            "Upload a CSV/XLSX downloaded from EEX Market Data Hub / EEX DataSource. "
-            "The dashboard will try to identify contract, settlement/price, product, market and load-type columns automatically."
-        )
-        uploaded_eex = st.file_uploader(
-            "Upload EEX forward curve export (CSV/XLSX)",
-            type=["csv", "xlsx", "xls"],
-            key="eex_forward_upload",
-        )
-        eex_forward_df = load_eex_forward_market_file(uploaded_eex)
-        if eex_forward_df.empty:
-            st.info(
-                "No EEX forward curve loaded yet. Upload an EEX export here, or save one as "
-                "data/eex_forward_market.csv or data/eex_forward_market.xlsx."
-            )
-        else:
-            products = sorted(eex_forward_df["product"].dropna().astype(str).unique().tolist())
-            markets = sorted(eex_forward_df["market_area"].dropna().astype(str).unique().tolist())
-            loads = sorted(eex_forward_df["load_type"].dropna().astype(str).unique().tolist())
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                selected_products = st.multiselect("Products", products, default=products[: min(len(products), 3)], key="eex_products")
-            with c2:
-                selected_markets = st.multiselect("Market areas", markets, default=markets, key="eex_markets")
-            with c3:
-                selected_loads = st.multiselect("Load types", loads, default=loads, key="eex_load_types")
-
-            eex_plot_df = eex_forward_df[
-                eex_forward_df["product"].astype(str).isin(selected_products)
-                & eex_forward_df["market_area"].astype(str).isin(selected_markets)
-                & eex_forward_df["load_type"].astype(str).isin(selected_loads)
-            ].copy()
-            eex_chart = build_forward_market_chart(eex_plot_df)
-            if eex_chart is not None:
-                st.altair_chart(eex_chart, use_container_width=True)
-            st.dataframe(styled_df(eex_plot_df.drop(columns=["contract_sort"], errors="ignore")), use_container_width=True)
-
+    # Forward market moved to pages/2_Forward_Market.py.
 
     # Selected day
     section_header("Selected day: price vs solar")
