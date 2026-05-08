@@ -622,21 +622,70 @@ def load_live_2026_demand_monthly_from_ree(start_day: date, end_day: date) -> pd
 
 
 def load_live_2026_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    """Load live 2026 installed capacity from REE monthly API.
+
+    Installed capacity is a stock and REE sometimes publishes the current year
+    with only the latest completed/available month. This function therefore tries
+    several month-end windows and keeps whatever 2026 months are available, so
+    the annual additions chart can show 2026 even when the year/month is not
+    complete yet.
+    """
+    cols = ["datetime", "technology", "capacity_mw"]
     start_day = max(start_day, LIVE_START_DATE)
     if start_day > end_day:
-        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
-    try:
-        payload = fetch_ree_widget("generacion", "potencia-instalada", start_day, end_day, time_trunc="month")
-        df = parse_ree_included_series(payload, value_field="value")
-    except Exception:
-        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
-    if df.empty:
-        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
-    df["capacity_mw"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
-    return df[["datetime", "technology", "capacity_mw"]].groupby(["datetime", "technology"], as_index=False)["capacity_mw"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+        return pd.DataFrame(columns=cols)
+
+    def _month_end(d: date) -> date:
+        first_next = date(d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1, 1)
+        return first_next - timedelta(days=1)
+
+    candidate_windows: list[tuple[date, date]] = []
+    # Main request: from 1-Jan-2026 to the selected/live end day.
+    candidate_windows.append((start_day, end_day))
+    # If the current month is not yet published, try through the previous month-end.
+    first_this_month = date(end_day.year, end_day.month, 1)
+    prev_month_end = first_this_month - timedelta(days=1)
+    if prev_month_end >= start_day:
+        candidate_windows.append((start_day, prev_month_end))
+    # Robust fallback: query each 2026 month separately, including the partial current month.
+    m = date(start_day.year, start_day.month, 1)
+    while m <= end_day:
+        me = min(_month_end(m), end_day)
+        if me >= start_day:
+            candidate_windows.append((max(m, start_day), me))
+        if m.month == 12:
+            m = date(m.year + 1, 1, 1)
+        else:
+            m = date(m.year, m.month + 1, 1)
+
+    frames = []
+    for s_day, e_day in candidate_windows:
+        try:
+            payload = fetch_ree_widget("generacion", "potencia-instalada", s_day, e_day, time_trunc="month")
+            df = parse_ree_included_series(payload, value_field="value")
+        except Exception:
+            df = pd.DataFrame(columns=["datetime", "title", "value"])
+        if df.empty:
+            continue
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+        df["capacity_mw"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
+        if not df.empty:
+            frames.append(df[cols])
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    out = (
+        out.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
+        .sum()
+        .sort_values(["datetime", "technology"])
+        .drop_duplicates(subset=["datetime", "technology"], keep="last")
+        .reset_index(drop=True)
+    )
+    return out
 
 
 # =========================================================
@@ -2949,32 +2998,7 @@ try:
             st.altair_chart(heat_chart, use_container_width=True)
 
 
-    section_header("Weekly load evolution")
-    weekly_load_df = pd.DataFrame()
-    try:
-        demand_daily = load_ree_demand_daily_history(start_day, max_refresh_day())
-        weekly_load_df = build_weekly_load_evolution(demand_daily)
-        if weekly_load_df.empty:
-            st.info("No weekly demand data available from REE.")
-        else:
-            load_years = sorted(weekly_load_df["year"].unique().tolist())
-            default_load_years = load_years[-3:] if len(load_years) >= 3 else load_years
-            selected_load_years = st.multiselect(
-                "Years for weekly load evolution",
-                load_years,
-                default=default_load_years,
-                key="weekly_load_years",
-            )
-            cumulative_load = st.checkbox("Show cumulative load", value=False, key="weekly_load_cumulative")
-            weekly_chart = build_weekly_load_chart(weekly_load_df, selected_load_years, cumulative=cumulative_load)
-            if weekly_chart is not None:
-                st.altair_chart(weekly_chart, use_container_width=True)
-                st.caption("Load is built from REE daily peninsular demand and aggregated by ISO week.")
-            with st.expander("Show weekly load data", expanded=False):
-                st.dataframe(styled_df(weekly_load_df), use_container_width=True)
-    except Exception as exc:
-        st.warning(f"Weekly load evolution could not be loaded: {exc}")
-        weekly_load_df = pd.DataFrame()
+    # Weekly load evolution section removed because REE daily load pull is currently unreliable.
 
     # Weather anomalies intentionally disabled for now.
     # AEMET API integration can be re-enabled once AEMET_API_KEY is available.
@@ -3056,9 +3080,18 @@ try:
         st.info("No installed capacity file found in /data.")
     else:
         cap_years = sorted(installed_capacity["datetime"].dt.year.unique().tolist())
-        default_years = cap_years[-4:] if len(cap_years) >= 4 else cap_years
+        default_years = cap_years[-5:] if len(cap_years) >= 5 else cap_years
+        # Make sure the current/live year is selected by default whenever it exists.
+        current_year = max_refresh_day().year
+        if current_year in cap_years and current_year not in default_years:
+            default_years = sorted(default_years + [current_year])
         selected_cap_years = st.multiselect("Installed capacity years", cap_years, default=default_years)
         cap_df_year = installed_capacity[installed_capacity["datetime"].dt.year.isin(selected_cap_years)].copy()
+        if current_year >= 2026 and 2026 not in cap_years:
+            st.warning(
+                "No 2026 installed-capacity data was returned by REE for this run. "
+                "The additions bridge can show a partial 2026 year as soon as REE's monthly installed-capacity endpoint returns any 2026 month."
+            )
 
         cap_view_mode = st.radio(
             "Installed capacity view",
@@ -3080,7 +3113,7 @@ try:
                 help="Additions mode is restricted to one technology so the bottom-up bridge is easy to read.",
             )
             cap_granularity = "Annual"
-            st.caption("Additions mode uses annual granularity only: first bar = initial base; following bars = annual MW additions on top of the previous total.")
+            st.caption("Additions mode uses annual granularity only: first bar = initial base; following bars = annual MW additions on top of the previous total. The latest year is shown even if it is partial, using the latest available monthly capacity value in that year.")
             cap_chart = build_installed_capacity_chart(cap_df_year, [selected_add_tech], cap_view_mode, cap_granularity)
             if cap_chart is not None:
                 st.altair_chart(cap_chart, use_container_width=True)
