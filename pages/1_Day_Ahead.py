@@ -173,6 +173,45 @@ TECH_COLOR_SCALE = alt.Scale(
     ],
 )
 
+
+CAPACITY_COLOR_DOMAIN = [
+    "Solar PV",
+    "Wind",
+    "Hydro",
+    "CCGT",
+    "Nuclear",
+    "Solar thermal",
+    "Pumped hydro",
+    "CHP",
+    "Biomass",
+    "Biogas",
+    "Other renewables",
+    "Coal",
+    "Fuel + Gas",
+    "Steam turbine",
+    "Other non-renewables",
+]
+
+CAPACITY_COLOR_RANGE = [
+    "#FACC15",  # Solar PV - yellow
+    "#2563EB",  # Wind - blue
+    "#38BDF8",  # Hydro - light blue
+    "#9CA3AF",  # CCGT - grey
+    "#C084FC",
+    "#FCA5A5",
+    "#0284C7",
+    "#F97316",
+    "#16A34A",
+    "#22C55E",
+    "#14B8A6",
+    "#374151",
+    "#6B7280",
+    "#4B5563",
+    "#7C2D12",
+]
+
+CAPACITY_COLOR_SCALE = alt.Scale(domain=CAPACITY_COLOR_DOMAIN, range=CAPACITY_COLOR_RANGE)
+
 TABLE_HEADER_FONT_PCT = "145%"
 TABLE_BODY_FONT_PCT = "112%"
 CORP_GREEN_DARK = "#0F766E"
@@ -2058,15 +2097,25 @@ def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
 def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     if negative_df.empty:
         return None
+
+    is_negative_only = mode == "Only negative prices"
+    y_title = "Cumulative negative hours" if is_negative_only else "Cumulative zero / negative hours"
+    chart_title = "Cumulative negative price hours" if is_negative_only else "Cumulative zero and negative price hours"
+    tooltip_title = "Cumulative negative hours" if is_negative_only else "Cumulative zero / negative hours"
+
     years = sorted(negative_df["year"].unique().tolist())
     colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
     chart = alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
-        y=alt.Y("cum_count:Q", title="Cumulative negative hours"),
+        y=alt.Y("cum_count:Q", title=y_title),
         color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
         detail="year:N",
-        tooltip=[alt.Tooltip("year:N", title="Year"), alt.Tooltip("month_name:N", title="Month"), alt.Tooltip("cum_count:Q", title="Cumulative count", format=",.0f")],
-    ).properties(height=330, title="Cumulative negative price hours")
+        tooltip=[
+            alt.Tooltip("year:N", title="Year"),
+            alt.Tooltip("month_name:N", title="Month"),
+            alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
+        ],
+    ).properties(height=330, title=chart_title)
     return apply_common_chart_style(chart, height=330)
 
 
@@ -2585,37 +2634,29 @@ def build_installed_capacity_chart(
         chart = alt.layer(bars, line, delta_labels, total_labels).properties(height=430, title=chart_title)
         return apply_common_chart_style(chart, height=430)
 
-    # Total installed evolution: only Monthly or Annual, shown as curves.
+    # Total installed evolution: only Monthly or Annual, shown as curves by technology.
+    # Do not include a total-total line here; each selected technology is shown separately.
     if granularity not in {"Monthly", "Annual"}:
         granularity = "Monthly"
     plot = build_installed_capacity_period_df(cap_df, selected_techs, granularity)
     if plot.empty:
         return None
 
-    totals = (
-        plot.groupby("period", as_index=False)["capacity_mw"]
-        .sum()
-        .assign(technology="Total selected")
-    )
-    line_df = pd.concat([plot, totals], ignore_index=True)
-    line_df["period_label"] = capacity_period_label(line_df["period"], granularity)
-
-    tech_order = ["Total selected"] + [t for t in selected_techs if t in plot["technology"].unique().tolist()]
-    color_range = ["#111827"] + TECH_COLOR_SCALE.to_dict().get("range", [])[: max(len(tech_order) - 1, 0)]
-    stroke_width = alt.condition(alt.datum.technology == "Total selected", alt.value(4), alt.value(2.2))
+    plot = plot.copy()
+    plot["period_label"] = capacity_period_label(plot["period"], granularity)
+    tech_order = [t for t in selected_techs if t in plot["technology"].unique().tolist()]
 
     x_axis = alt.Axis(title=None, labelAngle=-35 if granularity == "Monthly" else 0, labelPadding=8)
-    chart = alt.Chart(line_df).mark_line(point=True).encode(
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2.8).encode(
         x=alt.X("period:T", axis=x_axis),
         y=alt.Y("capacity_mw:Q", title="Installed capacity (MW)", scale=alt.Scale(zero=False)),
-        color=alt.Color("technology:N", title="Technology", scale=alt.Scale(domain=tech_order, range=color_range)),
-        strokeWidth=stroke_width,
+        color=alt.Color("technology:N", title="Technology", scale=CAPACITY_COLOR_SCALE, sort=tech_order),
         tooltip=[
             alt.Tooltip("period:T", title="Period", format="%Y-%m-%d"),
             alt.Tooltip("technology:N", title="Technology"),
             alt.Tooltip("capacity_mw:Q", title="Installed capacity MW", format=",.0f"),
         ],
-    ).properties(height=410, title=f"Total installed capacity evolution ({granularity.lower()})")
+    ).properties(height=410, title=f"Installed capacity evolution by technology ({granularity.lower()})")
     return apply_common_chart_style(chart, height=410)
 
 def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None, weekly_load_df: pd.DataFrame | None = None, aemet_anomalies_df: pd.DataFrame | None = None) -> bytes:
@@ -2839,13 +2880,23 @@ try:
             st.caption("Color scale: strong green = very low spot price; yellow/orange = medium price; strong red = very high spot price. Future or missing hours are shown in light grey.")
 
     section_header("Negative prices")
-    neg_mode = "Only negative prices"
+    neg_mode = st.radio(
+        "Negative price metric",
+        ["Only negative prices", "Zero and negative prices"],
+        index=0,
+        horizontal=True,
+        help="Choose whether the cumulative curve counts only hours with price < 0, or both zero-price and negative-price hours (price <= 0).",
+        key="negative_price_metric_mode",
+    )
     negative_price_df = build_negative_price_curves(price_hourly, neg_mode)
     neg_chart = build_negative_price_chart(negative_price_df, neg_mode)
     if neg_chart is not None:
         st.altair_chart(neg_chart, use_container_width=True)
-        st.caption("This chart shows the cumulative number of negative-price hours by month.")
-    subtle_subsection("Cumulative negative price hours data")
+        if neg_mode == "Only negative prices":
+            st.caption("This chart shows the cumulative number of hours with price below zero by month.")
+        else:
+            st.caption("This chart shows the cumulative number of hours with price equal to or below zero by month.")
+    subtle_subsection("Cumulative negative / zero-price hours data")
     st.dataframe(styled_df(negative_price_df), use_container_width=True)
 
     section_header("Economic curtailment and zero / negative price occurrence")
@@ -3059,7 +3110,7 @@ try:
                 "Technologies",
                 available_cap_techs,
                 default=default_techs or available_cap_techs[:5],
-                help="The chart shows the selected technologies and a bold total line for the selected basket.",
+                help="The chart shows each selected technology separately; no total-total line is included.",
             )
             cap_granularity = st.selectbox(
                 "Installed capacity granularity",
@@ -3073,27 +3124,19 @@ try:
 
             cap_period = build_installed_capacity_period_df(cap_df_year, selected_techs, cap_granularity)
             if not cap_period.empty:
-                cap_summary = cap_period.groupby("period", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Total selected installed capacity (MW)"})
-                cap_renew = cap_period[cap_period["technology"].isin(RENEWABLE_TECHS)].groupby("period", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Renewable selected capacity (MW)"})
-                cap_table = cap_summary.merge(cap_renew, on="period", how="left")
-                cap_table["Renewable selected capacity (MW)"] = cap_table["Renewable selected capacity (MW)"].fillna(0.0)
-                cap_table = cap_table.sort_values("period").reset_index(drop=True)
-                first_total = cap_table["Total selected installed capacity (MW)"].iloc[0]
-                cap_table["Change vs first period (MW)"] = cap_table["Total selected installed capacity (MW)"] - first_total
-                cap_table["% Renewable selected capacity"] = cap_table["Renewable selected capacity (MW)"] / cap_table["Total selected installed capacity (MW)"]
+                cap_table = cap_period.copy().sort_values(["period", "technology"]).reset_index(drop=True)
                 cap_table["Period"] = capacity_period_label(cap_table["period"], cap_granularity)
+                cap_table = cap_table.rename(
+                    columns={
+                        "technology": "Technology",
+                        "capacity_mw": "Installed capacity (MW)",
+                    }
+                )
 
-                subtle_subsection(f"Installed capacity {cap_granularity.lower()} evolution summary")
+                subtle_subsection(f"Installed capacity {cap_granularity.lower()} evolution by technology")
                 st.dataframe(
                     styled_df(
-                        cap_table[[
-                            "Period",
-                            "Total selected installed capacity (MW)",
-                            "Change vs first period (MW)",
-                            "Renewable selected capacity (MW)",
-                            "% Renewable selected capacity",
-                        ]],
-                        pct_cols=["% Renewable selected capacity"],
+                        cap_table[["Period", "Technology", "Installed capacity (MW)"]]
                     ),
                     use_container_width=True,
                 )
