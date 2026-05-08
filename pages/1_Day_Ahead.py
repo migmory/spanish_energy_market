@@ -2583,16 +2583,27 @@ def build_installed_capacity_chart(
         order = totals.sort_values("period")["period_label"].tolist()
         y_max = max(float(plot["bar_high"].max()) * 1.15, 1.0)
 
+        # In additions / waterfall mode, the first bar is not a generic component:
+        # it is the initial base for the selected technology. Therefore it should
+        # inherit that technology's colour, e.g. Solar PV = yellow, Wind = blue,
+        # Hydro = light blue, CCGT = grey. Additions and reductions keep green/red.
+        capacity_colour_map = dict(zip(CAPACITY_COLOR_DOMAIN, CAPACITY_COLOR_RANGE))
+        initial_base_colour = capacity_colour_map.get(selected_tech, "#9CA3AF")
+        plot = plot.copy()
+        plot["component_for_colour"] = plot["component"].replace(
+            {"Initial base": f"Initial base ({selected_tech})"}
+        )
+
         bars = alt.Chart(plot).mark_bar(size=46).encode(
             x=alt.X("period_label:N", sort=order, axis=alt.Axis(title=None, labelAngle=0, labelPadding=8)),
             y=alt.Y("bar_low:Q", title="Installed capacity bridge (MW)", scale=alt.Scale(domain=[0, y_max])),
             y2="bar_high:Q",
             color=alt.Color(
-                "component:N",
+                "component_for_colour:N",
                 title="Component",
                 scale=alt.Scale(
-                    domain=["Initial base", "Addition", "Reduction"],
-                    range=["#9CA3AF", CORP_GREEN, PRICE_HIGH_RED],
+                    domain=[f"Initial base ({selected_tech})", "Addition", "Reduction"],
+                    range=[initial_base_colour, CORP_GREEN, PRICE_HIGH_RED],
                 ),
             ),
             tooltip=[
