@@ -1,43 +1,32 @@
 """
-Email Report - Day Ahead Spain Spot Prices
+Streamlit page: Email Report
 
-What it does
-------------
-1) Loads historical hourly prices from /data/hourly_avg_price_since2021.xlsx.
-2) Loads live 2026 OMIE / ESIOS spot prices from indicator 600 when ESIOS_TOKEN is present.
-3) Builds:
-   - OMIE hourly price heatmap, 24 x 365, with strong red = high prices and strong green = low prices.
-   - Cumulative negative-price hours by month.
-   - Weekly load evolution from REE daily demand.
-   - Optional AEMET temperature and humidity anomaly charts.
-   - Summary KPIs and monthly negative-hour table.
-4) Creates an HTML email/report and optional PNG attachments.
-5) Optional: sends the email using SMTP settings in .env.
+Place this file as: pages/4_Email_Report.py
 
-Expected .env variables
------------------------
-ESIOS_TOKEN=...
-AEMET_API_KEY=...  # Optional, only needed for --include-aemet
+Required password setting:
+  EMAIL_REPORT_PASSWORD = "your_password"
 
-# Optional SMTP sending
-SMTP_HOST=smtp.office365.com
-SMTP_PORT=587
-SMTP_USER=your@email.com
-SMTP_PASSWORD=...
-EMAIL_FROM=your@email.com
-EMAIL_TO=recipient1@email.com,recipient2@email.com
-EMAIL_SUBJECT=Spain Day Ahead Price Report
+Optional data/API settings:
+  ESIOS_TOKEN=...
+  ESIOS_API_TOKEN=...              # alternative name
 
-Run
----
-python 2_Email_Report.py --year 2026 --send
-python 2_Email_Report.py --year 2026 --no-send
-python 2_Email_Report.py --year 2026 --include-aemet --no-send
+Optional SMTP settings for sending:
+  SMTP_HOST=smtp.gmail.com         # or smtp.office365.com
+  SMTP_PORT=587
+  SMTP_USER=your@email.com
+  SMTP_PASSWORD=your_app_password
+  EMAIL_FROM=your@email.com
+  EMAIL_TO=recipient1@email.com,recipient2@email.com
+  EMAIL_SUBJECT=Spain Day Ahead Price Report
+
+Notes:
+- The password gate is intentionally executed before any data/API loading.
+- In Streamlit Cloud, put secrets in App > Settings > Secrets.
+- Locally, you can keep them in a .env file at the project root.
 """
 
 from __future__ import annotations
 
-import argparse
 import base64
 import os
 import re
@@ -45,7 +34,6 @@ import smtplib
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
-from io import BytesIO
 from pathlib import Path
 from time import sleep
 from zoneinfo import ZoneInfo
@@ -54,38 +42,97 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+import streamlit as st
 from dotenv import load_dotenv
 from matplotlib.colors import LinearSegmentedColormap
 
 # =========================================================
-# CONFIG
+# BASIC CONFIG + PASSWORD GATE FIRST
 # =========================================================
-BASE_DIR = Path(__file__).resolve().parents[1]
+try:
+    BASE_DIR = Path(__file__).resolve().parents[1]
+except Exception:
+    BASE_DIR = Path.cwd()
+
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
+st.set_page_config(page_title="Email Report", layout="wide")
+
+
+def get_secret(name: str, default: str = "") -> str:
+    """Read Streamlit secrets first, then .env/environment variables."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return str(os.getenv(name, default)).strip()
+
+
+def get_secret_any(names: list[str], default: str = "") -> str:
+    for name in names:
+        value = get_secret(name, "")
+        if value:
+            return value
+    return default
+
+
+def check_password() -> bool:
+    correct_password = get_secret_any(["EMAIL_REPORT_PASSWORD", "REPORT_PASSWORD", "APP_PASSWORD"])
+
+    if not correct_password:
+        st.title("Email Report")
+        st.error(
+            "No report password configured. Add EMAIL_REPORT_PASSWORD in Streamlit Secrets or in your local .env."
+        )
+        st.code('EMAIL_REPORT_PASSWORD = "your_password"', language="toml")
+        return False
+
+    if st.session_state.get("email_report_authenticated") is True:
+        return True
+
+    st.title("Email Report")
+    st.markdown("Enter the password to access the Email Report.")
+
+    with st.form("email_report_password_form"):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Enter")
+
+    if submitted:
+        if password == correct_password:
+            st.session_state["email_report_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+
+    return False
+
+
+if not check_password():
+    st.stop()
+
+# =========================================================
+# REPORT CONFIG
+# =========================================================
+MADRID_TZ = ZoneInfo("Europe/Madrid")
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs" / "email_report"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-MADRID_TZ = ZoneInfo("Europe/Madrid")
 LIVE_START_DATE = date(2026, 1, 1)
 HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 PRICE_INDICATOR_ID = 600
 
-REE_API_BASE = "https://apidatos.ree.es/es/datos"
-REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
-AEMET_API_BASE = "https://opendata.aemet.es/opendata/api"
-AEMET_CACHE_FILE = DATA_DIR / "aemet_daily_cache.csv"
-
-# Color convention requested by user:
-# low prices = strong green; high prices = strong red.
+# Heatmap: green = low price, red = high price.
 PRICE_CMAP = LinearSegmentedColormap.from_list(
     "price_green_to_red",
     ["#006400", "#16A34A", "#FDE047", "#F97316", "#DC2626"],
 )
 NEGATIVE_2025_COLOR = "#1D4ED8"
 NEGATIVE_2026_COLOR = "#059669"
+CORP_GREEN_DARK = "#0F766E"
+CORP_GREEN = "#10B981"
 
 
 @dataclass
@@ -93,16 +140,42 @@ class EmailReportResult:
     html_path: Path
     heatmap_path: Path
     negative_hours_path: Path
-    weekly_load_path: Path | None
-    aemet_anomalies_path: Path | None
-    workbook_path: Path | None
+    workbook_path: Path
 
 
 # =========================================================
-# ESIOS HELPERS
+# UI HELPERS
 # =========================================================
-def require_esios_token() -> str | None:
-    token = (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip()
+def section_header(title: str) -> None:
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(90deg, {CORP_GREEN_DARK} 0%, {CORP_GREEN} 55%, #C7F0DD 100%);
+            color: white;
+            padding: 12px 18px;
+            border-radius: 12px;
+            font-weight: 800;
+            font-size: 1.25rem;
+            margin-top: 14px;
+            margin-bottom: 14px;
+            box-shadow: 0 2px 8px rgba(15,118,110,0.14);
+        ">{title}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def fmt(value, decimals: int = 2, suffix: str = "") -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{value:,.{decimals}f}{suffix}"
+
+
+# =========================================================
+# ESIOS DATA HELPERS
+# =========================================================
+def get_esios_token() -> str | None:
+    token = get_secret_any(["ESIOS_TOKEN", "ESIOS_API_TOKEN"])
     return token or None
 
 
@@ -135,7 +208,6 @@ def parse_esios_indicator(raw_json: dict, source_name: str) -> pd.DataFrame:
     if "geo_id" not in df.columns:
         df["geo_id"] = None
 
-    # Prefer Spain when multiple geographies are returned.
     if (df["geo_id"] == 3).any():
         df = df[df["geo_id"] == 3].copy()
     else:
@@ -152,6 +224,7 @@ def parse_esios_indicator(raw_json: dict, source_name: str) -> pd.DataFrame:
     return df[["datetime", "value", "source", "geo_name", "geo_id"]].sort_values("datetime")
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_esios_range(
     indicator_id: int,
     start_day: date,
@@ -197,7 +270,7 @@ def fetch_esios_range(
                 sleep(1.5 * (attempt + 1))
 
         if last_error is not None:
-            print(f"Warning: skipped ESIOS chunk {chunk_start} to {chunk_end}: {last_error}")
+            st.warning(f"Skipped ESIOS chunk {chunk_start} to {chunk_end}: {last_error}")
 
         chunk_start = chunk_end + timedelta(days=1)
 
@@ -215,9 +288,9 @@ def fetch_esios_range(
 # =========================================================
 # DATA LOADERS
 # =========================================================
+@st.cache_data(show_spinner=False)
 def load_historical_prices() -> pd.DataFrame:
     if not HIST_PRICES_FILE.exists():
-        print(f"Warning: historical price file not found: {HIST_PRICES_FILE}")
         return pd.DataFrame(columns=["datetime", "price"])
 
     try:
@@ -227,6 +300,13 @@ def load_historical_prices() -> pd.DataFrame:
         if "price" not in df.columns and "value" in df.columns:
             df = df.rename(columns={"value": "price"})
 
+    if "datetime" not in df.columns:
+        return pd.DataFrame(columns=["datetime", "price"])
+    if "price" not in df.columns and "value" in df.columns:
+        df = df.rename(columns={"value": "price"})
+    if "price" not in df.columns:
+        return pd.DataFrame(columns=["datetime", "price"])
+
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df = df.dropna(subset=["datetime", "price"])
@@ -234,22 +314,22 @@ def load_historical_prices() -> pd.DataFrame:
     return df[["datetime", "price"]].sort_values("datetime").reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_live_prices(year: int, token: str | None) -> pd.DataFrame:
     if token is None or year < 2026:
         return pd.DataFrame(columns=["datetime", "price"])
 
-    today_madrid = datetime.now(MADRID_TZ).date()
-    start_day = max(date(year, 1, 1), LIVE_START_DATE)
-    end_day = min(today_madrid + timedelta(days=1), date(year, 12, 31))
-    if start_day > end_day:
-        return pd.DataFrame(columns=["datetime", "price"])
-
+    start_day = date(year, 1, 1)
+    today = datetime.now(MADRID_TZ).date()
+    end_day = min(date(year, 12, 31), today + timedelta(days=1))
     raw = fetch_esios_range(PRICE_INDICATOR_ID, start_day, end_day, token)
     if raw.empty:
         return pd.DataFrame(columns=["datetime", "price"])
 
     out = raw[["datetime", "value"]].rename(columns={"value": "price"})
-    out["datetime"] = out["datetime"].dt.floor("h")
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.dropna(subset=["datetime", "price"])
     return out.groupby("datetime", as_index=False)["price"].mean().sort_values("datetime")
 
 
@@ -260,510 +340,251 @@ def combine_prices(hist_prices: pd.DataFrame, live_prices: pd.DataFrame) -> pd.D
     combined["datetime"] = pd.to_datetime(combined["datetime"], errors="coerce")
     combined["price"] = pd.to_numeric(combined["price"], errors="coerce")
     combined = combined.dropna(subset=["datetime", "price"])
-    return combined.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+    return (
+        combined.sort_values("datetime")
+        .drop_duplicates(subset=["datetime"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
 # =========================================================
 # ANALYTICS
 # =========================================================
-def build_cumulative_negative_hours(price_hourly: pd.DataFrame, years: list[int]) -> pd.DataFrame:
-    cols = ["year", "month_num", "month_name", "negative_hours", "cum_negative_hours"]
+def build_summary_metrics(price_hourly: pd.DataFrame, year: int, negative_mode: str) -> dict:
+    df = price_hourly[price_hourly["datetime"].dt.year == year].copy()
+    if df.empty:
+        return {}
+    negative_mask = df["price"] < 0 if negative_mode == "Only negative prices" else df["price"] <= 0
+    return {
+        "year": year,
+        "data_from": df["datetime"].min(),
+        "data_to": df["datetime"].max(),
+        "hours": int(len(df)),
+        "avg_price": float(df["price"].mean()),
+        "min_price": float(df["price"].min()),
+        "max_price": float(df["price"].max()),
+        "negative_or_zero_hours": int(negative_mask.sum()),
+        "negative_or_zero_share": float(negative_mask.mean()),
+        "negative_mode": negative_mode,
+    }
+
+
+def build_cumulative_negative_hours(price_hourly: pd.DataFrame, years: list[int], negative_mode: str) -> pd.DataFrame:
     if price_hourly.empty:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=["year", "month_num", "month_name", "cum_count"])
 
     df = price_hourly[price_hourly["datetime"].dt.year.isin(years)].copy()
     if df.empty:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=["year", "month_num", "month_name", "cum_count"])
 
-    df["is_negative"] = (df["price"] < 0).astype(int)
+    df["flag"] = (df["price"] < 0).astype(int) if negative_mode == "Only negative prices" else (df["price"] <= 0).astype(int)
     df["year"] = df["datetime"].dt.year
     df["month_num"] = df["datetime"].dt.month
     df["month_name"] = df["datetime"].dt.strftime("%b")
 
     monthly = (
-        df.groupby(["year", "month_num", "month_name"], as_index=False)["is_negative"]
+        df.groupby(["year", "month_num", "month_name"], as_index=False)["flag"]
         .sum()
-        .rename(columns={"is_negative": "negative_hours"})
-        .sort_values(["year", "month_num"])
+        .rename(columns={"flag": "count"})
     )
-    monthly["cum_negative_hours"] = monthly.groupby("year")["negative_hours"].cumsum()
-    return monthly[cols]
 
-
-def build_summary_metrics(price_hourly: pd.DataFrame, year: int) -> dict:
-    df = price_hourly[price_hourly["datetime"].dt.year == year].copy()
-    if df.empty:
-        return {
-            "year": year,
-            "hours": 0,
-            "avg_price": None,
-            "min_price": None,
-            "max_price": None,
-            "negative_hours": 0,
-            "zero_or_negative_hours": 0,
-        }
-    return {
-        "year": year,
-        "hours": int(len(df)),
-        "avg_price": float(df["price"].mean()),
-        "min_price": float(df["price"].min()),
-        "max_price": float(df["price"].max()),
-        "negative_hours": int((df["price"] < 0).sum()),
-        "zero_or_negative_hours": int((df["price"] <= 0).sum()),
-    }
-
-
-def format_number(value, decimals: int = 2, suffix: str = "") -> str:
-    if value is None or pd.isna(value):
-        return "-"
-    return f"{value:,.{decimals}f}{suffix}"
-
-
-
-# =========================================================
-# REE WEEKLY LOAD / AEMET WEATHER ANOMALIES
-# =========================================================
-def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
     rows = []
-    for item in payload.get("included", []) or []:
-        attrs = item.get("attributes", {}) or {}
-        title = attrs.get("title") or item.get("id")
-        for val in attrs.get("values", []) or []:
-            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
-            if pd.isna(dt):
-                continue
-            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
-            rows.append({
-                "datetime": dt,
-                "title": str(title).strip(),
-                value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
-            })
+    month_names = [datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]
+    for y in sorted(monthly["year"].unique().tolist()):
+        temp = monthly[monthly["year"] == y].set_index("month_num")
+        cum = 0
+        max_month = int(temp.index.max()) if len(temp.index) else 0
+        for m in range(1, max_month + 1):
+            if m in temp.index:
+                value = temp.loc[m, "count"]
+                if isinstance(value, pd.Series):
+                    value = value.sum()
+                cum += float(value)
+            rows.append({"year": str(y), "month_num": m, "month_name": month_names[m - 1], "cum_count": cum})
     return pd.DataFrame(rows)
 
 
-def fetch_ree_widget(category: str, widget: str, start_day: date, end_day: date, time_trunc: str = "day") -> dict:
-    params = {
-        "start_date": f"{start_day.isoformat()}T00:00",
-        "end_date": f"{end_day.isoformat()}T23:59",
-        "time_trunc": time_trunc,
-        **REE_PENINSULAR_PARAMS,
-    }
-    url = f"{REE_API_BASE}/{category}/{widget}"
-    resp = requests.get(url, params=params, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def normalize_ree_demand_to_mwh(series: pd.Series) -> pd.Series:
-    vals = pd.to_numeric(series, errors="coerce")
-    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
-    if pd.notna(max_abs) and max_abs < 5000:
-        return vals * 1000.0
-    return vals
-
-
-def load_ree_demand_daily_history(start_day: date, end_day: date) -> pd.DataFrame:
-    if start_day > end_day:
-        return pd.DataFrame(columns=["datetime", "demand_mwh"])
-    frames = []
-    for year in range(start_day.year, end_day.year + 1):
-        s_day = max(start_day, date(year, 1, 1))
-        e_day = min(end_day, date(year, 12, 31))
-        try:
-            payload = fetch_ree_widget("demanda", "ire-general", s_day, e_day, time_trunc="day")
-            df = parse_ree_included_series(payload, value_field="value")
-        except Exception as exc:
-            print(f"Warning: skipped REE demand {s_day} to {e_day}: {exc}")
-            continue
-        if df.empty:
-            continue
-        df["title_norm"] = df["title"].astype(str).str.lower()
-        preferred = df[df["title_norm"].str.contains("real", na=False)].copy()
-        if preferred.empty:
-            preferred = df.copy()
-        preferred["datetime"] = pd.to_datetime(preferred["datetime"], errors="coerce").dt.normalize()
-        preferred["demand_mwh"] = normalize_ree_demand_to_mwh(preferred["value"])
-        preferred = preferred.dropna(subset=["datetime", "demand_mwh"])
-        frames.append(preferred[["datetime", "demand_mwh"]])
-    if not frames:
-        return pd.DataFrame(columns=["datetime", "demand_mwh"])
-    return pd.concat(frames, ignore_index=True).groupby("datetime", as_index=False)["demand_mwh"].sum().sort_values("datetime")
-
-
-def build_weekly_load_evolution(demand_daily: pd.DataFrame) -> pd.DataFrame:
-    cols = ["year", "week", "week_start", "weekly_load_gwh", "cum_load_gwh"]
-    if demand_daily.empty:
-        return pd.DataFrame(columns=cols)
-    tmp = demand_daily.copy()
-    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
-    iso = tmp["datetime"].dt.isocalendar()
-    tmp["year"] = iso["year"].astype(int)
-    tmp["week"] = iso["week"].astype(int)
-    tmp["week_start"] = tmp["datetime"].dt.to_period("W-SUN").dt.start_time
-    weekly = tmp.groupby(["year", "week", "week_start"], as_index=False)["demand_mwh"].sum().sort_values(["year", "week"])
-    weekly["weekly_load_gwh"] = weekly["demand_mwh"] / 1000.0
-    weekly["cum_load_gwh"] = weekly.groupby("year")["weekly_load_gwh"].cumsum()
-    return weekly[cols]
-
-
-def get_aemet_token() -> str | None:
-    token = (os.getenv("AEMET_API_KEY") or os.getenv("AEMET_TOKEN") or "").strip()
-    return token or None
-
-
-def parse_spanish_decimal(value):
-    if pd.isna(value):
-        return pd.NA
-    s0 = str(value).strip().replace(",", ".")
-    if not s0 or s0.lower() in {"nan", "none", "ip"}:
-        return pd.NA
-    try:
-        return float(s0)
-    except Exception:
-        return pd.NA
-
-
-def _aemet_indirect_get(endpoint: str, token: str) -> list[dict]:
-    url = f"{AEMET_API_BASE}/{endpoint.lstrip('/')}"
-    first = requests.get(url, params={"api_key": token}, timeout=(15, 60))
-    first.raise_for_status()
-    meta = first.json()
-    datos_url = meta.get("datos")
-    if not datos_url:
-        return []
-    second = requests.get(datos_url, timeout=(15, 120))
-    second.raise_for_status()
-    payload = second.json()
-    return payload if isinstance(payload, list) else []
-
-
-def _read_aemet_cache() -> pd.DataFrame:
-    cols = ["fecha", "indicativo", "provincia", "nombre", "tmed", "hrMedia"]
-    if not AEMET_CACHE_FILE.exists():
-        return pd.DataFrame(columns=cols)
-    try:
-        df = pd.read_csv(AEMET_CACHE_FILE, dtype={"indicativo": str})
-    except Exception:
-        return pd.DataFrame(columns=cols)
-    for c in cols:
-        if c not in df.columns:
-            df[c] = pd.NA
-    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
-    return df[cols].dropna(subset=["fecha"])
-
-
-def _write_aemet_cache(df: pd.DataFrame) -> None:
+def build_monthly_negative_table(price_hourly: pd.DataFrame, year: int, negative_mode: str) -> pd.DataFrame:
+    df = price_hourly[price_hourly["datetime"].dt.year == year].copy()
     if df.empty:
-        return
-    out = df.copy()
-    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
-    out = out.drop_duplicates(subset=["fecha", "indicativo"], keep="last")
-    AEMET_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(AEMET_CACHE_FILE, index=False)
+        return pd.DataFrame(columns=["Month", "Hours", "Share"])
+    df["flag"] = (df["price"] < 0).astype(int) if negative_mode == "Only negative prices" else (df["price"] <= 0).astype(int)
+    df["month"] = df["datetime"].dt.to_period("M").dt.to_timestamp()
+    out = df.groupby("month", as_index=False).agg(Hours=("flag", "sum"), Total=("flag", "count"))
+    out["Share"] = out["Hours"] / out["Total"]
+    out["Month"] = out["month"].dt.strftime("%b-%Y")
+    return out[["Month", "Hours", "Share"]]
 
-
-def load_aemet_daily_all_stations(start_day: date, end_day: date, token: str) -> pd.DataFrame:
-    cols = ["fecha", "indicativo", "provincia", "nombre", "tmed", "hrMedia"]
-    if start_day > end_day:
-        return pd.DataFrame(columns=cols)
-    cache = _read_aemet_cache()
-    available_dates = set(cache["fecha"].tolist()) if not cache.empty else set()
-    needed_dates = pd.date_range(start_day, end_day, freq="D").date.tolist()
-    missing_dates = [d for d in needed_dates if d not in available_dates]
-    frames = [cache] if not cache.empty else []
-    if missing_dates:
-        chunk_start = min(missing_dates)
-        while chunk_start <= end_day:
-            if chunk_start not in missing_dates:
-                chunk_start += timedelta(days=1)
-                continue
-            chunk_end = min(chunk_start + timedelta(days=9), end_day)
-            endpoint = (
-                "valores/climatologicos/diarios/datos/"
-                f"fechaini/{chunk_start.isoformat()}T00:00:00UTC/"
-                f"fechafin/{chunk_end.isoformat()}T23:59:59UTC/"
-                "todasestaciones"
-            )
-            try:
-                rows = _aemet_indirect_get(endpoint, token)
-                if rows:
-                    raw = pd.DataFrame(rows)
-                    df = pd.DataFrame()
-                    df["fecha"] = pd.to_datetime(raw.get("fecha"), errors="coerce").dt.date
-                    df["indicativo"] = raw.get("indicativo", pd.Series(dtype=str)).astype(str)
-                    df["provincia"] = raw.get("provincia", pd.Series(dtype=str)).astype(str)
-                    df["nombre"] = raw.get("nombre", pd.Series(dtype=str)).astype(str)
-                    df["tmed"] = raw.get("tmed", pd.Series(dtype=object)).map(parse_spanish_decimal)
-                    if "hrMedia" in raw.columns:
-                        df["hrMedia"] = raw["hrMedia"].map(parse_spanish_decimal)
-                    elif "hrmedia" in raw.columns:
-                        df["hrMedia"] = raw["hrmedia"].map(parse_spanish_decimal)
-                    else:
-                        df["hrMedia"] = pd.NA
-                    df = df.dropna(subset=["fecha", "indicativo"])
-                    frames.append(df[cols])
-            except Exception as exc:
-                print(f"Warning: skipped AEMET {chunk_start} to {chunk_end}: {exc}")
-            sleep(0.35)
-            chunk_start = chunk_end + timedelta(days=1)
-    if not frames:
-        return pd.DataFrame(columns=cols)
-    out = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["fecha", "indicativo"], keep="last")
-    _write_aemet_cache(out[cols])
-    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce")
-    return out[(out["fecha"].dt.date >= start_day) & (out["fecha"].dt.date <= end_day)][cols]
-
-
-def build_aemet_weekly_anomalies(current_df: pd.DataFrame, baseline_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["week_start", "tmed_actual", "tmed_normal", "temperature_anomaly_c", "humidity_actual", "humidity_normal", "humidity_anomaly_pp", "stations_count"]
-    if current_df.empty or baseline_df.empty:
-        return pd.DataFrame(columns=cols)
-    cur, base = current_df.copy(), baseline_df.copy()
-    for df in [cur, base]:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-        df["tmed"] = pd.to_numeric(df["tmed"], errors="coerce")
-        df["hrMedia"] = pd.to_numeric(df["hrMedia"], errors="coerce")
-        df["doy"] = df["fecha"].dt.dayofyear
-    cur_daily = cur.groupby("fecha", as_index=False).agg(tmed_actual=("tmed", "mean"), humidity_actual=("hrMedia", "mean"), stations_count=("indicativo", "nunique"))
-    cur_daily["doy"] = cur_daily["fecha"].dt.dayofyear
-    base_daily = base.groupby(["fecha", "doy"], as_index=False).agg(tmed=("tmed", "mean"), hrMedia=("hrMedia", "mean"))
-    normals = base_daily.groupby("doy", as_index=False).agg(tmed_normal=("tmed", "mean"), humidity_normal=("hrMedia", "mean"))
-    merged = cur_daily.merge(normals, on="doy", how="left")
-    merged["temperature_anomaly_c"] = merged["tmed_actual"] - merged["tmed_normal"]
-    merged["humidity_anomaly_pp"] = merged["humidity_actual"] - merged["humidity_normal"]
-    merged["week_start"] = merged["fecha"].dt.to_period("W-SUN").dt.start_time
-    weekly = merged.groupby("week_start", as_index=False).agg(tmed_actual=("tmed_actual", "mean"), tmed_normal=("tmed_normal", "mean"), temperature_anomaly_c=("temperature_anomaly_c", "mean"), humidity_actual=("humidity_actual", "mean"), humidity_normal=("humidity_normal", "mean"), humidity_anomaly_pp=("humidity_anomaly_pp", "mean"), stations_count=("stations_count", "mean"))
-    return weekly[cols].sort_values("week_start")
 
 # =========================================================
 # CHARTS
 # =========================================================
-def save_hourly_price_heatmap(price_hourly: pd.DataFrame, year: int, output_path: Path) -> Path:
-    df = price_hourly[price_hourly["datetime"].dt.year == year].copy()
-    if df.empty:
+def save_hourly_price_heatmap(price_hourly: pd.DataFrame, year: int, output_path: Path) -> None:
+    year_df = price_hourly[price_hourly["datetime"].dt.year == year].copy()
+    if year_df.empty:
         raise ValueError(f"No hourly price data available for {year}")
 
-    df["date"] = df["datetime"].dt.normalize()
-    df["day_of_year"] = df["datetime"].dt.dayofyear
-    df["hour"] = df["datetime"].dt.hour
+    year_start = pd.Timestamp(year=year, month=1, day=1)
+    year_end = pd.Timestamp(year=year, month=12, day=31, hour=23)
+    full_hours = pd.date_range(year_start, year_end, freq="h")
 
-    full_days = pd.date_range(date(year, 1, 1), date(year, 12, 31), freq="D")
-    matrix = np.full((24, len(full_days)), np.nan)
-    day_to_idx = {d.normalize(): i for i, d in enumerate(full_days)}
+    grid = pd.DataFrame({"datetime": full_hours})
+    grid = grid.merge(year_df[["datetime", "price"]], on="datetime", how="left")
+    grid["day_of_year"] = grid["datetime"].dt.dayofyear
+    grid["hour"] = grid["datetime"].dt.hour
 
-    hourly = df.groupby(["date", "hour"], as_index=False)["price"].mean()
-    for _, row in hourly.iterrows():
-        d = pd.Timestamp(row["date"]).normalize()
-        h = int(row["hour"])
-        if d in day_to_idx and 0 <= h <= 23:
-            matrix[h, day_to_idx[d]] = float(row["price"])
+    pivot = grid.pivot(index="hour", columns="day_of_year", values="price").reindex(index=range(24))
+    data = np.ma.masked_invalid(pivot.values.astype(float))
 
-    valid = matrix[~np.isnan(matrix)]
-    if valid.size == 0:
-        raise ValueError(f"No valid heatmap values for {year}")
+    fig, ax = plt.subplots(figsize=(16, 6))
+    ax.set_facecolor("#F3F4F6")
 
-    vmin = min(float(np.nanpercentile(valid, 2)), 0.0)
-    vmax = float(np.nanpercentile(valid, 98))
-    if vmax <= vmin:
+    vmin = float(np.nanpercentile(pivot.values, 1)) if np.isfinite(pivot.values).any() else 0.0
+    vmax = float(np.nanpercentile(pivot.values, 99)) if np.isfinite(pivot.values).any() else 150.0
+    if vmin == vmax:
         vmax = vmin + 1.0
 
-    fig, ax = plt.subplots(figsize=(16, 5.8))
-    ax.set_facecolor("#F3F4F6")
-    im = ax.imshow(
-        matrix,
-        aspect="auto",
-        interpolation="nearest",
-        cmap=PRICE_CMAP,
-        vmin=vmin,
-        vmax=vmax,
-        origin="upper",
-    )
+    cmap = PRICE_CMAP.copy()
+    cmap.set_bad(color="#F3F4F6")
+    im = ax.imshow(data, aspect="auto", origin="upper", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
-    month_starts = pd.date_range(date(year, 1, 1), date(year, 12, 1), freq="MS")
-    month_positions = [(m - pd.Timestamp(date(year, 1, 1))).days for m in month_starts]
-    month_labels = [m.strftime("%b") for m in month_starts]
+    month_starts = pd.date_range(year_start, pd.Timestamp(year=year, month=12, day=1), freq="MS")
+    month_positions = [int(ts.dayofyear) - 1 for ts in month_starts]
+    month_labels = [ts.strftime("%b") for ts in month_starts]
     ax.set_xticks(month_positions)
     ax.set_xticklabels(month_labels)
     ax.set_xlabel("Month")
     ax.set_yticks(range(0, 24, 2))
     ax.set_yticklabels([str(h) for h in range(0, 24, 2)])
     ax.set_ylabel("Time [hour]")
-    ax.set_title(f"OMIE hourly price heatmap | {year} | 24 x 365", fontweight="bold")
+    ax.set_title(f"OMIE hourly price heatmap | {year} | 24 x 365", fontsize=14, weight="bold")
 
-    cbar = fig.colorbar(im, ax=ax, fraction=0.022, pad=0.02)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.026, pad=0.02)
     cbar.set_label("Spot [€/MWh]")
 
-    fig.tight_layout()
+    fig.text(
+        0.01,
+        0.01,
+        "Color scale: green = lower spot price; yellow/orange = medium; red = higher spot price. Missing/future hours are light grey.",
+        fontsize=9,
+        color="#6B7280",
+    )
+    fig.tight_layout(rect=[0, 0.03, 1, 1])
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
-    return output_path
 
 
-def save_cumulative_negative_hours_chart(cum_df: pd.DataFrame, output_path: Path) -> Path:
+def save_cumulative_negative_hours_chart(cum_df: pd.DataFrame, output_path: Path, negative_mode: str) -> None:
     if cum_df.empty:
-        raise ValueError("No cumulative negative-hour data available")
+        raise ValueError("No negative-price data available for the cumulative chart")
 
-    fig, ax = plt.subplots(figsize=(12, 5.8))
-    color_map = {2025: NEGATIVE_2025_COLOR, 2026: NEGATIVE_2026_COLOR}
+    title = "Cumulative negative price hours" if negative_mode == "Only negative prices" else "Cumulative zero / negative price hours"
+    y_label = "Cumulative negative hours" if negative_mode == "Only negative prices" else "Cumulative zero / negative hours"
 
-    for year, group in cum_df.groupby("year"):
+    fig, ax = plt.subplots(figsize=(12, 5.6))
+    colors = [NEGATIVE_2025_COLOR, NEGATIVE_2026_COLOR, "#D97706", "#7C3AED", "#DC2626", "#0EA5E9"]
+
+    for i, (year_label, group) in enumerate(cum_df.groupby("year")):
         group = group.sort_values("month_num")
-        color = color_map.get(int(year), None)
         ax.plot(
-            group["month_name"],
-            group["cum_negative_hours"],
+            group["month_num"],
+            group["cum_count"],
             marker="o",
             linewidth=2.8,
-            label=str(year),
-            color=color,
+            label=str(year_label),
+            color=colors[i % len(colors)],
         )
 
-    ax.set_title("Cumulative negative price hours", fontsize=14)
-    ax.set_ylabel("Cumulative negative hours")
-    ax.set_xlabel("")
-    ax.grid(axis="y", alpha=0.28)
-    ax.legend(loc="upper right")
+    ax.set_title(title, fontsize=14)
+    ax.set_ylabel(y_label)
+    ax.set_xticks(range(1, 13))
+    ax.set_xticklabels([datetime(2000, m, 1).strftime("%b") for m in range(1, 13)])
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
-    return output_path
 
 
-
-
-def save_weekly_load_chart(weekly_load: pd.DataFrame, output_path: Path, years: list[int] | None = None) -> Path | None:
-    if weekly_load.empty:
-        return None
-    plot = weekly_load.copy()
-    if years:
-        plot = plot[plot["year"].isin(years)].copy()
-    if plot.empty:
-        return None
-    fig, ax = plt.subplots(figsize=(12, 5.8))
-    for year, group in plot.groupby("year"):
-        group = group.sort_values("week")
-        ax.plot(group["week"], group["weekly_load_gwh"], marker="o", linewidth=2.4, label=str(year))
-    ax.set_title("Weekly load evolution by ISO week", fontsize=14)
-    ax.set_xlabel("ISO week")
-    ax.set_ylabel("Weekly load (GWh)")
-    ax.grid(axis="y", alpha=0.28)
-    ax.legend(loc="best")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    return output_path
-
-
-def save_aemet_anomalies_chart(anom_df: pd.DataFrame, output_path: Path) -> Path | None:
-    if anom_df.empty:
-        return None
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8.0), sharex=True)
-    axes[0].plot(anom_df["week_start"], anom_df["temperature_anomaly_c"], marker="o", linewidth=2.4, color="#DC2626")
-    axes[0].axhline(0, color="#6B7280", linestyle="--", linewidth=1)
-    axes[0].set_title("AEMET weekly temperature anomaly vs baseline", fontsize=13)
-    axes[0].set_ylabel("Temp anomaly (°C)")
-    axes[0].grid(axis="y", alpha=0.28)
-    axes[1].plot(anom_df["week_start"], anom_df["humidity_anomaly_pp"], marker="o", linewidth=2.4, color="#059669")
-    axes[1].axhline(0, color="#6B7280", linestyle="--", linewidth=1)
-    axes[1].set_title("AEMET weekly relative humidity anomaly vs baseline", fontsize=13)
-    axes[1].set_ylabel("Humidity anomaly (pp)")
-    axes[1].grid(axis="y", alpha=0.28)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    return output_path
-
+# =========================================================
+# HTML / EMAIL
+# =========================================================
 def image_to_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("utf-8")
 
 
-# =========================================================
-# REPORT / EMAIL
-# =========================================================
-def build_html_report(
-    metrics: dict,
-    cum_df: pd.DataFrame,
-    heatmap_path: Path,
-    negative_hours_path: Path,
-    weekly_load_path: Path | None = None,
-    aemet_anomalies_path: Path | None = None,
-) -> str:
+def build_html_report(metrics: dict, monthly_negative: pd.DataFrame, heatmap_path: Path, negative_hours_path: Path) -> str:
     heatmap_b64 = image_to_base64(heatmap_path)
     negative_b64 = image_to_base64(negative_hours_path)
-    weekly_b64 = image_to_base64(weekly_load_path) if weekly_load_path and weekly_load_path.exists() else None
-    aemet_b64 = image_to_base64(aemet_anomalies_path) if aemet_anomalies_path and aemet_anomalies_path.exists() else None
 
-    monthly_table = cum_df.copy()
-    if not monthly_table.empty:
-        monthly_table = monthly_table.rename(
-            columns={
-                "year": "Year",
-                "month_name": "Month",
-                "negative_hours": "Negative hours",
-                "cum_negative_hours": "Cumulative negative hours",
-            }
-        )[["Year", "Month", "Negative hours", "Cumulative negative hours"]]
-        monthly_html = monthly_table.to_html(index=False, border=0, classes="data-table")
-    else:
-        monthly_html = "<p>No monthly negative-hour data available.</p>"
+    rows = ""
+    if not monthly_negative.empty:
+        for _, row in monthly_negative.iterrows():
+            rows += (
+                f"<tr><td>{row['Month']}</td>"
+                f"<td>{int(row['Hours']):,}</td>"
+                f"<td>{row['Share']:.1%}</td></tr>"
+            )
+
+    data_from = metrics.get("data_from")
+    data_to = metrics.get("data_to")
+    data_from_str = pd.Timestamp(data_from).strftime("%Y-%m-%d %H:%M") if data_from is not None else "-"
+    data_to_str = pd.Timestamp(data_to).strftime("%Y-%m-%d %H:%M") if data_to is not None else "-"
 
     html = f"""
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <style>
-    body {{ font-family: Arial, sans-serif; color: #111827; margin: 0; padding: 0; }}
-    .container {{ max-width: 1100px; margin: 0 auto; padding: 24px; }}
-    .header {{ background: linear-gradient(90deg, #0F766E 0%, #10B981 60%, #C7F0DD 100%); color: white; padding: 18px 22px; border-radius: 12px; }}
-    .header h1 {{ margin: 0; font-size: 24px; }}
-    .caption {{ color: #6B7280; font-size: 13px; margin-top: 8px; }}
-    .kpi-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 18px 0; }}
-    .kpi {{ border: 1px solid #E5E7EB; border-radius: 12px; padding: 14px; background: #F9FAFB; }}
-    .kpi .label {{ font-size: 13px; color: #6B7280; }}
-    .kpi .value {{ font-size: 22px; font-weight: 800; margin-top: 4px; }}
-    .section {{ margin-top: 28px; }}
-    .section h2 {{ font-size: 19px; border-bottom: 1px solid #E5E7EB; padding-bottom: 8px; }}
-    img {{ max-width: 100%; border: 1px solid #E5E7EB; border-radius: 10px; }}
-    .data-table {{ border-collapse: collapse; width: 100%; margin-top: 12px; }}
-    .data-table th {{ background: #4B5563; color: white; padding: 8px; text-align: center; }}
-    .data-table td {{ border-bottom: 1px solid #E5E7EB; padding: 7px; text-align: right; }}
-    .data-table td:nth-child(2) {{ text-align: center; }}
-  </style>
+<meta charset="utf-8">
+<style>
+body {{ font-family: Arial, sans-serif; color: #111827; margin: 0; background: #F9FAFB; }}
+.container {{ max-width: 1180px; margin: 0 auto; padding: 24px; }}
+.header {{ background: linear-gradient(90deg, #0F766E, #10B981); color: white; padding: 18px 22px; border-radius: 14px; }}
+.card {{ background: white; border: 1px solid #E5E7EB; border-radius: 14px; padding: 18px; margin-top: 18px; }}
+.kpis {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }}
+.kpi {{ background: #F3F4F6; border-radius: 12px; padding: 14px; }}
+.kpi .label {{ color: #6B7280; font-size: 12px; }}
+.kpi .value {{ font-weight: 800; font-size: 22px; margin-top: 6px; }}
+img {{ max-width: 100%; border-radius: 10px; border: 1px solid #E5E7EB; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+th {{ background: #4B5563; color: white; padding: 8px; text-align: left; }}
+td {{ padding: 8px; border-bottom: 1px solid #E5E7EB; }}
+.caption {{ color: #6B7280; font-size: 13px; }}
+</style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>Spain Day Ahead Price Report</h1>
-      <div class="caption">Generated at {datetime.now(MADRID_TZ).strftime('%Y-%m-%d %H:%M:%S')} Europe/Madrid</div>
-    </div>
-
-    <div class="kpi-grid">
-      <div class="kpi"><div class="label">Year</div><div class="value">{metrics['year']}</div></div>
-      <div class="kpi"><div class="label">Average spot price</div><div class="value">{format_number(metrics['avg_price'], 2, ' €/MWh')}</div></div>
-      <div class="kpi"><div class="label">Observed hours</div><div class="value">{format_number(metrics['hours'], 0)}</div></div>
-      <div class="kpi"><div class="label">Minimum spot price</div><div class="value">{format_number(metrics['min_price'], 2, ' €/MWh')}</div></div>
-      <div class="kpi"><div class="label">Maximum spot price</div><div class="value">{format_number(metrics['max_price'], 2, ' €/MWh')}</div></div>
-      <div class="kpi"><div class="label">Negative-price hours</div><div class="value">{format_number(metrics['negative_hours'], 0)}</div></div>
-    </div>
-
-    <div class="section">
-      <h2>OMIE hourly price heatmap (24x365)</h2>
-      <p class="caption">Color scale: strong green = very low spot prices; yellow/orange = medium prices; strong red = very high spot prices. Missing/future hours are shown as blank/light background.</p>
-      <img src="data:image/png;base64,{heatmap_b64}" alt="OMIE hourly price heatmap">
-    </div>
-
-    <div class="section">
-      <h2>Cumulative negative price hours</h2>
-      <p class="caption">This is the cumulative quantity of negative-price hours by month, not the monthly % share.</p>
-      <img src="data:image/png;base64,{negative_b64}" alt="Cumulative negative price hours">
-      {monthly_html}
-    </div>
-
-    {f'<div class="section"><h2>Weekly load evolution</h2><p class="caption">REE daily peninsular demand aggregated by ISO week.</p><img src="data:image/png;base64,{weekly_b64}" alt="Weekly load evolution"></div>' if weekly_b64 else ''}
-
-    {f'<div class="section"><h2>AEMET weather anomalies</h2><p class="caption">Simple Spain-wide AEMET station average vs selected baseline years. Humidity anomaly is in percentage points.</p><img src="data:image/png;base64,{aemet_b64}" alt="AEMET weather anomalies"></div>' if aemet_b64 else ''}
+<div class="container">
+  <div class="header">
+    <h1>Spain Day Ahead Price Report | {metrics.get('year', '-')}</h1>
+    <div>Data range: {data_from_str} to {data_to_str}</div>
   </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Average spot price</div><div class="value">{fmt(metrics.get('avg_price'), 2, ' €/MWh')}</div></div>
+    <div class="kpi"><div class="label">Min price</div><div class="value">{fmt(metrics.get('min_price'), 2, ' €/MWh')}</div></div>
+    <div class="kpi"><div class="label">Max price</div><div class="value">{fmt(metrics.get('max_price'), 2, ' €/MWh')}</div></div>
+    <div class="kpi"><div class="label">{metrics.get('negative_mode', 'Negative mode')}</div><div class="value">{metrics.get('negative_or_zero_hours', 0):,} h</div></div>
+  </div>
+
+  <div class="card">
+    <h2>OMIE hourly price heatmap</h2>
+    <p class="caption">Green = lower spot price; red = higher spot price.</p>
+    <img src="data:image/png;base64,{heatmap_b64}" alt="OMIE hourly price heatmap">
+  </div>
+
+  <div class="card">
+    <h2>Cumulative negative / zero-price hours</h2>
+    <img src="data:image/png;base64,{negative_b64}" alt="Cumulative negative price hours">
+  </div>
+
+  <div class="card">
+    <h2>Monthly summary</h2>
+    <table>
+      <thead><tr><th>Month</th><th>Hours</th><th>Share</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -771,13 +592,18 @@ def build_html_report(
 
 
 def send_email(html: str, attachments: list[Path]) -> None:
-    smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER", "").strip()
-    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
-    email_from = os.getenv("EMAIL_FROM", smtp_user).strip()
-    email_to = os.getenv("EMAIL_TO", "").strip()
-    subject = os.getenv("EMAIL_SUBJECT", "Spain Day Ahead Price Report").strip()
+    smtp_host = get_secret("SMTP_HOST", "smtp.gmail.com")
+    smtp_port_raw = get_secret("SMTP_PORT", "587")
+    smtp_user = get_secret("SMTP_USER")
+    smtp_password = get_secret("SMTP_PASSWORD")
+    email_from = get_secret("EMAIL_FROM", smtp_user)
+    email_to = get_secret("EMAIL_TO")
+    subject = get_secret("EMAIL_SUBJECT", "Spain Day Ahead Price Report")
+
+    try:
+        smtp_port = int(smtp_port_raw)
+    except Exception:
+        smtp_port = 587
 
     missing = [
         name for name, value in {
@@ -790,7 +616,7 @@ def send_email(html: str, attachments: list[Path]) -> None:
         if not value
     ]
     if missing:
-        raise ValueError(f"Cannot send email; missing .env variables: {', '.join(missing)}")
+        raise ValueError(f"Cannot send email; missing variables: {', '.join(missing)}")
 
     msg = EmailMessage()
     msg["From"] = email_from
@@ -800,28 +626,37 @@ def send_email(html: str, attachments: list[Path]) -> None:
     msg.add_alternative(html, subtype="html")
 
     for attachment in attachments:
+        if not attachment.exists():
+            continue
         data = attachment.read_bytes()
-        maintype = "image" if attachment.suffix.lower() in {".png", ".jpg", ".jpeg"} else "application"
-        subtype = "png" if attachment.suffix.lower() == ".png" else "octet-stream"
+        if attachment.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+            maintype = "image"
+            subtype = "png" if attachment.suffix.lower() == ".png" else "jpeg"
+        elif attachment.suffix.lower() in {".xlsx"}:
+            maintype = "application"
+            subtype = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            maintype = "application"
+            subtype = "octet-stream"
         msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=attachment.name)
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
         server.starttls()
         server.login(smtp_user, smtp_password)
         server.send_message(msg)
 
 
 # =========================================================
-# MAIN
+# REPORT BUILDER
 # =========================================================
-def build_email_report(year: int, send: bool = False, include_aemet: bool = False, baseline_years: list[int] | None = None) -> EmailReportResult:
-    token = require_esios_token()
+def build_email_report(year: int, negative_mode: str, send: bool = False) -> EmailReportResult:
+    token = get_esios_token()
     hist_prices = load_historical_prices()
     live_prices = load_live_prices(year, token)
     price_hourly = combine_prices(hist_prices, live_prices)
 
     if price_hourly.empty:
-        raise ValueError("No price data available. Check the historical workbook and/or ESIOS token.")
+        raise ValueError("No price data available. Check data/hourly_avg_price_since2021.xlsx and/or ESIOS token.")
 
     available_years = sorted(price_hourly["datetime"].dt.year.unique().tolist())
     if year not in available_years:
@@ -831,91 +666,119 @@ def build_email_report(year: int, send: bool = False, include_aemet: bool = Fals
     if not years_for_negative_chart:
         years_for_negative_chart = [year]
 
-    metrics = build_summary_metrics(price_hourly, year)
-    cum_df = build_cumulative_negative_hours(price_hourly, years_for_negative_chart)
+    metrics = build_summary_metrics(price_hourly, year, negative_mode)
+    cum_df = build_cumulative_negative_hours(price_hourly, years_for_negative_chart, negative_mode)
+    monthly_negative = build_monthly_negative_table(price_hourly, year, negative_mode)
 
+    safe_mode = "negative_only" if negative_mode == "Only negative prices" else "zero_and_negative"
     heatmap_path = OUTPUT_DIR / f"omie_hourly_price_heatmap_{year}.png"
-    negative_hours_path = OUTPUT_DIR / f"cumulative_negative_price_hours_{'_'.join(map(str, years_for_negative_chart))}.png"
-    html_path = OUTPUT_DIR / f"day_ahead_email_report_{year}.html"
-    workbook_path = OUTPUT_DIR / f"day_ahead_email_report_data_{year}.xlsx"
+    negative_hours_path = OUTPUT_DIR / f"cumulative_price_hours_{safe_mode}_{'_'.join(map(str, years_for_negative_chart))}.png"
+    html_path = OUTPUT_DIR / f"day_ahead_email_report_{year}_{safe_mode}.html"
+    workbook_path = OUTPUT_DIR / f"day_ahead_email_report_data_{year}_{safe_mode}.xlsx"
 
     save_hourly_price_heatmap(price_hourly, year, heatmap_path)
-    save_cumulative_negative_hours_chart(cum_df, negative_hours_path)
-
-    # Weekly load evolution from REE daily demand.
-    weekly_load_path = OUTPUT_DIR / f"weekly_load_evolution_{year}.png"
-    demand_daily = load_ree_demand_daily_history(date(max(2021, year - 2), 1, 1), min(date(year, 12, 31), datetime.now(MADRID_TZ).date()))
-    weekly_load_df = build_weekly_load_evolution(demand_daily)
-    save_weekly_load_chart(weekly_load_df, weekly_load_path, years=[y for y in [year - 2, year - 1, year] if y >= 2021])
-
-    # Optional AEMET weather anomalies. This can be slow the first time because AEMET requests are chunked and cached.
-    aemet_anomalies_path = None
-    aemet_anomalies_df = pd.DataFrame()
-    if include_aemet:
-        aemet_token = get_aemet_token()
-        if aemet_token:
-            current_end = min(datetime.now(MADRID_TZ).date(), date(year, 12, 31))
-            current_start = date(year, 1, 1)
-            baseline_years = baseline_years or list(range(max(2016, year - 5), year))
-            current_weather = load_aemet_daily_all_stations(current_start, current_end, aemet_token)
-            baseline_frames = []
-            for byear in baseline_years:
-                baseline_frames.append(load_aemet_daily_all_stations(date(byear, 1, 1), min(date(byear, current_end.month, current_end.day), date(byear, 12, 31)), aemet_token))
-            baseline_weather = pd.concat(baseline_frames, ignore_index=True) if baseline_frames else pd.DataFrame()
-            aemet_anomalies_df = build_aemet_weekly_anomalies(current_weather, baseline_weather)
-            aemet_anomalies_path = OUTPUT_DIR / f"aemet_weather_anomalies_{year}.png"
-            save_aemet_anomalies_chart(aemet_anomalies_df, aemet_anomalies_path)
-        else:
-            print("Warning: --include-aemet requested but AEMET_API_KEY/AEMET_TOKEN was not found in .env")
+    save_cumulative_negative_hours_chart(cum_df, negative_hours_path, negative_mode)
 
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
         price_hourly[price_hourly["datetime"].dt.year == year].to_excel(writer, index=False, sheet_name="hourly_prices")
-        cum_df.to_excel(writer, index=False, sheet_name="negative_hours")
+        cum_df.to_excel(writer, index=False, sheet_name="cumulative_hours")
+        monthly_negative.to_excel(writer, index=False, sheet_name="monthly_hours")
         pd.DataFrame([metrics]).to_excel(writer, index=False, sheet_name="summary")
-        if not weekly_load_df.empty:
-            weekly_load_df.to_excel(writer, index=False, sheet_name="weekly_load")
-        if not aemet_anomalies_df.empty:
-            aemet_anomalies_df.to_excel(writer, index=False, sheet_name="aemet_anomalies")
 
-    html = build_html_report(metrics, cum_df, heatmap_path, negative_hours_path, weekly_load_path=weekly_load_path, aemet_anomalies_path=aemet_anomalies_path)
+    html = build_html_report(metrics, monthly_negative, heatmap_path, negative_hours_path)
     html_path.write_text(html, encoding="utf-8")
 
     if send:
-        attachments = [heatmap_path, negative_hours_path, workbook_path]
-        if weekly_load_path and weekly_load_path.exists():
-            attachments.append(weekly_load_path)
-        if aemet_anomalies_path and aemet_anomalies_path.exists():
-            attachments.append(aemet_anomalies_path)
-        send_email(html, attachments)
+        send_email(html, [heatmap_path, negative_hours_path, workbook_path])
 
     return EmailReportResult(
         html_path=html_path,
         heatmap_path=heatmap_path,
         negative_hours_path=negative_hours_path,
-        weekly_load_path=weekly_load_path if weekly_load_path.exists() else None,
-        aemet_anomalies_path=aemet_anomalies_path if aemet_anomalies_path and aemet_anomalies_path.exists() else None,
         workbook_path=workbook_path,
     )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build and optionally send the Spain Day Ahead email report.")
-    parser.add_argument("--year", type=int, default=datetime.now(MADRID_TZ).year, help="Report year, e.g. 2026")
-    parser.add_argument("--send", action="store_true", help="Send email using SMTP settings in .env")
-    parser.add_argument("--no-send", action="store_true", help="Build files but do not send email")
-    parser.add_argument("--include-aemet", action="store_true", help="Include AEMET temperature/humidity anomaly charts; requires AEMET_API_KEY in .env")
-    parser.add_argument("--baseline-years", type=str, default="", help="Comma-separated AEMET baseline years, e.g. 2021,2022,2023,2024,2025")
-    return parser.parse_args()
+# =========================================================
+# STREAMLIT APP BODY
+# =========================================================
+def main() -> None:
+    st.title("Email Report")
+    st.caption("Build and optionally send the Spain Day Ahead email report.")
+
+    section_header("Report controls")
+
+    hist_prices = load_historical_prices()
+    token_present = bool(get_esios_token())
+
+    available_years = []
+    if not hist_prices.empty:
+        available_years.extend(hist_prices["datetime"].dt.year.unique().tolist())
+    current_year = datetime.now(MADRID_TZ).year
+    if token_present and current_year >= 2026:
+        available_years.append(current_year)
+    available_years = sorted(set(int(y) for y in available_years if pd.notna(y)))
+
+    if not available_years:
+        st.error("No historical price data found and no live ESIOS token is available.")
+        st.info(f"Expected historical file: {HIST_PRICES_FILE}")
+        return
+
+    default_year = current_year if current_year in available_years else max(available_years)
+
+    col1, col2, col3 = st.columns([1, 1.4, 1])
+    with col1:
+        year = st.selectbox("Report year", available_years, index=available_years.index(default_year))
+    with col2:
+        negative_mode = st.radio(
+            "Negative-price mode",
+            ["Only negative prices", "Zero and negative prices"],
+            horizontal=True,
+            index=0,
+        )
+    with col3:
+        send_now = st.checkbox("Send email after generation", value=False)
+
+    with st.expander("Configuration status", expanded=False):
+        st.write({
+            "Historical file exists": HIST_PRICES_FILE.exists(),
+            "ESIOS token configured": token_present,
+            "SMTP_HOST configured": bool(get_secret("SMTP_HOST")),
+            "SMTP_USER configured": bool(get_secret("SMTP_USER")),
+            "SMTP_PASSWORD configured": bool(get_secret("SMTP_PASSWORD")),
+            "EMAIL_TO configured": bool(get_secret("EMAIL_TO")),
+        })
+        st.caption("In Streamlit Cloud, configure these under App → Settings → Secrets.")
+
+    if st.button("Generate report", type="primary"):
+        with st.spinner("Generating report..."):
+            result = build_email_report(year=year, negative_mode=negative_mode, send=send_now)
+        st.success("Report generated" + (" and sent." if send_now else "."))
+        st.session_state["email_report_result"] = result
+
+    result: EmailReportResult | None = st.session_state.get("email_report_result")
+    if result:
+        section_header("Generated files")
+        col_a, col_b, col_c, col_d = st.columns(4)
+        with col_a:
+            st.download_button("Download HTML", result.html_path.read_bytes(), file_name=result.html_path.name, mime="text/html")
+        with col_b:
+            st.download_button("Download heatmap PNG", result.heatmap_path.read_bytes(), file_name=result.heatmap_path.name, mime="image/png")
+        with col_c:
+            st.download_button("Download negative-hours PNG", result.negative_hours_path.read_bytes(), file_name=result.negative_hours_path.name, mime="image/png")
+        with col_d:
+            st.download_button("Download Excel", result.workbook_path.read_bytes(), file_name=result.workbook_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        section_header("Preview")
+        st.image(str(result.heatmap_path), use_container_width=True)
+        st.image(str(result.negative_hours_path), use_container_width=True)
+
+        with st.expander("HTML preview", expanded=False):
+            st.components.v1.html(result.html_path.read_text(encoding="utf-8"), height=900, scrolling=True)
 
 
-if __name__ == "__main__":
-    args = parse_args()
-    baseline_years = [int(x.strip()) for x in args.baseline_years.split(",") if x.strip()] or None
-    result = build_email_report(year=args.year, send=bool(args.send and not args.no_send), include_aemet=args.include_aemet, baseline_years=baseline_years)
-    print("Email report generated:")
-    print(f"  HTML: {result.html_path}")
-    print(f"  Heatmap: {result.heatmap_path}")
-    print(f"  Negative hours chart: {result.negative_hours_path}")
-    print(f"  Weekly load chart: {result.weekly_load_path}")
-    print(f"  AEMET anomalies chart: {result.aemet_anomalies_path}")
-    print(f"  Workbook: {result.workbook_path}")
+try:
+    main()
+except Exception as exc:
+    st.error(f"Email Report failed: {exc}")
+    st.exception(exc)
