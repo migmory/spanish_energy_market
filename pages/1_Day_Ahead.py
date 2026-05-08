@@ -181,11 +181,11 @@ YELLOW_DARK = "#D97706"
 YELLOW_LIGHT = "#FBBF24"
 BLUE_PRICE = "#1D4ED8"
 GREEN_RENEWABLES = "#059669"
-PRICE_LOW_RED = "#DC2626"
-PRICE_MID_ORANGE = "#F97316"
+PRICE_LOW_GREEN_DARK = "#006400"
+PRICE_LOW_GREEN = "#16A34A"
 PRICE_MID_YELLOW = "#FDE047"
-PRICE_HIGH_GREEN = "#16A34A"
-PRICE_HIGH_GREEN_DARK = "#006400"
+PRICE_MID_ORANGE = "#F97316"
+PRICE_HIGH_RED = "#DC2626"
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
 REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
 
@@ -979,6 +979,49 @@ def combine_hist_and_live(hist_df: pd.DataFrame, live_df: pd.DataFrame, subset_c
     if combined.empty:
         return combined
     return combined.sort_values(subset_cols).drop_duplicates(subset=subset_cols, keep="last").reset_index(drop=True)
+
+
+def normalize_installed_capacity_df(cap_df: pd.DataFrame) -> pd.DataFrame:
+    """Make installed-capacity data robust before any .dt calls.
+
+    The historical Excel loader and the live REE API path can occasionally return
+    empty/object-typed datetime columns. Streamlit then raises:
+    "Can only use .dt accessor with datetimelike values".
+    This function standardises the dataframe to monthly naive timestamps and
+    numeric MW values, and always returns the expected columns.
+    """
+    expected_cols = ["datetime", "technology", "capacity_mw"]
+    if cap_df is None or cap_df.empty:
+        return pd.DataFrame(columns=expected_cols)
+
+    out = cap_df.copy()
+    for col in expected_cols:
+        if col not in out.columns:
+            out[col] = pd.NA
+
+    # Use UTC parsing to handle possible tz-aware strings from REE and plain
+    # Excel timestamps in one path, then convert back to Madrid/no timezone.
+    dt = pd.to_datetime(out["datetime"], errors="coerce", utc=True)
+    out["datetime"] = (
+        dt.dt.tz_convert("Europe/Madrid")
+        .dt.tz_localize(None)
+        .dt.to_period("M")
+        .dt.to_timestamp()
+    )
+    out["technology"] = out["technology"].astype(str).str.strip()
+    out["capacity_mw"] = pd.to_numeric(out["capacity_mw"], errors="coerce")
+
+    out = out.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
+    if out.empty:
+        return pd.DataFrame(columns=expected_cols)
+
+    return (
+        out[expected_cols]
+        .groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
+        .sum()
+        .sort_values(["datetime", "technology"])
+        .reset_index(drop=True)
+    )
 
 
 # =========================================================
@@ -1918,9 +1961,9 @@ def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
     """Altair heatmap: x = day of year, y = hour, color = spot price.
 
     Color convention requested:
-      * strong red = very low prices
+      * strong green = very low prices
       * yellow/orange = medium prices
-      * strong green = very high prices
+      * strong red = very high prices
 
     The x-axis is ordinal day_of_year. This avoids the misleading rendering that
     happens when mark_rect is plotted against a temporal axis without x2: cells
@@ -1990,7 +2033,7 @@ def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
             title="Spot [€/MWh]",
             scale=alt.Scale(
                 domain=[p_low, p_mid_1, p_mid_2, p_mid_3, p_high],
-                range=[PRICE_LOW_RED, PRICE_MID_ORANGE, PRICE_MID_YELLOW, PRICE_HIGH_GREEN, PRICE_HIGH_GREEN_DARK],
+                range=[PRICE_LOW_GREEN_DARK, PRICE_LOW_GREEN, PRICE_MID_YELLOW, PRICE_MID_ORANGE, PRICE_HIGH_RED],
                 clamp=True,
             ),
             legend=alt.Legend(orient="right", title="Spot [€/MWh]"),
@@ -2155,30 +2198,62 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame):
     return apply_common_chart_style(chart, height=330)
 
 
-def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[str]):
+def build_installed_capacity_additions_df(cap_df: pd.DataFrame, selected_techs: list[str]) -> pd.DataFrame:
+    """Return installed capacity as MW additions versus the first available month.
+
+    For each technology, the baseline is the first value within the selected date range.
+    addition_mw = current capacity_mw - first selected capacity_mw.
+    This makes the chart show capacity additions rather than absolute installed capacity.
+    """
+    cols = ["datetime", "technology", "capacity_mw", "baseline_capacity_mw", "addition_mw"]
     if cap_df.empty or not selected_techs:
-        return None
+        return pd.DataFrame(columns=cols)
+
     plot = cap_df[cap_df["technology"].isin(selected_techs)].copy()
     if plot.empty:
-        return None
+        return pd.DataFrame(columns=cols)
 
-    plot["datetime"] = pd.to_datetime(plot["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    plot["datetime"] = pd.to_datetime(plot["datetime"], errors="coerce")
+    plot["capacity_mw"] = pd.to_numeric(plot["capacity_mw"], errors="coerce")
+    plot = plot.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
+    if plot.empty:
+        return pd.DataFrame(columns=cols)
+
+    plot["datetime"] = plot["datetime"].dt.to_period("M").dt.to_timestamp()
     plot = (
         plot.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
         .sum()
-        .sort_values(["datetime", "technology"])
+        .sort_values(["technology", "datetime"])
     )
+
+    baselines = (
+        plot.sort_values(["technology", "datetime"])
+        .groupby("technology", as_index=False)
+        .first()[["technology", "capacity_mw"]]
+        .rename(columns={"capacity_mw": "baseline_capacity_mw"})
+    )
+    plot = plot.merge(baselines, on="technology", how="left")
+    plot["addition_mw"] = plot["capacity_mw"] - plot["baseline_capacity_mw"]
+    return plot[cols].sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[str]):
+    plot = build_installed_capacity_additions_df(cap_df, selected_techs)
+    if plot.empty:
+        return None
 
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%b-%y", labelAngle=0, tickCount="month")),
-        y=alt.Y("capacity_mw:Q", title="Installed capacity (MW)"),
+        y=alt.Y("addition_mw:Q", title="Installed capacity additions from first selected month (MW)"),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
         tooltip=[
             alt.Tooltip("datetime:T", title="Month"),
             alt.Tooltip("technology:N", title="Technology"),
-            alt.Tooltip("capacity_mw:Q", title="MW", format=",.2f"),
+            alt.Tooltip("baseline_capacity_mw:Q", title="Baseline MW", format=",.2f"),
+            alt.Tooltip("capacity_mw:Q", title="Current MW", format=",.2f"),
+            alt.Tooltip("addition_mw:Q", title="Addition MW", format=",.2f"),
         ],
-    ).properties(height=360)
+    ).properties(height=360, title="Installed capacity additions vs first selected month")
     return apply_common_chart_style(chart, height=360)
 
 def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None, weekly_load_df: pd.DataFrame | None = None, aemet_anomalies_df: pd.DataFrame | None = None) -> bytes:
@@ -2242,7 +2317,9 @@ try:
     price_hourly = combine_hist_and_live(hist_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_and_live(hist_solar, live_solar, ["datetime"])
     mix_daily = combine_hist_and_live(hist_mix, live_mix, ["datetime", "technology", "data_source"])
-    installed_capacity = combine_hist_and_live(hist_installed_capacity, live_installed_capacity, ["datetime", "technology"])
+    installed_capacity = normalize_installed_capacity_df(
+        combine_hist_and_live(hist_installed_capacity, live_installed_capacity, ["datetime", "technology"])
+    )
     demand_hourly = live_demand.copy() if live_demand is not None else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
     if demand_hourly.empty:
         demand_hourly = pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"])
@@ -2393,7 +2470,7 @@ try:
         price_heatmap = build_hourly_price_heatmap(price_hourly, int(price_heatmap_year))
         if price_heatmap is not None:
             st.altair_chart(price_heatmap, use_container_width=True)
-            st.caption("Color scale: strong red = very low spot price; yellow/orange = medium price; strong green = very high spot price. Future or missing hours are shown in light grey.")
+            st.caption("Color scale: strong green = very low spot price; yellow/orange = medium price; strong red = very high spot price. Future or missing hours are shown in light grey.")
 
     section_header("Negative prices")
     neg_mode = "Only negative prices"
@@ -2546,6 +2623,7 @@ try:
 
     # Installed capacity
     section_header("Installed capacity")
+    installed_capacity = normalize_installed_capacity_df(installed_capacity)
     if installed_capacity.empty:
         st.info("No installed capacity file found in /data.")
     else:
@@ -2563,10 +2641,33 @@ try:
         cap_renew = cap_df_year[cap_df_year["technology"].isin(RENEWABLE_TECHS)].groupby("datetime", as_index=False)["capacity_mw"].sum().rename(columns={"capacity_mw": "Renewable capacity (MW)"})
         cap_table = cap_summary.merge(cap_renew, on="datetime", how="left")
         cap_table["Renewable capacity (MW)"] = cap_table["Renewable capacity (MW)"].fillna(0.0)
+        cap_table = cap_table.sort_values("datetime").reset_index(drop=True)
+        if not cap_table.empty:
+            first_total = cap_table["Total installed capacity (MW)"].iloc[0]
+            first_re = cap_table["Renewable capacity (MW)"].iloc[0]
+            cap_table["Total capacity additions (MW)"] = cap_table["Total installed capacity (MW)"] - first_total
+            cap_table["Renewable capacity additions (MW)"] = cap_table["Renewable capacity (MW)"] - first_re
+        else:
+            cap_table["Total capacity additions (MW)"] = pd.NA
+            cap_table["Renewable capacity additions (MW)"] = pd.NA
         cap_table["% Renewable capacity"] = cap_table["Renewable capacity (MW)"] / cap_table["Total installed capacity (MW)"]
         cap_table["Month"] = cap_table["datetime"].dt.strftime("%b - %Y")
-        subtle_subsection("Installed capacity monthly summary")
-        st.dataframe(styled_df(cap_table[["Month", "Total installed capacity (MW)", "Renewable capacity (MW)", "% Renewable capacity"]], pct_cols=["% Renewable capacity"]), use_container_width=True)
+        subtle_subsection("Installed capacity additions monthly summary")
+        st.caption("Additions are calculated against the first month selected in the Installed capacity years filter.")
+        st.dataframe(
+            styled_df(
+                cap_table[[
+                    "Month",
+                    "Total capacity additions (MW)",
+                    "Renewable capacity additions (MW)",
+                    "Total installed capacity (MW)",
+                    "Renewable capacity (MW)",
+                    "% Renewable capacity",
+                ]],
+                pct_cols=["% Renewable capacity"],
+            ),
+            use_container_width=True,
+        )
 
     # Raw 12x24 table download (kept at the end)
     if not heat_table.empty:
