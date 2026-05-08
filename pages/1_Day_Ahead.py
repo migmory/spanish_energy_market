@@ -17,6 +17,7 @@ except Exception:
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 # =========================================================
@@ -188,6 +189,10 @@ PRICE_MID_ORANGE = "#F97316"
 PRICE_HIGH_RED = "#DC2626"
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
 REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+
+EEX_MARKET_DATA_HUB_URL = "https://www.eex.com/en/market-data/market-data-hub"
+EEX_FORWARD_LOCAL_CSV = DATA_DIR / "eex_forward_market.csv"
+EEX_FORWARD_LOCAL_XLSX = DATA_DIR / "eex_forward_market.xlsx"
 
 # AEMET OpenData. Get a free API key from AEMET OpenData and place it in .env as AEMET_API_KEY=...
 AEMET_API_BASE = "https://opendata.aemet.es/opendata/api"
@@ -2198,6 +2203,181 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame):
     return apply_common_chart_style(chart, height=330)
 
 
+
+# =========================================================
+# EEX FORWARD MARKET HELPERS
+# =========================================================
+def _clean_col_name(col) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
+
+
+def _first_existing_col(columns: list[str], candidates: list[str]) -> str | None:
+    col_set = set(columns)
+    for c in candidates:
+        if c in col_set:
+            return c
+    return None
+
+
+def _parse_contract_sort_value(value):
+    """Best-effort sort key for EEX delivery products: months, quarters and years."""
+    if pd.isna(value):
+        return pd.NaT
+    s = str(value).strip()
+    if not s:
+        return pd.NaT
+
+    # Direct datetime parsing first: 2027-01-01, Jan-27, etc.
+    direct = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if pd.notna(direct):
+        return pd.Timestamp(direct).normalize()
+
+    s_up = s.upper().replace("_", " ").replace("-", " ").replace("/", " ")
+
+    # Quarter formats: Q1 2027, 2027 Q1, CAL 2027 Q1.
+    q_match = re.search(r"Q([1-4]).*?(20\d{2})", s_up) or re.search(r"(20\d{2}).*?Q([1-4])", s_up)
+    if q_match:
+        g1, g2 = q_match.groups()
+        if g1.startswith("20"):
+            year = int(g1)
+            quarter = int(g2)
+        else:
+            quarter = int(g1)
+            year = int(g2)
+        month = (quarter - 1) * 3 + 1
+        return pd.Timestamp(year, month, 1)
+
+    # Year / calendar formats: Cal-27, Calendar 2027, Year 2027, 2027 Baseload.
+    y_match = re.search(r"(20\d{2})", s_up)
+    if y_match and re.search(r"CAL|CALENDAR|YEAR|YR|BASE|PEAK|POWER", s_up):
+        return pd.Timestamp(int(y_match.group(1)), 1, 1)
+
+    return pd.NaT
+
+
+def normalize_eex_forward_market_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a CSV/XLSX export from EEX Market Data Hub / DataSource.
+
+    The EEX export column names can vary by product/view. This function maps common
+    column names to a compact forward-curve schema used by the dashboard.
+    Required output: contract + price. Optional: as_of_date, product, market_area, load_type, currency.
+    """
+    cols_out = [
+        "as_of_date",
+        "product",
+        "market_area",
+        "load_type",
+        "contract",
+        "contract_sort",
+        "price",
+        "currency",
+        "source",
+    ]
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    df = raw_df.copy()
+    df.columns = [_clean_col_name(c) for c in df.columns]
+    columns = df.columns.tolist()
+
+    date_col = _first_existing_col(columns, [
+        "as_of_date", "trading_day", "trading_date", "trade_date", "business_date",
+        "date", "settlement_date", "data_date", "timestamp",
+    ])
+    product_col = _first_existing_col(columns, [
+        "product", "product_name", "instrument", "instrument_name", "contract_name",
+        "name", "eex_product", "commodity",
+    ])
+    market_col = _first_existing_col(columns, [
+        "market_area", "market", "area", "country", "zone", "delivery_area", "hub",
+    ])
+    load_col = _first_existing_col(columns, [
+        "load_type", "load", "profile", "base_peak", "baseload_peakload", "contract_type",
+    ])
+    contract_col = _first_existing_col(columns, [
+        "contract", "delivery_period", "maturity", "maturity_date", "delivery", "delivery_start",
+        "period", "expiry", "expiration", "contract_month", "contract_year",
+    ])
+    price_col = _first_existing_col(columns, [
+        "settlement_price", "settlement", "settle", "settle_price", "final_settlement_price",
+        "last_price", "last", "price", "close", "closing_price", "px_last",
+    ])
+    currency_col = _first_existing_col(columns, ["currency", "ccy"])
+
+    if contract_col is None or price_col is None:
+        return pd.DataFrame(columns=cols_out)
+
+    out = pd.DataFrame()
+    out["as_of_date"] = pd.to_datetime(df[date_col], errors="coerce") if date_col else pd.NaT
+    out["product"] = df[product_col].astype(str).str.strip() if product_col else "EEX forward"
+    out["market_area"] = df[market_col].astype(str).str.strip() if market_col else ""
+    out["load_type"] = df[load_col].astype(str).str.strip() if load_col else ""
+    out["contract"] = df[contract_col].astype(str).str.strip()
+    out["price"] = pd.to_numeric(df[price_col], errors="coerce")
+    out["currency"] = df[currency_col].astype(str).str.strip() if currency_col else "EUR/MWh"
+    out["source"] = "EEX upload/local"
+
+    # Infer load type when it is embedded in product/contract text.
+    combined_txt = (out["product"].fillna("") + " " + out["contract"].fillna("")).str.lower()
+    out.loc[out["load_type"].isin(["", "nan", "None"]), "load_type"] = ""
+    out.loc[out["load_type"].eq("") & combined_txt.str.contains("base|baseload", na=False), "load_type"] = "Baseload"
+    out.loc[out["load_type"].eq("") & combined_txt.str.contains("peak|peakload", na=False), "load_type"] = "Peakload"
+    out.loc[out["load_type"].eq(""), "load_type"] = "All"
+
+    out["contract_sort"] = out["contract"].map(_parse_contract_sort_value)
+    fallback_sort = pd.to_datetime(out["contract"], errors="coerce", dayfirst=True)
+    out["contract_sort"] = out["contract_sort"].combine_first(fallback_sort)
+    out = out.dropna(subset=["contract", "price"]).copy()
+    out = out.sort_values(["product", "market_area", "load_type", "contract_sort", "contract"]).reset_index(drop=True)
+    return out[cols_out]
+
+
+def load_eex_forward_market_file(uploaded_file=None) -> pd.DataFrame:
+    """Load an EEX forward curve either from an uploaded file or from /data."""
+    try:
+        if uploaded_file is not None:
+            name = uploaded_file.name.lower()
+            if name.endswith((".xlsx", ".xls")):
+                raw = pd.read_excel(uploaded_file)
+            else:
+                raw = pd.read_csv(uploaded_file)
+            return normalize_eex_forward_market_df(raw)
+
+        if EEX_FORWARD_LOCAL_XLSX.exists():
+            return normalize_eex_forward_market_df(pd.read_excel(EEX_FORWARD_LOCAL_XLSX))
+        if EEX_FORWARD_LOCAL_CSV.exists():
+            return normalize_eex_forward_market_df(pd.read_csv(EEX_FORWARD_LOCAL_CSV))
+    except Exception:
+        return pd.DataFrame(columns=["as_of_date", "product", "market_area", "load_type", "contract", "contract_sort", "price", "currency", "source"])
+
+    return pd.DataFrame(columns=["as_of_date", "product", "market_area", "load_type", "contract", "contract_sort", "price", "currency", "source"])
+
+
+def build_forward_market_chart(forward_df: pd.DataFrame):
+    if forward_df.empty:
+        return None
+    plot = forward_df.copy()
+    plot["series"] = plot[["market_area", "load_type"]].fillna("").agg(" | ".join, axis=1).str.strip(" |")
+    plot.loc[plot["series"].eq(""), "series"] = plot["product"]
+    plot["contract_axis"] = plot["contract"]
+    order = plot.sort_values(["contract_sort", "contract"])["contract_axis"].drop_duplicates().tolist()
+
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("contract_axis:N", sort=order, axis=alt.Axis(title="Delivery contract", labelAngle=-35)),
+        y=alt.Y("price:Q", title="Forward price / settlement (EUR/MWh)"),
+        color=alt.Color("series:N", title="Market / load"),
+        tooltip=[
+            alt.Tooltip("as_of_date:T", title="As of", format="%Y-%m-%d"),
+            alt.Tooltip("product:N", title="Product"),
+            alt.Tooltip("market_area:N", title="Market area"),
+            alt.Tooltip("load_type:N", title="Load type"),
+            alt.Tooltip("contract:N", title="Contract"),
+            alt.Tooltip("price:Q", title="Price", format=",.2f"),
+            alt.Tooltip("currency:N", title="Currency"),
+        ],
+    ).properties(height=360, title="EEX forward curve")
+    return apply_common_chart_style(chart, height=360)
+
 def build_installed_capacity_additions_df(cap_df: pd.DataFrame, selected_techs: list[str]) -> pd.DataFrame:
     """Return installed capacity as MW additions versus the first available month.
 
@@ -2237,24 +2417,100 @@ def build_installed_capacity_additions_df(cap_df: pd.DataFrame, selected_techs: 
     return plot[cols].sort_values(["datetime", "technology"]).reset_index(drop=True)
 
 
-def build_installed_capacity_chart(cap_df: pd.DataFrame, selected_techs: list[str]):
-    plot = build_installed_capacity_additions_df(cap_df, selected_techs)
-    if plot.empty:
-        return None
+def build_installed_capacity_chart(
+    cap_df: pd.DataFrame,
+    selected_techs: list[str],
+    view_mode: str = "Additions from initial base",
+):
+    """Build installed-capacity chart.
 
-    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("datetime:T", axis=alt.Axis(title=None, format="%b-%y", labelAngle=0, tickCount="month")),
-        y=alt.Y("addition_mw:Q", title="Installed capacity additions from first selected month (MW)"),
+    Two views are available:
+    - Additions from initial base: stacked columns of cumulative MW additions vs
+      the first selected month. This answers: how many MW have been added since
+      the initial selected capacity base?
+    - Total installed evolution: stacked columns of absolute installed capacity.
+
+    Labels show the monthly total so the figures are readable without hovering.
+    """
+    if view_mode == "Total installed evolution":
+        cols = ["datetime", "technology", "capacity_mw"]
+        if cap_df.empty or not selected_techs:
+            return None
+        plot = cap_df[cap_df["technology"].isin(selected_techs)].copy()
+        if plot.empty:
+            return None
+        plot["datetime"] = pd.to_datetime(plot["datetime"], errors="coerce")
+        plot["capacity_mw"] = pd.to_numeric(plot["capacity_mw"], errors="coerce")
+        plot = plot.dropna(subset=cols).copy()
+        if plot.empty:
+            return None
+        plot["datetime"] = plot["datetime"].dt.to_period("M").dt.to_timestamp()
+        plot = (
+            plot.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
+            .sum()
+            .sort_values(["datetime", "technology"])
+        )
+        y_col = "capacity_mw"
+        y_title = "Installed capacity (MW)"
+        chart_title = "Total installed capacity evolution"
+        tooltip_value_title = "Installed MW"
+    else:
+        plot = build_installed_capacity_additions_df(cap_df, selected_techs)
+        if plot.empty:
+            return None
+        y_col = "addition_mw"
+        y_title = "Capacity additions vs initial base (MW)"
+        chart_title = "Installed capacity additions from first selected month"
+        tooltip_value_title = "Addition MW"
+
+    plot["month_label"] = plot["datetime"].dt.strftime("%b-%y")
+    order = plot.sort_values("datetime")["month_label"].drop_duplicates().tolist()
+
+    monthly_totals = (
+        plot.groupby(["datetime", "month_label"], as_index=False)[y_col]
+        .sum()
+        .rename(columns={y_col: "monthly_total_mw"})
+        .sort_values("datetime")
+    )
+
+    bars = alt.Chart(plot).mark_bar(size=34).encode(
+        x=alt.X(
+            "month_label:N",
+            sort=order,
+            axis=alt.Axis(title=None, labelAngle=-35, labelPadding=8),
+        ),
+        y=alt.Y(f"{y_col}:Q", title=y_title, stack="zero"),
         color=alt.Color("technology:N", title="Technology", scale=TECH_COLOR_SCALE),
         tooltip=[
-            alt.Tooltip("datetime:T", title="Month"),
+            alt.Tooltip("datetime:T", title="Month", format="%b-%Y"),
             alt.Tooltip("technology:N", title="Technology"),
-            alt.Tooltip("baseline_capacity_mw:Q", title="Baseline MW", format=",.2f"),
-            alt.Tooltip("capacity_mw:Q", title="Current MW", format=",.2f"),
-            alt.Tooltip("addition_mw:Q", title="Addition MW", format=",.2f"),
+            alt.Tooltip(f"{y_col}:Q", title=tooltip_value_title, format=",.0f"),
+            alt.Tooltip("capacity_mw:Q", title="Current MW", format=",.0f"),
         ],
-    ).properties(height=360, title="Installed capacity additions vs first selected month")
-    return apply_common_chart_style(chart, height=360)
+    )
+
+    labels = alt.Chart(monthly_totals).mark_text(
+        align="center",
+        baseline="bottom",
+        dy=-6,
+        fontSize=12,
+        fontWeight="bold",
+        color="#111827",
+    ).encode(
+        x=alt.X("month_label:N", sort=order),
+        y=alt.Y("monthly_total_mw:Q"),
+        text=alt.Text("monthly_total_mw:Q", format=",.0f"),
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Month", format="%b-%Y"),
+            alt.Tooltip("monthly_total_mw:Q", title="Total MW", format=",.0f"),
+        ],
+    )
+
+    # A zero line helps when additions include retirements / capacity reductions.
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6B7280", strokeWidth=1.2).encode(y="y:Q")
+
+    chart = alt.layer(bars, labels, zero).properties(height=390, title=chart_title)
+    return apply_common_chart_style(chart, height=390)
 
 def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None, weekly_load_df: pd.DataFrame | None = None, aemet_anomalies_df: pd.DataFrame | None = None) -> bytes:
     output = BytesIO()
@@ -2379,6 +2635,66 @@ try:
 
     # Keep the monthly table available for the Excel export, regardless of the chart aggregation selected above.
     monthly_combo = build_monthly_capture_table(price_hourly, solar_hourly)
+
+
+
+    section_header("Forward market - EEX")
+    st.caption(
+        "EEX Market Data Hub can be opened from here. For automated forward curves, use an EEX DataSource export/API subscription or upload the exported CSV/XLSX below."
+    )
+    eex_tab_hub, eex_tab_curve = st.tabs(["EEX Market Data Hub", "Forward curve data"])
+
+    with eex_tab_hub:
+        st.markdown(f"[Open EEX Market Data Hub]({EEX_MARKET_DATA_HUB_URL})")
+        st.caption("If the embedded page does not load, open the link above. Some EEX/MarketView pages block embedding for security reasons.")
+        try:
+            components.html(
+                f'<iframe src="{EEX_MARKET_DATA_HUB_URL}" width="100%" height="720" style="border:1px solid #E5E7EB; border-radius:10px;"></iframe>',
+                height=740,
+                scrolling=True,
+            )
+        except Exception:
+            st.info("The EEX page could not be embedded. Use the link above instead.")
+
+    with eex_tab_curve:
+        st.markdown(
+            "Upload a CSV/XLSX downloaded from EEX Market Data Hub / EEX DataSource. "
+            "The dashboard will try to identify contract, settlement/price, product, market and load-type columns automatically."
+        )
+        uploaded_eex = st.file_uploader(
+            "Upload EEX forward curve export (CSV/XLSX)",
+            type=["csv", "xlsx", "xls"],
+            key="eex_forward_upload",
+        )
+        eex_forward_df = load_eex_forward_market_file(uploaded_eex)
+        if eex_forward_df.empty:
+            st.info(
+                "No EEX forward curve loaded yet. Upload an EEX export here, or save one as "
+                "data/eex_forward_market.csv or data/eex_forward_market.xlsx."
+            )
+        else:
+            products = sorted(eex_forward_df["product"].dropna().astype(str).unique().tolist())
+            markets = sorted(eex_forward_df["market_area"].dropna().astype(str).unique().tolist())
+            loads = sorted(eex_forward_df["load_type"].dropna().astype(str).unique().tolist())
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                selected_products = st.multiselect("Products", products, default=products[: min(len(products), 3)], key="eex_products")
+            with c2:
+                selected_markets = st.multiselect("Market areas", markets, default=markets, key="eex_markets")
+            with c3:
+                selected_loads = st.multiselect("Load types", loads, default=loads, key="eex_load_types")
+
+            eex_plot_df = eex_forward_df[
+                eex_forward_df["product"].astype(str).isin(selected_products)
+                & eex_forward_df["market_area"].astype(str).isin(selected_markets)
+                & eex_forward_df["load_type"].astype(str).isin(selected_loads)
+            ].copy()
+            eex_chart = build_forward_market_chart(eex_plot_df)
+            if eex_chart is not None:
+                st.altair_chart(eex_chart, use_container_width=True)
+            st.dataframe(styled_df(eex_plot_df.drop(columns=["contract_sort"], errors="ignore")), use_container_width=True)
+
 
     # Selected day
     section_header("Selected day: price vs solar")
@@ -2633,7 +2949,14 @@ try:
         cap_df_year = installed_capacity[installed_capacity["datetime"].dt.year.isin(selected_cap_years)].copy()
         default_techs = [t for t in ["Solar PV", "Wind", "Hydro", "CCGT", "Nuclear"] if t in cap_df_year["technology"].unique()]
         selected_techs = st.multiselect("Technologies", sorted(cap_df_year["technology"].unique().tolist()), default=default_techs or sorted(cap_df_year["technology"].unique().tolist())[:5])
-        cap_chart = build_installed_capacity_chart(cap_df_year, selected_techs)
+        cap_view_mode = st.radio(
+            "Installed capacity view",
+            ["Additions from initial base", "Total installed evolution"],
+            index=0,
+            horizontal=True,
+            help="Additions are cumulative MW changes from the first selected month. Total installed evolution shows absolute installed MW.",
+        )
+        cap_chart = build_installed_capacity_chart(cap_df_year, selected_techs, cap_view_mode)
         if cap_chart is not None:
             st.altair_chart(cap_chart, use_container_width=True)
 
@@ -2652,8 +2975,8 @@ try:
             cap_table["Renewable capacity additions (MW)"] = pd.NA
         cap_table["% Renewable capacity"] = cap_table["Renewable capacity (MW)"] / cap_table["Total installed capacity (MW)"]
         cap_table["Month"] = cap_table["datetime"].dt.strftime("%b - %Y")
-        subtle_subsection("Installed capacity additions monthly summary")
-        st.caption("Additions are calculated against the first month selected in the Installed capacity years filter.")
+        subtle_subsection("Installed capacity monthly summary")
+        st.caption("Additions are cumulative MW changes against the first month selected in the Installed capacity years filter; absolute installed MW is kept alongside for reference.")
         st.dataframe(
             styled_df(
                 cap_table[[
