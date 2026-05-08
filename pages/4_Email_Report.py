@@ -6,8 +6,10 @@ What it does
 1) Loads historical hourly prices from /data/hourly_avg_price_since2021.xlsx.
 2) Loads live 2026 OMIE / ESIOS spot prices from indicator 600 when ESIOS_TOKEN is present.
 3) Builds:
-   - OMIE hourly price heatmap, 24 x 365, with strong green = high prices and strong red = low prices.
+   - OMIE hourly price heatmap, 24 x 365, with strong red = high prices and strong green = low prices.
    - Cumulative negative-price hours by month.
+   - Weekly load evolution from REE daily demand.
+   - Optional AEMET temperature and humidity anomaly charts.
    - Summary KPIs and monthly negative-hour table.
 4) Creates an HTML email/report and optional PNG attachments.
 5) Optional: sends the email using SMTP settings in .env.
@@ -15,6 +17,7 @@ What it does
 Expected .env variables
 -----------------------
 ESIOS_TOKEN=...
+AEMET_API_KEY=...  # Optional, only needed for --include-aemet
 
 # Optional SMTP sending
 SMTP_HOST=smtp.office365.com
@@ -29,6 +32,7 @@ Run
 ---
 python 2_Email_Report.py --year 2026 --send
 python 2_Email_Report.py --year 2026 --no-send
+python 2_Email_Report.py --year 2026 --include-aemet --no-send
 """
 
 from __future__ import annotations
@@ -69,11 +73,16 @@ LIVE_START_DATE = date(2026, 1, 1)
 HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 PRICE_INDICATOR_ID = 600
 
+REE_API_BASE = "https://apidatos.ree.es/es/datos"
+REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+AEMET_API_BASE = "https://opendata.aemet.es/opendata/api"
+AEMET_CACHE_FILE = DATA_DIR / "aemet_daily_cache.csv"
+
 # Color convention requested by user:
-# low prices = strong red; high prices = strong green.
+# low prices = strong green; high prices = strong red.
 PRICE_CMAP = LinearSegmentedColormap.from_list(
-    "price_red_to_green",
-    ["#DC2626", "#F97316", "#FDE047", "#16A34A", "#006400"],
+    "price_green_to_red",
+    ["#006400", "#16A34A", "#FDE047", "#F97316", "#DC2626"],
 )
 NEGATIVE_2025_COLOR = "#1D4ED8"
 NEGATIVE_2026_COLOR = "#059669"
@@ -84,6 +93,8 @@ class EmailReportResult:
     html_path: Path
     heatmap_path: Path
     negative_hours_path: Path
+    weekly_load_path: Path | None
+    aemet_anomalies_path: Path | None
     workbook_path: Path | None
 
 
@@ -308,6 +319,222 @@ def format_number(value, decimals: int = 2, suffix: str = "") -> str:
     return f"{value:,.{decimals}f}{suffix}"
 
 
+
+# =========================================================
+# REE WEEKLY LOAD / AEMET WEATHER ANOMALIES
+# =========================================================
+def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
+            rows.append({
+                "datetime": dt,
+                "title": str(title).strip(),
+                value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
+            })
+    return pd.DataFrame(rows)
+
+
+def fetch_ree_widget(category: str, widget: str, start_day: date, end_day: date, time_trunc: str = "day") -> dict:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": time_trunc,
+        **REE_PENINSULAR_PARAMS,
+    }
+    url = f"{REE_API_BASE}/{category}/{widget}"
+    resp = requests.get(url, params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def normalize_ree_demand_to_mwh(series: pd.Series) -> pd.Series:
+    vals = pd.to_numeric(series, errors="coerce")
+    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
+    if pd.notna(max_abs) and max_abs < 5000:
+        return vals * 1000.0
+    return vals
+
+
+def load_ree_demand_daily_history(start_day: date, end_day: date) -> pd.DataFrame:
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "demand_mwh"])
+    frames = []
+    for year in range(start_day.year, end_day.year + 1):
+        s_day = max(start_day, date(year, 1, 1))
+        e_day = min(end_day, date(year, 12, 31))
+        try:
+            payload = fetch_ree_widget("demanda", "ire-general", s_day, e_day, time_trunc="day")
+            df = parse_ree_included_series(payload, value_field="value")
+        except Exception as exc:
+            print(f"Warning: skipped REE demand {s_day} to {e_day}: {exc}")
+            continue
+        if df.empty:
+            continue
+        df["title_norm"] = df["title"].astype(str).str.lower()
+        preferred = df[df["title_norm"].str.contains("real", na=False)].copy()
+        if preferred.empty:
+            preferred = df.copy()
+        preferred["datetime"] = pd.to_datetime(preferred["datetime"], errors="coerce").dt.normalize()
+        preferred["demand_mwh"] = normalize_ree_demand_to_mwh(preferred["value"])
+        preferred = preferred.dropna(subset=["datetime", "demand_mwh"])
+        frames.append(preferred[["datetime", "demand_mwh"]])
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "demand_mwh"])
+    return pd.concat(frames, ignore_index=True).groupby("datetime", as_index=False)["demand_mwh"].sum().sort_values("datetime")
+
+
+def build_weekly_load_evolution(demand_daily: pd.DataFrame) -> pd.DataFrame:
+    cols = ["year", "week", "week_start", "weekly_load_gwh", "cum_load_gwh"]
+    if demand_daily.empty:
+        return pd.DataFrame(columns=cols)
+    tmp = demand_daily.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    iso = tmp["datetime"].dt.isocalendar()
+    tmp["year"] = iso["year"].astype(int)
+    tmp["week"] = iso["week"].astype(int)
+    tmp["week_start"] = tmp["datetime"].dt.to_period("W-SUN").dt.start_time
+    weekly = tmp.groupby(["year", "week", "week_start"], as_index=False)["demand_mwh"].sum().sort_values(["year", "week"])
+    weekly["weekly_load_gwh"] = weekly["demand_mwh"] / 1000.0
+    weekly["cum_load_gwh"] = weekly.groupby("year")["weekly_load_gwh"].cumsum()
+    return weekly[cols]
+
+
+def get_aemet_token() -> str | None:
+    token = (os.getenv("AEMET_API_KEY") or os.getenv("AEMET_TOKEN") or "").strip()
+    return token or None
+
+
+def parse_spanish_decimal(value):
+    if pd.isna(value):
+        return pd.NA
+    s0 = str(value).strip().replace(",", ".")
+    if not s0 or s0.lower() in {"nan", "none", "ip"}:
+        return pd.NA
+    try:
+        return float(s0)
+    except Exception:
+        return pd.NA
+
+
+def _aemet_indirect_get(endpoint: str, token: str) -> list[dict]:
+    url = f"{AEMET_API_BASE}/{endpoint.lstrip('/')}"
+    first = requests.get(url, params={"api_key": token}, timeout=(15, 60))
+    first.raise_for_status()
+    meta = first.json()
+    datos_url = meta.get("datos")
+    if not datos_url:
+        return []
+    second = requests.get(datos_url, timeout=(15, 120))
+    second.raise_for_status()
+    payload = second.json()
+    return payload if isinstance(payload, list) else []
+
+
+def _read_aemet_cache() -> pd.DataFrame:
+    cols = ["fecha", "indicativo", "provincia", "nombre", "tmed", "hrMedia"]
+    if not AEMET_CACHE_FILE.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(AEMET_CACHE_FILE, dtype={"indicativo": str})
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+    return df[cols].dropna(subset=["fecha"])
+
+
+def _write_aemet_cache(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    out = df.copy()
+    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out = out.drop_duplicates(subset=["fecha", "indicativo"], keep="last")
+    AEMET_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(AEMET_CACHE_FILE, index=False)
+
+
+def load_aemet_daily_all_stations(start_day: date, end_day: date, token: str) -> pd.DataFrame:
+    cols = ["fecha", "indicativo", "provincia", "nombre", "tmed", "hrMedia"]
+    if start_day > end_day:
+        return pd.DataFrame(columns=cols)
+    cache = _read_aemet_cache()
+    available_dates = set(cache["fecha"].tolist()) if not cache.empty else set()
+    needed_dates = pd.date_range(start_day, end_day, freq="D").date.tolist()
+    missing_dates = [d for d in needed_dates if d not in available_dates]
+    frames = [cache] if not cache.empty else []
+    if missing_dates:
+        chunk_start = min(missing_dates)
+        while chunk_start <= end_day:
+            if chunk_start not in missing_dates:
+                chunk_start += timedelta(days=1)
+                continue
+            chunk_end = min(chunk_start + timedelta(days=9), end_day)
+            endpoint = (
+                "valores/climatologicos/diarios/datos/"
+                f"fechaini/{chunk_start.isoformat()}T00:00:00UTC/"
+                f"fechafin/{chunk_end.isoformat()}T23:59:59UTC/"
+                "todasestaciones"
+            )
+            try:
+                rows = _aemet_indirect_get(endpoint, token)
+                if rows:
+                    raw = pd.DataFrame(rows)
+                    df = pd.DataFrame()
+                    df["fecha"] = pd.to_datetime(raw.get("fecha"), errors="coerce").dt.date
+                    df["indicativo"] = raw.get("indicativo", pd.Series(dtype=str)).astype(str)
+                    df["provincia"] = raw.get("provincia", pd.Series(dtype=str)).astype(str)
+                    df["nombre"] = raw.get("nombre", pd.Series(dtype=str)).astype(str)
+                    df["tmed"] = raw.get("tmed", pd.Series(dtype=object)).map(parse_spanish_decimal)
+                    if "hrMedia" in raw.columns:
+                        df["hrMedia"] = raw["hrMedia"].map(parse_spanish_decimal)
+                    elif "hrmedia" in raw.columns:
+                        df["hrMedia"] = raw["hrmedia"].map(parse_spanish_decimal)
+                    else:
+                        df["hrMedia"] = pd.NA
+                    df = df.dropna(subset=["fecha", "indicativo"])
+                    frames.append(df[cols])
+            except Exception as exc:
+                print(f"Warning: skipped AEMET {chunk_start} to {chunk_end}: {exc}")
+            sleep(0.35)
+            chunk_start = chunk_end + timedelta(days=1)
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    out = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["fecha", "indicativo"], keep="last")
+    _write_aemet_cache(out[cols])
+    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce")
+    return out[(out["fecha"].dt.date >= start_day) & (out["fecha"].dt.date <= end_day)][cols]
+
+
+def build_aemet_weekly_anomalies(current_df: pd.DataFrame, baseline_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["week_start", "tmed_actual", "tmed_normal", "temperature_anomaly_c", "humidity_actual", "humidity_normal", "humidity_anomaly_pp", "stations_count"]
+    if current_df.empty or baseline_df.empty:
+        return pd.DataFrame(columns=cols)
+    cur, base = current_df.copy(), baseline_df.copy()
+    for df in [cur, base]:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        df["tmed"] = pd.to_numeric(df["tmed"], errors="coerce")
+        df["hrMedia"] = pd.to_numeric(df["hrMedia"], errors="coerce")
+        df["doy"] = df["fecha"].dt.dayofyear
+    cur_daily = cur.groupby("fecha", as_index=False).agg(tmed_actual=("tmed", "mean"), humidity_actual=("hrMedia", "mean"), stations_count=("indicativo", "nunique"))
+    cur_daily["doy"] = cur_daily["fecha"].dt.dayofyear
+    base_daily = base.groupby(["fecha", "doy"], as_index=False).agg(tmed=("tmed", "mean"), hrMedia=("hrMedia", "mean"))
+    normals = base_daily.groupby("doy", as_index=False).agg(tmed_normal=("tmed", "mean"), humidity_normal=("hrMedia", "mean"))
+    merged = cur_daily.merge(normals, on="doy", how="left")
+    merged["temperature_anomaly_c"] = merged["tmed_actual"] - merged["tmed_normal"]
+    merged["humidity_anomaly_pp"] = merged["humidity_actual"] - merged["humidity_normal"]
+    merged["week_start"] = merged["fecha"].dt.to_period("W-SUN").dt.start_time
+    weekly = merged.groupby("week_start", as_index=False).agg(tmed_actual=("tmed_actual", "mean"), tmed_normal=("tmed_normal", "mean"), temperature_anomaly_c=("temperature_anomaly_c", "mean"), humidity_actual=("humidity_actual", "mean"), humidity_normal=("humidity_normal", "mean"), humidity_anomaly_pp=("humidity_anomaly_pp", "mean"), stations_count=("stations_count", "mean"))
+    return weekly[cols].sort_values("week_start")
+
 # =========================================================
 # CHARTS
 # =========================================================
@@ -402,6 +629,50 @@ def save_cumulative_negative_hours_chart(cum_df: pd.DataFrame, output_path: Path
     return output_path
 
 
+
+
+def save_weekly_load_chart(weekly_load: pd.DataFrame, output_path: Path, years: list[int] | None = None) -> Path | None:
+    if weekly_load.empty:
+        return None
+    plot = weekly_load.copy()
+    if years:
+        plot = plot[plot["year"].isin(years)].copy()
+    if plot.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(12, 5.8))
+    for year, group in plot.groupby("year"):
+        group = group.sort_values("week")
+        ax.plot(group["week"], group["weekly_load_gwh"], marker="o", linewidth=2.4, label=str(year))
+    ax.set_title("Weekly load evolution by ISO week", fontsize=14)
+    ax.set_xlabel("ISO week")
+    ax.set_ylabel("Weekly load (GWh)")
+    ax.grid(axis="y", alpha=0.28)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_aemet_anomalies_chart(anom_df: pd.DataFrame, output_path: Path) -> Path | None:
+    if anom_df.empty:
+        return None
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8.0), sharex=True)
+    axes[0].plot(anom_df["week_start"], anom_df["temperature_anomaly_c"], marker="o", linewidth=2.4, color="#DC2626")
+    axes[0].axhline(0, color="#6B7280", linestyle="--", linewidth=1)
+    axes[0].set_title("AEMET weekly temperature anomaly vs baseline", fontsize=13)
+    axes[0].set_ylabel("Temp anomaly (°C)")
+    axes[0].grid(axis="y", alpha=0.28)
+    axes[1].plot(anom_df["week_start"], anom_df["humidity_anomaly_pp"], marker="o", linewidth=2.4, color="#059669")
+    axes[1].axhline(0, color="#6B7280", linestyle="--", linewidth=1)
+    axes[1].set_title("AEMET weekly relative humidity anomaly vs baseline", fontsize=13)
+    axes[1].set_ylabel("Humidity anomaly (pp)")
+    axes[1].grid(axis="y", alpha=0.28)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
 def image_to_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("utf-8")
 
@@ -414,9 +685,13 @@ def build_html_report(
     cum_df: pd.DataFrame,
     heatmap_path: Path,
     negative_hours_path: Path,
+    weekly_load_path: Path | None = None,
+    aemet_anomalies_path: Path | None = None,
 ) -> str:
     heatmap_b64 = image_to_base64(heatmap_path)
     negative_b64 = image_to_base64(negative_hours_path)
+    weekly_b64 = image_to_base64(weekly_load_path) if weekly_load_path and weekly_load_path.exists() else None
+    aemet_b64 = image_to_base64(aemet_anomalies_path) if aemet_anomalies_path and aemet_anomalies_path.exists() else None
 
     monthly_table = cum_df.copy()
     if not monthly_table.empty:
@@ -474,7 +749,7 @@ def build_html_report(
 
     <div class="section">
       <h2>OMIE hourly price heatmap (24x365)</h2>
-      <p class="caption">Color scale: strong red = very low spot prices; yellow/orange = medium prices; strong green = very high spot prices. Missing/future hours are shown as blank/light background.</p>
+      <p class="caption">Color scale: strong green = very low spot prices; yellow/orange = medium prices; strong red = very high spot prices. Missing/future hours are shown as blank/light background.</p>
       <img src="data:image/png;base64,{heatmap_b64}" alt="OMIE hourly price heatmap">
     </div>
 
@@ -484,6 +759,10 @@ def build_html_report(
       <img src="data:image/png;base64,{negative_b64}" alt="Cumulative negative price hours">
       {monthly_html}
     </div>
+
+    {f'<div class="section"><h2>Weekly load evolution</h2><p class="caption">REE daily peninsular demand aggregated by ISO week.</p><img src="data:image/png;base64,{weekly_b64}" alt="Weekly load evolution"></div>' if weekly_b64 else ''}
+
+    {f'<div class="section"><h2>AEMET weather anomalies</h2><p class="caption">Simple Spain-wide AEMET station average vs selected baseline years. Humidity anomaly is in percentage points.</p><img src="data:image/png;base64,{aemet_b64}" alt="AEMET weather anomalies"></div>' if aemet_b64 else ''}
   </div>
 </body>
 </html>
@@ -535,7 +814,7 @@ def send_email(html: str, attachments: list[Path]) -> None:
 # =========================================================
 # MAIN
 # =========================================================
-def build_email_report(year: int, send: bool = False) -> EmailReportResult:
+def build_email_report(year: int, send: bool = False, include_aemet: bool = False, baseline_years: list[int] | None = None) -> EmailReportResult:
     token = require_esios_token()
     hist_prices = load_historical_prices()
     live_prices = load_live_prices(year, token)
@@ -563,21 +842,58 @@ def build_email_report(year: int, send: bool = False) -> EmailReportResult:
     save_hourly_price_heatmap(price_hourly, year, heatmap_path)
     save_cumulative_negative_hours_chart(cum_df, negative_hours_path)
 
+    # Weekly load evolution from REE daily demand.
+    weekly_load_path = OUTPUT_DIR / f"weekly_load_evolution_{year}.png"
+    demand_daily = load_ree_demand_daily_history(date(max(2021, year - 2), 1, 1), min(date(year, 12, 31), datetime.now(MADRID_TZ).date()))
+    weekly_load_df = build_weekly_load_evolution(demand_daily)
+    save_weekly_load_chart(weekly_load_df, weekly_load_path, years=[y for y in [year - 2, year - 1, year] if y >= 2021])
+
+    # Optional AEMET weather anomalies. This can be slow the first time because AEMET requests are chunked and cached.
+    aemet_anomalies_path = None
+    aemet_anomalies_df = pd.DataFrame()
+    if include_aemet:
+        aemet_token = get_aemet_token()
+        if aemet_token:
+            current_end = min(datetime.now(MADRID_TZ).date(), date(year, 12, 31))
+            current_start = date(year, 1, 1)
+            baseline_years = baseline_years or list(range(max(2016, year - 5), year))
+            current_weather = load_aemet_daily_all_stations(current_start, current_end, aemet_token)
+            baseline_frames = []
+            for byear in baseline_years:
+                baseline_frames.append(load_aemet_daily_all_stations(date(byear, 1, 1), min(date(byear, current_end.month, current_end.day), date(byear, 12, 31)), aemet_token))
+            baseline_weather = pd.concat(baseline_frames, ignore_index=True) if baseline_frames else pd.DataFrame()
+            aemet_anomalies_df = build_aemet_weekly_anomalies(current_weather, baseline_weather)
+            aemet_anomalies_path = OUTPUT_DIR / f"aemet_weather_anomalies_{year}.png"
+            save_aemet_anomalies_chart(aemet_anomalies_df, aemet_anomalies_path)
+        else:
+            print("Warning: --include-aemet requested but AEMET_API_KEY/AEMET_TOKEN was not found in .env")
+
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
         price_hourly[price_hourly["datetime"].dt.year == year].to_excel(writer, index=False, sheet_name="hourly_prices")
         cum_df.to_excel(writer, index=False, sheet_name="negative_hours")
         pd.DataFrame([metrics]).to_excel(writer, index=False, sheet_name="summary")
+        if not weekly_load_df.empty:
+            weekly_load_df.to_excel(writer, index=False, sheet_name="weekly_load")
+        if not aemet_anomalies_df.empty:
+            aemet_anomalies_df.to_excel(writer, index=False, sheet_name="aemet_anomalies")
 
-    html = build_html_report(metrics, cum_df, heatmap_path, negative_hours_path)
+    html = build_html_report(metrics, cum_df, heatmap_path, negative_hours_path, weekly_load_path=weekly_load_path, aemet_anomalies_path=aemet_anomalies_path)
     html_path.write_text(html, encoding="utf-8")
 
     if send:
-        send_email(html, [heatmap_path, negative_hours_path, workbook_path])
+        attachments = [heatmap_path, negative_hours_path, workbook_path]
+        if weekly_load_path and weekly_load_path.exists():
+            attachments.append(weekly_load_path)
+        if aemet_anomalies_path and aemet_anomalies_path.exists():
+            attachments.append(aemet_anomalies_path)
+        send_email(html, attachments)
 
     return EmailReportResult(
         html_path=html_path,
         heatmap_path=heatmap_path,
         negative_hours_path=negative_hours_path,
+        weekly_load_path=weekly_load_path if weekly_load_path.exists() else None,
+        aemet_anomalies_path=aemet_anomalies_path if aemet_anomalies_path and aemet_anomalies_path.exists() else None,
         workbook_path=workbook_path,
     )
 
@@ -587,14 +903,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--year", type=int, default=datetime.now(MADRID_TZ).year, help="Report year, e.g. 2026")
     parser.add_argument("--send", action="store_true", help="Send email using SMTP settings in .env")
     parser.add_argument("--no-send", action="store_true", help="Build files but do not send email")
+    parser.add_argument("--include-aemet", action="store_true", help="Include AEMET temperature/humidity anomaly charts; requires AEMET_API_KEY in .env")
+    parser.add_argument("--baseline-years", type=str, default="", help="Comma-separated AEMET baseline years, e.g. 2021,2022,2023,2024,2025")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    result = build_email_report(year=args.year, send=bool(args.send and not args.no_send))
+    baseline_years = [int(x.strip()) for x in args.baseline_years.split(",") if x.strip()] or None
+    result = build_email_report(year=args.year, send=bool(args.send and not args.no_send), include_aemet=args.include_aemet, baseline_years=baseline_years)
     print("Email report generated:")
     print(f"  HTML: {result.html_path}")
     print(f"  Heatmap: {result.heatmap_path}")
     print(f"  Negative hours chart: {result.negative_hours_path}")
+    print(f"  Weekly load chart: {result.weekly_load_path}")
+    print(f"  AEMET anomalies chart: {result.aemet_anomalies_path}")
     print(f"  Workbook: {result.workbook_path}")
