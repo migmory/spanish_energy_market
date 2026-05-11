@@ -513,7 +513,7 @@ def build_curve_chart(df: pd.DataFrame, title: str):
             sort=order,
             axis=alt.Axis(title="Delivery period", labelAngle=-35),
         ),
-        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=True)),
         color=alt.Color("series:N", title=None, scale=color_scale),
         tooltip=[
             alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
@@ -539,7 +539,7 @@ def build_time_evolution_chart(df: pd.DataFrame, contract: str, title: str):
         return None
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
         x=alt.X("market_date:T", title=None, axis=alt.Axis(format="%d-%b", labelAngle=0)),
-        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=True)),
         tooltip=[
             alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
             alt.Tooltip("contract:N", title="Contract"),
@@ -571,7 +571,7 @@ def build_time_evolution_by_delivery_chart(df: pd.DataFrame, delivery_label: str
     )
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("market_date:T", title="Market date", axis=alt.Axis(format="%d-%b", labelAngle=0)),
-        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=True)),
         color=alt.Color("series:N", title=None, scale=color_scale),
         tooltip=[
             alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
@@ -609,23 +609,47 @@ def dataframe_to_excel_bytes(data: pd.DataFrame, debug: pd.DataFrame | None = No
 section_header("OMIP live forward curve")
 st.caption(
     "Uses the same approach as your working Python scripts: requests.get(...) + pd.read_html(io.StringIO(html)). "
-    "For date ranges, select the delivery period once and both Baseload and Solar curves are overlaid where available."
+    "In date-range mode, choose one delivery period (for example YR28) and the chart overlays Baseload and Solar."
 )
 
 c1, c2, c3 = st.columns(3)
 with c1:
     mode = st.radio("Mode", ["Single date", "Date range"], horizontal=True)
-    asof = st.date_input("Market date (OMIP published curve date)", value=date.today())
-    st.caption("Market date = date used in the OMIP URL to retrieve the published forward curve, not the delivery year.")
-    start_date = st.date_input("Start market date", value=date.today() - timedelta(days=7))
-    end_date = st.date_input("End market date", value=date.today())
+
+    if mode == "Single date":
+        asof = st.date_input(
+            "Market date (OMIP published curve date)",
+            value=date.today(),
+            key="omip_single_market_date",
+        )
+        start_date = None
+        end_date = None
+        st.caption("Market date = date used in the OMIP URL to retrieve the published forward curve, not the delivery year.")
+    else:
+        asof = None
+        start_date = st.date_input(
+            "Start market date",
+            value=date.today() - timedelta(days=7),
+            key="omip_range_start_date",
+        )
+        end_date = st.date_input(
+            "End market date",
+            value=date.today(),
+            key="omip_range_end_date",
+        )
+        st.caption("Start/end market dates = publication dates used in the OMIP URL range.")
+
 with c2:
     product_label = st.selectbox("Product", list(PRODUCTS.keys()), index=0)
     zone_label = st.selectbox("Zone", list(ZONES.keys()), index=0)
     maturity_label = st.selectbox("Maturity filter", list(MATURITY_FILTERS.keys()), index=list(MATURITY_FILTERS.keys()).index("Year"))
 with c3:
     curve_choice = st.multiselect("Curves", ["Baseload", "Solar"], default=["Baseload", "Solar"])
-    include_maturity_param = st.checkbox("Send maturity parameter to OMIP URL", value=False, help="Off by default because the scripts that work do not send maturity; they filter after reading the page.")
+    include_maturity_param = st.checkbox(
+        "Send maturity parameter to OMIP URL",
+        value=False,
+        help="Off by default because the scripts that work do not send maturity; they filter after reading the page.",
+    )
     pull = st.button("Pull OMIP prices", type="primary")
 
 product = PRODUCTS[product_label]
@@ -639,68 +663,120 @@ if "Solar" in curve_choice:
     selected_instruments["Solar"] = "FTS"
 
 sample_instrument = next(iter(selected_instruments.values()), "FTB")
-st.markdown(f"[Open OMIP page]({omip_url(asof.strftime('%Y-%m-%d'), product, zone, sample_instrument, include_maturity_param, maturity_param)})")
+link_date = asof if mode == "Single date" else start_date
+if link_date is not None:
+    st.markdown(
+        f"[Open OMIP page]({omip_url(link_date.strftime('%Y-%m-%d'), product, zone, sample_instrument, include_maturity_param, maturity_param)})"
+    )
 
+# Persist the latest pulled dataset in session_state. Without this, selecting a different
+# delivery period triggers a Streamlit rerun and the chart disappears because the previous
+# pull result only existed inside the button-click run.
 if pull:
     if not selected_instruments:
         st.warning("Select at least one curve.")
+    elif mode == "Date range" and (start_date is None or end_date is None or start_date > end_date):
+        st.warning("Please select a valid date range.")
     else:
         if mode == "Single date":
             data, debug, raw_tables = fetch_and_parse_day(asof, product, zone, selected_instruments, include_maturity_param, maturity_param)
+            result_label = f"Market date {asof.isoformat()}"
         else:
             data, debug = fetch_and_parse_range(start_date, end_date, product, zone, selected_instruments, include_maturity_param, maturity_param)
             raw_tables = {}
+            result_label = f"Market dates {start_date.isoformat()} to {end_date.isoformat()}"
 
         if not data.empty:
             data = filter_maturity(data, maturity_filter)
 
-        if data.empty:
-            st.warning("OMIP page(s) were reachable or attempted, but no curve rows could be parsed for the selected filters.")
+        st.session_state["omip_forward_result"] = {
+            "data": data,
+            "debug": debug,
+            "raw_tables": raw_tables,
+            "mode": mode,
+            "zone_label": zone_label,
+            "zone": zone,
+            "product": product,
+            "maturity_label": maturity_label,
+            "result_label": result_label,
+            "pulled_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+result = st.session_state.get("omip_forward_result")
+if result is not None:
+    data = result.get("data", pd.DataFrame())
+    debug = result.get("debug", pd.DataFrame())
+    raw_tables = result.get("raw_tables", {})
+    result_mode = result.get("mode", mode)
+    result_zone_label = result.get("zone_label", zone_label)
+    result_zone = result.get("zone", zone)
+    result_product = result.get("product", product)
+    result_maturity_label = result.get("maturity_label", maturity_label)
+    result_label = result.get("result_label", "")
+
+    if data.empty:
+        st.warning("OMIP page(s) were reachable or attempted, but no curve rows could be parsed for the selected filters.")
+        if debug is not None and not debug.empty:
             st.dataframe(debug, use_container_width=True)
-            st.download_button(
-                "Download debug Excel",
-                data=dataframe_to_excel_bytes(data, debug, raw_tables),
-                file_name=f"omip_debug_{zone}_{asof.isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        st.download_button(
+            "Download debug Excel",
+            data=dataframe_to_excel_bytes(data, debug, raw_tables),
+            file_name=f"omip_debug_{result_zone}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.success(f"Loaded {len(data)} OMIP rows. Latest pull: {result_label}.")
+        if result_mode == "Single date":
+            chart = build_curve_chart(
+                data,
+                f"OMIP {result_zone_label} forward curve | {result_label} | {result_maturity_label}",
             )
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True)
         else:
-            st.success(f"Loaded {len(data)} OMIP rows.")
-            if mode == "Single date":
-                chart = build_curve_chart(data, f"OMIP {zone_label} forward curve | Market date {asof.isoformat()} | {maturity_label}")
-                if chart is not None:
-                    st.altair_chart(chart, use_container_width=True)
-            else:
-                delivery_options = (
-                    data[["delivery_label", "sort_key"]]
-                    .drop_duplicates()
-                    .sort_values("sort_key")["delivery_label"]
-                    .tolist()
+            delivery_options = (
+                data[["delivery_label", "sort_key"]]
+                .drop_duplicates()
+                .sort_values("sort_key")["delivery_label"]
+                .tolist()
+            )
+            if delivery_options:
+                selected_delivery = st.selectbox(
+                    "Delivery period to plot over time",
+                    delivery_options,
+                    key="omip_delivery_period_over_time",
                 )
-                selected_delivery = st.selectbox("Delivery period to plot over time", delivery_options)
                 chart = build_time_evolution_by_delivery_chart(
                     data,
                     selected_delivery,
-                    f"OMIP {zone_label} {selected_delivery} evolution | Baseload vs Solar",
+                    f"OMIP {result_zone_label} {selected_delivery} evolution | Baseload vs Solar",
                 )
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
                 else:
                     st.warning("No data available for the selected delivery period.")
+            else:
+                st.warning("No delivery periods found in the pulled dataset.")
 
-            display_cols = [
-                "market_date", "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price",
-                "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest",
-                "nr_contracts", "otc_volume_mwh", "session_volume_mwh",
-            ]
-            st.dataframe(styled_df(data[[c for c in display_cols if c in data.columns]]), use_container_width=True)
-            with st.expander("Debug"):
+        display_cols = [
+            "market_date", "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price",
+            "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest",
+            "nr_contracts", "otc_volume_mwh", "session_volume_mwh",
+        ]
+        st.dataframe(styled_df(data[[c for c in display_cols if c in data.columns]]), use_container_width=True)
+        with st.expander("Debug"):
+            if debug is not None and not debug.empty:
                 st.dataframe(debug, use_container_width=True)
-            st.download_button(
-                "Download OMIP parsed Excel",
-                data=dataframe_to_excel_bytes(data, debug, raw_tables),
-                file_name=f"omip_{zone}_{product}_{mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            else:
+                st.info("No debug rows for the latest pull.")
+        st.download_button(
+            "Download OMIP parsed Excel",
+            data=dataframe_to_excel_bytes(data, debug, raw_tables),
+            file_name=f"omip_{result_zone}_{result_product}_{result_mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+else:
+    st.info("Select the OMIP parameters and click Pull OMIP prices.")
 
 section_header("Upload OMIP Excel fallback")
 st.caption("Upload an Excel produced by your working script. The app will parse the Baseload / Solar sheets and chart the contracts.")
