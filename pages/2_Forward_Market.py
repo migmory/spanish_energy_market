@@ -291,6 +291,24 @@ def contract_sort_key(contract: str) -> int:
     return 99999999
 
 
+def delivery_label_from_contract(contract: str) -> str:
+    """Return a common delivery label shared by Baseload/Solar, e.g. FTB YR-27 and FTS YR-27 -> YR27."""
+    c = normalize_str(contract)
+    m = re.search(r"\bYR-(\d{2})", c)
+    if m:
+        return f"YR{m.group(1)}"
+    m = re.search(r"\bQ([1-4])-(\d{2})", c)
+    if m:
+        return f"Q{m.group(1)}-{m.group(2)}"
+    m = re.search(r"\bM\s+([A-Za-z]{3})-(\d{2})", c)
+    if m:
+        return f"{m.group(1).title()}-{m.group(2)}"
+    m = re.search(r"\b(?:W|WK)(\d{1,2})-(\d{2})", c)
+    if m:
+        return f"WK{int(m.group(1)):02d}-{m.group(2)}"
+    return re.sub(r"^(FTB|FTS|FTP|FWB|SWB)\s+", "", c).replace("-", "") or c
+
+
 def parse_raw_tables_to_contracts(tables: list[pd.DataFrame], asof: date, sheet_name: str, instrument: str) -> pd.DataFrame:
     rows: list[dict] = []
     for table_id, table in enumerate(tables, start=1):
@@ -377,10 +395,11 @@ def parse_raw_tables_to_contracts(tables: list[pd.DataFrame], asof: date, sheet_
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=[
-            "market_date", "sheet", "instrument", "contract", "maturity", "curve_price",
+            "market_date", "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price",
             "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest", "sort_key"
         ])
     out["sort_key"] = out["contract"].map(contract_sort_key)
+    out["delivery_label"] = out["contract"].map(delivery_label_from_contract)
     out = out.drop_duplicates(subset=["market_date", "sheet", "instrument", "contract"], keep="last")
     return out.sort_values(["sheet", "sort_key", "contract"]).reset_index(drop=True)
 
@@ -476,19 +495,30 @@ def build_curve_chart(df: pd.DataFrame, title: str):
         return None
     plot = df.copy()
     plot["series"] = plot["sheet"].astype(str)
-    plot["contract_label"] = plot["contract"].astype(str)
-    order = plot.sort_values("sort_key")["contract_label"].drop_duplicates().tolist()
+    if "delivery_label" not in plot.columns:
+        plot["delivery_label"] = plot["contract"].map(delivery_label_from_contract)
+    order = (
+        plot[["delivery_label", "sort_key"]]
+        .drop_duplicates()
+        .sort_values("sort_key")["delivery_label"]
+        .tolist()
+    )
     color_scale = alt.Scale(
         domain=["Baseload", "Solar"],
         range=[BLUE_PRICE, YELLOW_PRICE],
     )
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("contract_label:N", sort=order, axis=alt.Axis(title=None, labelAngle=-35)),
+        x=alt.X(
+            "delivery_label:N",
+            sort=order,
+            axis=alt.Axis(title="Delivery period", labelAngle=-35),
+        ),
         y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
         color=alt.Color("series:N", title=None, scale=color_scale),
         tooltip=[
             alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
             alt.Tooltip("sheet:N", title="Curve"),
+            alt.Tooltip("delivery_label:N", title="Delivery period"),
             alt.Tooltip("contract:N", title="Contract"),
             alt.Tooltip("curve_price:Q", title="Curve price €/MWh", format=",.2f"),
             alt.Tooltip("d_price:Q", title="D €/MWh", format=",.2f"),
@@ -563,7 +593,8 @@ Your standalone `.py` works because your local environment has the HTML parser i
 c1, c2, c3 = st.columns(3)
 with c1:
     mode = st.radio("Mode", ["Single date", "Date range"], horizontal=True)
-    asof = st.date_input("Market date", value=date.today())
+    asof = st.date_input("Market date (OMIP published curve date)", value=date.today())
+    st.caption("Market date = date used in the OMIP URL to retrieve the published forward curve, not the delivery year.")
     start_date = st.date_input("Start date", value=date.today() - timedelta(days=7))
     end_date = st.date_input("End date", value=date.today())
 with c2:
@@ -613,7 +644,7 @@ if pull:
         else:
             st.success(f"Loaded {len(data)} OMIP rows.")
             if mode == "Single date":
-                chart = build_curve_chart(data, f"OMIP {zone_label} forward curve | {asof.isoformat()} | {maturity_label}")
+                chart = build_curve_chart(data, f"OMIP {zone_label} forward curve | Market date {asof.isoformat()} | {maturity_label}")
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
             else:
@@ -624,7 +655,7 @@ if pull:
                     st.altair_chart(chart, use_container_width=True)
 
             display_cols = [
-                "market_date", "sheet", "instrument", "contract", "maturity", "curve_price",
+                "market_date", "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price",
                 "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest",
                 "nr_contracts", "otc_volume_mwh", "session_volume_mwh",
             ]
@@ -653,7 +684,7 @@ if file is not None:
             if chart is not None:
                 st.altair_chart(chart, use_container_width=True)
             display_cols = [
-                "sheet", "instrument", "contract", "maturity", "curve_price", "d_price", "d_minus_1",
+                "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price", "d_price", "d_minus_1",
                 "best_bid", "best_ask", "last_price", "open_interest", "nr_contracts"
             ]
             st.dataframe(styled_df(uploaded[[c for c in display_cols if c in uploaded.columns]]), use_container_width=True)
