@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import html
+import io
 import re
-from datetime import date, timedelta
-from html.parser import HTMLParser
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import urlencode
 
 import altair as alt
@@ -28,8 +26,8 @@ st.title("Forward Market - OMIP")
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
 BLUE_PRICE = "#1D4ED8"
-YELLOW_DARK = "#D97706"
-GREY_SHADE = "#F3F4F6"
+YELLOW_PRICE = "#FACC15"
+GREY = "#6B7280"
 OMIP_BASE_URL = "https://www.omip.pt/en/dados-mercado"
 
 PRODUCTS = {
@@ -47,51 +45,32 @@ ZONES = {
 }
 
 INSTRUMENTS = {
-    "SPEL Base Futures": "FTB",
-    "SPEL Peak Futures": "FTP",
-    "SPEL Base Forwards": "FWB",
-    "SPEL Base Swaps": "SWB",
-    "SPEL Solar Futures": "FTS",
+    "Baseload - FTB": "FTB",
+    "Solar - FTS": "FTS",
+    "Peak - FTP": "FTP",
+    "Base Forward - FWB": "FWB",
+    "Base Swap - SWB": "SWB",
 }
 
+# User-facing maturity filters. OMIP page can be requested without maturity;
+# the parser then filters the contracts we care about.
 MATURITY_FILTERS = {
     "All": None,
-    "Day": "DAY",
+    "Day": "D",
     "Weekend": "WE",
-    "Week": "WK",
-    "Month": "MTH",
-    "Quarter": "QTR",
+    "Week": "W",
+    "Month": "M",
+    "Quarter": "Q",
     "Year": "YR",
     "PPA": "PPA",
 }
 
 TABLE_HEADER_FONT_PCT = "135%"
 TABLE_BODY_FONT_PCT = "108%"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept-Language": "en-GB,en;q=0.9,es;q=0.8",
-    "Referer": "https://www.omip.pt/",
-}
 WS_RE = re.compile(r"\s+", re.UNICODE)
 
-# Expected OMIP columns after the contract name. The public table layout can move,
-# but these names match the scripts that successfully extract OMIP with pd.read_html.
-OMIP_VALUE_COLUMNS = [
-    "Best bid (€/MWh)",
-    "Best Ask (€/MWh)",
-    "Session volume (MWh)",
-    "Last price (€/MWh)",
-    "Last time",
-    "Last volume (MWh)",
-    "Open Interest",
-    "Nr of Contracts",
-    "OTC volume (MWh)",
-    "D (€/MWh)",
-    "D-1 (€/MWh)",
-]
-
 # =========================================================
-# STYLE HELPERS
+# DISPLAY HELPERS
 # =========================================================
 def section_header(title: str) -> None:
     st.markdown(
@@ -142,7 +121,7 @@ def styled_df(df: pd.DataFrame):
     )
 
 
-def apply_common_chart_style(chart, height: int = 420):
+def apply_common_chart_style(chart, height: int = 390):
     return (
         chart.properties(height=height)
         .configure_view(stroke="#E5E7EB", fill="white")
@@ -166,121 +145,75 @@ def apply_common_chart_style(chart, height: int = 420):
     )
 
 # =========================================================
-# HTML TABLE PARSER WITHOUT lxml
+# OMIP FETCH - SAME STYLE AS WORKING SCRIPT
 # =========================================================
-class SimpleTableParser(HTMLParser):
-    """Tiny stdlib HTML table extractor.
-
-    This avoids pandas.read_html(), so Streamlit Cloud does not need lxml.
-    It extracts text from <table>/<tr>/<td>/<th> into a list of tables.
-    """
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.tables: list[list[list[str]]] = []
-        self._in_table = False
-        self._in_row = False
-        self._in_cell = False
-        self._current_table: list[list[str]] = []
-        self._current_row: list[str] = []
-        self._current_cell: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs):
-        tag = tag.lower()
-        if tag == "table":
-            self._in_table = True
-            self._current_table = []
-        elif self._in_table and tag == "tr":
-            self._in_row = True
-            self._current_row = []
-        elif self._in_table and self._in_row and tag in {"td", "th"}:
-            self._in_cell = True
-            self._current_cell = []
-        elif self._in_cell and tag in {"br", "p", "div", "span"}:
-            self._current_cell.append(" ")
-
-    def handle_endtag(self, tag: str):
-        tag = tag.lower()
-        if self._in_cell and tag in {"td", "th"}:
-            value = normalize_scalar("".join(self._current_cell))
-            self._current_row.append(value)
-            self._current_cell = []
-            self._in_cell = False
-        elif self._in_table and self._in_row and tag == "tr":
-            if any(x.strip() for x in self._current_row):
-                self._current_table.append(self._current_row)
-            self._current_row = []
-            self._in_row = False
-        elif self._in_table and tag == "table":
-            if self._current_table:
-                self.tables.append(self._current_table)
-            self._current_table = []
-            self._in_table = False
-
-    def handle_data(self, data: str):
-        if self._in_cell:
-            self._current_cell.append(data)
-
-
-def normalize_scalar(value) -> str:
-    s = html.unescape(str(value))
-    s = s.replace("\xa0", " ").replace("\u202f", " ").replace("\ufeff", "")
-    s = WS_RE.sub(" ", s).strip()
-    return s
-
-
-def normalize_text_series(s: pd.Series) -> pd.Series:
-    return s.astype(str).map(normalize_scalar)
-
-
-def tables_from_html_no_lxml(raw_html: str) -> list[pd.DataFrame]:
-    parser = SimpleTableParser()
-    parser.feed(raw_html)
-    dfs: list[pd.DataFrame] = []
-
-    for rows in parser.tables:
-        if not rows:
-            continue
-        max_len = max(len(r) for r in rows)
-        padded = [r + [""] * (max_len - len(r)) for r in rows]
-        df = pd.DataFrame(padded)
-        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        if not df.empty:
-            dfs.append(df)
-    return dfs
-
-# =========================================================
-# OMIP PARSING
-# =========================================================
-def build_omip_url(asof: date, product: str, zone: str, instrument: str, maturity: str | None = None) -> str:
-    # Important: the working extraction scripts did not need maturity in the request.
-    # We include it only if explicitly selected, but we also parse/filter after download.
+def omip_url(date_str: str, product: str, zone: str, instrument: str, include_maturity_param: bool = False, maturity: str | None = None) -> str:
     params = {
-        "date": asof.isoformat(),
+        "date": date_str,
         "product": product,
         "zone": zone,
         "instrument": instrument,
     }
-    if maturity and maturity != "ALL":
+    # The local scripts that worked did NOT pass maturity in the request.
+    # Keep it optional for testing, but off by default.
+    if include_maturity_param and maturity and maturity != "ALL":
         params["maturity"] = maturity
     return f"{OMIP_BASE_URL}?{urlencode(params)}"
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def fetch_omip_html(asof: date, product: str, zone: str, instrument: str, maturity: str | None = None) -> tuple[str, str]:
-    url = build_omip_url(asof, product, zone, instrument, maturity)
-    resp = requests.get(url, headers=HEADERS, timeout=(15, 60))
-    resp.raise_for_status()
-    return resp.text, url
+def fetch_tables(date_str: str, product: str, zone: str, instrument: str, include_maturity_param: bool = False, maturity: str | None = None) -> tuple[list[pd.DataFrame], str]:
+    url = omip_url(date_str, product, zone, instrument, include_maturity_param, maturity)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-GB,en;q=0.9,es;q=0.8",
+        "Referer": "https://www.omip.pt/",
+    }
+    r = requests.get(url, headers=headers, timeout=60)
+    r.raise_for_status()
+    html = r.text
+
+    # CLAVE: exactly as your working scripts do it.
+    # On Streamlit Cloud, make sure lxml is in requirements.txt.
+    # If lxml is not installed, pandas raises: ImportError: lxml not found.
+    tables = pd.read_html(io.StringIO(html))
+    return tables, url
+
+
+def daterange(d0: date, d1: date):
+    d = d0
+    while d <= d1:
+        yield d
+        d += timedelta(days=1)
+
+
+def concat_tables(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    blocks = []
+    for i, df in enumerate(tables, start=1):
+        temp = df.copy()
+        temp.insert(0, "table_id", i)
+        blocks.append(temp)
+        blocks.append(pd.DataFrame([{}]))
+    return pd.concat(blocks, ignore_index=True) if blocks else pd.DataFrame()
+
+# =========================================================
+# PARSING
+# =========================================================
+def normalize_str(x) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x)
+    s = s.replace("\xa0", " ").replace("\u202f", " ").replace("\ufeff", "")
+    s = WS_RE.sub(" ", s).strip()
+    return s
 
 
 def parse_num(value) -> float | None:
-    if value is None:
-        return None
-    s = normalize_scalar(value)
-    if not s or s.lower() in {"n.a.", "n.a", "na", "nan", "none", "-", "—"}:
+    s = normalize_str(value)
+    if not s or s.lower() in {"n.a.", "na", "nan", "none", "-", ""}:
         return None
     s = s.replace("€", "").replace("/MWh", "").replace("MWh", "").replace(" ", "")
+    # Decimal comma support; thousands comma support.
     if "," in s and "." not in s:
         s = s.replace(",", ".")
     else:
@@ -294,278 +227,315 @@ def parse_num(value) -> float | None:
 def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [" | ".join([str(x) for x in tup if str(x) != "nan"]).strip() for tup in out.columns]
-    else:
-        out.columns = [str(c).strip() for c in out.columns]
+        out.columns = [
+            " | ".join([str(x) for x in tup if str(x) != "nan"]).strip()
+            for tup in out.columns
+        ]
+    out.columns = [str(c).strip() for c in out.columns]
     return out
 
 
-def rows_to_structured_df(table: pd.DataFrame, instrument: str) -> pd.DataFrame:
-    """Extract OMIP contract rows from a raw table-like dataframe.
-
-    Works with both parsed tables with real headers and stdlib parser tables where
-    the header may still be row 0.
-    """
-    if table.empty:
-        return pd.DataFrame()
-
-    df = flatten_columns(table).dropna(axis=1, how="all").dropna(axis=0, how="all").copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    # Normalize all cells to strings for robust matching.
-    for c in df.columns:
-        df[c] = df[c].map(normalize_scalar)
-
-    rows = []
-    patt = re.compile(rf"^{re.escape(instrument)}\s+", re.IGNORECASE)
-
-    # Search each row for a cell that starts with FTB / FTS / etc.
-    for _, row in df.iterrows():
-        cells = [normalize_scalar(x) for x in row.tolist()]
-        contract_idx = None
-        for idx, cell in enumerate(cells):
-            if patt.search(cell):
-                contract_idx = idx
-                break
-        if contract_idx is None:
-            continue
-
-        contract_name = normalize_scalar(cells[contract_idx])
-        values = cells[contract_idx + 1:]
-        values = values + [None] * max(0, len(OMIP_VALUE_COLUMNS) - len(values))
-        record = {"contract": contract_name}
-        for col_name, value in zip(OMIP_VALUE_COLUMNS, values):
-            record[col_name] = value
-        rows.append(record)
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    return out
+def extract_contract_name(raw_text: str, instrument: str) -> str | None:
+    text = normalize_str(raw_text)
+    # OMIP read_html often returns one long string:
+    # "ISIN Code: ... Trading quotation: €/MWhFTS YR-27"
+    m = re.search(rf"({re.escape(instrument)}\s+[A-Za-z0-9\-]+(?:\s+[A-Za-z0-9\-]+)?)\s*$", text)
+    if m:
+        return normalize_str(m.group(1))
+    # Fallback: any occurrence of instrument followed by text, stop before transparency if present.
+    m = re.search(rf"({re.escape(instrument)}\s+.+)$", text)
+    if m:
+        tail = normalize_str(m.group(1))
+        tail = tail.split(" Transparency")[0].strip()
+        return tail[:80]
+    return None
 
 
-def parse_contract_lines_from_text(raw_html: str, instrument: str) -> pd.DataFrame:
-    """Last-resort parser using page text lines, no lxml/bs4 required."""
-    text = re.sub(r"<script.*?</script>", " ", raw_html, flags=re.I | re.S)
-    text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", "\n", text)
-    text = html.unescape(text).replace("\xa0", " ").replace("\u202f", " ")
-    lines = [normalize_scalar(line) for line in text.splitlines()]
-    lines = [line for line in lines if line]
-
-    rows = []
-    patt = re.compile(rf"^({re.escape(instrument)})\s+([^\s]+)\s+(.*)$", re.I)
-    for line in lines:
-        m = patt.match(line)
-        if not m:
-            continue
-        instr, tail, rest = m.groups()
-        contract = f"{instr.upper()} {tail}"
-        toks = rest.split()
-        toks = toks + [None] * max(0, len(OMIP_VALUE_COLUMNS) - len(toks))
-        record = {"contract": contract}
-        for col_name, value in zip(OMIP_VALUE_COLUMNS, toks):
-            record[col_name] = value
-        rows.append(record)
-
-    return pd.DataFrame(rows)
+def contract_maturity(contract: str) -> str:
+    c = normalize_str(contract)
+    if re.search(rf"\bYR-\d{{2}}", c):
+        return "YR"
+    if re.search(rf"\bQ[1-4]-\d{{2}}", c) or re.search(rf"\bQ\s+Q[1-4]-\d{{2}}", c):
+        return "Q"
+    if re.search(rf"\bM\s+[A-Za-z]{{3}}-\d{{2}}", c):
+        return "M"
+    if re.search(rf"\bW[K]?\d{{1,2}}-\d{{2}}", c) or re.search(rf"\bW\s+W[K]?\d{{1,2}}-\d{{2}}", c):
+        return "W"
+    if re.search(rf"\bWE\b", c):
+        return "WE"
+    if re.search(rf"\bD\b", c):
+        return "D"
+    if "PPA" in c:
+        return "PPA"
+    return "Other"
 
 
 def contract_sort_key(contract: str) -> int:
-    if not isinstance(contract, str):
-        return 999999999
-    c = contract.upper()
+    c = normalize_str(contract)
     m = re.search(r"YR-(\d{2})", c)
     if m:
         return (2000 + int(m.group(1))) * 10000
     m = re.search(r"Q([1-4])-(\d{2})", c)
     if m:
         return (2000 + int(m.group(2))) * 10000 + int(m.group(1)) * 1000
-    m = re.search(r"M(\d{1,2})-(\d{2})", c)
+    m = re.search(r"M\s+([A-Za-z]{3})-(\d{2})", c)
     if m:
-        return (2000 + int(m.group(2))) * 10000 + int(m.group(1)) * 100
-    m = re.search(r"WK(\d{1,2})-(\d{2})", c)
+        months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6, "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+        return (2000 + int(m.group(2))) * 10000 + months.get(m.group(1).title(), 99) * 100
+    m = re.search(r"(?:W|WK)(\d{1,2})-(\d{2})", c)
     if m:
         return (2000 + int(m.group(2))) * 10000 + int(m.group(1))
     m = re.search(r"(\d{2})$", c)
     if m:
         return (2000 + int(m.group(1))) * 10000
-    return 999999999
+    return 99999999
 
 
-def maturity_matches(contract: str, maturity: str | None) -> bool:
-    if maturity is None or maturity == "ALL":
-        return True
-    c = str(contract).upper()
-    if maturity == "YR":
-        return "YR-" in c
-    if maturity == "QTR":
-        return bool(re.search(r"\bQ[1-4]-", c))
-    if maturity == "MTH":
-        return bool(re.search(r"\bM\d{1,2}-", c))
-    if maturity == "WK":
-        return "WK" in c
-    return maturity in c
+def parse_raw_tables_to_contracts(tables: list[pd.DataFrame], asof: date, sheet_name: str, instrument: str) -> pd.DataFrame:
+    rows: list[dict] = []
+    for table_id, table in enumerate(tables, start=1):
+        df = flatten_columns(table)
+        if df.empty:
+            continue
+        # Scan row by row. This is more robust than relying on headers because OMIP
+        # has multi-level headers and rows with embedded ISIN metadata.
+        for _, row in df.iterrows():
+            values = list(row.values)
+            texts = [normalize_str(v) for v in values]
+            joined = " | ".join(texts)
+            contract = None
+            contract_col_pos = None
+            for pos, txt in enumerate(texts):
+                maybe = extract_contract_name(txt, instrument)
+                if maybe:
+                    contract = maybe
+                    contract_col_pos = pos
+                    break
+            if not contract:
+                continue
 
+            # OMIP standard table positions after pandas read_html:
+            # 0 Contract name; 3 Best bid; 4 Best Ask; 5 Session Vol; 7 Last Price;
+            # 8 Last Time; 9 Last Vol; 11 Open Interest; 12 Nr Contracts; 13 OTC Vol;
+            # 15 D; 16 D-1; 20 Transparency.
+            def val_at(pos: int):
+                return values[pos] if pos < len(values) else None
 
-def normalize_omip_contract_rows(raw: pd.DataFrame, instrument: str, maturity: str | None, market_date: date, sheet_name: str, url: str) -> pd.DataFrame:
-    if raw.empty:
-        return pd.DataFrame()
+            best_bid = parse_num(val_at(3))
+            best_ask = parse_num(val_at(4))
+            session_volume = parse_num(val_at(5))
+            last_price = parse_num(val_at(7))
+            last_time = normalize_str(val_at(8)) or None
+            last_volume = parse_num(val_at(9))
+            open_interest = parse_num(val_at(11))
+            nr_contracts = parse_num(val_at(12))
+            otc_volume = parse_num(val_at(13))
+            d_price = parse_num(val_at(15))
+            d_minus_1 = parse_num(val_at(16))
 
-    out = raw.copy()
-    out["contract"] = normalize_text_series(out["contract"])
-    out = out[out["contract"].str.upper().str.startswith(f"{instrument} ", na=False)].copy()
-    out = out[out["contract"].map(lambda x: maturity_matches(x, maturity))].copy()
+            # If the table positions ever shift, try a weak fallback by taking the last
+            # numeric values in the row. D and D-1 are usually the last two price-like cells.
+            if d_price is None and d_minus_1 is None:
+                nums = [parse_num(v) for v in values]
+                nums = [x for x in nums if x is not None]
+                if len(nums) >= 2:
+                    d_price, d_minus_1 = nums[-2], nums[-1]
+                elif len(nums) == 1:
+                    d_price = nums[-1]
 
+            curve_price = d_price
+            if curve_price is None:
+                curve_price = last_price
+            if curve_price is None and best_bid is not None and best_ask is not None:
+                curve_price = (best_bid + best_ask) / 2.0
+            if curve_price is None:
+                curve_price = d_minus_1
+
+            rows.append(
+                {
+                    "market_date": asof,
+                    "sheet": sheet_name,
+                    "instrument": instrument,
+                    "table_id": table_id,
+                    "contract": contract,
+                    "maturity": contract_maturity(contract),
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "session_volume_mwh": session_volume,
+                    "last_price": last_price,
+                    "last_time": last_time,
+                    "last_volume_mwh": last_volume,
+                    "open_interest": open_interest,
+                    "nr_contracts": nr_contracts,
+                    "otc_volume_mwh": otc_volume,
+                    "d_price": d_price,
+                    "d_minus_1": d_minus_1,
+                    "curve_price": curve_price,
+                    "raw_contract_cell": normalize_str(values[contract_col_pos]) if contract_col_pos is not None else joined[:300],
+                }
+            )
+    out = pd.DataFrame(rows)
     if out.empty:
-        return pd.DataFrame()
-
-    numeric_map = {
-        "Best bid (€/MWh)": "best_bid",
-        "Best Ask (€/MWh)": "best_ask",
-        "Session volume (MWh)": "session_volume_mwh",
-        "Last price (€/MWh)": "last_price",
-        "Last volume (MWh)": "last_volume_mwh",
-        "Open Interest": "open_interest",
-        "Nr of Contracts": "nr_contracts",
-        "OTC volume (MWh)": "otc_volume_mwh",
-        "D (€/MWh)": "reference_price",
-        "D-1 (€/MWh)": "d_minus_1",
-    }
-
-    for src, dst in numeric_map.items():
-        out[dst] = out[src].map(parse_num) if src in out.columns else None
-
-    if "Last time" in out.columns:
-        out["last_time"] = out["Last time"].map(normalize_scalar)
-    else:
-        out["last_time"] = None
-
-    out["curve_price"] = out["reference_price"].combine_first(out["last_price"]).combine_first(
-        (out["best_bid"] + out["best_ask"]) / 2
-    )
-    out = out.dropna(subset=["curve_price"], how="all").copy()
-    if out.empty:
-        return pd.DataFrame()
-
-    out.insert(0, "date", pd.to_datetime(market_date))
-    out.insert(1, "sheet", sheet_name)
-    out.insert(2, "instrument", instrument)
-    out["url"] = url
+        return pd.DataFrame(columns=[
+            "market_date", "sheet", "instrument", "contract", "maturity", "curve_price",
+            "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest", "sort_key"
+        ])
     out["sort_key"] = out["contract"].map(contract_sort_key)
-    keep_cols = [
-        "date",
-        "sheet",
-        "instrument",
-        "contract",
-        "curve_price",
-        "reference_price",
-        "d_minus_1",
-        "best_bid",
-        "best_ask",
-        "last_price",
-        "last_time",
-        "session_volume_mwh",
-        "last_volume_mwh",
-        "open_interest",
-        "nr_contracts",
-        "otc_volume_mwh",
-        "url",
-        "sort_key",
-    ]
-    return out[keep_cols].sort_values(["date", "sheet", "sort_key"]).reset_index(drop=True)
+    out = out.drop_duplicates(subset=["market_date", "sheet", "instrument", "contract"], keep="last")
+    return out.sort_values(["sheet", "sort_key", "contract"]).reset_index(drop=True)
 
 
-def parse_omip_page(raw_html: str, instrument: str, maturity: str | None, market_date: date, sheet_name: str, url: str) -> tuple[pd.DataFrame, dict]:
-    debug = {"date": market_date.isoformat(), "sheet": sheet_name, "instrument": instrument, "url": url, "tables_found": 0, "rows_parsed": 0, "parser": "none", "error": ""}
-
-    try:
-        tables = tables_from_html_no_lxml(raw_html)
-        debug["tables_found"] = len(tables)
-        parts = []
-        for table in tables:
-            rows = rows_to_structured_df(table, instrument)
-            if not rows.empty:
-                parts.append(rows)
-        if parts:
-            raw_rows = pd.concat(parts, ignore_index=True)
-            curve = normalize_omip_contract_rows(raw_rows, instrument, maturity, market_date, sheet_name, url)
-            if not curve.empty:
-                debug["rows_parsed"] = len(curve)
-                debug["parser"] = "stdlib_html_table_parser"
-                return curve, debug
-    except Exception as exc:
-        debug["error"] = f"table parser: {exc}"
-
-    try:
-        raw_rows = parse_contract_lines_from_text(raw_html, instrument)
-        curve = normalize_omip_contract_rows(raw_rows, instrument, maturity, market_date, sheet_name, url)
-        if not curve.empty:
-            debug["rows_parsed"] = len(curve)
-            debug["parser"] = "text_fallback_parser"
-            return curve, debug
-    except Exception as exc:
-        debug["error"] = (debug.get("error", "") + f" | text parser: {exc}").strip(" |")
-
-    return pd.DataFrame(), debug
+def parse_working_excel_upload(file) -> pd.DataFrame:
+    xls = pd.ExcelFile(file)
+    parts = []
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(xls, sheet_name=sheet, header=None)
+        if raw.empty:
+            continue
+        instrument = "FTS" if "solar" in sheet.lower() else "FTB" if "base" in sheet.lower() else None
+        if instrument is None:
+            # Try to infer from row text.
+            joined = " ".join(raw.astype(str).fillna("").head(20).values.ravel().tolist())
+            if "FTS" in joined:
+                instrument = "FTS"
+            elif "FTB" in joined:
+                instrument = "FTB"
+            else:
+                continue
+        # Since this is already Excel from concat_tables, pass it as a single table.
+        parsed = parse_raw_tables_to_contracts([raw], date.today(), sheet, instrument)
+        if not parsed.empty:
+            parts.append(parsed)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
-def daterange(d0: date, d1: date):
-    d = d0
-    while d <= d1:
-        yield d
-        d += timedelta(days=1)
+def filter_maturity(df: pd.DataFrame, maturity_filter: str | None) -> pd.DataFrame:
+    if df.empty or maturity_filter is None:
+        return df
+    return df[df["maturity"] == maturity_filter].copy()
 
 
-@st.cache_data(show_spinner=False, ttl=1800)
-def fetch_and_parse_one_day(asof: date, product: str, zone: str, instrument: str, maturity: str | None, sheet_name: str) -> tuple[pd.DataFrame, dict]:
-    raw_html, url = fetch_omip_html(asof, product, zone, instrument, maturity)
-    return parse_omip_page(raw_html, instrument, maturity, asof, sheet_name, url)
+def fetch_and_parse_day(asof: date, product: str, zone: str, instruments: dict[str, str], include_maturity_param: bool, maturity_param: str | None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
+    parts = []
+    debug_rows = []
+    raw_tables_by_sheet: dict[str, pd.DataFrame] = {}
+    date_str = asof.strftime("%Y-%m-%d")
+
+    for sheet_name, instrument in instruments.items():
+        try:
+            tables, url = fetch_tables(date_str, product, zone, instrument, include_maturity_param, maturity_param)
+            raw_concat = concat_tables(tables)
+            raw_tables_by_sheet[sheet_name] = raw_concat
+            parsed = parse_raw_tables_to_contracts(tables, asof, sheet_name, instrument)
+            parts.append(parsed)
+            debug_rows.append({
+                "date": date_str,
+                "sheet": sheet_name,
+                "instrument": instrument,
+                "url": url,
+                "tables_found": len(tables),
+                "raw_rows": int(sum(len(t) for t in tables)),
+                "rows_parsed": len(parsed),
+                "error": "",
+            })
+        except Exception as exc:
+            debug_rows.append({
+                "date": date_str,
+                "sheet": sheet_name,
+                "instrument": instrument,
+                "url": omip_url(date_str, product, zone, instrument, include_maturity_param, maturity_param),
+                "tables_found": 0,
+                "raw_rows": 0,
+                "rows_parsed": 0,
+                "error": str(exc),
+            })
+
+    data = pd.concat([p for p in parts if p is not None and not p.empty], ignore_index=True) if any(not p.empty for p in parts) else pd.DataFrame()
+    debug = pd.DataFrame(debug_rows)
+    return data, debug, raw_tables_by_sheet
 
 
-def build_forward_curve_chart(df: pd.DataFrame, title: str):
+def fetch_and_parse_range(start_date: date, end_date: date, product: str, zone: str, instruments: dict[str, str], include_maturity_param: bool, maturity_param: str | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    parts = []
+    debug_parts = []
+    for d in daterange(start_date, end_date):
+        data, debug, _ = fetch_and_parse_day(d, product, zone, instruments, include_maturity_param, maturity_param)
+        if not data.empty:
+            parts.append(data)
+        if not debug.empty:
+            debug_parts.append(debug)
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    dbg = pd.concat(debug_parts, ignore_index=True) if debug_parts else pd.DataFrame()
+    return out, dbg
+
+# =========================================================
+# CHARTS / EXPORT
+# =========================================================
+def build_curve_chart(df: pd.DataFrame, title: str):
     if df.empty:
         return None
     plot = df.copy()
-    plot["date_label"] = pd.to_datetime(plot["date"]).dt.strftime("%Y-%m-%d")
-    plot["series"] = plot["sheet"] + " | " + plot["date_label"]
-    # Use the most recent date for contract ordering.
-    latest = plot[plot["date"] == plot["date"].max()].sort_values(["sheet", "sort_key"])
-    order = latest["contract"].drop_duplicates().tolist()
-    if not order:
-        order = plot.sort_values("sort_key")["contract"].drop_duplicates().tolist()
-
+    plot["series"] = plot["sheet"].astype(str)
+    plot["contract_label"] = plot["contract"].astype(str)
+    order = plot.sort_values("sort_key")["contract_label"].drop_duplicates().tolist()
+    color_scale = alt.Scale(
+        domain=["Baseload", "Solar"],
+        range=[BLUE_PRICE, YELLOW_PRICE],
+    )
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("contract:N", sort=order, axis=alt.Axis(title=None, labelAngle=-35)),
+        x=alt.X("contract_label:N", sort=order, axis=alt.Axis(title=None, labelAngle=-35)),
         y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
-        color=alt.Color("series:N", title=None),
+        color=alt.Color("series:N", title=None, scale=color_scale),
         tooltip=[
-            alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+            alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
             alt.Tooltip("sheet:N", title="Curve"),
             alt.Tooltip("contract:N", title="Contract"),
             alt.Tooltip("curve_price:Q", title="Curve price €/MWh", format=",.2f"),
-            alt.Tooltip("reference_price:Q", title="D €/MWh", format=",.2f"),
+            alt.Tooltip("d_price:Q", title="D €/MWh", format=",.2f"),
             alt.Tooltip("d_minus_1:Q", title="D-1 €/MWh", format=",.2f"),
             alt.Tooltip("best_bid:Q", title="Best bid €/MWh", format=",.2f"),
             alt.Tooltip("best_ask:Q", title="Best ask €/MWh", format=",.2f"),
             alt.Tooltip("open_interest:Q", title="Open interest", format=",.0f"),
         ],
-    ).properties(title=title, height=430)
-    return apply_common_chart_style(chart, height=430)
+    ).properties(title=title, height=420)
+    return apply_common_chart_style(chart, height=420)
 
 
-def dataframe_to_excel_bytes(curves: pd.DataFrame, debug: pd.DataFrame) -> bytes:
+def build_time_evolution_chart(df: pd.DataFrame, contract: str, title: str):
+    if df.empty or not contract:
+        return None
+    plot = df[df["contract"] == contract].copy()
+    if plot.empty:
+        return None
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
+        x=alt.X("market_date:T", title=None, axis=alt.Axis(format="%d-%b", labelAngle=0)),
+        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        tooltip=[
+            alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
+            alt.Tooltip("contract:N", title="Contract"),
+            alt.Tooltip("curve_price:Q", title="Curve price €/MWh", format=",.2f"),
+            alt.Tooltip("d_price:Q", title="D €/MWh", format=",.2f"),
+            alt.Tooltip("d_minus_1:Q", title="D-1 €/MWh", format=",.2f"),
+        ],
+    ).properties(title=title, height=380)
+    return apply_common_chart_style(chart, height=380)
+
+
+def dataframe_to_excel_bytes(data: pd.DataFrame, debug: pd.DataFrame | None = None, raw_tables: dict[str, pd.DataFrame] | None = None) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if curves.empty:
-            pd.DataFrame({"info": ["No parsed OMIP data"]}).to_excel(writer, index=False, sheet_name="OMIP")
+        if data.empty:
+            pd.DataFrame({"info": ["No parsed OMIP data"]}).to_excel(writer, sheet_name="info", index=False)
         else:
-            for sheet_name, df_sheet in curves.groupby("sheet"):
-                df_sheet.drop(columns=["sort_key"], errors="ignore").to_excel(writer, index=False, sheet_name=str(sheet_name)[:31])
-            curves.drop(columns=["sort_key"], errors="ignore").to_excel(writer, index=False, sheet_name="All curves")
-        debug.to_excel(writer, index=False, sheet_name="DEBUG")
+            data.drop(columns=["raw_contract_cell"], errors="ignore").to_excel(writer, sheet_name="All curves", index=False)
+            for sheet in sorted(data["sheet"].dropna().unique().tolist()):
+                data[data["sheet"] == sheet].drop(columns=["raw_contract_cell"], errors="ignore").to_excel(writer, sheet_name=str(sheet)[:31], index=False)
+        if debug is not None and not debug.empty:
+            debug.to_excel(writer, sheet_name="DEBUG", index=False)
+        if raw_tables:
+            for name, raw in raw_tables.items():
+                if not raw.empty:
+                    raw.to_excel(writer, sheet_name=f"RAW_{name}"[:31], index=False)
     return output.getvalue()
 
 # =========================================================
@@ -573,116 +543,125 @@ def dataframe_to_excel_bytes(curves: pd.DataFrame, debug: pd.DataFrame) -> bytes
 # =========================================================
 section_header("OMIP live forward curve")
 st.caption(
-    "Uses the same public OMIP page pattern as the working scripts, but avoids pandas.read_html/lxml. "
-    "It parses HTML tables with a small built-in parser and falls back to text parsing."
+    "Uses the same approach as your working Python scripts: requests.get(...) + pd.read_html(io.StringIO(html)). "
+    "On Streamlit Cloud this requires lxml in requirements.txt."
 )
 
-left, mid, right = st.columns([1, 1, 1])
-with left:
-    start_date = st.date_input("Start date", value=date(2026, 2, 3))
-    end_date = st.date_input("End date", value=date(2026, 2, 3))
-with mid:
+with st.expander("Important deployment note", expanded=False):
+    st.markdown(
+        """
+If the app shows an error like **`Import lxml failed`**, add this line to your `requirements.txt` and redeploy:
+
+```txt
+lxml
+```
+
+Your standalone `.py` works because your local environment has the HTML parser installed. Streamlit Cloud needs the same dependency.
+        """
+    )
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    mode = st.radio("Mode", ["Single date", "Date range"], horizontal=True)
+    asof = st.date_input("Market date", value=date.today())
+    start_date = st.date_input("Start date", value=date.today() - timedelta(days=7))
+    end_date = st.date_input("End date", value=date.today())
+with c2:
     product_label = st.selectbox("Product", list(PRODUCTS.keys()), index=0)
     zone_label = st.selectbox("Zone", list(ZONES.keys()), index=0)
-with right:
     maturity_label = st.selectbox("Maturity filter", list(MATURITY_FILTERS.keys()), index=list(MATURITY_FILTERS.keys()).index("Year"))
-    curve_choice = st.multiselect(
-        "Curves to pull",
-        options=["Baseload", "Solar"],
-        default=["Baseload", "Solar"],
-    )
+with c3:
+    curve_choice = st.multiselect("Curves", ["Baseload", "Solar"], default=["Baseload", "Solar"])
+    include_maturity_param = st.checkbox("Send maturity parameter to OMIP URL", value=False, help="Off by default because the scripts that work do not send maturity; they filter after reading the page.")
+    pull = st.button("Pull OMIP prices", type="primary")
 
 product = PRODUCTS[product_label]
 zone = ZONES[zone_label]
-maturity = MATURITY_FILTERS[maturity_label]
-instrument_map = {"Baseload": "FTB", "Solar": "FTS"}
+maturity_filter = MATURITY_FILTERS[maturity_label]
+maturity_param = "ALL" if maturity_filter is None else maturity_filter
+selected_instruments = {}
+if "Baseload" in curve_choice:
+    selected_instruments["Baseload"] = "FTB"
+if "Solar" in curve_choice:
+    selected_instruments["Solar"] = "FTS"
 
-example_url = build_omip_url(start_date, product, zone, instrument_map.get(curve_choice[0], "FTB") if curve_choice else "FTB", maturity)
-st.markdown(f"[Open OMIP example page]({example_url})")
-
-pull = st.button("Pull OMIP prices", type="primary")
+sample_instrument = next(iter(selected_instruments.values()), "FTB")
+st.markdown(f"[Open OMIP page]({omip_url(asof.strftime('%Y-%m-%d'), product, zone, sample_instrument, include_maturity_param, maturity_param)})")
 
 if pull:
-    if start_date > end_date:
-        st.error("Start date must be before or equal to end date.")
-        st.stop()
-    if not curve_choice:
-        st.warning("Select at least one curve to pull.")
-        st.stop()
-
-    all_parts: list[pd.DataFrame] = []
-    debug_rows: list[dict] = []
-    progress_total = (end_date - start_date).days + 1
-    progress = st.progress(0, text="Pulling OMIP data...")
-
-    for i, d in enumerate(daterange(start_date, end_date), start=1):
-        for sheet_name in curve_choice:
-            instrument = instrument_map[sheet_name]
-            try:
-                df_day, dbg = fetch_and_parse_one_day(d, product, zone, instrument, maturity, sheet_name)
-                debug_rows.append(dbg)
-                if not df_day.empty:
-                    all_parts.append(df_day)
-            except Exception as exc:
-                debug_rows.append({
-                    "date": d.isoformat(),
-                    "sheet": sheet_name,
-                    "instrument": instrument,
-                    "url": build_omip_url(d, product, zone, instrument, maturity),
-                    "tables_found": 0,
-                    "rows_parsed": 0,
-                    "parser": "error",
-                    "error": str(exc),
-                })
-        progress.progress(i / progress_total, text=f"Pulled {i}/{progress_total} day(s)")
-
-    debug_df = pd.DataFrame(debug_rows)
-    curves = pd.concat(all_parts, ignore_index=True) if all_parts else pd.DataFrame()
-
-    if curves.empty:
-        st.warning("OMIP page(s) were reachable or attempted, but no curve rows could be parsed.")
-        st.dataframe(debug_df, use_container_width=True)
+    if not selected_instruments:
+        st.warning("Select at least one curve.")
     else:
-        st.success(f"Loaded {len(curves)} OMIP contract rows.")
-        chart = build_forward_curve_chart(curves, f"OMIP {zone_label} forward curves | {start_date.isoformat()} to {end_date.isoformat()}")
-        if chart is not None:
-            st.altair_chart(chart, use_container_width=True)
-        display_cols = [c for c in curves.columns if c not in {"sort_key"}]
-        st.dataframe(styled_df(curves[display_cols]), use_container_width=True)
+        if mode == "Single date":
+            data, debug, raw_tables = fetch_and_parse_day(asof, product, zone, selected_instruments, include_maturity_param, maturity_param)
+        else:
+            data, debug = fetch_and_parse_range(start_date, end_date, product, zone, selected_instruments, include_maturity_param, maturity_param)
+            raw_tables = {}
 
-    st.download_button(
-        "Download OMIP curves + DEBUG as Excel",
-        data=dataframe_to_excel_bytes(curves, debug_df),
-        file_name=f"omip_{zone}_{product}_{start_date.isoformat()}_{end_date.isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        if not data.empty:
+            data = filter_maturity(data, maturity_filter)
 
-section_header("Manual upload fallback")
-st.caption("Upload a CSV/XLSX copied/exported from OMIP. This parser also avoids lxml.")
-file = st.file_uploader("Upload OMIP CSV/XLSX export or copied table", type=["csv", "xlsx", "xls"])
+        if data.empty:
+            st.warning("OMIP page(s) were reachable or attempted, but no curve rows could be parsed for the selected filters.")
+            st.dataframe(debug, use_container_width=True)
+            st.download_button(
+                "Download debug Excel",
+                data=dataframe_to_excel_bytes(data, debug, raw_tables),
+                file_name=f"omip_debug_{zone}_{asof.isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.success(f"Loaded {len(data)} OMIP rows.")
+            if mode == "Single date":
+                chart = build_curve_chart(data, f"OMIP {zone_label} forward curve | {asof.isoformat()} | {maturity_label}")
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
+            else:
+                available_contracts = data.sort_values(["sheet", "sort_key"])["contract"].drop_duplicates().tolist()
+                selected_contract = st.selectbox("Contract to plot over time", available_contracts)
+                chart = build_time_evolution_chart(data, selected_contract, f"OMIP {selected_contract} evolution")
+                if chart is not None:
+                    st.altair_chart(chart, use_container_width=True)
+
+            display_cols = [
+                "market_date", "sheet", "instrument", "contract", "maturity", "curve_price",
+                "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest",
+                "nr_contracts", "otc_volume_mwh", "session_volume_mwh",
+            ]
+            st.dataframe(styled_df(data[[c for c in display_cols if c in data.columns]]), use_container_width=True)
+            with st.expander("Debug"):
+                st.dataframe(debug, use_container_width=True)
+            st.download_button(
+                "Download OMIP parsed Excel",
+                data=dataframe_to_excel_bytes(data, debug, raw_tables),
+                file_name=f"omip_{zone}_{product}_{mode.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+section_header("Upload OMIP Excel fallback")
+st.caption("Upload an Excel produced by your working script. The app will parse the Baseload / Solar sheets and chart the contracts.")
+file = st.file_uploader("Upload OMIP_ES_EL_YYYY-MM-DD.xlsx", type=["xlsx", "xls"])
 if file is not None:
     try:
-        if file.name.lower().endswith(".csv"):
-            raw_upload = pd.read_csv(file)
+        uploaded = parse_working_excel_upload(file)
+        uploaded = filter_maturity(uploaded, maturity_filter)
+        if uploaded.empty:
+            st.warning("The uploaded Excel was read, but no contracts matched the selected maturity filter.")
         else:
-            raw_upload = pd.read_excel(file)
-
-        # Try both FTB and FTS against the uploaded file.
-        parts = []
-        for label, instr in {"Baseload": "FTB", "Solar": "FTS"}.items():
-            raw_rows = rows_to_structured_df(raw_upload, instr)
-            parsed = normalize_omip_contract_rows(raw_rows, instr, maturity, start_date, label, "uploaded_file")
-            if not parsed.empty:
-                parts.append(parsed)
-
-        upload_curve = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-        if upload_curve.empty:
-            st.warning("Could not identify OMIP curve rows in the uploaded file.")
-            st.dataframe(raw_upload, use_container_width=True)
-        else:
-            chart = build_forward_curve_chart(upload_curve, "Uploaded OMIP curve")
+            st.success(f"Parsed {len(uploaded)} rows from uploaded Excel.")
+            chart = build_curve_chart(uploaded, f"Uploaded OMIP curve | {maturity_label}")
             if chart is not None:
                 st.altair_chart(chart, use_container_width=True)
-            st.dataframe(styled_df(upload_curve.drop(columns=["sort_key"], errors="ignore")), use_container_width=True)
+            display_cols = [
+                "sheet", "instrument", "contract", "maturity", "curve_price", "d_price", "d_minus_1",
+                "best_bid", "best_ask", "last_price", "open_interest", "nr_contracts"
+            ]
+            st.dataframe(styled_df(uploaded[[c for c in display_cols if c in uploaded.columns]]), use_container_width=True)
+            st.download_button(
+                "Download parsed upload",
+                data=dataframe_to_excel_bytes(uploaded),
+                file_name="omip_uploaded_parsed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
     except Exception as exc:
-        st.error(f"Could not parse upload: {exc}")
+        st.error(f"Could not parse uploaded OMIP Excel: {exc}")
