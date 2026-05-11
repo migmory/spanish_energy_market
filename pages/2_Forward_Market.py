@@ -551,6 +551,41 @@ def build_time_evolution_chart(df: pd.DataFrame, contract: str, title: str):
     return apply_common_chart_style(chart, height=380)
 
 
+
+
+def build_time_evolution_by_delivery_chart(df: pd.DataFrame, delivery_label: str, title: str):
+    """Plot Baseload and Solar price evolution over market_date for the same delivery period.
+
+    Example: delivery_label='YR27' overlays FTB YR-27 and FTS YR-27 on the same x-axis.
+    """
+    if df.empty or not delivery_label:
+        return None
+    plot = df[df["delivery_label"] == delivery_label].copy()
+    if plot.empty:
+        return None
+
+    plot["series"] = plot["sheet"].astype(str)
+    color_scale = alt.Scale(
+        domain=["Baseload", "Solar"],
+        range=[BLUE_PRICE, YELLOW_PRICE],
+    )
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("market_date:T", title="Market date", axis=alt.Axis(format="%d-%b", labelAngle=0)),
+        y=alt.Y("curve_price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        color=alt.Color("series:N", title=None, scale=color_scale),
+        tooltip=[
+            alt.Tooltip("market_date:T", title="Market date", format="%Y-%m-%d"),
+            alt.Tooltip("sheet:N", title="Curve"),
+            alt.Tooltip("delivery_label:N", title="Delivery period"),
+            alt.Tooltip("contract:N", title="Contract"),
+            alt.Tooltip("curve_price:Q", title="Curve price €/MWh", format=",.2f"),
+            alt.Tooltip("d_price:Q", title="D €/MWh", format=",.2f"),
+            alt.Tooltip("d_minus_1:Q", title="D-1 €/MWh", format=",.2f"),
+        ],
+    ).properties(title=title, height=380)
+    return apply_common_chart_style(chart, height=380)
+
+
 def dataframe_to_excel_bytes(data: pd.DataFrame, debug: pd.DataFrame | None = None, raw_tables: dict[str, pd.DataFrame] | None = None) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -574,29 +609,16 @@ def dataframe_to_excel_bytes(data: pd.DataFrame, debug: pd.DataFrame | None = No
 section_header("OMIP live forward curve")
 st.caption(
     "Uses the same approach as your working Python scripts: requests.get(...) + pd.read_html(io.StringIO(html)). "
-    "On Streamlit Cloud this requires lxml in requirements.txt."
+    "For date ranges, select the delivery period once and both Baseload and Solar curves are overlaid where available."
 )
-
-with st.expander("Important deployment note", expanded=False):
-    st.markdown(
-        """
-If the app shows an error like **`Import lxml failed`**, add this line to your `requirements.txt` and redeploy:
-
-```txt
-lxml
-```
-
-Your standalone `.py` works because your local environment has the HTML parser installed. Streamlit Cloud needs the same dependency.
-        """
-    )
 
 c1, c2, c3 = st.columns(3)
 with c1:
     mode = st.radio("Mode", ["Single date", "Date range"], horizontal=True)
     asof = st.date_input("Market date (OMIP published curve date)", value=date.today())
     st.caption("Market date = date used in the OMIP URL to retrieve the published forward curve, not the delivery year.")
-    start_date = st.date_input("Start date", value=date.today() - timedelta(days=7))
-    end_date = st.date_input("End date", value=date.today())
+    start_date = st.date_input("Start market date", value=date.today() - timedelta(days=7))
+    end_date = st.date_input("End market date", value=date.today())
 with c2:
     product_label = st.selectbox("Product", list(PRODUCTS.keys()), index=0)
     zone_label = st.selectbox("Zone", list(ZONES.keys()), index=0)
@@ -648,11 +670,22 @@ if pull:
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
             else:
-                available_contracts = data.sort_values(["sheet", "sort_key"])["contract"].drop_duplicates().tolist()
-                selected_contract = st.selectbox("Contract to plot over time", available_contracts)
-                chart = build_time_evolution_chart(data, selected_contract, f"OMIP {selected_contract} evolution")
+                delivery_options = (
+                    data[["delivery_label", "sort_key"]]
+                    .drop_duplicates()
+                    .sort_values("sort_key")["delivery_label"]
+                    .tolist()
+                )
+                selected_delivery = st.selectbox("Delivery period to plot over time", delivery_options)
+                chart = build_time_evolution_by_delivery_chart(
+                    data,
+                    selected_delivery,
+                    f"OMIP {zone_label} {selected_delivery} evolution | Baseload vs Solar",
+                )
                 if chart is not None:
                     st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.warning("No data available for the selected delivery period.")
 
             display_cols = [
                 "market_date", "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price",
