@@ -8,3 +8,4 @@ vl-convert-python
 pulp
 plotly
 paramiko
+lxml
