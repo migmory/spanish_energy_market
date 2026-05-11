@@ -29,6 +29,13 @@ BLUE_PRICE = "#1D4ED8"
 YELLOW_PRICE = "#FACC15"
 GREY = "#6B7280"
 OMIP_BASE_URL = "https://www.omip.pt/en/dados-mercado"
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data"
+OMIP_HIST_CACHE_FILENAME = "omip_ES_EL_date_range2025_20260511.xlsx"
+# These are only fallbacks; the app now infers the actual date coverage from the Excel cache.
+OMIP_HIST_CACHE_START = date(2025, 1, 1)
+OMIP_HIST_CACHE_END = date(2026, 5, 11)
+
 
 PRODUCTS = {
     "Power": "EL",
@@ -306,7 +313,7 @@ def delivery_label_from_contract(contract: str) -> str:
     m = re.search(r"\b(?:W|WK)(\d{1,2})-(\d{2})", c)
     if m:
         return f"WK{int(m.group(1)):02d}-{m.group(2)}"
-    return re.sub(r"^(FTB|FTS|FTP|FWB|SWB)\s+", "", c).replace("-", "") or c
+    return re.sub(r"^(?:FTB|FTS|FTP|FWB|SWB)\s+", "", c).replace("-", "") or c
 
 
 def parse_raw_tables_to_contracts(tables: list[pd.DataFrame], asof: date, sheet_name: str, instrument: str) -> pd.DataFrame:
@@ -404,28 +411,440 @@ def parse_raw_tables_to_contracts(tables: list[pd.DataFrame], asof: date, sheet_
     return out.sort_values(["sheet", "sort_key", "contract"]).reset_index(drop=True)
 
 
-def parse_working_excel_upload(file) -> pd.DataFrame:
-    xls = pd.ExcelFile(file)
+
+def find_col_by_name(df: pd.DataFrame, patterns: list[str], exact: bool = False) -> str | None:
+    """Find first column whose normalised name matches one of the patterns."""
+    pats = [p.lower() for p in patterns]
+    for col in df.columns:
+        name = normalize_str(col).lower()
+        if exact:
+            if name in pats:
+                return col
+        else:
+            if any(p in name for p in pats):
+                return col
+    return None
+
+
+def parse_market_date_value(value, fallback: date | None = None) -> date | None:
+    if value is None or pd.isna(value):
+        return fallback
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.notna(ts):
+            return ts.date()
+    except Exception:
+        pass
+    return fallback
+
+
+def instrument_from_contract_or_sheet(contract: str, sheet_name: str | None = None) -> tuple[str | None, str | None]:
+    c = normalize_str(contract)
+    if c.startswith("FTS"):
+        return "FTS", "Solar"
+    if c.startswith("FTB"):
+        return "FTB", "Baseload"
+    if c.startswith("FTP"):
+        return "FTP", "Peak"
+    if c.startswith("FWB"):
+        return "FWB", "Base Forward"
+    if c.startswith("SWB"):
+        return "SWB", "Base Swap"
+    sh = (sheet_name or "").lower()
+    if "solar" in sh:
+        return "FTS", "Solar"
+    if "base" in sh:
+        return "FTB", "Baseload"
+    return None, None
+
+
+def parse_direct_omip_contract_sheet(df_in: pd.DataFrame, sheet_name: str, fallback_market_date: date | None = None) -> pd.DataFrame:
+    """Parse Excel sheets produced by OMIP_range_dataEXTRACT.py or previous app exports.
+
+    Supports both:
+    - normalised range sheets with columns like date, sheet, instrument, contract_name, D, D-1;
+    - parsed app exports with columns like market_date, sheet, instrument, contract, curve_price;
+    - raw OMIP sheets where the first contract column contains FTB/FTS rows.
+    """
+    if df_in is None or df_in.empty:
+        return pd.DataFrame()
+
+    df = flatten_columns(df_in)
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    # Ignore info/debug-only sheets.
+    joined_cols = " ".join([normalize_str(c).lower() for c in df.columns])
+    if sheet_name.lower().startswith("debug") or ("info" in joined_cols and len(df.columns) <= 2):
+        return pd.DataFrame()
+
+    contract_col = find_col_by_name(df, ["contract_name", "contract name", "contract"], exact=False)
+    if contract_col is None:
+        # Fallback: find a column that contains FTB/FTS-like values.
+        for col in df.columns:
+            sample = df[col].astype(str).map(normalize_str)
+            if sample.str.contains(r"^(?:FTB|FTS|FTP|FWB|SWB)\s+", regex=True, na=False).any():
+                contract_col = col
+                break
+    if contract_col is None:
+        return pd.DataFrame()
+
+    date_col = find_col_by_name(df, ["market_date", "market date", "date"], exact=False)
+    sheet_col = find_col_by_name(df, ["sheet", "curve"], exact=True)
+    instr_col = find_col_by_name(df, ["instrument"], exact=True)
+
+    bid_col = find_col_by_name(df, ["best bid"], exact=False)
+    ask_col = find_col_by_name(df, ["best ask", "best offer"], exact=False)
+    last_col = find_col_by_name(df, ["last price"], exact=False)
+    oi_col = find_col_by_name(df, ["open interest"], exact=False)
+    nr_col = find_col_by_name(df, ["nr of contracts", "contracts"], exact=False)
+    otc_col = find_col_by_name(df, ["otc volume"], exact=False)
+    sess_col = find_col_by_name(df, ["session volume"], exact=False)
+
+    # Prefer exact D / D-1 style columns, then looser matches.
+    d_col = None
+    d1_col = None
+    for col in df.columns:
+        nm = normalize_str(col).lower()
+        if nm in {"d", "d (€/mwh)", "d eur/mwh", "d €/mwh"}:
+            d_col = col
+        if nm in {"d-1", "d-1 (€/mwh)", "d-1 eur/mwh", "d-1 €/mwh"} or "d-1" in nm:
+            d1_col = col
+    if d_col is None:
+        d_col = find_col_by_name(df, ["reference_price", "reference price", "d_price", "d price", "settlement"], exact=False)
+    if d1_col is None:
+        d1_col = find_col_by_name(df, ["d_minus_1", "d minus 1"], exact=False)
+    curve_col = find_col_by_name(df, ["curve_price", "curve price"], exact=False)
+
+    rows = []
+    for _, row in df.iterrows():
+        contract = normalize_str(row.get(contract_col))
+        if not re.match(r"^(?:FTB|FTS|FTP|FWB|SWB)\s+", contract):
+            # Raw OMIP first column may include long metadata and the contract at the end.
+            maybe_instr = normalize_str(row.get(instr_col)) if instr_col else None
+            instr_guess = maybe_instr if maybe_instr in {"FTB", "FTS", "FTP", "FWB", "SWB"} else None
+            if instr_guess:
+                maybe = extract_contract_name(contract, instr_guess)
+                contract = maybe or contract
+        if not re.match(r"^(?:FTB|FTS|FTP|FWB|SWB)\s+", contract):
+            continue
+
+        instr, default_sheet = instrument_from_contract_or_sheet(contract, sheet_name)
+        if instr_col and normalize_str(row.get(instr_col)) in {"FTB", "FTS", "FTP", "FWB", "SWB"}:
+            instr = normalize_str(row.get(instr_col))
+        sheet_value = normalize_str(row.get(sheet_col)) if sheet_col else ""
+        sheet_value = sheet_value or default_sheet or sheet_name
+
+        market_date = parse_market_date_value(row.get(date_col) if date_col else None, fallback=fallback_market_date)
+        if market_date is None:
+            # The date can sometimes be encoded in the file/sheet context; if unavailable, keep today's date.
+            market_date = date.today()
+
+        best_bid = parse_num(row.get(bid_col)) if bid_col else None
+        best_ask = parse_num(row.get(ask_col)) if ask_col else None
+        last_price = parse_num(row.get(last_col)) if last_col else None
+        open_interest = parse_num(row.get(oi_col)) if oi_col else None
+        nr_contracts = parse_num(row.get(nr_col)) if nr_col else None
+        otc_volume = parse_num(row.get(otc_col)) if otc_col else None
+        session_volume = parse_num(row.get(sess_col)) if sess_col else None
+        d_price = parse_num(row.get(d_col)) if d_col else None
+        d_minus_1 = parse_num(row.get(d1_col)) if d1_col else None
+        curve_price = parse_num(row.get(curve_col)) if curve_col else None
+        if curve_price is None:
+            curve_price = d_price
+        if curve_price is None:
+            curve_price = last_price
+        if curve_price is None and best_bid is not None and best_ask is not None:
+            curve_price = (best_bid + best_ask) / 2
+        if curve_price is None:
+            curve_price = d_minus_1
+        if curve_price is None:
+            continue
+
+        rows.append({
+            "market_date": market_date,
+            "sheet": sheet_value,
+            "instrument": instr,
+            "table_id": parse_num(row.get("table_id")) if "table_id" in df.columns else None,
+            "contract": contract,
+            "maturity": contract_maturity(contract),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "session_volume_mwh": session_volume,
+            "last_price": last_price,
+            "last_time": normalize_str(row.get("Last time")) if "Last time" in df.columns else None,
+            "last_volume_mwh": None,
+            "open_interest": open_interest,
+            "nr_contracts": nr_contracts,
+            "otc_volume_mwh": otc_volume,
+            "d_price": d_price,
+            "d_minus_1": d_minus_1,
+            "curve_price": curve_price,
+            "raw_contract_cell": contract,
+            "source": "historical_cache" if fallback_market_date is None else "excel_upload",
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["market_date"] = pd.to_datetime(out["market_date"], errors="coerce").dt.date
+    out["sort_key"] = out["contract"].map(contract_sort_key)
+    out["delivery_label"] = out["contract"].map(delivery_label_from_contract)
+    out = out.drop_duplicates(subset=["market_date", "sheet", "instrument", "contract"], keep="last")
+    return out.sort_values(["market_date", "sheet", "sort_key", "contract"]).reset_index(drop=True)
+
+
+def parse_normalised_all_curves_sheet(df_in: pd.DataFrame, source_label: str = "historical_cache") -> pd.DataFrame:
+    """Fast path for the cached Excel uploaded to /data.
+
+    The file omip_ES_EL_date_range2025_20260511.xlsx already has a normalised
+    'All curves' sheet with columns such as market_date, sheet, instrument,
+    contract, maturity, d_price, d_minus_1, curve_price, sort_key, delivery_label.
+    Reading this sheet directly is much faster and avoids reparsing raw OMIP tables.
+    """
+    if df_in is None or df_in.empty:
+        return pd.DataFrame()
+    df = df_in.copy()
+    df.columns = [normalize_str(c) for c in df.columns]
+    required = {"market_date", "sheet", "instrument", "contract", "curve_price"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    df["market_date"] = pd.to_datetime(df["market_date"], errors="coerce").dt.date
+    df["sheet"] = df["sheet"].astype(str).map(normalize_str)
+    df["instrument"] = df["instrument"].astype(str).map(normalize_str)
+    df["contract"] = df["contract"].astype(str).map(normalize_str)
+
+    numeric_cols = [
+        "best_bid", "best_ask", "session_volume_mwh", "last_price", "last_volume_mwh",
+        "open_interest", "nr_contracts", "otc_volume_mwh", "d_price", "d_minus_1",
+        "curve_price", "sort_key",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "maturity" not in df.columns:
+        df["maturity"] = df["contract"].map(contract_maturity)
+    else:
+        df["maturity"] = df["maturity"].astype(str).map(normalize_str)
+
+    if "sort_key" not in df.columns:
+        df["sort_key"] = df["contract"].map(contract_sort_key)
+    if "delivery_label" not in df.columns:
+        df["delivery_label"] = df["contract"].map(delivery_label_from_contract)
+    else:
+        df["delivery_label"] = df["delivery_label"].astype(str).map(normalize_str)
+
+    for col in [
+        "table_id", "best_bid", "best_ask", "session_volume_mwh", "last_price", "last_time",
+        "last_volume_mwh", "open_interest", "nr_contracts", "otc_volume_mwh", "d_price",
+        "d_minus_1",
+    ]:
+        if col not in df.columns:
+            df[col] = None
+
+    df["source"] = source_label
+    out_cols = [
+        "market_date", "sheet", "instrument", "table_id", "contract", "maturity",
+        "best_bid", "best_ask", "session_volume_mwh", "last_price", "last_time",
+        "last_volume_mwh", "open_interest", "nr_contracts", "otc_volume_mwh",
+        "d_price", "d_minus_1", "curve_price", "sort_key", "delivery_label", "source",
+    ]
+    out = df[[c for c in out_cols if c in df.columns]].copy()
+    out = out.dropna(subset=["market_date", "contract", "curve_price"])
+    out = out[out["contract"].str.contains(r"^(?:FTB|FTS|FTP|FWB|SWB)\s+", regex=True, na=False)].copy()
+    out = out.drop_duplicates(subset=["market_date", "sheet", "instrument", "contract"], keep="last")
+    return out.sort_values(["market_date", "sheet", "sort_key", "contract"]).reset_index(drop=True)
+
+
+def parse_omip_excel_file(path_or_file, default_market_date: date | None = None) -> pd.DataFrame:
+    """Read an OMIP Excel cache/export and return the normalised contract dataset."""
+    try:
+        xls = pd.ExcelFile(path_or_file)
+    except Exception:
+        return pd.DataFrame()
+
+    # Fast path for the cache file currently stored in /data. It has a ready-made
+    # normalised All curves sheet, so do not parse the Baseload/Solar sheets again.
+    if "All curves" in xls.sheet_names:
+        try:
+            all_curves = pd.read_excel(xls, sheet_name="All curves")
+            parsed_all = parse_normalised_all_curves_sheet(
+                all_curves,
+                source_label="historical_cache" if default_market_date is None else "excel_upload",
+            )
+            if not parsed_all.empty:
+                return parsed_all
+        except Exception:
+            pass
+
     parts = []
     for sheet in xls.sheet_names:
-        raw = pd.read_excel(xls, sheet_name=sheet, header=None)
-        if raw.empty:
+        try:
+            raw = pd.read_excel(xls, sheet_name=sheet)
+        except Exception:
             continue
-        instrument = "FTS" if "solar" in sheet.lower() else "FTB" if "base" in sheet.lower() else None
-        if instrument is None:
-            # Try to infer from row text.
-            joined = " ".join(raw.astype(str).fillna("").head(20).values.ravel().tolist())
-            if "FTS" in joined:
-                instrument = "FTS"
-            elif "FTB" in joined:
-                instrument = "FTB"
-            else:
-                continue
-        # Since this is already Excel from concat_tables, pass it as a single table.
-        parsed = parse_raw_tables_to_contracts([raw], date.today(), sheet, instrument)
+        parsed = parse_direct_omip_contract_sheet(raw, sheet, fallback_market_date=default_market_date)
         if not parsed.empty:
             parts.append(parsed)
+            continue
+
+        # Fallback for Excel generated with concat_tables where headers may be shifted.
+        try:
+            raw_no_header = pd.read_excel(xls, sheet_name=sheet, header=None)
+            instrument = "FTS" if "solar" in sheet.lower() else "FTB" if "base" in sheet.lower() else None
+            if instrument is None:
+                joined = " ".join(raw_no_header.astype(str).fillna("").head(20).values.ravel().tolist())
+                instrument = "FTS" if "FTS" in joined else "FTB" if "FTB" in joined else None
+            if instrument is not None:
+                fallback = parse_raw_tables_to_contracts([raw_no_header], default_market_date or date.today(), sheet, instrument)
+                if not fallback.empty:
+                    fallback["source"] = "historical_cache" if default_market_date is None else "excel_upload"
+                    parts.append(fallback)
+        except Exception:
+            pass
+
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def find_historical_omip_cache_files(product: str, zone: str) -> list[Path]:
+    """Find OMIP historical cache files under /data.
+
+    Primary expected file:
+        data/omip_ES_EL_date_range2025_20260511.xlsx
+
+    The function still has flexible fallbacks, but it always prefers the exact
+    cache filename if present.
+    """
+    if not DATA_DIR.exists():
+        return []
+
+    preferred = DATA_DIR / OMIP_HIST_CACHE_FILENAME
+    files: list[Path] = []
+    if preferred.exists():
+        # This is the vetted historical cache file. Use it alone so a one-day
+        # debug/export workbook in /data does not contaminate the historical range.
+        return [preferred]
+
+    patterns = [
+        f"*omip*{zone}*{product}*.xlsx",
+        f"*OMIP*{zone}*{product}*.xlsx",
+        "*omip*.xlsx",
+        "*OMIP*.xlsx",
+    ]
+    for pat in patterns:
+        files.extend(DATA_DIR.glob(pat))
+
+    # De-duplicate, keep the exact preferred file first, then date_range files.
+    unique = []
+    seen = set()
+    for f in files:
+        if f not in seen:
+            unique.append(f)
+            seen.add(f)
+    unique = sorted(
+        unique,
+        key=lambda x: (x.name != OMIP_HIST_CACHE_FILENAME, "date_range" not in x.name.lower(), x.name.lower()),
+    )
+    return unique
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def load_historical_omip_cache(product: str, zone: str) -> pd.DataFrame:
+    files = find_historical_omip_cache_files(product, zone)
+    parts = []
+    for f in files:
+        parsed = parse_omip_excel_file(f)
+        if not parsed.empty:
+            parsed["source_file"] = f.name
+            parts.append(parsed)
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    out["market_date"] = pd.to_datetime(out["market_date"], errors="coerce").dt.date
+    out = out.dropna(subset=["market_date", "contract", "curve_price"])
+    return out.drop_duplicates(subset=["market_date", "sheet", "instrument", "contract"], keep="last").reset_index(drop=True)
+
+
+def fetch_and_parse_range_hybrid(start_date: date, end_date: date, product: str, zone: str, instruments: dict[str, str], include_maturity_param: bool, maturity_param: str | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Use /data historical cache first, then fetch only missing dates from OMIP.
+
+    The cache coverage is inferred from the Excel itself. With the current file
+    omip_ES_EL_date_range2025_20260511.xlsx, this means 2025-01-01 to 2026-05-11.
+    """
+    selected_instr_codes = set(instruments.values())
+    parts = []
+    debug_parts = []
+
+    cache = load_historical_omip_cache(product, zone)
+    cache_used = pd.DataFrame()
+    cache_start = None
+    cache_end = None
+
+    if not cache.empty:
+        cache_start = min(cache["market_date"])
+        cache_end = max(cache["market_date"])
+        cache_tmp = cache.copy()
+        cache_tmp = cache_tmp[
+            (cache_tmp["market_date"] >= start_date)
+            & (cache_tmp["market_date"] <= end_date)
+            & (cache_tmp["instrument"].isin(selected_instr_codes))
+            & (cache_tmp["market_date"] >= cache_start)
+            & (cache_tmp["market_date"] <= cache_end)
+        ].copy()
+        if not cache_tmp.empty:
+            cache_tmp["source"] = "historical_cache"
+            parts.append(cache_tmp)
+            cache_used = cache_tmp
+
+    fetch_ranges: list[tuple[date, date]] = []
+    if cache.empty or cache_start is None or cache_end is None:
+        fetch_ranges.append((start_date, end_date))
+    else:
+        if start_date < cache_start:
+            fetch_ranges.append((start_date, min(end_date, cache_start - timedelta(days=1))))
+        if end_date > cache_end:
+            fetch_ranges.append((max(start_date, cache_end + timedelta(days=1)), end_date))
+
+    for a, b in fetch_ranges:
+        if a <= b:
+            data_live, debug_live = fetch_and_parse_range(a, b, product, zone, instruments, include_maturity_param, maturity_param)
+            if not data_live.empty:
+                data_live["source"] = "web_pull"
+                parts.append(data_live)
+            if not debug_live.empty:
+                debug_parts.append(debug_live)
+
+    cache_files = find_historical_omip_cache_files(product, zone)
+    debug_rows = [{
+        "date": f"{start_date.isoformat()} to {end_date.isoformat()}",
+        "sheet": "historical_cache",
+        "instrument": ",".join(sorted(selected_instr_codes)),
+        "url": ", ".join([p.name for p in cache_files]) or "No cache file found in /data",
+        "tables_found": None,
+        "raw_rows": int(len(cache)) if not cache.empty else 0,
+        "rows_parsed": int(len(cache_used)),
+        "cache_start": cache_start.isoformat() if cache_start else None,
+        "cache_end": cache_end.isoformat() if cache_end else None,
+        "web_fetch_ranges": "; ".join([f"{a.isoformat()} to {b.isoformat()}" for a, b in fetch_ranges]),
+        "error": "",
+    }]
+    debug_cache = pd.DataFrame(debug_rows)
+
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    debug = pd.concat([debug_cache] + debug_parts, ignore_index=True) if debug_parts else debug_cache
+    if not out.empty:
+        out = out.drop_duplicates(subset=["market_date", "sheet", "instrument", "contract"], keep="last")
+        out = out.sort_values(["market_date", "sheet", "sort_key", "contract"]).reset_index(drop=True)
+    return out, debug
+
+def parse_working_excel_upload(file) -> pd.DataFrame:
+    parsed = parse_omip_excel_file(file, default_market_date=date.today())
+    if not parsed.empty:
+        parsed["source"] = "excel_upload"
+    return parsed
 
 
 def filter_maturity(df: pd.DataFrame, maturity_filter: str | None) -> pd.DataFrame:
@@ -609,7 +1028,8 @@ def dataframe_to_excel_bytes(data: pd.DataFrame, debug: pd.DataFrame | None = No
 section_header("OMIP live forward curve")
 st.caption(
     "Uses the same approach as your working Python scripts: requests.get(...) + pd.read_html(io.StringIO(html)). "
-    "In date-range mode, choose one delivery period (for example YR28) and the chart overlays Baseload and Solar."
+    "In date-range mode, choose one delivery period (for example YR28) and the chart overlays Baseload and Solar. "
+    "For date ranges, the app uses the OMIP Excel cache in /data first (currently omip_ES_EL_date_range2025_20260511.xlsx) and only pulls dates outside the cache from the web."
 )
 
 c1, c2, c3 = st.columns(3)
@@ -682,7 +1102,7 @@ if pull:
             data, debug, raw_tables = fetch_and_parse_day(asof, product, zone, selected_instruments, include_maturity_param, maturity_param)
             result_label = f"Market date {asof.isoformat()}"
         else:
-            data, debug = fetch_and_parse_range(start_date, end_date, product, zone, selected_instruments, include_maturity_param, maturity_param)
+            data, debug = fetch_and_parse_range_hybrid(start_date, end_date, product, zone, selected_instruments, include_maturity_param, maturity_param)
             raw_tables = {}
             result_label = f"Market dates {start_date.isoformat()} to {end_date.isoformat()}"
 
@@ -761,7 +1181,7 @@ if result is not None:
         display_cols = [
             "market_date", "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price",
             "d_price", "d_minus_1", "best_bid", "best_ask", "last_price", "open_interest",
-            "nr_contracts", "otc_volume_mwh", "session_volume_mwh",
+            "nr_contracts", "otc_volume_mwh", "session_volume_mwh", "source", "source_file",
         ]
         st.dataframe(styled_df(data[[c for c in display_cols if c in data.columns]]), use_container_width=True)
         with st.expander("Debug"):
