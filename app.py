@@ -2,10 +2,12 @@ import streamlit as st
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-LOGO_PATH = BASE_DIR / "data" / "nexwell-power.jpg"
+LOGO_PATH = BASE_DIR / "data" / "nexwell-power-.jpg"
 
 if LOGO_PATH.exists():
     st.logo(str(LOGO_PATH))
+
+
 st.set_page_config(
     page_title="Spanish Energy Market App",
     layout="wide",
