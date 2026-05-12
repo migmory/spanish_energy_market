@@ -518,7 +518,7 @@ def make_forwards(raw: pd.DataFrame) -> pd.DataFrame:
 # AGGREGATION / CHARTS
 # =========================================================
 def aggregate_price_series(df: pd.DataFrame, granularity: str, group_cols: list[str]) -> pd.DataFrame:
-    """Aggregate price data to daily, monthly, annual, or rolling 30D average."""
+    """Aggregate price data to daily, weekly, monthly, annual, or rolling 30D average."""
     if df.empty:
         return pd.DataFrame()
 
@@ -538,6 +538,17 @@ def aggregate_price_series(df: pd.DataFrame, granularity: str, group_cols: list[
             .sort_values(group_cols + ["period"])
         )
         out["period_label"] = out["period"].dt.strftime("%Y-%m-%d")
+        return out
+
+    if granularity == "Weekly":
+        # Monday-start week; the timestamp represents the first day of the week.
+        tmp["period"] = tmp["trading_day"].dt.to_period("W-SUN").dt.start_time
+        out = (
+            tmp.groupby(group_cols + ["period"], as_index=False)
+            .agg(price=("price", "mean"), volume_traded_mwh=("volume_traded_mwh", "sum"))
+            .sort_values(group_cols + ["period"])
+        )
+        out["period_label"] = out["period"].dt.strftime("Week of %d-%b-%Y")
         return out
 
     if granularity == "Monthly":
@@ -587,7 +598,8 @@ def build_price_chart(df: pd.DataFrame, granularity: str, title_y: str, color_fi
     if granularity == "Annual":
         x_enc = alt.X("period_label:N", title=None, sort=sorted(df["period_label"].unique().tolist()), axis=alt.Axis(labelAngle=0))
     else:
-        x_enc = alt.X("period:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0))
+        x_format = "%d-%b-%Y" if granularity in {"Daily", "Weekly", "Rolling 30D average"} else "%b-%Y"
+        x_enc = alt.X("period:T", title=None, axis=alt.Axis(format=x_format, labelAngle=0))
 
     tooltip = [
         alt.Tooltip("period_label:N", title="Period"),
@@ -625,8 +637,8 @@ def render_actuals_section(actuals_f: pd.DataFrame):
     st.subheader("Historical actuals - GDAES D+1 Reference Price by delivery day")
     granularity = st.radio(
         "Actuals granularity",
-        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
-        index=1,
+        options=["Daily", "Weekly", "Rolling 30D average", "Monthly", "Annual"],
+        index=2,
         horizontal=True,
         key="actuals_granularity",
     )
@@ -646,8 +658,8 @@ def render_forwards_section(forwards_f: pd.DataFrame):
     st.caption("The chart uses EOD Price when available; otherwise Last Price; otherwise Reference Price.")
     granularity = st.radio(
         "Forwards granularity",
-        options=["Daily", "Rolling 30D average", "Monthly", "Annual"],
-        index=1,
+        options=["Daily", "Weekly", "Rolling 30D average", "Monthly", "Annual"],
+        index=2,
         horizontal=True,
         key="forwards_granularity",
     )
