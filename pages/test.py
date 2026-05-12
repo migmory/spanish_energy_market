@@ -7,6 +7,7 @@ st.set_page_config(page_title="REE Installed Capacity Test", layout="wide")
 st.title("REE Installed Capacity - 2026 API Test")
 
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
+
 REE_PENINSULAR_PARAMS = {
     "geo_trunc": "electric_system",
     "geo_limit": "peninsular",
@@ -34,7 +35,7 @@ LOCAL_MIX_TECH_MAP = {
 }
 
 
-def fetch_installed_capacity(start_day: date, end_day: date) -> tuple[requests.Response, dict]:
+def fetch_installed_capacity(start_day: date, end_day: date):
     url = f"{REE_API_BASE}/generacion/potencia-instalada"
     params = {
         "start_date": f"{start_day.isoformat()}T00:00",
@@ -42,9 +43,26 @@ def fetch_installed_capacity(start_day: date, end_day: date) -> tuple[requests.R
         "time_trunc": "month",
         **REE_PENINSULAR_PARAMS,
     }
+
     resp = requests.get(url, params=params, timeout=60)
-    payload = resp.json()
-    return resp, payload
+
+    debug_info = {
+        "status_code": resp.status_code,
+        "url_called": resp.url,
+        "content_type": resp.headers.get("Content-Type"),
+        "response_preview": resp.text[:5000],
+    }
+
+    try:
+        payload = resp.json()
+        debug_info["json_ok"] = True
+        debug_info["json_error"] = None
+    except Exception as e:
+        payload = None
+        debug_info["json_ok"] = False
+        debug_info["json_error"] = f"{type(e).__name__}: {e}"
+
+    return resp, payload, debug_info
 
 
 def parse_ree_included_series(payload: dict) -> pd.DataFrame:
@@ -99,8 +117,10 @@ def postprocess_capacity(df: pd.DataFrame) -> pd.DataFrame:
 st.markdown("### Test parameters")
 
 c1, c2 = st.columns(2)
+
 with c1:
     start_day = st.date_input("Start date", value=date(2026, 1, 1))
+
 with c2:
     end_day = st.date_input("End date", value=date.today())
 
@@ -108,34 +128,29 @@ run = st.button("Run REE test", type="primary")
 
 if run:
     try:
-        resp, payload = fetch_installed_capacity(start_day, end_day)
+        resp, payload, debug_info = fetch_installed_capacity(start_day, end_day)
 
-        st.markdown("### 1. HTTP response")
-        st.write(
-            {
-                "status_code": resp.status_code,
-                "url_called": resp.url,
-                "ok": resp.ok,
-            }
-        )
+        st.markdown("### 1. Raw HTTP debug")
+        st.write(debug_info)
 
         if not resp.ok:
             st.error("REE returned an HTTP error.")
-            st.code(resp.text[:5000])
             st.stop()
 
-        st.markdown("### 2. Top-level JSON keys")
-        st.write(list(payload.keys()))
+        if payload is None:
+            st.error("REE did not return valid JSON.")
+            st.stop()
 
-        included = payload.get("included", []) or []
+        st.markdown("### 2. Top-level JSON structure")
         st.write(
             {
-                "included_items": len(included),
+                "top_level_keys": list(payload.keys()),
+                "included_items": len(payload.get("included", []) or []),
                 "has_data_key": "data" in payload,
             }
         )
 
-        st.markdown("### 3. Raw JSON sample")
+        st.markdown("### 3. Raw JSON")
         st.json(payload)
 
         parsed = parse_ree_included_series(payload)
@@ -144,7 +159,11 @@ if run:
         st.write(
             {
                 "parsed_rows": len(parsed),
-                "unique_titles": sorted(parsed["title"].dropna().unique().tolist()) if not parsed.empty else [],
+                "unique_titles": (
+                    sorted(parsed["title"].dropna().unique().tolist())
+                    if not parsed.empty
+                    else []
+                ),
             }
         )
         st.dataframe(parsed, use_container_width=True)
@@ -155,15 +174,23 @@ if run:
         st.write(
             {
                 "final_rows": len(processed),
-                "months_returned": sorted(processed["datetime"].dt.strftime("%Y-%m").unique().tolist()) if not processed.empty else [],
+                "months_returned": (
+                    sorted(processed["datetime"].dt.strftime("%Y-%m").unique().tolist())
+                    if not processed.empty
+                    else []
+                ),
+                "technologies_returned": (
+                    sorted(processed["technology"].dropna().unique().tolist())
+                    if not processed.empty
+                    else []
+                ),
             }
         )
         st.dataframe(processed, use_container_width=True)
 
         if processed.empty:
             st.warning(
-                "REE answered, but no installed-capacity rows survived the parser. "
-                "This explains the warning in your dashboard."
+                "REE answered with valid JSON, but no installed-capacity rows survived the parser."
             )
         else:
             st.success("REE installed-capacity data was returned and parsed correctly.")
