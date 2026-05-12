@@ -17,12 +17,36 @@ except Exception:
     pass
 
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 import pandas as pd
 import pulp
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+
+try:
+    from scipy.optimize import linprog
+    SCIPY_LINPROG_AVAILABLE = True
+except Exception:
+    linprog = None
+    SCIPY_LINPROG_AVAILABLE = False
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        Image as RLImage, PageBreak, KeepTogether
+    )
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
+
 
 # =========================================================
 # CONFIG
@@ -34,6 +58,9 @@ load_dotenv(dotenv_path=ENV_PATH, override=True)
 HISTORICAL_DIR = BASE_DIR / "historical_data"
 HISTORICAL_DIR.mkdir(exist_ok=True)
 DATA_DIR = BASE_DIR / "data"
+NEXWELL_LOGO_PATH = DATA_DIR / "nexwell-power.jpg"
+BESS_DEFAULT_DATA_PATH = DATA_DIR / "data.xlsx"
+BESS_DEFAULT_SOLAR_PROFILE_PATH = DATA_DIR / "profile_production_1y_hourly.xlsx"
 
 PRICE_RAW_CSV_PATH = HISTORICAL_DIR / "day_ahead_spain_spot_600_raw.csv"
 SOLAR_P48_RAW_CSV_PATH = HISTORICAL_DIR / "solar_p48_spain_84_raw.csv"
@@ -1161,98 +1188,54 @@ def compute_bess_tb_spread(
     eta_dis: float = 1.0,
 ) -> float | None:
     """
-    Devuelve valor diario de arbitrage por MWh nominal de batería.
-    Está alineado con la lógica de la pestaña BESS standalone:
-    - generacion = 0
-    - consumo = 0
-    - omie_compra = omie_venta
-    - spread = beneficio neto / capacidad nominal
+    Deterministic TB spread proxy without external solver binaries.
+
+    For a 1-cycle standalone battery with equal buy/sell spot prices:
+    - TB4 (c-rate 0.25) = weighted sell price of the 4 highest-price hours
+      minus weighted buy price of the 4 lowest-price hours.
+    - TB2 (c-rate 0.50) = same logic over 2 charging/discharging hours.
+
+    This avoids CBC/PuLP executable issues on Streamlit Cloud while keeping the
+    standard economic interpretation of TB spreads.
     """
     if hourly_df.empty or "Price (€/MWh)" not in hourly_df.columns:
         return None
 
-    prices = pd.to_numeric(hourly_df["Price (€/MWh)"], errors="coerce").tolist()
-    prices = [p for p in prices if pd.notna(p)]
-    n = len(prices)
-    if n == 0:
+    prices = pd.to_numeric(hourly_df["Price (€/MWh)"], errors="coerce").dropna().tolist()
+    if not prices:
         return None
 
-    omie_sell = prices
-    omie_buy = prices
-    gen = [0.0] * n
-    load = [0.0] * n
-
-    max_power = capacity_mwh * c_rate
-    max_grid_flow = max([0.0] + gen + load) + max_power
-    max_grid_flow = max(max_grid_flow, 1.0)
-
-    model = pulp.LpProblem("email_report_bess_tb", pulp.LpMaximize)
-
-    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
-    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
-    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
-    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
-    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
-    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
-    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
-    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
-    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
-    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
-
-    model += soc[0] == 0.0
-    model += soc[n] == 0.0
-
-    for t in range(n):
-        model += g_to_batt[t] + grid_charge[t] <= max_power * is_charging[t]
-        model += batt_for_load[t] + batt_for_sell[t] <= max_power * (1 - is_charging[t])
-
-        model += g_to_grid[t] + batt_for_sell[t] <= max_power
-        model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
-        model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
-
-        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == gen[t]
-        model += load[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
-
-        model += soc[t + 1] == (
-            soc[t]
-            + eta_ch * (g_to_batt[t] + grid_charge[t])
-            - (1 / max(eta_dis, 1e-9)) * (batt_for_load[t] + batt_for_sell[t])
-        )
-        model += soc[t] <= capacity_mwh
-
-    model += soc[n] <= capacity_mwh
-    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= capacity_mwh / max(eta_ch, 1e-9)
-    model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(
-        g_to_batt[t] + grid_charge[t] for t in range(n)
-    )
-
-    # Igual que la pestaña BESS: beneficio neto
-    model += pulp.lpSum(
-        g_to_grid[t] * omie_sell[t]
-        + batt_for_sell[t] * omie_sell[t]
-        - grid_purchase[t] * omie_buy[t]
-        - grid_charge[t] * omie_buy[t]
-        for t in range(n)
-    )
-
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    model.solve(solver)
-
-    if pulp.LpStatus[model.status] != "Optimal":
+    capacity_mwh = float(capacity_mwh)
+    c_rate = float(c_rate)
+    eta_ch = max(float(eta_ch), 1e-9)
+    eta_dis = max(float(eta_dis), 1e-9)
+    power_mwh_per_hour = capacity_mwh * c_rate
+    if capacity_mwh <= 0 or power_mwh_per_hour <= 0:
         return None
 
-    revenue = sum(
-        ((pulp.value(g_to_grid[t]) or 0.0) * omie_sell[t])
-        + ((pulp.value(batt_for_sell[t]) or 0.0) * omie_sell[t])
-        - ((pulp.value(grid_purchase[t]) or 0.0) * omie_buy[t])
-        - ((pulp.value(grid_charge[t]) or 0.0) * omie_buy[t])
-        for t in range(n)
-    )
+    remaining_charge = capacity_mwh / eta_ch
+    remaining_discharge = capacity_mwh * eta_dis
+    buy_cost = 0.0
+    sell_revenue = 0.0
 
-    if capacity_mwh <= 0:
+    for p in sorted(prices):
+        q = min(power_mwh_per_hour, remaining_charge)
+        if q <= 0:
+            break
+        buy_cost += q * float(p)
+        remaining_charge -= q
+
+    for p in sorted(prices, reverse=True):
+        q = min(power_mwh_per_hour, remaining_discharge)
+        if q <= 0:
+            break
+        sell_revenue += q * float(p)
+        remaining_discharge -= q
+
+    if remaining_charge > 1e-6 or remaining_discharge > 1e-6:
         return None
 
-    return revenue / capacity_mwh
+    return (sell_revenue - buy_cost) / capacity_mwh
 
 
 def make_tb_spreads_table(hourly_df: pd.DataFrame) -> pd.DataFrame:
@@ -2360,6 +2343,537 @@ def make_metric_kpis(day_ahead_df: pd.DataFrame, mibgas_df: pd.DataFrame, tb_df:
     return items
 
 
+
+# =========================================================
+# BESS PERIOD REVENUES (REPORT VERSION)
+# =========================================================
+def load_bess_default_solar_profile_for_report() -> pd.DataFrame:
+    if not BESS_DEFAULT_SOLAR_PROFILE_PATH.exists():
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    try:
+        df = pd.read_excel(BESS_DEFAULT_SOLAR_PROFILE_PATH)
+    except Exception:
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    if df.empty:
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    col_map = {str(c).lower().strip(): c for c in df.columns}
+    gen_col = next((col_map[c] for c in ["generation", "generacion", "gen"] if c in col_map), None)
+    if gen_col is None:
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    out = pd.DataFrame({"generation": pd.to_numeric(df[gen_col], errors="coerce").fillna(0.0)})
+    out["hour_of_year"] = np.arange(1, len(out) + 1)
+    return out[["hour_of_year", "generation"]]
+
+
+def load_bess_default_demand_profile_for_report() -> pd.DataFrame:
+    if not BESS_DEFAULT_DATA_PATH.exists():
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    try:
+        df = pd.read_excel(BESS_DEFAULT_DATA_PATH, sheet_name=0)
+    except Exception:
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    if df.empty:
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    cols = list(df.columns)
+    if len(cols) < 6:
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    tmp = df.copy()
+    tmp["consumption"] = pd.to_numeric(tmp[cols[5]], errors="coerce").fillna(0.0)
+    tmp["hour_of_year"] = np.arange(1, len(tmp) + 1)
+    return tmp[["hour_of_year", "consumption"]]
+
+
+def make_period_hourly_bess_inputs(
+    price_hourly: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    mode: str,
+    bess_power_mw: float = 1.0,
+) -> pd.DataFrame:
+    tmp = ensure_datetime_col(price_hourly, "datetime")
+    tmp = tmp[
+        (tmp["datetime"].dt.date >= start_d)
+        & (tmp["datetime"].dt.date <= end_d)
+    ][["datetime", "price"]].copy()
+    if tmp.empty:
+        return pd.DataFrame()
+
+    tmp["date"] = tmp["datetime"].dt.date
+    tmp["hour"] = tmp["datetime"].dt.hour + 1
+    tmp["year"] = tmp["datetime"].dt.year
+    tmp["hour_of_year"] = tmp["datetime"].dt.dayofyear.sub(1).mul(24).add(tmp["datetime"].dt.hour + 1)
+
+    solar_profile = load_bess_default_solar_profile_for_report()
+    demand_profile = load_bess_default_demand_profile_for_report()
+
+    tmp = tmp.merge(solar_profile, on="hour_of_year", how="left")
+    tmp = tmp.merge(demand_profile, on="hour_of_year", how="left")
+    tmp["generation"] = tmp["generation"].fillna(0.0) * float(bess_power_mw)
+    tmp["consumption"] = tmp["consumption"].fillna(0.0)
+
+    if mode == "Standalone BESS":
+        tmp["generation"] = 0.0
+        tmp["consumption"] = 0.0
+        tmp["buy_price"] = tmp["price"]
+    elif mode == "BESS with demand":
+        tmp["buy_price"] = tmp["price"]
+    elif mode == "BESS without demand":
+        tmp["buy_price"] = 1000.0
+        tmp["consumption"] = 0.0
+    else:
+        raise ValueError(f"Unknown BESS mode: {mode}")
+
+    tmp = tmp.rename(columns={"price": "sell_price"})
+    return tmp[["datetime", "date", "hour", "sell_price", "buy_price", "generation", "consumption"]].copy()
+
+
+def _linprog_bess_day_revenue(
+    df_day: pd.DataFrame,
+    capacity_mwh: float = 4.0,
+    power_mw: float = 1.0,
+    eta_ch: float = 0.93,
+    eta_dis: float = 0.93,
+    cycle_limit_factor: float = 1.0,
+) -> dict:
+    """
+    Continuous-LP report replica of the BESS logic.
+    It keeps the same economic objective and operational constraints as the BESS tab,
+    but drops binary import/export switches so it can run with scipy.linprog
+    without relying on an external CBC executable.
+    """
+    if not SCIPY_LINPROG_AVAILABLE or df_day.empty:
+        return {
+            "Revenue BESS (€)": None,
+            "Charged (MWh)": None,
+            "Discharged (MWh)": None,
+            "Solver": "Unavailable",
+        }
+
+    d = df_day.sort_values("hour").reset_index(drop=True).copy()
+    sell = pd.to_numeric(d["sell_price"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    buy = pd.to_numeric(d["buy_price"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    gen = pd.to_numeric(d["generation"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    load = pd.to_numeric(d["consumption"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    n = len(d)
+    if n == 0:
+        return {
+            "Revenue BESS (€)": None,
+            "Charged (MWh)": None,
+            "Discharged (MWh)": None,
+            "Solver": "No data",
+        }
+
+    # Variable slices
+    ofs = {}
+    k = 0
+    for name in ["g_to_grid", "g_to_batt", "g_to_self", "grid_charge", "batt_for_load", "batt_for_sell", "grid_purchase"]:
+        ofs[name] = slice(k, k + n)
+        k += n
+    ofs["soc"] = slice(k, k + n + 1)
+    total_vars = k + n + 1
+
+    # Objective: linprog minimizes, so use negative of project cash flow objective.
+    c = np.zeros(total_vars)
+    c[ofs["g_to_grid"]] = -sell
+    c[ofs["batt_for_sell"]] = -sell
+    c[ofs["grid_purchase"]] = buy
+    c[ofs["grid_charge"]] = buy
+
+    A_eq = []
+    b_eq = []
+
+    # g_to_grid + g_to_batt + g_to_self == generation
+    for t in range(n):
+        row = np.zeros(total_vars)
+        row[ofs["g_to_grid"].start + t] = 1.0
+        row[ofs["g_to_batt"].start + t] = 1.0
+        row[ofs["g_to_self"].start + t] = 1.0
+        A_eq.append(row)
+        b_eq.append(gen[t])
+
+    # g_to_self + batt_for_load + grid_purchase == demand
+    for t in range(n):
+        row = np.zeros(total_vars)
+        row[ofs["g_to_self"].start + t] = 1.0
+        row[ofs["batt_for_load"].start + t] = 1.0
+        row[ofs["grid_purchase"].start + t] = 1.0
+        A_eq.append(row)
+        b_eq.append(load[t])
+
+    # SOC transitions
+    eta_ch = max(float(eta_ch), 1e-9)
+    eta_dis = max(float(eta_dis), 1e-9)
+    for t in range(n):
+        row = np.zeros(total_vars)
+        row[ofs["soc"].start + t + 1] = 1.0
+        row[ofs["soc"].start + t] = -1.0
+        row[ofs["g_to_batt"].start + t] = -eta_ch
+        row[ofs["grid_charge"].start + t] = -eta_ch
+        row[ofs["batt_for_load"].start + t] = 1.0 / eta_dis
+        row[ofs["batt_for_sell"].start + t] = 1.0 / eta_dis
+        A_eq.append(row)
+        b_eq.append(0.0)
+
+    # SOC start/end = 0
+    row = np.zeros(total_vars)
+    row[ofs["soc"].start] = 1.0
+    A_eq.append(row)
+    b_eq.append(0.0)
+
+    row = np.zeros(total_vars)
+    row[ofs["soc"].stop - 1] = 1.0
+    A_eq.append(row)
+    b_eq.append(0.0)
+
+    A_ub = []
+    b_ub = []
+    max_power = max(float(power_mw), 1e-9)
+    max_grid_flow = max_power
+
+    # charge/discharge/export/import power caps
+    for t in range(n):
+        row = np.zeros(total_vars)
+        row[ofs["g_to_batt"].start + t] = 1.0
+        row[ofs["grid_charge"].start + t] = 1.0
+        A_ub.append(row)
+        b_ub.append(max_power)
+
+        row = np.zeros(total_vars)
+        row[ofs["batt_for_load"].start + t] = 1.0
+        row[ofs["batt_for_sell"].start + t] = 1.0
+        A_ub.append(row)
+        b_ub.append(max_power)
+
+        row = np.zeros(total_vars)
+        row[ofs["g_to_grid"].start + t] = 1.0
+        row[ofs["batt_for_sell"].start + t] = 1.0
+        A_ub.append(row)
+        b_ub.append(max_grid_flow)
+
+        row = np.zeros(total_vars)
+        row[ofs["grid_purchase"].start + t] = 1.0
+        row[ofs["grid_charge"].start + t] = 1.0
+        A_ub.append(row)
+        b_ub.append(max_grid_flow)
+
+    # 1 cycle/day charging limit
+    row = np.zeros(total_vars)
+    row[ofs["g_to_batt"]] = 1.0
+    row[ofs["grid_charge"]] = 1.0
+    A_ub.append(row)
+    b_ub.append(float(cycle_limit_factor) * float(capacity_mwh) / eta_ch)
+
+    # Discharge <= charge
+    row = np.zeros(total_vars)
+    row[ofs["batt_for_load"]] = 1.0
+    row[ofs["batt_for_sell"]] = 1.0
+    row[ofs["g_to_batt"]] = -1.0
+    row[ofs["grid_charge"]] = -1.0
+    A_ub.append(row)
+    b_ub.append(0.0)
+
+    bounds = [(0.0, None)] * total_vars
+    for i in range(ofs["soc"].start, ofs["soc"].stop):
+        bounds[i] = (0.0, float(capacity_mwh))
+
+    try:
+        res = linprog(
+            c,
+            A_ub=np.asarray(A_ub),
+            b_ub=np.asarray(b_ub),
+            A_eq=np.asarray(A_eq),
+            b_eq=np.asarray(b_eq),
+            bounds=bounds,
+            method="highs",
+        )
+    except Exception:
+        return {
+            "Revenue BESS (€)": None,
+            "Charged (MWh)": None,
+            "Discharged (MWh)": None,
+            "Solver": "Error",
+        }
+
+    if not res.success or res.x is None:
+        return {
+            "Revenue BESS (€)": None,
+            "Charged (MWh)": None,
+            "Discharged (MWh)": None,
+            "Solver": "No optimum",
+        }
+
+    x = res.x
+    g_to_batt = x[ofs["g_to_batt"]]
+    grid_charge = x[ofs["grid_charge"]]
+    batt_for_load = x[ofs["batt_for_load"]]
+    batt_for_sell = x[ofs["batt_for_sell"]]
+
+    revenue_bess = float(
+        (-g_to_batt * sell).sum()
+        - (grid_charge * buy).sum()
+        + (batt_for_sell * sell).sum()
+    )
+    return {
+        "Revenue BESS (€)": revenue_bess,
+        "Charged (MWh)": float((g_to_batt + grid_charge).sum()),
+        "Discharged (MWh)": float((batt_for_load + batt_for_sell).sum()),
+        "Solver": "SciPy LP",
+    }
+
+
+def build_bess_revenue_period_table(
+    price_hourly: pd.DataFrame,
+    period_specs: list[tuple[str, date, date]],
+    capacity_mwh: float = 4.0,
+    c_rate: float = 0.25,
+    eta_ch: float = 0.93,
+    eta_dis: float = 0.93,
+) -> pd.DataFrame:
+    modes = ["Standalone BESS", "BESS with demand", "BESS without demand"]
+    power_mw = float(capacity_mwh) * float(c_rate)
+    rows = []
+    for mode in modes:
+        for label, s, e in period_specs:
+            data = make_period_hourly_bess_inputs(price_hourly, s, e, mode, bess_power_mw=power_mw)
+            daily_rows = []
+            if not data.empty:
+                for _day, day_df in data.groupby("date"):
+                    daily_rows.append(
+                        _linprog_bess_day_revenue(
+                            day_df,
+                            capacity_mwh=capacity_mwh,
+                            power_mw=power_mw,
+                            eta_ch=eta_ch,
+                            eta_dis=eta_dis,
+                            cycle_limit_factor=1.0,
+                        )
+                    )
+            tmp = pd.DataFrame(daily_rows)
+            revenue = tmp["Revenue BESS (€)"].sum(min_count=1) if not tmp.empty else None
+            charged = tmp["Charged (MWh)"].sum(min_count=1) if not tmp.empty else None
+            discharged = tmp["Discharged (MWh)"].sum(min_count=1) if not tmp.empty else None
+            valid_days = int(tmp["Revenue BESS (€)"].notna().sum()) if not tmp.empty and "Revenue BESS (€)" in tmp.columns else 0
+            rows.append({
+                "Mode": mode,
+                "Period": label,
+                "Revenue BESS (€)": revenue,
+                "Revenue BESS (€/MW)": (revenue / power_mw) if revenue is not None and pd.notna(revenue) and power_mw > 0 else None,
+                "Charged (MWh)": charged,
+                "Discharged (MWh)": discharged,
+                "Solved days": valid_days,
+                "Assumptions": f"{capacity_mwh:.1f} MWh / {power_mw:.1f} MW, ηch={eta_ch:.0%}, ηdis={eta_dis:.0%}, 1 cycle/day",
+            })
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# CORPORATE PDF EXPORT
+# =========================================================
+def _pdf_safe_text(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):,.2f}"
+    return str(value)
+
+
+def _pdf_df_table(df: pd.DataFrame, max_rows: int = 18):
+    if not REPORTLAB_AVAILABLE or df is None or df.empty:
+        return Paragraph("<i>No data available.</i>", getSampleStyleSheet()["BodyText"])
+    work = df.head(max_rows).copy()
+    data = [[_pdf_safe_text(c) for c in work.columns]]
+    for _, row in work.iterrows():
+        data.append([_pdf_safe_text(v) for v in row.tolist()])
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F766E")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return tbl
+
+
+def _pdf_img_from_b64(image_b64: str | None, width_cm: float = 24.0):
+    if not REPORTLAB_AVAILABLE or not image_b64:
+        return None
+    try:
+        bio = BytesIO(base64.b64decode(image_b64))
+        img = RLImage(bio)
+        ratio = img.imageHeight / max(img.imageWidth, 1)
+        img.drawWidth = width_cm * cm
+        img.drawHeight = img.drawWidth * ratio
+        return img
+    except Exception:
+        return None
+
+
+def build_corporate_pdf_bytes(
+    subject: str,
+    report_granularity: str,
+    selected_period_label: str,
+    kpi_items: list[tuple[str, str]],
+    day_ahead_df: pd.DataFrame,
+    forward_df: pd.DataFrame,
+    mibgas_df: pd.DataFrame,
+    tb_df: pd.DataFrame,
+    bess_revenue_df: pd.DataFrame,
+    mix_df: pd.DataFrame,
+    ytd_negative_df: pd.DataFrame,
+    omie_heatmap_b64: str | None,
+    mix_chart_b64: str | None,
+    neg_chart_b64: str | None,
+    zero_neg_b64: str | None,
+    curt_b64: str | None,
+    spot_b64: str | None,
+) -> bytes | None:
+    if not REPORTLAB_AVAILABLE:
+        return None
+
+    output = BytesIO()
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=landscape(A4),
+        rightMargin=0.8 * cm,
+        leftMargin=0.8 * cm,
+        topMargin=1.25 * cm,
+        bottomMargin=1.0 * cm,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="NexwellTitle",
+        parent=styles["Title"],
+        fontSize=19,
+        leading=22,
+        textColor=colors.HexColor("#0F766E"),
+        alignment=TA_LEFT,
+        spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="NexwellH2",
+        parent=styles["Heading2"],
+        fontSize=11,
+        leading=13,
+        textColor=colors.HexColor("#0F766E"),
+        spaceBefore=8,
+        spaceAfter=4,
+    ))
+    styles.add(ParagraphStyle(
+        name="NexwellBody",
+        parent=styles["BodyText"],
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#1F2937"),
+    ))
+    styles.add(ParagraphStyle(
+        name="NexwellSmall",
+        parent=styles["BodyText"],
+        fontSize=7,
+        leading=9,
+        textColor=colors.HexColor("#475569"),
+    ))
+
+    def _header_footer(canvas, _doc):
+        canvas.saveState()
+        page_w, page_h = landscape(A4)
+        canvas.setFillColor(colors.HexColor("#0F766E"))
+        canvas.rect(0, page_h - 0.55 * cm, page_w, 0.55 * cm, fill=1, stroke=0)
+        if NEXWELL_LOGO_PATH.exists():
+            try:
+                canvas.drawImage(
+                    ImageReader(str(NEXWELL_LOGO_PATH)),
+                    0.9 * cm,
+                    page_h - 0.46 * cm,
+                    width=1.0 * cm,
+                    height=0.32 * cm,
+                    preserveAspectRatio=True,
+                    mask="auto",
+                )
+            except Exception:
+                pass
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawRightString(page_w - 0.9 * cm, page_h - 0.34 * cm, "Nexwell Power | Energy Markets")
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawString(0.9 * cm, 0.45 * cm, f"{subject} | {selected_period_label}")
+        canvas.drawRightString(page_w - 0.9 * cm, 0.45 * cm, f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    story = []
+    story.append(Paragraph(subject, styles["NexwellTitle"]))
+    story.append(Paragraph(
+        f"<b>Report type:</b> {report_granularity} &nbsp;&nbsp; "
+        f"<b>Selected period:</b> {selected_period_label}",
+        styles["NexwellBody"],
+    ))
+    story.append(Spacer(1, 0.18 * cm))
+
+    if NEXWELL_LOGO_PATH.exists():
+        try:
+            logo = RLImage(str(NEXWELL_LOGO_PATH))
+            logo.drawHeight = 0.72 * cm
+            logo.drawWidth = 2.2 * cm
+            story.append(logo)
+            story.append(Spacer(1, 0.15 * cm))
+        except Exception:
+            pass
+
+    if kpi_items:
+        kpi_df = pd.DataFrame(kpi_items, columns=["Quick metric", "Value"])
+        story.append(Paragraph("Executive quick metrics", styles["NexwellH2"]))
+        story.append(_pdf_df_table(kpi_df, max_rows=20))
+
+    sections = [
+        ("Day-ahead spot and solar captured prices", day_ahead_df),
+        ("Forward market summary", forward_df),
+        ("MIBGAS GDAES D+1 summary", mibgas_df),
+        ("BESS TB spreads", tb_df),
+        ("BESS revenue comparison", bess_revenue_df),
+        ("Generation mix comparison", mix_df),
+        ("Negative prices YTD", ytd_negative_df),
+    ]
+    for title, df in sections:
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph(title, styles["NexwellH2"]))
+        story.append(_pdf_df_table(df, max_rows=18))
+
+    chart_sections = [
+        ("OMIE hourly price heatmap", omie_heatmap_b64),
+        ("Generation mix chart", mix_chart_b64),
+        ("Monthly negative-price frequency", neg_chart_b64),
+        ("12x24 negative-price frequency", zero_neg_b64),
+        ("Monthly economic curtailment", curt_b64),
+        ("Spot and solar capture evolution", spot_b64),
+    ]
+    for title, img_b64 in chart_sections:
+        img = _pdf_img_from_b64(img_b64)
+        if img is not None:
+            story.append(PageBreak())
+            story.append(Paragraph(title, styles["NexwellH2"]))
+            story.append(img)
+
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph(
+        "Method note: BESS revenue comparison uses the Email Report's continuous LP replica "
+        "of the BESS-tab dispatch logic with default assumptions of 4.0 MWh, 1.0 MW, "
+        "93% charging/discharging efficiency and 1 cycle/day. "
+        "If the default demand file is unavailable, the 'BESS with demand' case uses a zero-demand fallback.",
+        styles["NexwellSmall"],
+    ))
+
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    output.seek(0)
+    return output.getvalue()
+
+
 # =========================================================
 # LOAD DATA
 # =========================================================
@@ -2465,6 +2979,14 @@ ytd_negative_df = build_ytd_negative_table(price_hourly, selected_end, negative_
 mix_period_df = build_period_mix_table(ree_daily_raw, period_specs)
 mix_period_chart = build_period_mix_chart(mix_period_df)
 tb_period_df = build_period_tb_table(price_hourly, period_specs)
+bess_revenue_period_df = build_bess_revenue_period_table(
+    price_hourly,
+    period_specs,
+    capacity_mwh=4.0,
+    c_rate=0.25,
+    eta_ch=0.93,
+    eta_dis=0.93,
+)
 
 mibgas_actuals_df = load_mibgas_actuals_for_report()
 mibgas_period_df = build_mibgas_summary_table(mibgas_actuals_df, period_specs)
@@ -2516,7 +3038,17 @@ if tb_period_df.empty:
     st.info("No TB spread data available.")
 else:
     st.dataframe(tb_period_df, use_container_width=True)
-    st.caption("TB4 and TB2 are averaged from daily standalone arbitrage spreads aligned with the BESS-tab logic.")
+    st.caption("TB4 and TB2 are averaged from daily standalone arbitrage spreads without relying on CBC/PuLP solver binaries.")
+
+st.subheader("BESS revenue comparison")
+if bess_revenue_period_df.empty:
+    st.info("No BESS revenue comparison available.")
+else:
+    st.dataframe(bess_revenue_period_df, use_container_width=True)
+    st.caption(
+        "Revenue comparison uses 4.0 MWh / 1.0 MW, 93% charging and discharging efficiency, and 1 cycle/day. "
+        "The three scenarios follow the BESS tab naming: Standalone BESS, BESS with demand, and BESS without demand."
+    )
 
 st.subheader("Generation mix comparison")
 if mix_period_df.empty:
@@ -2568,6 +3100,7 @@ day_ahead_html = df_to_html_table(
 forward_html = df_to_html_table(forward_summary_df, pct_cols=["Δ %"]) if not forward_summary_df.empty else "<p>No OMIP forward cache available for the selected period.</p>"
 mibgas_html = df_to_html_table(mibgas_period_df) if not mibgas_period_df.empty else "<p>No MIBGAS period summary available.</p>"
 tb_html = df_to_html_table(tb_period_df) if not tb_period_df.empty else "<p>No TB spread summary available.</p>"
+bess_revenue_html = df_to_html_table(bess_revenue_period_df) if not bess_revenue_period_df.empty else "<p>No BESS revenue comparison available.</p>"
 mix_html = df_to_html_table(mix_period_df, pct_cols=["Renewables share (%)"]) if not mix_period_df.empty else "<p>No generation mix period summary available.</p>"
 ytd_negative_html = df_to_html_table(ytd_negative_df, pct_cols=[f"% {price_event_label(negative_price_mode)} hours"])
 neg_pct_html = df_to_html_table(neg_pct_table.drop(columns=["month_num"], errors="ignore"), pct_cols=["pct_event"]) if not neg_pct_table.empty else "<p>No monthly negative-price frequency table available.</p>"
@@ -2643,6 +3176,7 @@ email_html = f"""
   <h3>Forward market summary</h3>{forward_html}<br>
   <h3>MIBGAS GDAES D+1 summary</h3>{mibgas_html}<br>
   <h3>BESS TB spreads</h3>{tb_html}<br>
+  <h3>BESS revenue comparison</h3>{bess_revenue_html}<br>
   <h3>Generation mix comparison</h3>{mix_html}<br>
   {mix_chart_html}
   <h3>Negative prices YTD</h3>{ytd_negative_html}<br>
@@ -2660,6 +3194,43 @@ email_html = f"""
 """
 
 report_day = selected_start
+mix_chart_b64 = chart_to_base64_png(mix_period_chart)
+neg_chart_b64 = chart_to_base64_png(neg_pct_chart)
+zero_neg_b64 = chart_to_base64_png(zero_neg_heatmap)
+curt_b64 = chart_to_base64_png(curt_chart)
+spot_b64 = chart_to_base64_png(spot_capture_chart)
+
+pdf_bytes = build_corporate_pdf_bytes(
+    subject=subject,
+    report_granularity=report_granularity,
+    selected_period_label=period_label(report_granularity, selected_start, selected_end),
+    kpi_items=kpi_cards_preview,
+    day_ahead_df=day_ahead_period_df,
+    forward_df=forward_summary_df,
+    mibgas_df=mibgas_period_df,
+    tb_df=tb_period_df,
+    bess_revenue_df=bess_revenue_period_df,
+    mix_df=mix_period_df,
+    ytd_negative_df=ytd_negative_df,
+    omie_heatmap_b64=omie_heatmap_b64,
+    mix_chart_b64=mix_chart_b64,
+    neg_chart_b64=neg_chart_b64,
+    zero_neg_b64=zero_neg_b64,
+    curt_b64=curt_b64,
+    spot_b64=spot_b64,
+)
+
+st.subheader("Corporate PDF export")
+if pdf_bytes:
+    st.download_button(
+        label="Download corporate PDF",
+        data=pdf_bytes,
+        file_name=f"nexwell_energy_market_report_{period_label(report_granularity, selected_start, selected_end).replace(' ', '_')}.pdf",
+        mime="application/pdf",
+    )
+else:
+    st.info("Corporate PDF export is unavailable. Add 'reportlab' to requirements.txt if it is not installed.")
+
 st.subheader("Email HTML preview")
 st.code(email_html, language="html")
 
@@ -2715,7 +3286,9 @@ else:
                 st.error(f"Send failed: {e}")
 
 st.info(
-    "This report now supports Daily, Weekly, Monthly, Quarterly and Annual snapshots. "
-    "TB4/TB2 are period averages of daily standalone battery spreads aligned with the BESS logic. "
+    "This report supports Daily, Weekly, Monthly, Quarterly and Annual snapshots. "
+    "TB4/TB2 now use a deterministic spread method that avoids CBC/PuLP executable failures on Streamlit Cloud. "
+    "The report also adds BESS revenue comparison for Standalone BESS, BESS with demand, and BESS without demand, "
+    "plus a branded Nexwell corporate PDF export. "
     "MIBGAS 2026 values are read from the cache generated by the MIBGAS tab when available."
 )
