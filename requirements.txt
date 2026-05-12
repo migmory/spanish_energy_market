@@ -9,3 +9,5 @@ pulp
 plotly
 paramiko
 lxml
+reportlab
+scipy
