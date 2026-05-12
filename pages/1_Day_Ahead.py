@@ -1833,6 +1833,73 @@ def build_period_shading_df(capture_combo: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def build_capture_price_overlay_chart(capture_combo: pd.DataFrame):
+    """Overlay selected monthly years on a common Jan-Dec x-axis."""
+    if capture_combo.empty:
+        return None
+
+    plot_df = capture_combo.copy().rename(
+        columns={
+            "avg_spot_price": "Average spot price",
+            "captured_solar_price_curtailed": "Solar captured (curtailed)",
+            "captured_solar_price_uncurtailed": "Solar captured (uncurtailed)",
+        }
+    )
+
+    long_df = plot_df.melt(
+        id_vars=["period"],
+        value_vars=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        var_name="series",
+        value_name="value",
+    ).dropna(subset=["value"])
+
+    if long_df.empty:
+        return None
+
+    long_df["year"] = long_df["period"].dt.year.astype(str)
+    long_df["month_num"] = long_df["period"].dt.month.astype(int)
+    long_df["month_name"] = long_df["period"].dt.strftime("%b")
+
+    month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    dash_scale = alt.Scale(
+        domain=["Average spot price", "Solar captured (curtailed)", "Solar captured (uncurtailed)"],
+        range=[[1, 0], [6, 4], [2, 2]],
+    )
+
+    chart = (
+        alt.Chart(long_df)
+        .mark_line(point=True, strokeWidth=2.7)
+        .encode(
+            x=alt.X(
+                "month_name:N",
+                sort=month_order,
+                axis=alt.Axis(
+                    title=None,
+                    labelAngle=0,
+                    labelPadding=8,
+                    ticks=False,
+                    domain=False,
+                    grid=False,
+                ),
+            ),
+            y=alt.Y("value:Q", title="€/MWh"),
+            color=alt.Color("year:N", title="Year"),
+            strokeDash=alt.StrokeDash("series:N", title="Series", scale=dash_scale),
+            detail=["year:N", "series:N"],
+            tooltip=[
+                alt.Tooltip("year:N", title="Year"),
+                alt.Tooltip("month_name:N", title="Month", sort=month_order),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
+            ],
+        )
+        .properties(height=330)
+    )
+    return apply_common_chart_style(chart, height=330)
+
+
 def build_capture_price_chart(capture_combo: pd.DataFrame, aggregation: str = "Monthly"):
     if capture_combo.empty:
         return None
@@ -2810,11 +2877,45 @@ try:
     )
 
     capture_combo = build_capture_price_table(price_hourly, solar_hourly, capture_aggregation)
-    capture_chart = build_capture_price_chart(capture_combo, capture_aggregation)
+    capture_display = capture_combo.copy()
+    overlay_monthly_years = False
+
+    if capture_aggregation == "Monthly" and not capture_combo.empty:
+        overlay_monthly_years = st.checkbox(
+            "Overlay selected years on a common Jan-Dec axis",
+            value=False,
+            key="capture_price_overlay_monthly_years",
+        )
+        if overlay_monthly_years:
+            available_capture_years = sorted(capture_combo["period"].dt.year.dropna().astype(int).unique().tolist())
+            default_capture_years = (
+                available_capture_years[-3:]
+                if len(available_capture_years) >= 3
+                else available_capture_years
+            )
+            selected_capture_years = st.multiselect(
+                "Years to overlay",
+                options=available_capture_years,
+                default=default_capture_years,
+                key="capture_price_overlay_years",
+            )
+            capture_display = capture_combo[
+                capture_combo["period"].dt.year.isin(selected_capture_years)
+            ].copy()
+
+    if overlay_monthly_years:
+        if capture_display.empty:
+            st.warning("Select at least one year to show the Jan-Dec overlay chart.")
+            capture_chart = None
+        else:
+            capture_chart = build_capture_price_overlay_chart(capture_display)
+    else:
+        capture_chart = build_capture_price_chart(capture_display, capture_aggregation)
+
     if capture_chart is not None:
         st.altair_chart(capture_chart, use_container_width=True)
 
-    capture_table = capture_combo.copy()
+    capture_table = capture_display.copy()
     if not capture_table.empty:
         if capture_aggregation == "Daily":
             capture_table["Period"] = capture_table["period"].dt.strftime("%d-%b-%Y")
