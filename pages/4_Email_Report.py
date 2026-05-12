@@ -172,6 +172,31 @@ PRICE_HIGH_RED = "#DC2626"
 MISSING_GREY = "#F3F4F6"
 
 
+
+REE_API_BASE = "https://apidatos.ree.es/es/datos"
+REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+LIVE_MIX_START_DATE = date(2026, 1, 1)
+
+LOCAL_REE_MIX_TECH_MAP = {
+    "Hidráulica": "Hydro",
+    "Hidroeólica": "Other renewables",
+    "Turbinación bombeo": "Hydro",
+    "Nuclear": "Nuclear",
+    "Carbón": "Other non-renewables",
+    "Fuel + Gas": "Other non-renewables",
+    "Turbina de vapor": "Other non-renewables",
+    "Ciclo combinado": "CCGT",
+    "Eólica": "Wind",
+    "Solar fotovoltaica": "Solar PV",
+    "Solar térmica": "Solar thermal",
+    "Otras renovables": "Other renewables",
+    "Cogeneración": "CHP",
+    "Residuos no renovables": "Other non-renewables",
+    "Residuos renovables": "Biomass",
+    "Biogás": "Biogas",
+    "Biomasa": "Biomass",
+}
+
 RENEWABLE_TECHS = {
     "Wind",
     "Solar PV",
@@ -790,7 +815,82 @@ def build_hourly_weights_from_energy(df_hourly: pd.DataFrame, report_day: date, 
 # =========================================================
 # MIX
 # =========================================================
+def parse_mixed_date(value):
+    dt = pd.to_datetime(value, errors="coerce")
+    return dt if pd.notna(dt) else pd.NaT
+
+
+def load_historical_generation_mix_daily_for_report() -> pd.DataFrame:
+    """
+    Historical generation mix aligned with the Day Ahead page:
+    load /data/generation_mix_daily_2021_2025.xlsx when available.
+    Output is kept in GWh to match the Email Report tables.
+    """
+    if not HIST_MIX_XLSX_PATH.exists():
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+
+    try:
+        raw = pd.read_excel(HIST_MIX_XLSX_PATH, sheet_name="data", header=None)
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+
+    if raw.empty or raw.shape[0] < 6:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+
+    date_values = raw.iloc[4, 1:].tolist()
+    dates = []
+    for v in date_values:
+        dt = pd.to_datetime(v, utc=True, errors="coerce")
+        if pd.notna(dt):
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None).normalize()
+        else:
+            dt = parse_mixed_date(v)
+            if pd.notna(dt):
+                dt = pd.Timestamp(dt).normalize()
+        dates.append(dt)
+
+    tech_rows = raw.iloc[5:18, :].copy()
+    records = []
+    for _, row in tech_rows.iterrows():
+        tech_raw = str(row.iloc[0]).strip()
+        tech = LOCAL_REE_MIX_TECH_MAP.get(tech_raw, DAILY_REE_TECH_MAP.get(tech_raw, tech_raw))
+        if tech not in TECH_ORDER:
+            continue
+        values = pd.to_numeric(row.iloc[1:], errors="coerce")
+        for dt, val in zip(dates, values):
+            if pd.isna(dt) or pd.isna(val):
+                continue
+            records.append(
+                {
+                    "datetime": pd.Timestamp(dt).normalize(),
+                    "technology": tech,
+                    "value_gwh": float(val),
+                    "data_source": "Historical workbook",
+                }
+            )
+
+    out = pd.DataFrame(records)
+    if out.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+
+    out = (
+        out.groupby(["datetime", "technology", "data_source"], as_index=False)["value_gwh"]
+        .sum()
+        .sort_values(["datetime", "technology", "data_source"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
 def load_ree_mix_daily() -> pd.DataFrame:
+    """
+    Primary historical source: generation_mix_daily_2021_2025.xlsx.
+    Fallback source: historical_data/ree_generation_structure_daily_peninsular.csv.
+    """
+    hist = load_historical_generation_mix_daily_for_report()
+    if not hist.empty:
+        return hist
+
     df = load_raw_history(REE_MIX_DAILY_CSV_PATH)
     if df.empty:
         return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
@@ -803,10 +903,8 @@ def load_ree_mix_daily() -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df["value_gwh"] = pd.to_numeric(df["value_gwh"], errors="coerce")
     df = df.dropna(subset=["datetime", "value_gwh", "technology"]).copy()
-
     df["technology"] = df["technology"].replace(DAILY_REE_TECH_MAP)
     df = df[df["technology"].isin(TECH_ORDER)].copy()
-
     df = (
         df.groupby(["datetime", "technology"], as_index=False)
         .agg(value_gwh=("value_gwh", "sum"), data_source=("data_source", "first"))
@@ -814,6 +912,102 @@ def load_ree_mix_daily() -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return df
+
+
+def parse_ree_included_series_for_report(payload: dict, value_field: str = "value") -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
+            rows.append(
+                {
+                    "datetime": dt,
+                    "title": str(title).strip(),
+                    value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def normalize_ree_energy_to_gwh(series: pd.Series) -> pd.Series:
+    """
+    Daily REE widget data may arrive in GWh-scale values or MWh-scale values
+    depending on endpoint behaviour. Normalize to GWh for the Email Report.
+    """
+    vals = pd.to_numeric(series, errors="coerce")
+    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
+    if pd.notna(max_abs) and max_abs > 10000:
+        return vals / 1000.0
+    return vals
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_ree_widget_for_report(category: str, widget: str, start_day: date, end_day: date, time_trunc: str = "day") -> dict:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": time_trunc,
+        **REE_PENINSULAR_PARAMS,
+    }
+    url = f"{REE_API_BASE}/{category}/{widget}"
+    resp = requests.get(url, params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def load_live_2026_mix_daily_from_ree_for_report(start_day: date, end_day: date) -> pd.DataFrame:
+    start_day = max(start_day, LIVE_MIX_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+    try:
+        payload = fetch_ree_widget_for_report("generacion", "estructura-generacion", start_day, end_day, time_trunc="day")
+        df = parse_ree_included_series_for_report(payload, value_field="value")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+
+    if df.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "value_gwh", "data_source"])
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
+    df["technology"] = df["title"].map(lambda x: LOCAL_REE_MIX_TECH_MAP.get(str(x).strip(), DAILY_REE_TECH_MAP.get(str(x).strip(), str(x).strip())))
+    df["value_gwh"] = normalize_ree_energy_to_gwh(df["value"])
+    df["data_source"] = "REE API"
+    df = df.dropna(subset=["datetime", "technology", "value_gwh"]).copy()
+    df = df[df["technology"].isin(TECH_ORDER)].copy()
+
+    out = (
+        df.groupby(["datetime", "technology", "data_source"], as_index=False)["value_gwh"]
+        .sum()
+        .sort_values(["datetime", "technology", "data_source"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def enrich_mix_with_live_2026(ree_daily_df: pd.DataFrame, period_specs: list[tuple[str, date, date]]) -> pd.DataFrame:
+    base = ensure_datetime_col(ree_daily_df, "datetime")
+    needed = [(s, e) for _, s, e in period_specs if e >= LIVE_MIX_START_DATE]
+    if not needed:
+        return base
+    start_d = max(min(s for s, _ in needed), LIVE_MIX_START_DATE)
+    end_d = max(e for _, e in needed)
+    live = load_live_2026_mix_daily_from_ree_for_report(start_d, end_d)
+    if live.empty:
+        return base
+    out = pd.concat([base, live], ignore_index=True)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.normalize()
+    out = (
+        out.dropna(subset=["datetime", "technology", "value_gwh"])
+        .sort_values(["datetime", "technology", "data_source"])
+        .drop_duplicates(subset=["datetime", "technology"], keep="last")
+        .reset_index(drop=True)
+    )
+    return out
 
 
 def get_daily_mix_totals(report_day: date, ree_daily_df: pd.DataFrame) -> pd.DataFrame:
@@ -3078,6 +3272,13 @@ def build_corporate_pdf_bytes(
         kpi_df = pd.DataFrame(kpi_items, columns=["Quick metric", "Value"])
         story.append(Paragraph("Executive quick metrics", styles["NexwellH2"]))
         story.append(_pdf_df_table(kpi_df, max_rows=20))
+        story.append(Spacer(1, 0.15 * cm))
+        story.append(Paragraph(
+            "This corporate market digest consolidates spot, captured prices, forward direction, gas, BESS value, "
+            "generation mix, curtailment and negative-price diagnostics in one period-comparison pack. "
+            "The first comparison is always versus the previous equivalent period; the second is versus the same period one year earlier when available.",
+            styles["NexwellBody"],
+        ))
 
     sections = [
         ("Day-ahead spot and solar captured prices", day_ahead_df),
@@ -3248,7 +3449,8 @@ day_ahead_period_df = build_period_day_ahead_table(
 )
 capture_period_chart = build_capture_period_chart(day_ahead_period_df)
 ytd_negative_df = build_ytd_negative_table(price_hourly, selected_end, negative_price_mode)
-mix_period_df = build_period_mix_table(ree_daily_raw, period_specs)
+ree_daily_reporting = enrich_mix_with_live_2026(ree_daily_raw, period_specs)
+mix_period_df = build_period_mix_table(ree_daily_reporting, period_specs)
 mix_period_chart = build_period_mix_chart(mix_period_df)
 mix_delta_df = build_period_mix_delta_table(mix_period_df)
 mix_delta_chart = build_period_mix_delta_chart(mix_delta_df)
@@ -3293,6 +3495,20 @@ kpi_cards_preview = make_metric_kpis(day_ahead_period_df, mibgas_period_df, tb_p
 if kpi_cards_preview:
     st.markdown(make_kpi_cards_html(kpi_cards_preview), unsafe_allow_html=True)
 
+st.markdown(
+    f"""
+    <div style="padding:14px 16px;border:1px solid #d9e4e1;border-radius:14px;background:#f5fbfa;margin:12px 0 18px 0;">
+      <div style="font-weight:700;color:#0f766e;font-size:15px;margin-bottom:4px;">Market digest</div>
+      <div style="color:#334155;font-size:13px;">
+        Selected period: <b>{period_label(report_granularity, selected_start, selected_end)}</b>.
+        The dashboard compares it against the prior equivalent period and the same period last year,
+        and rolls together spot, solar capture, forward direction, MIBGAS, storage value and generation mix.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.subheader("⚡ Day-ahead spot and solar captured prices")
 st.dataframe(day_ahead_period_df, use_container_width=True)
 if capture_period_chart is not None:
@@ -3333,7 +3549,7 @@ else:
 
 st.subheader("🌍 Generation mix comparison")
 if mix_period_df.empty:
-    st.info("No period generation mix data available.")
+    st.info("No period generation mix data available. Historical 2022–2025 comes from the local workbook; 2026 is fetched live from REE's generation-structure endpoint.")
 else:
     st.dataframe(mix_period_df, use_container_width=True)
     if mix_period_chart is not None:
@@ -3617,6 +3833,7 @@ else:
 st.info(
     "This report supports Daily, Weekly, Monthly, Quarterly and Annual snapshots. "
     "Historical solar now follows the same source priority as Day Ahead, so the economic-curtailment chart remains aligned (including Apr-2025). "
+    "Generation mix now uses the historical 2022–2025 workbook plus live REE 2026 generation-structure data for selected comparison periods. "
     "Recent OMIE and solar days are preloaded so weekly and monthly selectors can reach the latest available May periods. "
     "TB4/TB2 now use a deterministic spread method that avoids CBC/PuLP executable failures on Streamlit Cloud. "
     "The report also adds BESS revenue comparison for Standalone BESS, BESS with demand, and BESS without demand, "
