@@ -2028,6 +2028,82 @@ def ensure_recent_price_days(price_hourly: pd.DataFrame, start_d: date, end_d: d
     return out
 
 
+def extend_price_history_to_latest(price_hourly: pd.DataFrame, token: str | None) -> pd.DataFrame:
+    """Preload recent live day-ahead prices so Weekly/Monthly selectors include the latest periods."""
+    out = ensure_datetime_col(price_hourly, "datetime")
+    if out.empty or not token:
+        return out
+    start_d = out["datetime"].dt.date.max() + timedelta(days=1)
+    end_d = max_refresh_day_from_clock()
+    if start_d > end_d:
+        return out
+    return ensure_recent_price_days(out, start_d, end_d, token)
+
+
+def ensure_recent_best_solar_days(
+    solar_p48_hourly: pd.DataFrame,
+    solar_forecast_hourly: pd.DataFrame,
+    historical_best_solar: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    token: str | None,
+) -> pd.DataFrame:
+    """Append best-available solar profiles for recent missing days so capture metrics work beyond the local cache."""
+    out = ensure_datetime_col(historical_best_solar, "datetime")
+    solar_p48_hourly = ensure_datetime_col(solar_p48_hourly, "datetime")
+    solar_forecast_hourly = ensure_datetime_col(solar_forecast_hourly, "datetime")
+    d = start_d
+    extra = []
+    while d <= end_d:
+        has_day = not out[out["datetime"].dt.date == d].empty
+        if not has_day:
+            live_best = build_solar_profile_for_report_day(solar_p48_hourly, solar_forecast_hourly, d, token)
+            if not live_best.empty:
+                extra.append(live_best[["datetime", "solar_best_mw", "solar_source"]].copy())
+        d += timedelta(days=1)
+    if not extra:
+        return out
+    out = pd.concat([out] + extra, ignore_index=True)
+    out = out.drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime").reset_index(drop=True)
+    return out
+
+
+def build_capture_period_chart(day_ahead_df: pd.DataFrame):
+    if day_ahead_df.empty:
+        return None
+    cols = [
+        "Captured solar uncurtailed (€/MWh)",
+        "Captured solar curtailed (€/MWh)",
+        "Average spot (€/MWh)",
+    ]
+    plot = day_ahead_df[["Period"] + [c for c in cols if c in day_ahead_df.columns]].copy()
+    plot = plot.melt(id_vars=["Period"], var_name="Metric", value_name="€/MWh").dropna()
+    if plot.empty:
+        return None
+    return alt.Chart(plot).mark_bar().encode(
+        x=alt.X("Period:N", title=None, sort=day_ahead_df["Period"].tolist()),
+        y=alt.Y("€/MWh:Q", title="€/MWh"),
+        xOffset="Metric:N",
+        color=alt.Color("Metric:N", title=None),
+        tooltip=["Period", "Metric", alt.Tooltip("€/MWh:Q", format=",.2f")],
+    ).properties(height=300, title="Spot and captured-price comparison")
+
+
+def build_bess_revenue_comparison_chart(bess_df: pd.DataFrame):
+    if bess_df.empty:
+        return None
+    plot = bess_df.dropna(subset=["Revenue BESS (€)"]).copy()
+    if plot.empty:
+        return None
+    return alt.Chart(plot).mark_bar().encode(
+        x=alt.X("Mode:N", title=None, sort=["Standalone BESS", "BESS with demand", "BESS without demand"]),
+        y=alt.Y("Revenue BESS (€):Q", title="Revenue (€)"),
+        color=alt.Color("Period:N", title=None),
+        xOffset="Period:N",
+        tooltip=["Mode", "Period", alt.Tooltip("Revenue BESS (€):Q", format=",.2f"), alt.Tooltip("Revenue BESS (€/MW):Q", format=",.2f")],
+    ).properties(height=330, title="BESS revenue comparison by mode and period")
+
+
 def build_period_day_ahead_row(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, label: str, start_d: date, end_d: date, mode: str) -> dict:
     metrics = compute_period_metrics(price_hourly, solar_hourly, start_d, end_d)
     tmp_p = price_hourly[
@@ -2321,25 +2397,60 @@ def build_mibgas_summary_table(mibgas_df: pd.DataFrame, period_specs: list[tuple
     return pd.DataFrame(rows)
 
 
-def make_metric_kpis(day_ahead_df: pd.DataFrame, mibgas_df: pd.DataFrame, tb_df: pd.DataFrame, forward_df: pd.DataFrame) -> list[tuple[str, str]]:
+def make_metric_kpis(
+    day_ahead_df: pd.DataFrame,
+    mibgas_df: pd.DataFrame,
+    tb_df: pd.DataFrame,
+    forward_df: pd.DataFrame,
+    mix_df: pd.DataFrame | None = None,
+    bess_revenue_df: pd.DataFrame | None = None,
+) -> list[tuple[str, str]]:
     items = []
     if not day_ahead_df.empty:
         sel = day_ahead_df.iloc[0]
         prev = day_ahead_df.iloc[1] if len(day_ahead_df) > 1 else None
-        items.append(("Average spot", fmt_eur(sel.get("Average spot (€/MWh)"))))
+        yoy = day_ahead_df.iloc[2] if len(day_ahead_df) > 2 else None
+
+        items.append(("⚡ Baseload avg", fmt_eur(sel.get("Average spot (€/MWh)"))))
         if prev is not None:
             ch = pct_change(sel.get("Average spot (€/MWh)"), prev.get("Average spot (€/MWh)"))
-            items.append(("Spot vs previous", "n/a" if ch is None else f"{ch:+.1%}"))
-        items.append(("Captured solar uncurtailed", fmt_eur(sel.get("Captured solar uncurtailed (€/MWh)"))))
-        items.append(("Captured solar curtailed", fmt_eur(sel.get("Captured solar curtailed (€/MWh)"))))
+            items.append(("↔ Spot vs previous", "n/a" if ch is None else f"{ch:+.1%}"))
+        if yoy is not None:
+            ch = pct_change(sel.get("Average spot (€/MWh)"), yoy.get("Average spot (€/MWh)"))
+            items.append(("🕘 Spot vs YoY", "n/a" if ch is None else f"{ch:+.1%}"))
+
+        items.append(("☀️ Captured uncurtailed", fmt_eur(sel.get("Captured solar uncurtailed (€/MWh)"))))
+        items.append(("☀️ Captured curtailed", fmt_eur(sel.get("Captured solar curtailed (€/MWh)"))))
+
     if not mibgas_df.empty:
-        items.append(("MIBGAS average", fmt_eur(mibgas_df.iloc[0].get("MIBGAS GDAES D+1 average (€/MWh)"))))
+        sel = mibgas_df.iloc[0]
+        items.append(("🔥 MIBGAS avg", fmt_eur(sel.get("MIBGAS GDAES D+1 average (€/MWh)"))))
+        if len(mibgas_df) > 1:
+            ch = pct_change(sel.get("MIBGAS GDAES D+1 average (€/MWh)"), mibgas_df.iloc[1].get("MIBGAS GDAES D+1 average (€/MWh)"))
+            items.append(("↔ MIBGAS vs previous", "n/a" if ch is None else f"{ch:+.1%}"))
+
     if not tb_df.empty:
-        items.append(("TB4 spread", fmt_eur(tb_df.iloc[0].get("TB4 average spread (€/MWh)"))))
-        items.append(("TB2 spread", fmt_eur(tb_df.iloc[0].get("TB2 average spread (€/MWh)"))))
-    if not forward_df.empty:
+        items.append(("🔋 TB4 spread", fmt_eur(tb_df.iloc[0].get("TB4 average spread (€/MWh)"))))
+        items.append(("🔋 TB2 spread", fmt_eur(tb_df.iloc[0].get("TB2 average spread (€/MWh)"))))
+
+    if forward_df is not None and not forward_df.empty:
         dirs = sorted(forward_df["Direction"].dropna().astype(str).unique().tolist())
-        items.append(("Forward basket direction", ", ".join(dirs) if dirs else "n/a"))
+        items.append(("📈 Forward curve", ", ".join(dirs) if dirs else "n/a"))
+        delta = forward_df["Δ €/MWh"].mean() if "Δ €/MWh" in forward_df.columns else None
+        if pd.notna(delta):
+            items.append(("📊 Forward avg move", f"{float(delta):+,.2f} €/MWh"))
+
+    if mix_df is not None and not mix_df.empty:
+        items.append(("🌿 Renewable share", fmt_num(100 * mix_df.iloc[0].get("Renewables share (%)"), suffix="%", decimals=1)))
+        items.append(("💨 Wind output", fmt_num(mix_df.iloc[0].get("Wind (GWh)"), suffix=" GWh", decimals=1)))
+
+    if bess_revenue_df is not None and not bess_revenue_df.empty:
+        st_row = bess_revenue_df[bess_revenue_df["Mode"].eq("Standalone BESS")].head(1)
+        wd_row = bess_revenue_df[bess_revenue_df["Mode"].eq("BESS with demand")].head(1)
+        if not st_row.empty:
+            items.append(("💰 Standalone BESS", fmt_num(st_row.iloc[0].get("Revenue BESS (€)"), suffix=" €", decimals=0)))
+        if not wd_row.empty:
+            items.append(("🏭 BESS with demand", fmt_num(wd_row.iloc[0].get("Revenue BESS (€)"), suffix=" €", decimals=0)))
     return items
 
 
@@ -2727,6 +2838,8 @@ def build_corporate_pdf_bytes(
     bess_revenue_df: pd.DataFrame,
     mix_df: pd.DataFrame,
     ytd_negative_df: pd.DataFrame,
+    capture_period_b64: str | None,
+    bess_revenue_chart_b64: str | None,
     omie_heatmap_b64: str | None,
     mix_chart_b64: str | None,
     neg_chart_b64: str | None,
@@ -2846,6 +2959,8 @@ def build_corporate_pdf_bytes(
         story.append(_pdf_df_table(df, max_rows=18))
 
     chart_sections = [
+        ("Spot and captured-price comparison", capture_period_b64),
+        ("BESS revenue comparison", bess_revenue_chart_b64),
         ("OMIE hourly price heatmap", omie_heatmap_b64),
         ("Generation mix chart", mix_chart_b64),
         ("Monthly negative-price frequency", neg_chart_b64),
@@ -2898,6 +3013,7 @@ latest_available_day = price_hourly["datetime"].dt.date.max()
 tomorrow_allowed = max_refresh_day_from_clock()
 
 historical_best_solar = build_best_solar_hourly(solar_p48_hourly, solar_forecast_hourly)
+price_hourly = extend_price_history_to_latest(price_hourly, token)
 
 # Period selector
 period_options = build_available_period_options(price_hourly, report_granularity)
@@ -2917,6 +3033,14 @@ selected_start, selected_end = selected_option["start"], selected_option["end"]
 
 # Enrich recent price history when the selected period reaches beyond local history.
 price_hourly = ensure_recent_price_days(price_hourly, selected_start, selected_end, token)
+historical_best_solar = ensure_recent_best_solar_days(
+    solar_p48_hourly,
+    solar_forecast_hourly,
+    historical_best_solar,
+    selected_start,
+    selected_end,
+    token,
+)
 
 previous_start, previous_end = previous_period(selected_start, selected_end, report_granularity)
 prior_start, prior_end = prior_year_same_period(selected_start, selected_end, report_granularity)
@@ -2936,6 +3060,15 @@ else:
         (previous_label_long, previous_start, previous_end),
         (prior_label_long, prior_start, prior_end),
     ]
+
+historical_best_solar = ensure_recent_best_solar_days(
+    solar_p48_hourly,
+    solar_forecast_hourly,
+    historical_best_solar,
+    min([x[1] for x in period_specs]),
+    max([x[2] for x in period_specs]),
+    token,
+)
 
 # Mail config
 col1, col2 = st.columns(2)
@@ -2975,6 +3108,7 @@ day_ahead_period_df = build_period_day_ahead_table(
     period_specs,
     negative_price_mode,
 )
+capture_period_chart = build_capture_period_chart(day_ahead_period_df)
 ytd_negative_df = build_ytd_negative_table(price_hourly, selected_end, negative_price_mode)
 mix_period_df = build_period_mix_table(ree_daily_raw, period_specs)
 mix_period_chart = build_period_mix_chart(mix_period_df)
@@ -2987,6 +3121,7 @@ bess_revenue_period_df = build_bess_revenue_period_table(
     eta_ch=0.93,
     eta_dis=0.93,
 )
+bess_revenue_chart = build_bess_revenue_comparison_chart(bess_revenue_period_df)
 
 mibgas_actuals_df = load_mibgas_actuals_for_report()
 mibgas_period_df = build_mibgas_summary_table(mibgas_actuals_df, period_specs)
@@ -3012,45 +3147,50 @@ spot_capture_chart, _spot_capture_plot = build_spot_capture_evolution_chart(pric
 spot_capture_pivot = build_spot_capture_table(price_hourly, historical_best_solar, selected_year)
 
 # Preview: fast metrics
-st.subheader("Quick metrics")
-kpi_cards_preview = make_metric_kpis(day_ahead_period_df, mibgas_period_df, tb_period_df, forward_summary_df)
+st.subheader("📌 Executive dashboard")
+kpi_cards_preview = make_metric_kpis(day_ahead_period_df, mibgas_period_df, tb_period_df, forward_summary_df, mix_df=mix_period_df, bess_revenue_df=bess_revenue_period_df)
 if kpi_cards_preview:
     st.markdown(make_kpi_cards_html(kpi_cards_preview), unsafe_allow_html=True)
 
-st.subheader("Day-ahead spot and solar captured prices")
+st.subheader("⚡ Day-ahead spot and solar captured prices")
 st.dataframe(day_ahead_period_df, use_container_width=True)
+if capture_period_chart is not None:
+    st.altair_chart(capture_period_chart, use_container_width=True)
+st.caption("Captured prices are computed from the best available solar profile (P48 first, forecast as fallback) matched against OMIE spot prices.")
 
-st.subheader("Forward market during the selected period")
+st.subheader("📈 Forward market during the selected period")
 if forward_summary_df.empty:
     st.info("No OMIP forward cache was available for this period.")
 else:
     st.dataframe(forward_summary_df, use_container_width=True)
     st.caption("Forward summary uses the average of available yearly OMIP curve rows in the local cache, split by curve basket.")
 
-st.subheader("MIBGAS GDAES D+1")
+st.subheader("🔥 MIBGAS GDAES D+1")
 if mibgas_period_df.empty:
     st.info("No MIBGAS actuals available. The report reads local MIBGAS files plus the 2026 cache created by the MIBGAS tab.")
 else:
     st.dataframe(mibgas_period_df, use_container_width=True)
 
-st.subheader("BESS TB spreads")
+st.subheader("🔋 BESS TB spreads")
 if tb_period_df.empty:
     st.info("No TB spread data available.")
 else:
     st.dataframe(tb_period_df, use_container_width=True)
     st.caption("TB4 and TB2 are averaged from daily standalone arbitrage spreads without relying on CBC/PuLP solver binaries.")
 
-st.subheader("BESS revenue comparison")
+st.subheader("💰 BESS revenue comparison")
 if bess_revenue_period_df.empty:
     st.info("No BESS revenue comparison available.")
 else:
     st.dataframe(bess_revenue_period_df, use_container_width=True)
+    if bess_revenue_chart is not None:
+        st.altair_chart(bess_revenue_chart, use_container_width=True)
     st.caption(
         "Revenue comparison uses 4.0 MWh / 1.0 MW, 93% charging and discharging efficiency, and 1 cycle/day. "
         "The three scenarios follow the BESS tab naming: Standalone BESS, BESS with demand, and BESS without demand."
     )
 
-st.subheader("Generation mix comparison")
+st.subheader("🌍 Generation mix comparison")
 if mix_period_df.empty:
     st.info("No period generation mix data available.")
 else:
@@ -3058,32 +3198,32 @@ else:
     if mix_period_chart is not None:
         st.altair_chart(mix_period_chart, use_container_width=True)
 
-st.subheader("Negative prices YTD")
+st.subheader("🧊 Negative prices YTD")
 st.dataframe(ytd_negative_df, use_container_width=True)
 
-st.subheader("OMIE hourly price heatmap")
+st.subheader("🗺️ OMIE hourly price heatmap")
 if omie_heatmap_b64:
     st.image(BytesIO(base64.b64decode(omie_heatmap_b64)), use_container_width=True)
 
-st.subheader(f"Monthly {price_event_label(negative_price_mode)} frequency")
+st.subheader(f"📉 Monthly {price_event_label(negative_price_mode)} frequency")
 if neg_pct_chart is not None:
     st.altair_chart(neg_pct_chart, use_container_width=True)
 if not neg_pct_table.empty:
     st.dataframe(neg_pct_table, use_container_width=True)
 
-st.subheader(f"12x24 {price_event_label(negative_price_mode)} frequency ({selected_year})")
+st.subheader(f"🕒 12x24 {price_event_label(negative_price_mode)} frequency ({selected_year})")
 if zero_neg_heatmap is not None:
     st.altair_chart(zero_neg_heatmap, use_container_width=True)
 if not zero_neg_heatmap_table.empty:
     st.dataframe(zero_neg_heatmap_table, use_container_width=True)
 
-st.subheader("Monthly economic curtailment")
+st.subheader("✂️ Monthly economic curtailment")
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
 if not curt_pct_table.empty:
     st.dataframe(curt_pct_table, use_container_width=True)
 
-st.subheader("Spot and capture evolution")
+st.subheader("☀️ Spot and capture evolution")
 if spot_capture_chart is not None:
     st.altair_chart(spot_capture_chart, use_container_width=True)
 if not spot_capture_pivot.empty:
@@ -3154,6 +3294,15 @@ if curt_b64:
     <br><br>
     """
 
+capture_period_chart_html = ""
+capture_period_b64 = chart_to_base64_png(capture_period_chart)
+if capture_period_b64:
+    capture_period_chart_html = f"""
+    <h3>Spot and captured-price comparison</h3>
+    <img src="data:image/png;base64,{capture_period_b64}" alt="Spot and captured price comparison" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+    <br><br>
+    """
+
 spot_capture_chart_html = ""
 spot_b64 = chart_to_base64_png(spot_capture_chart)
 if spot_b64:
@@ -3173,6 +3322,7 @@ email_html = f"""
   </p>
   {kpi_cards_html}<br><br>
   <h3>Day-ahead spot and solar captured prices</h3>{day_ahead_html}<br>
+  {capture_period_chart_html}
   <h3>Forward market summary</h3>{forward_html}<br>
   <h3>MIBGAS GDAES D+1 summary</h3>{mibgas_html}<br>
   <h3>BESS TB spreads</h3>{tb_html}<br>
@@ -3195,6 +3345,8 @@ email_html = f"""
 
 report_day = selected_start
 mix_chart_b64 = chart_to_base64_png(mix_period_chart)
+capture_period_b64 = chart_to_base64_png(capture_period_chart)
+bess_revenue_chart_b64 = chart_to_base64_png(bess_revenue_chart)
 neg_chart_b64 = chart_to_base64_png(neg_pct_chart)
 zero_neg_b64 = chart_to_base64_png(zero_neg_heatmap)
 curt_b64 = chart_to_base64_png(curt_chart)
@@ -3212,6 +3364,8 @@ pdf_bytes = build_corporate_pdf_bytes(
     bess_revenue_df=bess_revenue_period_df,
     mix_df=mix_period_df,
     ytd_negative_df=ytd_negative_df,
+    capture_period_b64=capture_period_b64,
+    bess_revenue_chart_b64=bess_revenue_chart_b64,
     omie_heatmap_b64=omie_heatmap_b64,
     mix_chart_b64=mix_chart_b64,
     neg_chart_b64=neg_chart_b64,
@@ -3287,6 +3441,7 @@ else:
 
 st.info(
     "This report supports Daily, Weekly, Monthly, Quarterly and Annual snapshots. "
+    "Recent OMIE and solar days are preloaded so weekly and monthly selectors can reach the latest available May periods. "
     "TB4/TB2 now use a deterministic spread method that avoids CBC/PuLP executable failures on Streamlit Cloud. "
     "The report also adds BESS revenue comparison for Standalone BESS, BESS with demand, and BESS without demand, "
     "plus a branded Nexwell corporate PDF export. "
