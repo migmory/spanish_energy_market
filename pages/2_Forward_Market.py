@@ -1197,31 +1197,3 @@ if result is not None:
         )
 else:
     st.info("Select the OMIP parameters and click Pull OMIP prices.")
-
-section_header("Upload OMIP Excel fallback")
-st.caption("Upload an Excel produced by your working script. The app will parse the Baseload / Solar sheets and chart the contracts.")
-file = st.file_uploader("Upload OMIP_ES_EL_YYYY-MM-DD.xlsx", type=["xlsx", "xls"])
-if file is not None:
-    try:
-        uploaded = parse_working_excel_upload(file)
-        uploaded = filter_maturity(uploaded, maturity_filter)
-        if uploaded.empty:
-            st.warning("The uploaded Excel was read, but no contracts matched the selected maturity filter.")
-        else:
-            st.success(f"Parsed {len(uploaded)} rows from uploaded Excel.")
-            chart = build_curve_chart(uploaded, f"Uploaded OMIP curve | {maturity_label}")
-            if chart is not None:
-                st.altair_chart(chart, use_container_width=True)
-            display_cols = [
-                "sheet", "instrument", "delivery_label", "contract", "maturity", "curve_price", "d_price", "d_minus_1",
-                "best_bid", "best_ask", "last_price", "open_interest", "nr_contracts"
-            ]
-            st.dataframe(styled_df(uploaded[[c for c in display_cols if c in uploaded.columns]]), use_container_width=True)
-            st.download_button(
-                "Download parsed upload",
-                data=dataframe_to_excel_bytes(uploaded),
-                file_name="omip_uploaded_parsed.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    except Exception as exc:
-        st.error(f"Could not parse uploaded OMIP Excel: {exc}")
