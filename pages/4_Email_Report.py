@@ -69,6 +69,7 @@ DEMAND_RAW_CSV_PATH = HISTORICAL_DIR / "demand_p48_total_10027_raw.csv"
 REE_MIX_DAILY_CSV_PATH = HISTORICAL_DIR / "ree_generation_structure_daily_peninsular.csv"
 
 HIST_PRICES_XLSX_PATH = DATA_DIR / "hourly_avg_price_since2021.xlsx"
+HIST_WORKBOOK_XLSX_PATH = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_SOLAR_CSV_PATH = DATA_DIR / "p48solar_since21.csv"
 HIST_MIX_XLSX_PATH = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
 
@@ -394,26 +395,58 @@ def load_price_history_fallback() -> pd.DataFrame:
     return df
 
 def load_solar_p48_history_fallback() -> pd.DataFrame:
+    """
+    Historical solar loader aligned with the Day Ahead page.
+
+    Priority:
+    1) Full workbook export /data/hourly_avg_price_since2021.xlsx, sheet solar_hourly_best
+    2) /data/p48solar_since21.csv
+    3) historical_data/solar_p48_spain_84_raw.csv
+
+    This avoids incomplete raw slices hiding 2025 months in the Email Report
+    economic-curtailment charts.
+    """
+    if HIST_WORKBOOK_XLSX_PATH.exists():
+        try:
+            df = pd.read_excel(HIST_WORKBOOK_XLSX_PATH, sheet_name="solar_hourly_best")
+            if not df.empty:
+                if "solar_best_mw" in df.columns and "value" not in df.columns:
+                    df = df.rename(columns={"solar_best_mw": "value"})
+                if "datetime" in df.columns:
+                    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+                if "value" in df.columns:
+                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                df = df.dropna(subset=["datetime", "value"]).copy()
+                df["source"] = "historical_workbook_solar_hourly_best"
+                df["geo_name"] = None
+                df["geo_id"] = None
+                return df
+        except Exception:
+            pass
+
+    if HIST_SOLAR_CSV_PATH.exists():
+        try:
+            df = pd.read_csv(HIST_SOLAR_CSV_PATH)
+            if not df.empty:
+                if "solar_best_mw" in df.columns and "value" not in df.columns:
+                    df = df.rename(columns={"solar_best_mw": "value"})
+                if "datetime" in df.columns:
+                    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+                if "value" in df.columns:
+                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                df = df.dropna(subset=["datetime", "value"]).copy()
+                df["source"] = "historical_solar_csv"
+                df["geo_name"] = None
+                df["geo_id"] = None
+                return df
+        except Exception:
+            pass
+
     if SOLAR_P48_RAW_CSV_PATH.exists():
         return load_raw_history(SOLAR_P48_RAW_CSV_PATH, "esios_84")
 
-    if not HIST_SOLAR_CSV_PATH.exists():
-        return pd.DataFrame()
+    return pd.DataFrame()
 
-    df = pd.read_csv(HIST_SOLAR_CSV_PATH)
-    if df.empty:
-        return pd.DataFrame()
-
-    if "solar_best_mw" in df.columns and "value" not in df.columns:
-        df = df.rename(columns={"solar_best_mw": "value"})
-    if "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    if "value" in df.columns:
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["source"] = "historical_solar_csv"
-    df["geo_name"] = None
-    df["geo_id"] = None
-    return df
 
 def infer_interval_hours(df: pd.DataFrame) -> pd.Series:
     if df.empty or "datetime" not in df.columns:
@@ -2211,6 +2244,105 @@ def build_period_mix_chart(mix_table: pd.DataFrame):
     ).properties(height=320, title="Generation comparison for selected technologies")
 
 
+def build_period_mix_delta_table(mix_table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build explicit deltas for the selected period versus:
+    - previous period
+    - same period prior year
+
+    The existing absolute mix table is useful, but the user asked for a true difference view.
+    """
+    if mix_table.empty or len(mix_table) < 2:
+        return pd.DataFrame()
+
+    selected = mix_table.iloc[0]
+    comparisons = []
+    value_cols = [
+        "Solar PV (GWh)",
+        "Wind (GWh)",
+        "Hydro (GWh)",
+        "Nuclear (GWh)",
+        "Renewables share (%)",
+    ]
+
+    for idx in range(1, len(mix_table)):
+        comp = mix_table.iloc[idx]
+        comp_label = str(comp.get("Period", f"Comparison {idx}"))
+        for col in value_cols:
+            cur = selected.get(col)
+            ref = comp.get(col)
+            delta = None if pd.isna(cur) or pd.isna(ref) else float(cur) - float(ref)
+            rel = None
+            if pd.notna(cur) and pd.notna(ref) and float(ref) != 0:
+                rel = float(cur) / float(ref) - 1.0
+            comparisons.append(
+                {
+                    "Comparison": comp_label,
+                    "Metric": col,
+                    "Selected value": cur,
+                    "Reference value": ref,
+                    "Δ absolute": delta,
+                    "Δ %": rel,
+                }
+            )
+    return pd.DataFrame(comparisons)
+
+
+def build_period_mix_delta_chart(mix_delta_table: pd.DataFrame):
+    if mix_delta_table.empty:
+        return None
+    plot = mix_delta_table.copy()
+    plot = plot[plot["Metric"] != "Renewables share (%)"].dropna(subset=["Δ absolute"])
+    if plot.empty:
+        return None
+    return (
+        alt.Chart(plot)
+        .mark_bar()
+        .encode(
+            x=alt.X("Metric:N", title=None),
+            y=alt.Y("Δ absolute:Q", title="Δ GWh"),
+            color=alt.Color("Comparison:N", title=None),
+            xOffset="Comparison:N",
+            tooltip=[
+                "Comparison",
+                "Metric",
+                alt.Tooltip("Selected value:Q", format=",.1f"),
+                alt.Tooltip("Reference value:Q", format=",.1f"),
+                alt.Tooltip("Δ absolute:Q", format="+,.1f"),
+                alt.Tooltip("Δ %:Q", format="+.1%"),
+            ],
+        )
+        .properties(height=320, title="Energy mix differences vs previous period and prior year")
+    )
+
+
+def build_renewables_share_delta_chart(mix_delta_table: pd.DataFrame):
+    if mix_delta_table.empty:
+        return None
+    plot = mix_delta_table[mix_delta_table["Metric"] == "Renewables share (%)"].copy()
+    plot = plot.dropna(subset=["Δ absolute"])
+    if plot.empty:
+        return None
+    # Share is stored as decimal: show percentage-point delta.
+    plot["Δ p.p."] = plot["Δ absolute"] * 100.0
+    return (
+        alt.Chart(plot)
+        .mark_bar()
+        .encode(
+            x=alt.X("Comparison:N", title=None),
+            y=alt.Y("Δ p.p.:Q", title="Δ renewable share (p.p.)"),
+            color=alt.Color("Comparison:N", legend=None),
+            tooltip=[
+                "Comparison",
+                alt.Tooltip("Selected value:Q", title="Selected RE share", format=".1%"),
+                alt.Tooltip("Reference value:Q", title="Reference RE share", format=".1%"),
+                alt.Tooltip("Δ p.p.:Q", title="Δ p.p.", format="+.1f"),
+            ],
+        )
+        .properties(height=260, title="Renewables share delta")
+    )
+
+
 def _tb_hourly_for_day(price_hourly: pd.DataFrame, d: date) -> pd.DataFrame:
     tmp = price_hourly[price_hourly["datetime"].dt.date == d].copy()
     if tmp.empty:
@@ -2837,8 +2969,11 @@ def build_corporate_pdf_bytes(
     tb_df: pd.DataFrame,
     bess_revenue_df: pd.DataFrame,
     mix_df: pd.DataFrame,
+    mix_delta_df: pd.DataFrame,
     ytd_negative_df: pd.DataFrame,
     capture_period_b64: str | None,
+    mix_delta_b64: str | None,
+    mix_re_share_delta_b64: str | None,
     bess_revenue_chart_b64: str | None,
     omie_heatmap_b64: str | None,
     mix_chart_b64: str | None,
@@ -2951,6 +3086,7 @@ def build_corporate_pdf_bytes(
         ("BESS TB spreads", tb_df),
         ("BESS revenue comparison", bess_revenue_df),
         ("Generation mix comparison", mix_df),
+        ("Generation mix deltas", mix_delta_df),
         ("Negative prices YTD", ytd_negative_df),
     ]
     for title, df in sections:
@@ -2961,6 +3097,8 @@ def build_corporate_pdf_bytes(
     chart_sections = [
         ("Spot and captured-price comparison", capture_period_b64),
         ("BESS revenue comparison", bess_revenue_chart_b64),
+        ("Energy mix differences", mix_delta_b64),
+        ("Renewables share delta", mix_re_share_delta_b64),
         ("OMIE hourly price heatmap", omie_heatmap_b64),
         ("Generation mix chart", mix_chart_b64),
         ("Monthly negative-price frequency", neg_chart_b64),
@@ -3112,6 +3250,9 @@ capture_period_chart = build_capture_period_chart(day_ahead_period_df)
 ytd_negative_df = build_ytd_negative_table(price_hourly, selected_end, negative_price_mode)
 mix_period_df = build_period_mix_table(ree_daily_raw, period_specs)
 mix_period_chart = build_period_mix_chart(mix_period_df)
+mix_delta_df = build_period_mix_delta_table(mix_period_df)
+mix_delta_chart = build_period_mix_delta_chart(mix_delta_df)
+mix_re_share_delta_chart = build_renewables_share_delta_chart(mix_delta_df)
 tb_period_df = build_period_tb_table(price_hourly, period_specs)
 bess_revenue_period_df = build_bess_revenue_period_table(
     price_hourly,
@@ -3198,6 +3339,16 @@ else:
     if mix_period_chart is not None:
         st.altair_chart(mix_period_chart, use_container_width=True)
 
+    st.markdown("#### Mix deltas vs previous period and prior year")
+    if mix_delta_df.empty:
+        st.info("No generation-mix differences available for the selected comparison periods.")
+    else:
+        st.dataframe(mix_delta_df, use_container_width=True)
+        if mix_delta_chart is not None:
+            st.altair_chart(mix_delta_chart, use_container_width=True)
+        if mix_re_share_delta_chart is not None:
+            st.altair_chart(mix_re_share_delta_chart, use_container_width=True)
+
 st.subheader("🧊 Negative prices YTD")
 st.dataframe(ytd_negative_df, use_container_width=True)
 
@@ -3242,6 +3393,7 @@ mibgas_html = df_to_html_table(mibgas_period_df) if not mibgas_period_df.empty e
 tb_html = df_to_html_table(tb_period_df) if not tb_period_df.empty else "<p>No TB spread summary available.</p>"
 bess_revenue_html = df_to_html_table(bess_revenue_period_df) if not bess_revenue_period_df.empty else "<p>No BESS revenue comparison available.</p>"
 mix_html = df_to_html_table(mix_period_df, pct_cols=["Renewables share (%)"]) if not mix_period_df.empty else "<p>No generation mix period summary available.</p>"
+mix_delta_html = df_to_html_table(mix_delta_df, pct_cols=["Δ %"]) if not mix_delta_df.empty else "<p>No generation mix delta summary available.</p>"
 ytd_negative_html = df_to_html_table(ytd_negative_df, pct_cols=[f"% {price_event_label(negative_price_mode)} hours"])
 neg_pct_html = df_to_html_table(neg_pct_table.drop(columns=["month_num"], errors="ignore"), pct_cols=["pct_event"]) if not neg_pct_table.empty else "<p>No monthly negative-price frequency table available.</p>"
 zero_neg_table_html = df_to_html_table(zero_neg_heatmap_table, pct_cols=[c for c in zero_neg_heatmap_table.columns if c.startswith("H")]) if not zero_neg_heatmap_table.empty else "<p>No 12x24 negative-price frequency table available.</p>"
@@ -3264,6 +3416,22 @@ if mix_b64:
     mix_chart_html = f"""
     <h3>Generation mix comparison</h3>
     <img src="data:image/png;base64,{mix_b64}" alt="Generation mix comparison" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+    <br><br>
+    """
+
+mix_delta_chart_html = ""
+mix_delta_b64 = chart_to_base64_png(mix_delta_chart)
+mix_re_share_delta_b64 = chart_to_base64_png(mix_re_share_delta_chart)
+if mix_delta_b64:
+    mix_delta_chart_html += f"""
+    <h3>Energy mix differences</h3>
+    <img src="data:image/png;base64,{mix_delta_b64}" alt="Energy mix differences" style="max-width:100%; height:auto; border:1px solid #ddd;" />
+    <br><br>
+    """
+if mix_re_share_delta_b64:
+    mix_delta_chart_html += f"""
+    <h3>Renewables share delta</h3>
+    <img src="data:image/png;base64,{mix_re_share_delta_b64}" alt="Renewables share delta" style="max-width:100%; height:auto; border:1px solid #ddd;" />
     <br><br>
     """
 
@@ -3329,6 +3497,8 @@ email_html = f"""
   <h3>BESS revenue comparison</h3>{bess_revenue_html}<br>
   <h3>Generation mix comparison</h3>{mix_html}<br>
   {mix_chart_html}
+  <h3>Generation mix deltas vs previous period and prior year</h3>{mix_delta_html}<br>
+  {mix_delta_chart_html}
   <h3>Negative prices YTD</h3>{ytd_negative_html}<br>
   {omie_heatmap_html}
   {neg_chart_html}
@@ -3345,6 +3515,8 @@ email_html = f"""
 
 report_day = selected_start
 mix_chart_b64 = chart_to_base64_png(mix_period_chart)
+mix_delta_b64 = chart_to_base64_png(mix_delta_chart)
+mix_re_share_delta_b64 = chart_to_base64_png(mix_re_share_delta_chart)
 capture_period_b64 = chart_to_base64_png(capture_period_chart)
 bess_revenue_chart_b64 = chart_to_base64_png(bess_revenue_chart)
 neg_chart_b64 = chart_to_base64_png(neg_pct_chart)
@@ -3363,8 +3535,11 @@ pdf_bytes = build_corporate_pdf_bytes(
     tb_df=tb_period_df,
     bess_revenue_df=bess_revenue_period_df,
     mix_df=mix_period_df,
+    mix_delta_df=mix_delta_df,
     ytd_negative_df=ytd_negative_df,
     capture_period_b64=capture_period_b64,
+    mix_delta_b64=mix_delta_b64,
+    mix_re_share_delta_b64=mix_re_share_delta_b64,
     bess_revenue_chart_b64=bess_revenue_chart_b64,
     omie_heatmap_b64=omie_heatmap_b64,
     mix_chart_b64=mix_chart_b64,
@@ -3441,6 +3616,7 @@ else:
 
 st.info(
     "This report supports Daily, Weekly, Monthly, Quarterly and Annual snapshots. "
+    "Historical solar now follows the same source priority as Day Ahead, so the economic-curtailment chart remains aligned (including Apr-2025). "
     "Recent OMIE and solar days are preloaded so weekly and monthly selectors can reach the latest available May periods. "
     "TB4/TB2 now use a deterministic spread method that avoids CBC/PuLP executable failures on Streamlit Cloud. "
     "The report also adds BESS revenue comparison for Standalone BESS, BESS with demand, and BESS without demand, "
