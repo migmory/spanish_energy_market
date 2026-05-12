@@ -4,7 +4,7 @@ import os
 import base64
 import re
 from datetime import date, datetime, time, timedelta
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -2146,7 +2146,7 @@ def _tb_hourly_for_day(price_hourly: pd.DataFrame, d: date) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, ttl=3600)
 def build_daily_tb_cache(price_csv_key: str, price_hourly_json: str) -> pd.DataFrame:
     """Compute daily TB4/TB2 spread cache for the price history supplied by the app."""
-    price_hourly = pd.read_json(price_hourly_json, orient="split")
+    price_hourly = pd.read_json(StringIO(price_hourly_json), orient="split")
     price_hourly["datetime"] = pd.to_datetime(price_hourly["datetime"], errors="coerce")
     rows = []
     for d in sorted(price_hourly["datetime"].dt.date.dropna().unique().tolist()):
