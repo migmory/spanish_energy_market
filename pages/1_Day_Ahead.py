@@ -1890,7 +1890,7 @@ def build_capture_price_overlay_chart(capture_combo: pd.DataFrame):
             detail=["year:N", "series:N"],
             tooltip=[
                 alt.Tooltip("year:N", title="Year"),
-                alt.Tooltip("month_name:N", title="Month", sort=month_order),
+                alt.Tooltip("month_name:N", title="Month"),
                 alt.Tooltip("series:N", title="Series"),
                 alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
             ],
