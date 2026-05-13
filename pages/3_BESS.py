@@ -135,6 +135,23 @@ def metric_value_or_blank(x):
     return "" if pd.isna(x) else f"{x:,.2f}"
 
 
+def show_dataframe_safely(df: pd.DataFrame, *, style: bool = True, use_container_width: bool = True) -> None:
+    """
+    Streamlit can fail when a very large pandas Styler object is sent to st.dataframe.
+    Keep corporate styling for compact summary tables, but render large hourly tables
+    as plain dataframes so the app does not crash.
+    """
+    if df is None:
+        st.dataframe(pd.DataFrame(), use_container_width=use_container_width)
+        return
+
+    n_cells = int(df.shape[0] * max(df.shape[1], 1))
+    if style and n_cells <= 120_000:
+        st.dataframe(style_total_rows(df), use_container_width=use_container_width)
+    else:
+        st.dataframe(df, use_container_width=use_container_width)
+
+
 def draw_side_legend(items: list[tuple[str, str, str | None]]) -> None:
     rows = []
     for label, color, style in items:
@@ -1080,10 +1097,14 @@ def build_avg_24h_dispatch_chart(df_period: pd.DataFrame) -> alt.Chart:
         )
     )
 
+    charge_negative = chart_df[["Hour", "charge"]].rename(columns={"charge": "mwh"}).assign(series="Charge")
+    charge_negative["mwh"] = -charge_negative["mwh"]
+    discharge_positive = chart_df[["Hour", "discharge"]].rename(columns={"discharge": "mwh"}).assign(series="Discharge")
+
     bars = pd.concat(
         [
-            chart_df[["Hour", "charge"]].rename(columns={"charge": "mwh"}).assign(series="Charge"),
-            chart_df[["Hour", "discharge"]].rename(columns={"discharge": "mwh"}).assign(series="Discharge"),
+            charge_negative,
+            discharge_positive,
         ],
         ignore_index=True,
     )
@@ -1097,7 +1118,7 @@ def build_avg_24h_dispatch_chart(df_period: pd.DataFrame) -> alt.Chart:
             xOffset="series:N",
             color=alt.Color(
                 "series:N",
-                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#2e8b57", "#c0392b"]),
+                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#c0392b", "#1b7f3b"]),
                 legend=alt.Legend(title=None),
             ),
             tooltip=["Hour", "series", alt.Tooltip("mwh:Q", format=",.3f")],
@@ -1120,10 +1141,14 @@ def build_avg_24h_dispatch_chart(df_period: pd.DataFrame) -> alt.Chart:
 def build_daily_dispatch_chart(df_day: pd.DataFrame) -> alt.Chart:
     chart_df = df_day.sort_values("Hour").copy()
 
+    charge_negative = chart_df[["Hour", "charge_mwh"]].rename(columns={"charge_mwh": "mwh"}).assign(series="Charge")
+    charge_negative["mwh"] = -charge_negative["mwh"]
+    discharge_positive = chart_df[["Hour", "discharge_mwh"]].rename(columns={"discharge_mwh": "mwh"}).assign(series="Discharge")
+
     bars = pd.concat(
         [
-            chart_df[["Hour", "charge_mwh"]].rename(columns={"charge_mwh": "mwh"}).assign(series="Charge"),
-            chart_df[["Hour", "discharge_mwh"]].rename(columns={"discharge_mwh": "mwh"}).assign(series="Discharge"),
+            charge_negative,
+            discharge_positive,
         ],
         ignore_index=True,
     )
@@ -1137,7 +1162,7 @@ def build_daily_dispatch_chart(df_day: pd.DataFrame) -> alt.Chart:
             xOffset="series:N",
             color=alt.Color(
                 "series:N",
-                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#2e8b57", "#c0392b"]),
+                scale=alt.Scale(domain=["Charge", "Discharge"], range=["#c0392b", "#1b7f3b"]),
                 legend=alt.Legend(title=None),
             ),
             tooltip=["Hour", "series", alt.Tooltip("mwh:Q", format=",.3f")],
@@ -1548,16 +1573,26 @@ if st.session_state.dispatch is not None:
             fig, ax_price = plt.subplots(figsize=(12, 4.8), dpi=140)
             ax_flow = ax_price.twinx()
             x = avg_profile["Hour"].astype(int).values
-            ax_flow.bar(x - 0.18, avg_profile["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
-            ax_flow.bar(x - 0.18, avg_profile["grid_charge"], width=0.35, bottom=avg_profile["g_to_batt"], color="#8fd19e", alpha=0.95)
-            ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
+            avg_profile["charge_from_pv_negative"] = -avg_profile["g_to_batt"]
+            avg_profile["charge_from_grid_negative"] = -avg_profile["grid_charge"]
+            ax_flow.axhline(0, linewidth=0.9, color="#64748b", alpha=0.75)
+            ax_flow.bar(x - 0.18, avg_profile["charge_from_pv_negative"], width=0.35, color="#c0392b", alpha=0.90)
+            ax_flow.bar(
+                x - 0.18,
+                avg_profile["charge_from_grid_negative"],
+                width=0.35,
+                bottom=avg_profile["charge_from_pv_negative"],
+                color="#f19a95",
+                alpha=0.95,
+            )
+            ax_flow.bar(x + 0.18, avg_profile["discharge_mwh"], width=0.35, color="#1b7f3b", alpha=0.90)
             if mode_result != "Standalone BESS":
                 ax_flow.plot(x, avg_profile["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
                 ax_flow.fill_between(x, avg_profile["hybrid_profile_mwh"], color="#facc15", alpha=0.22)
             ax_price.plot(x, avg_profile["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
             ax_price.set_xlabel("Hour")
             ax_price.set_ylabel("OMIE (€/MWh)")
-            ax_flow.set_ylabel("Charge / Discharge / Solar / Hybrid (MWh)", labelpad=16)
+            ax_flow.set_ylabel("Battery flow (MWh): discharge + / charge −", labelpad=16)
             ax_price.grid(axis="y", alpha=0.25)
             ax_price.set_xticks(x)
             fig.tight_layout(rect=[0, 0, 0.9, 1])
@@ -1565,7 +1600,7 @@ if st.session_state.dispatch is not None:
             with cplot:
                 st.pyplot(fig, use_container_width=True)
             with cbox:
-                legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
+                legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#c0392b", None), ("Charge from Grid", "#f19a95", None), ("Discharge / sale", "#1b7f3b", None)]
                 if mode_result != "Standalone BESS":
                     legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
                 draw_side_legend(legend_items)
@@ -1589,15 +1624,25 @@ if st.session_state.dispatch is not None:
         ax_flow = ax_price.twinx()
         x = day_df["Hour"].astype(int).values
         ax_price.plot(x, day_df["omie_venta"], linestyle=(0,(3,3)), linewidth=1.8, color="#1f4e79")
-        ax_flow.bar(x - 0.18, day_df["g_to_batt"], width=0.35, color="#1b7f3b", alpha=0.9)
-        ax_flow.bar(x - 0.18, day_df["grid_charge"], width=0.35, bottom=day_df["g_to_batt"], color="#8fd19e", alpha=0.95)
-        ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#c0392b", alpha=0.85)
+        day_df["charge_from_pv_negative"] = -day_df["g_to_batt"]
+        day_df["charge_from_grid_negative"] = -day_df["grid_charge"]
+        ax_flow.axhline(0, linewidth=0.9, color="#64748b", alpha=0.75)
+        ax_flow.bar(x - 0.18, day_df["charge_from_pv_negative"], width=0.35, color="#c0392b", alpha=0.90)
+        ax_flow.bar(
+            x - 0.18,
+            day_df["charge_from_grid_negative"],
+            width=0.35,
+            bottom=day_df["charge_from_pv_negative"],
+            color="#f19a95",
+            alpha=0.95,
+        )
+        ax_flow.bar(x + 0.18, day_df["discharge_mwh"], width=0.35, color="#1b7f3b", alpha=0.90)
         if mode_result != "Standalone BESS":
             ax_flow.plot(x, day_df["generacion"], linestyle=(0,(3,3)), linewidth=2, color="#f59e0b")
             ax_flow.fill_between(x, day_df["hybrid profile (MWh)"], color="#facc15", alpha=0.22)
         ax_price.set_xlabel("Hour")
         ax_price.set_ylabel("OMIE (€/MWh)")
-        right_label = "Charge / Discharge (MWh)" if mode_result == "Standalone BESS" else "Charge / Discharge / Solar / Hybrid (MWh)"
+        right_label = "Battery flow (MWh): discharge + / charge −"
         ax_flow.set_ylabel(right_label, labelpad=16)
         ax_price.grid(axis="y", alpha=0.25)
         ax_price.set_xticks(x)
@@ -1606,7 +1651,7 @@ if st.session_state.dispatch is not None:
         with dplot:
             st.pyplot(fig, use_container_width=True)
         with dside:
-            legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#1b7f3b", None), ("Charge from Grid", "#8fd19e", None), ("Discharge", "#c0392b", None)]
+            legend_items = [("OMIE sell price", "#1f4e79", "dashed"), ("Charge from PV", "#c0392b", None), ("Charge from Grid", "#f19a95", None), ("Discharge / sale", "#1b7f3b", None)]
             if mode_result != "Standalone BESS":
                 legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
             draw_side_legend(legend_items)
@@ -1682,13 +1727,13 @@ if st.session_state.dispatch is not None:
         "grid_purchase",
         "soc",
     ]
-    st.dataframe(style_total_rows(dispatch[dispatch_cols]), use_container_width=True)
+    show_dataframe_safely(dispatch[dispatch_cols], style=False, use_container_width=True)
 
     st.subheader("Hourly dataset used")
-    st.dataframe(style_total_rows(data_used), use_container_width=True)
+    show_dataframe_safely(data_used, style=False, use_container_width=True)
 
     st.subheader("Variable definitions")
-    st.dataframe(style_total_rows(variable_definitions), use_container_width=True)
+    show_dataframe_safely(variable_definitions, style=True, use_container_width=True)
 
     csv_bytes = dispatch[dispatch_cols].to_csv(index=False).encode("utf-8")
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
