@@ -190,6 +190,12 @@ FORWARD_PROVIDER_FILES = {
         FORWARD_DIR / "Aurora Q1-26 central.xlsx",
     ),
     "Baringa": resolve_existing(
+        FORWARD_DIR / "Bringa_Q1.26.xlsx",
+        FORWARD_DIR / "Baringa_Q1.26.xlsx",
+        FORWARD_DIR / "Baringa Q1.26.xlsx",
+        DATA_DIR / "Bringa_Q1.26.xlsx",
+        DATA_DIR / "Baringa_Q1.26.xlsx",
+        DATA_DIR / "Baringa Q1.26.xlsx",
         DATA_DIR / "Baringa nominal.xlsx",
         FORWARD_DIR / "Baringa nominal.xlsx",
     ),
