@@ -1693,8 +1693,26 @@ if st.session_state.dispatch is not None:
     st.dataframe(style_total_rows(monthly_summary[captured_cols]), use_container_width=True)
 
     hero_header("Monthly Revenue BESS (€/MW) detail")
-    revenue_detail_cols = ["Year", "month", "Revenue BESS €/MW", "Avg buy price (€/MWh)", "Avg sell price (€/MWh)", "Captured spread (€/MWh)"]
-    st.dataframe(style_total_rows(monthly_summary[revenue_detail_cols]), use_container_width=True)
+    revenue_detail_cols = [
+        "Year",
+        "month",
+        "Revenue BESS €/MW",
+        "Avg buy price (€/MWh)",
+        "Avg sell price (€/MWh)",
+        "Captured spread (€/MWh)",
+    ]
+    monthly_revenue_detail = monthly_summary[
+        monthly_summary["month"] != "TOTAL"
+    ][revenue_detail_cols].copy()
+    st.dataframe(style_total_rows(monthly_revenue_detail), use_container_width=True)
+
+    hero_header("Yearly Revenue BESS (€/MW) detail")
+    yearly_revenue_detail = monthly_summary[
+        monthly_summary["month"] == "TOTAL"
+    ][revenue_detail_cols].copy()
+    yearly_revenue_detail = yearly_revenue_detail.rename(columns={"month": "Period"})
+    yearly_revenue_detail["Period"] = "TOTAL"
+    st.dataframe(style_total_rows(yearly_revenue_detail), use_container_width=True)
 
     data_header("Download / data tables")
     st.caption("From this point downward, this section is mainly for validation, download and detailed data inspection.")
