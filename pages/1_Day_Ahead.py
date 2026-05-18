@@ -226,6 +226,8 @@ PRICE_LOW_GREEN = "#16A34A"
 PRICE_MID_YELLOW = "#FDE047"
 PRICE_MID_ORANGE = "#F97316"
 PRICE_HIGH_RED = "#DC2626"
+AURORA_FORECAST_RED = "#DC2626"
+BARINGA_FORECAST_BLUE = "#2563EB"
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
 REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
 
@@ -2263,8 +2265,221 @@ def build_hourly_price_heatmap(price_hourly: pd.DataFrame, year_sel: int):
     )
     return apply_common_chart_style(chart, height=455)
 
-def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
-    if negative_df.empty:
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_forward_model_metric_files() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load Aurora/Baringa forecast metric files from /data.
+
+    This loader is intentionally permissive because provider exports often differ in naming.
+    Supported files: CSV/XLS/XLSX with ``aurora`` or ``baringa`` in the filename.
+
+    The parser looks for:
+      - monthly negative/zero-negative hours, either monthly or already cumulative;
+      - monthly economic-curtailment percentages.
+
+    Returns:
+      1) negative-price forecast rows with cumulative counts by month;
+      2) economic-curtailment forecast rows with monthly percentages.
+    """
+    neg_cols = [
+        "provider", "year", "month_num", "month_name", "cum_count",
+        "metric_mode", "source_file",
+    ]
+    curt_cols = [
+        "provider", "year", "month_num", "month_name", "pct_curtailment",
+        "source_file",
+    ]
+
+    if not DATA_DIR.exists():
+        return pd.DataFrame(columns=neg_cols), pd.DataFrame(columns=curt_cols)
+
+    candidate_files = []
+    for pattern in ("*.csv", "*.xlsx", "*.xls"):
+        for f in DATA_DIR.glob(pattern):
+            stem = f.stem.lower()
+            if "aurora" in stem or "baringa" in stem:
+                candidate_files.append(f)
+
+    if not candidate_files:
+        return pd.DataFrame(columns=neg_cols), pd.DataFrame(columns=curt_cols)
+
+    def _provider_from(path: Path, df: pd.DataFrame) -> str | None:
+        stem = path.stem.lower()
+        if "aurora" in stem:
+            return "Aurora"
+        if "baringa" in stem:
+            return "Baringa"
+        for c in ["provider", "source", "scenario", "consultant", "model"]:
+            if c in df.columns:
+                vals = df[c].astype(str).str.lower()
+                if vals.str.contains("aurora", na=False).any():
+                    return "Aurora"
+                if vals.str.contains("baringa", na=False).any():
+                    return "Baringa"
+        return None
+
+    def _month_num_from_series(s: pd.Series) -> pd.Series:
+        as_num = pd.to_numeric(s, errors="coerce")
+        out = as_num.where(as_num.between(1, 12))
+        if out.notna().any():
+            return out
+        month_txt = s.astype(str).str.strip().str[:3].str.lower()
+        month_map = {
+            "jan": 1, "ene": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4, "abr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8, "ago": 8,
+            "sep": 9, "set": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12, "dic": 12,
+        }
+        return month_txt.map(month_map)
+
+    def _parse_period_fields(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        cols = out.columns.tolist()
+        date_col = _first_existing_col(cols, [
+            "datetime", "date", "period_date", "delivery_date", "month_date",
+            "forecast_date", "timestamp", "period_start",
+        ])
+        year_col = _first_existing_col(cols, ["year", "calendar_year", "forecast_year", "delivery_year"])
+        month_col = _first_existing_col(cols, ["month_num", "month_number", "month", "calendar_month", "forecast_month"])
+        period_col = _first_existing_col(cols, ["period", "month_year", "delivery_period", "contract", "label"])
+
+        out["_period_dt"] = pd.NaT
+        if date_col:
+            out["_period_dt"] = pd.to_datetime(out[date_col], errors="coerce", dayfirst=True)
+        if out["_period_dt"].isna().all() and period_col:
+            out["_period_dt"] = pd.to_datetime(out[period_col], errors="coerce", dayfirst=True)
+
+        out["year"] = pd.to_numeric(out[year_col], errors="coerce") if year_col else out["_period_dt"].dt.year
+        if month_col:
+            out["month_num"] = _month_num_from_series(out[month_col])
+        else:
+            out["month_num"] = out["_period_dt"].dt.month
+
+        # Fallback: parse years and months from a textual period label such as Jan-2027.
+        if period_col:
+            period_txt = out[period_col].astype(str)
+            missing_year = out["year"].isna()
+            extracted_year = period_txt.str.extract(r"(20\d{2})", expand=False)
+            out.loc[missing_year, "year"] = pd.to_numeric(extracted_year[missing_year], errors="coerce")
+
+            missing_month = out["month_num"].isna()
+            out.loc[missing_month, "month_num"] = _month_num_from_series(period_txt[missing_month])
+
+        out["year"] = pd.to_numeric(out["year"], errors="coerce")
+        out["month_num"] = pd.to_numeric(out["month_num"], errors="coerce")
+        out = out[out["year"].ge(2026) & out["month_num"].between(1, 12)].copy()
+        out["year"] = out["year"].astype(int)
+        out["month_num"] = out["month_num"].astype(int)
+        out["month_name"] = out["month_num"].map(lambda m: datetime(2000, int(m), 1).strftime("%b"))
+        return out
+
+    negative_frames: list[pd.DataFrame] = []
+    curtailment_frames: list[pd.DataFrame] = []
+
+    for file_path in sorted(set(candidate_files)):
+        try:
+            if file_path.suffix.lower() in {".xlsx", ".xls"}:
+                xls = pd.ExcelFile(file_path)
+                raw_frames = [pd.read_excel(file_path, sheet_name=sheet) for sheet in xls.sheet_names]
+            else:
+                raw_frames = [pd.read_csv(file_path)]
+        except Exception:
+            continue
+
+        for raw in raw_frames:
+            if raw is None or raw.empty:
+                continue
+            df = raw.copy()
+            df.columns = [_clean_col_name(c) for c in df.columns]
+            provider = _provider_from(file_path, df)
+            if provider is None:
+                continue
+            df = _parse_period_fields(df)
+            if df.empty:
+                continue
+
+            columns = df.columns.tolist()
+            # Prefer an explicit zero+negative series when the dashboard is in that mode.
+            zero_neg_monthly_col = _first_existing_col(columns, [
+                "zero_negative_hours", "zero_and_negative_hours", "hours_zero_negative",
+                "zero_or_negative_hours", "non_positive_hours", "hours_price_le_0",
+            ])
+            zero_neg_cum_col = _first_existing_col(columns, [
+                "cum_zero_negative_hours", "cumulative_zero_negative_hours",
+                "cumulative_zero_and_negative_hours", "cum_non_positive_hours",
+            ])
+            neg_monthly_col = _first_existing_col(columns, [
+                "negative_hours", "hours_negative", "hours_price_lt_0", "monthly_negative_hours",
+            ])
+            neg_cum_col = _first_existing_col(columns, [
+                "cum_negative_hours", "cumulative_negative_hours", "negative_hours_cum",
+            ])
+
+            for mode, monthly_col, cum_col in [
+                ("Only negative prices", neg_monthly_col, neg_cum_col),
+                ("Zero and negative prices", zero_neg_monthly_col, zero_neg_cum_col),
+            ]:
+                metric_col = cum_col or monthly_col
+                if metric_col is None:
+                    continue
+                tmp = df[["year", "month_num", "month_name", metric_col]].copy()
+                tmp[metric_col] = pd.to_numeric(tmp[metric_col], errors="coerce")
+                tmp = tmp.dropna(subset=[metric_col]).copy()
+                if tmp.empty:
+                    continue
+                tmp["provider"] = provider
+                tmp["metric_mode"] = mode
+                tmp["source_file"] = file_path.name
+                tmp = (
+                    tmp.groupby(["provider", "metric_mode", "source_file", "year", "month_num", "month_name"], as_index=False)[metric_col]
+                    .sum()
+                    .sort_values(["provider", "metric_mode", "year", "month_num"])
+                    .reset_index(drop=True)
+                )
+                if cum_col:
+                    tmp["cum_count"] = tmp[metric_col]
+                else:
+                    tmp["cum_count"] = tmp.groupby(["provider", "metric_mode", "year"])[metric_col].cumsum()
+                negative_frames.append(tmp[neg_cols])
+
+            curt_col = _first_existing_col(columns, [
+                "pct_curtailment", "economic_curtailment", "economic_curtailment_pct",
+                "curtailment_pct", "pct_economic_curtailment", "economic_curtailment_share",
+            ])
+            if curt_col:
+                tmp = df[["year", "month_num", "month_name", curt_col]].copy()
+                tmp[curt_col] = pd.to_numeric(tmp[curt_col], errors="coerce")
+                tmp = tmp.dropna(subset=[curt_col]).copy()
+                if not tmp.empty:
+                    # Accept either fractions (0.12) or percentages (12).
+                    if tmp[curt_col].abs().max(skipna=True) > 1.5:
+                        tmp[curt_col] = tmp[curt_col] / 100.0
+                    tmp["provider"] = provider
+                    tmp["pct_curtailment"] = tmp[curt_col]
+                    tmp["source_file"] = file_path.name
+                    tmp = (
+                        tmp.groupby(["provider", "source_file", "year", "month_num", "month_name"], as_index=False)["pct_curtailment"]
+                        .mean()
+                        .sort_values(["provider", "year", "month_num"])
+                        .reset_index(drop=True)
+                    )
+                    curtailment_frames.append(tmp[curt_cols])
+
+    neg_out = pd.concat(negative_frames, ignore_index=True) if negative_frames else pd.DataFrame(columns=neg_cols)
+    curt_out = pd.concat(curtailment_frames, ignore_index=True) if curtailment_frames else pd.DataFrame(columns=curt_cols)
+    return neg_out, curt_out
+
+
+def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forecast_df: pd.DataFrame | None = None):
+    if negative_df.empty and (forecast_df is None or forecast_df.empty):
         return None
 
     is_negative_only = mode == "Only negative prices"
@@ -2272,19 +2487,57 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str):
     chart_title = "Cumulative negative price hours" if is_negative_only else "Cumulative zero and negative price hours"
     tooltip_title = "Cumulative negative hours" if is_negative_only else "Cumulative zero / negative hours"
 
-    years = sorted(negative_df["year"].unique().tolist())
-    colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
-    chart = alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
-        y=alt.Y("cum_count:Q", title=y_title),
-        color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
-        detail="year:N",
-        tooltip=[
-            alt.Tooltip("year:N", title="Year"),
-            alt.Tooltip("month_name:N", title="Month"),
-            alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
-        ],
-    ).properties(height=330, title=chart_title)
+    layers = []
+    if not negative_df.empty:
+        years = sorted(negative_df["year"].unique().tolist())
+        colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
+        hist = alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
+            x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
+            y=alt.Y("cum_count:Q", title=y_title),
+            color=alt.Color("year:N", title="Observed year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
+            detail="year:N",
+            tooltip=[
+                alt.Tooltip("year:N", title="Observed year"),
+                alt.Tooltip("month_name:N", title="Month"),
+                alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
+            ],
+        )
+        layers.append(hist)
+
+    if forecast_df is not None and not forecast_df.empty:
+        fc = forecast_df[forecast_df["metric_mode"] == mode].copy()
+        fc = fc[fc["year"] >= 2026].copy()
+        if not fc.empty:
+            fc["series"] = fc["provider"] + " " + fc["year"].astype(str)
+            forecast_years = sorted(fc["year"].unique().tolist())
+            dash_values = [[1, 0], [6, 3], [3, 2], [10, 3], [2, 2]]
+            forecast = alt.Chart(fc).mark_line(point=True, strokeWidth=3.5).encode(
+                x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
+                y=alt.Y("cum_count:Q", title=y_title),
+                color=alt.Color(
+                    "provider:N",
+                    title="Forecast provider",
+                    scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_FORECAST_RED, BARINGA_FORECAST_BLUE]),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "year:N",
+                    title="Forecast year",
+                    scale=alt.Scale(domain=forecast_years, range=dash_values[:len(forecast_years)]),
+                ),
+                detail="series:N",
+                tooltip=[
+                    alt.Tooltip("provider:N", title="Provider"),
+                    alt.Tooltip("year:N", title="Forecast year"),
+                    alt.Tooltip("month_name:N", title="Month"),
+                    alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
+                    alt.Tooltip("source_file:N", title="Source file"),
+                ],
+            )
+            layers.append(forecast)
+
+    if not layers:
+        return None
+    chart = alt.layer(*layers).properties(height=330, title=chart_title)
     return apply_common_chart_style(chart, height=330)
 
 
@@ -2394,32 +2647,82 @@ def build_economic_curtailment_monthly(price_hourly: pd.DataFrame, solar_hourly:
     return out[cols].sort_values(["year", "month_num"]).reset_index(drop=True)
 
 
-def build_economic_curtailment_chart(curt_df: pd.DataFrame):
-    if curt_df.empty:
+def build_economic_curtailment_chart(curt_df: pd.DataFrame, forecast_df: pd.DataFrame | None = None):
+    if curt_df.empty and (forecast_df is None or forecast_df.empty):
         return None
-    years = sorted(curt_df["year"].unique().tolist())
-    colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
-    plot = curt_df.copy()
-    plot["month_label"] = plot["month_name"] + " - " + plot["year"].astype(str)
-    chart = alt.Chart(plot).mark_bar().encode(
-        x=alt.X(
-            "month_label:N",
-            title=None,
-            sort=plot.sort_values(["year", "month_num"])["month_label"].tolist(),
-            axis=alt.Axis(labelAngle=0),
-        ),
-        y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
-        color=alt.Color("year:N", title="Year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
-        tooltip=[
-            alt.Tooltip("year:N", title="Year"),
-            alt.Tooltip("month_name:N", title="Month"),
-            alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
-            alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
-            alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
-        ],
-    ).properties(height=330)
-    return apply_common_chart_style(chart, height=330)
 
+    hist = curt_df.copy()
+    fc = forecast_df.copy() if forecast_df is not None else pd.DataFrame()
+    if not hist.empty:
+        hist["month_label"] = hist["month_name"] + " - " + hist["year"].astype(str)
+    if not fc.empty:
+        fc = fc[fc["year"] >= 2026].copy()
+        fc["month_label"] = fc["month_name"] + " - " + fc["year"].astype(str)
+        fc["series"] = fc["provider"] + " " + fc["year"].astype(str)
+
+    order_parts = []
+    if not hist.empty:
+        order_parts.append(hist[["year", "month_num", "month_label"]])
+    if not fc.empty:
+        order_parts.append(fc[["year", "month_num", "month_label"]])
+    if not order_parts:
+        return None
+    month_order = (
+        pd.concat(order_parts, ignore_index=True)
+        .drop_duplicates()
+        .sort_values(["year", "month_num"])["month_label"]
+        .tolist()
+    )
+
+    layers = []
+    if not hist.empty:
+        years = sorted(hist["year"].unique().tolist())
+        colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
+        bars = alt.Chart(hist).mark_bar().encode(
+            x=alt.X("month_label:N", title=None, sort=month_order, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+            color=alt.Color("year:N", title="Observed year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
+            tooltip=[
+                alt.Tooltip("year:N", title="Observed year"),
+                alt.Tooltip("month_name:N", title="Month"),
+                alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
+                alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
+                alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
+            ],
+        )
+        layers.append(bars)
+
+    if not fc.empty:
+        forecast_years = sorted(fc["year"].unique().tolist())
+        dash_values = [[1, 0], [6, 3], [3, 2], [10, 3], [2, 2]]
+        lines = alt.Chart(fc).mark_line(point=True, strokeWidth=3.5).encode(
+            x=alt.X("month_label:N", title=None, sort=month_order, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+            color=alt.Color(
+                "provider:N",
+                title="Forecast provider",
+                scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_FORECAST_RED, BARINGA_FORECAST_BLUE]),
+            ),
+            strokeDash=alt.StrokeDash(
+                "year:N",
+                title="Forecast year",
+                scale=alt.Scale(domain=forecast_years, range=dash_values[:len(forecast_years)]),
+            ),
+            detail="series:N",
+            tooltip=[
+                alt.Tooltip("provider:N", title="Provider"),
+                alt.Tooltip("year:N", title="Forecast year"),
+                alt.Tooltip("month_name:N", title="Month"),
+                alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
+                alt.Tooltip("source_file:N", title="Source file"),
+            ],
+        )
+        layers.append(lines)
+
+    if not layers:
+        return None
+    chart = alt.layer(*layers).properties(height=330)
+    return apply_common_chart_style(chart, height=330)
 
 
 # =========================================================
@@ -3126,6 +3429,8 @@ try:
             st.altair_chart(price_heatmap, use_container_width=True)
             st.caption("Color scale: strong green = very low spot price; yellow/orange = medium price; strong red = very high spot price. Future or missing hours are shown in light grey.")
 
+    forward_negative_forecast_df, forward_curtailment_forecast_df = load_forward_model_metric_files()
+
     section_header("Negative prices")
     neg_mode = st.radio(
         "Negative price metric",
@@ -3136,13 +3441,15 @@ try:
         key="negative_price_metric_mode",
     )
     negative_price_df = build_negative_price_curves(price_hourly, neg_mode)
-    neg_chart = build_negative_price_chart(negative_price_df, neg_mode)
+    neg_chart = build_negative_price_chart(negative_price_df, neg_mode, forward_negative_forecast_df)
     if neg_chart is not None:
         st.altair_chart(neg_chart, use_container_width=True)
         if neg_mode == "Only negative prices":
             st.caption("This chart shows the cumulative number of hours with price below zero by month.")
         else:
             st.caption("This chart shows the cumulative number of hours with price equal to or below zero by month.")
+        if not forward_negative_forecast_df.empty:
+            st.caption("Forecast overlays from Aurora/Baringa files found in /data: red = Aurora, blue = Baringa; line dash separates forecast years.")
     subtle_subsection("Cumulative negative / zero-price hours data")
     st.dataframe(styled_df(negative_price_df), use_container_width=True)
 
@@ -3155,10 +3462,12 @@ try:
         key="selected_curtailment_years",
     )
     curt_df = build_economic_curtailment_monthly(price_hourly, solar_hourly, selected_curtailment_years)
-    curt_chart = build_economic_curtailment_chart(curt_df)
+    curt_chart = build_economic_curtailment_chart(curt_df, forward_curtailment_forecast_df)
     if curt_chart is not None:
         st.altair_chart(curt_chart, use_container_width=True)
         st.caption("Monthly economic curtailment = % of monthly P48 production generated during zero or negative price hours.")
+        if not forward_curtailment_forecast_df.empty:
+            st.caption("Forecast overlays from Aurora/Baringa files found in /data: red = Aurora, blue = Baringa; line dash separates forecast years.")
     if not curt_df.empty:
         curt_table = curt_df.copy()
         curt_table["Month"] = curt_table["month_name"] + " - " + curt_table["year"].astype(str)
@@ -3221,27 +3530,8 @@ try:
                     monthly_live,
                 ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
-        if granularity == "Monthly" and year_sel >= 2026:
-            demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
-            if not demand_live_monthly.empty:
-                demand_period = demand_live_monthly.copy()
-                demand_period["period_label"] = demand_period["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
-                demand_period["sort_key"] = demand_period["datetime"].dt.to_period("M").dt.to_timestamp()
-                demand_period = demand_period[["period_label", "sort_key", "demand_mwh"]].copy()
-            else:
-                demand_period = build_demand_period(
-                    demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-                    granularity,
-                    year_sel=year_sel,
-                    day_range=day_range,
-                )
-        else:
-            demand_period = build_demand_period(
-                demand_hourly if isinstance(demand_hourly, pd.DataFrame) else pd.DataFrame(columns=["datetime", "demand_mw", "energy_mwh"]),
-                granularity,
-                year_sel=year_sel,
-                day_range=day_range,
-            )
+        # Demand is intentionally not used in the energy-mix chart.
+        # The historical demand_period preparation was a residual from an older overlay version.
         if granularity == "Monthly" and mix_period.empty:
             st.info(f"No energy mix data available for {year_sel}. The historical mix file covers 2022-2025 and live extraction starts in 2026.")
         mix_chart = build_energy_mix_period_chart(mix_period, None)
