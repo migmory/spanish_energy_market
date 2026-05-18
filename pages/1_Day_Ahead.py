@@ -2320,17 +2320,29 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forward_df:
         fwd = forward_df.copy()
         fwd = fwd[fwd["year"].astype(str) == "2026"].copy()
         if not fwd.empty:
-            for model in ["Aurora", "Baringa"]:
-                model_df = fwd[fwd["model"] == model].copy()
-                if model_df.empty:
-                    continue
-                color = AURORA_COLOR if model == "Aurora" else BARINGA_COLOR if model == "Baringa" else "#111827"
+            fwd = fwd[fwd["model"].isin(["Aurora", "Baringa"])].copy()
+            if not fwd.empty:
+                fwd["series"] = fwd["model"]
                 layers.append(
-                    alt.Chart(model_df).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3], color=color).encode(
+                    alt.Chart(fwd).mark_line(
+                        point=alt.OverlayMarkDef(filled=True, size=70),
+                        strokeWidth=3.2,
+                    ).encode(
                         x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
                         y=alt.Y("cum_count:Q", title=y_title),
+                        color=alt.Color(
+                            "series:N",
+                            title="2026 forecast",
+                            scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_COLOR, BARINGA_COLOR]),
+                        ),
+                        strokeDash=alt.StrokeDash(
+                            "series:N",
+                            title="2026 forecast",
+                            scale=alt.Scale(domain=["Aurora", "Baringa"], range=[[7, 3], [7, 3]]),
+                        ),
+                        detail="series:N",
                         tooltip=[
-                            alt.Tooltip("model:N", title="2026 forecast"),
+                            alt.Tooltip("series:N", title="2026 forecast"),
                             alt.Tooltip("month_name:N", title="Month"),
                             alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
                         ],
@@ -2491,17 +2503,29 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
         )
 
     if not fwd.empty:
-        for model in ["Aurora", "Baringa"]:
-            model_df = fwd[fwd["model"] == model].copy()
-            if model_df.empty:
-                continue
-            color = AURORA_COLOR if model == "Aurora" else BARINGA_COLOR if model == "Baringa" else "#111827"
+        fwd = fwd[fwd["model"].isin(["Aurora", "Baringa"])].copy()
+        if not fwd.empty:
+            fwd["series"] = fwd["model"]
             layers.append(
-                alt.Chart(model_df).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3], color=color).encode(
+                alt.Chart(fwd).mark_line(
+                    point=alt.OverlayMarkDef(filled=True, size=70),
+                    strokeWidth=3.2,
+                ).encode(
                     x=alt.X("month_label:N", title=None, sort=full_order, axis=alt.Axis(labelAngle=0)),
                     y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+                    color=alt.Color(
+                        "series:N",
+                        title="2026 forecast",
+                        scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_COLOR, BARINGA_COLOR]),
+                    ),
+                    strokeDash=alt.StrokeDash(
+                        "series:N",
+                        title="2026 forecast",
+                        scale=alt.Scale(domain=["Aurora", "Baringa"], range=[[7, 3], [7, 3]]),
+                    ),
+                    detail="series:N",
                     tooltip=[
-                        alt.Tooltip("model:N", title="2026 forecast"),
+                        alt.Tooltip("series:N", title="2026 forecast"),
                         alt.Tooltip("month_name:N", title="Month"),
                         alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
                         alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
