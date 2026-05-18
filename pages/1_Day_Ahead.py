@@ -229,6 +229,8 @@ GREY_SHADE = "#F3F4F6"
 YELLOW_DARK = "#D97706"
 YELLOW_LIGHT = "#FBBF24"
 BLUE_PRICE = "#1D4ED8"
+AURORA_COLOR = "#EA580C"  # orange-red
+BARINGA_COLOR = "#1E40AF"  # strong blue
 GREEN_RENEWABLES = "#059669"
 PRICE_LOW_GREEN_DARK = "#006400"
 PRICE_LOW_GREEN = "#16A34A"
@@ -2306,7 +2308,7 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forward_df:
             model_order = [m for m in ["Aurora", "Baringa"] if m in fwd["model"].unique().tolist()]
             other_models = [m for m in sorted(fwd["model"].astype(str).unique().tolist()) if m not in model_order]
             model_order.extend(other_models)
-            fwd_colors = ["#DC2626" if m == "Aurora" else BLUE_PRICE if m == "Baringa" else "#111827" for m in model_order]
+            fwd_colors = [AURORA_COLOR if m == "Aurora" else BARINGA_COLOR if m == "Baringa" else "#111827" for m in model_order]
             layers.append(
                 alt.Chart(fwd).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3]).encode(
                     x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
@@ -2469,7 +2471,7 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
             model_order = [m for m in ["Aurora", "Baringa"] if m in fwd["model"].unique().tolist()]
             other_models = [m for m in sorted(fwd["model"].astype(str).unique().tolist()) if m not in model_order]
             model_order.extend(other_models)
-            fwd_colors = ["#DC2626" if m == "Aurora" else BLUE_PRICE if m == "Baringa" else "#111827" for m in model_order]
+            fwd_colors = [AURORA_COLOR if m == "Aurora" else BARINGA_COLOR if m == "Baringa" else "#111827" for m in model_order]
             layers.append(
                 alt.Chart(fwd).mark_line(point=True, strokeWidth=3.2).encode(
                     x=alt.X("month_label:N", title=None, sort=fwd.sort_values(["year", "month_num"])["month_label"].drop_duplicates().tolist(), axis=alt.Axis(labelAngle=0)),
@@ -2768,9 +2770,125 @@ def build_forward_capture_price_table(forward_prices: pd.DataFrame, solar_hourly
     return pd.concat(frames, ignore_index=True).sort_values(["model", "period"]).reset_index(drop=True)
 
 
+def compute_average_solar_generation(solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> float | None:
+    if solar_hourly.empty:
+        return None
+    period = solar_hourly[(solar_hourly["datetime"].dt.date >= start_d) & (solar_hourly["datetime"].dt.date <= end_d)].copy()
+    if period.empty:
+        return None
+    vals = pd.to_numeric(period["solar_best_mw"], errors="coerce")
+    if vals.dropna().empty:
+        return None
+    return float(vals.mean())
+
+
+def build_selected_range_hourly_overlay_chart(
+    price_hourly: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    forward_prices: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+):
+    cols = ["hour", "hour_label", "series", "value", "axis"]
+    frames = []
+
+    actual_price = price_hourly[(price_hourly["datetime"].dt.date >= start_d) & (price_hourly["datetime"].dt.date <= end_d)].copy()
+    if not actual_price.empty:
+        actual_price["hour"] = actual_price["datetime"].dt.hour
+        ap = actual_price.groupby("hour", as_index=False)["price"].mean()
+        ap["hour_label"] = ap["hour"].map(lambda x: f"{int(x):02d}:00")
+        ap["series"] = "Actual price"
+        ap["value"] = ap["price"]
+        ap["axis"] = "Price (€/MWh)"
+        frames.append(ap[cols])
+
+    actual_solar = solar_hourly[(solar_hourly["datetime"].dt.date >= start_d) & (solar_hourly["datetime"].dt.date <= end_d)].copy()
+    if not actual_solar.empty:
+        actual_solar["hour"] = actual_solar["datetime"].dt.hour
+        sp = actual_solar.groupby("hour", as_index=False)["solar_best_mw"].mean()
+        sp["hour_label"] = sp["hour"].map(lambda x: f"{int(x):02d}:00")
+        sp["series"] = "Avg solar generation"
+        sp["value"] = sp["solar_best_mw"]
+        sp["axis"] = "Solar generation (MW)"
+        frames.append(sp[cols])
+
+    if start_d.year == 2026 and end_d.year == 2026 and forward_prices is not None and not forward_prices.empty:
+        fp = _forward_2026_only(forward_prices)
+        for model in ["Aurora", "Baringa"]:
+            model_df = fp[fp["model"] == model].copy()
+            if model_df.empty:
+                continue
+            model_df = model_df[(model_df["datetime"].dt.date >= start_d) & (model_df["datetime"].dt.date <= end_d)].copy()
+            if model_df.empty:
+                continue
+            model_df["hour"] = model_df["datetime"].dt.hour
+            mp = model_df.groupby("hour", as_index=False)["price"].mean()
+            mp["hour_label"] = mp["hour"].map(lambda x: f"{int(x):02d}:00")
+            mp["series"] = f"{model} price"
+            mp["value"] = mp["price"]
+            mp["axis"] = "Price (€/MWh)"
+            frames.append(mp[cols])
+
+    if not frames:
+        return None
+
+    plot = pd.concat(frames, ignore_index=True)
+    plot["series"] = pd.Categorical(
+        plot["series"],
+        categories=["Actual price", "Aurora price", "Baringa price", "Avg solar generation"],
+        ordered=True,
+    )
+
+    price_plot = plot[plot["axis"] == "Price (€/MWh)"].copy()
+    solar_plot = plot[plot["axis"] == "Solar generation (MW)"].copy()
+
+    color_scale = alt.Scale(
+        domain=["Actual price", "Aurora price", "Baringa price", "Avg solar generation"],
+        range=["#111827", AURORA_COLOR, BARINGA_COLOR, GREEN_RENEWABLES],
+    )
+
+    line_dash_scale = alt.Scale(
+        domain=["Actual price", "Aurora price", "Baringa price", "Avg solar generation"],
+        range=[[1, 0], [7, 3], [7, 3], [4, 3]],
+    )
+
+    base = alt.Chart(price_plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("hour_label:N", sort=[f"{h:02d}:00" for h in range(24)], axis=alt.Axis(title="Hour", labelAngle=0)),
+        y=alt.Y("value:Q", title="Price (€/MWh)"),
+        color=alt.Color("series:N", title="Series", scale=color_scale),
+        strokeDash=alt.StrokeDash("series:N", scale=line_dash_scale, legend=None),
+        tooltip=[
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("hour_label:N", title="Hour"),
+            alt.Tooltip("value:Q", title="Value", format=",.2f"),
+        ],
+    ) if not price_plot.empty else None
+
+    solar_line = alt.Chart(solar_plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("hour_label:N", sort=[f"{h:02d}:00" for h in range(24)], axis=alt.Axis(title="Hour", labelAngle=0)),
+        y=alt.Y("value:Q", title="Solar generation (MW)"),
+        color=alt.Color("series:N", title="Series", scale=color_scale),
+        strokeDash=alt.StrokeDash("series:N", scale=line_dash_scale, legend=None),
+        tooltip=[
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("hour_label:N", title="Hour"),
+            alt.Tooltip("value:Q", title="Value", format=",.2f"),
+        ],
+    ) if not solar_plot.empty else None
+
+    if base is not None and solar_line is not None:
+        chart = alt.layer(base, solar_line).resolve_scale(y="independent").properties(height=340, title="Selected range: hourly average price and solar profile")
+        return apply_common_chart_style(chart, height=340)
+    if base is not None:
+        return apply_common_chart_style(base.properties(height=340, title="Selected range: hourly average price profile"), height=340)
+    if solar_line is not None:
+        return apply_common_chart_style(solar_line.properties(height=340, title="Selected range: hourly average solar profile"), height=340)
+    return None
+
+
 def compute_forward_period_metrics(forward_prices: pd.DataFrame, solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> pd.DataFrame:
     cols = [
-        "Model", "Range start", "Range end", "Average spot price", "Captured solar (uncurtailed)",
+        "Model", "Range start", "Range end", "Average spot price", "Average solar generation", "Captured solar (uncurtailed)",
         "Captured solar (curtailed)", "Capture rate (uncurtailed)", "Capture rate (curtailed)",
     ]
     if start_d.year != 2026 or end_d.year != 2026:
@@ -2790,6 +2908,7 @@ def compute_forward_period_metrics(forward_prices: pd.DataFrame, solar_hourly: p
             "Range start": pd.Timestamp(start_d),
             "Range end": pd.Timestamp(end_d),
             "Average spot price": metrics.get("avg_price"),
+            "Average solar generation": compute_average_solar_generation(solar_hourly, start_d, end_d),
             "Captured solar (uncurtailed)": metrics.get("captured_uncurtailed"),
             "Captured solar (curtailed)": metrics.get("captured_curtailed"),
             "Capture rate (uncurtailed)": metrics.get("capture_pct_uncurtailed"),
@@ -3070,7 +3189,7 @@ def build_installed_capacity_waterfall_df(
     """
     cols = [
         "period", "technology", "capacity_mw", "delta_mw", "y_start", "y_end",
-        "bar_low", "bar_high", "component", "delta_label", "total_label", "period_label",
+        "bar_low", "bar_high", "bar_mid", "component", "delta_label", "total_label", "period_label",
     ]
     if cap_df.empty or not selected_tech:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=["period", "period_label", "capacity_mw"])
@@ -3088,6 +3207,7 @@ def build_installed_capacity_waterfall_df(
     annual["y_end"] = annual["capacity_mw"]
     annual["bar_low"] = annual[["y_start", "y_end"]].min(axis=1)
     annual["bar_high"] = annual[["y_start", "y_end"]].max(axis=1)
+    annual["bar_mid"] = (annual["bar_low"] + annual["bar_high"]) / 2.0
     annual["component"] = "Initial base"
     annual.loc[annual.index[1:], "component"] = annual.loc[annual.index[1:], "delta_mw"].apply(
         lambda x: "Addition" if x >= 0 else "Reduction"
@@ -3181,7 +3301,7 @@ def build_installed_capacity_chart(
             align="center", baseline="middle", fontSize=12, fontWeight="bold", color="#111827"
         ).encode(
             x=alt.X("period_label:N", sort=order),
-            y=alt.Y("bar_high:Q"),
+            y=alt.Y("bar_mid:Q"),
             text="delta_label:N",
         )
 
@@ -3491,16 +3611,19 @@ try:
         st.warning("Average range start cannot be later than average range end.")
     else:
         avg_metrics = compute_period_metrics(price_hourly, solar_hourly, range_start, range_end)
-        m1, m2, m3 = st.columns(3)
+        avg_solar_generation = compute_average_solar_generation(solar_hourly, range_start, range_end)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Average spot price", format_metric(avg_metrics.get("avg_price"), " €/MWh"))
         m2.metric("Captured solar (uncurtailed)", format_metric(avg_metrics.get("captured_uncurtailed"), " €/MWh"))
         m3.metric("Captured solar (curtailed)", format_metric(avg_metrics.get("captured_curtailed"), " €/MWh"))
+        m4.metric("Average solar generation", format_metric(avg_solar_generation, " MW"))
 
         avg_table = pd.DataFrame([
             {
                 "Range start": pd.Timestamp(range_start),
                 "Range end": pd.Timestamp(range_end),
                 "Average spot price": avg_metrics.get("avg_price"),
+                "Average solar generation": avg_solar_generation,
                 "Captured solar (uncurtailed)": avg_metrics.get("captured_uncurtailed"),
                 "Captured solar (curtailed)": avg_metrics.get("captured_curtailed"),
                 "Capture rate (uncurtailed)": avg_metrics.get("capture_pct_uncurtailed"),
@@ -3519,6 +3642,11 @@ try:
                 styled_df(forward_range_metrics, pct_cols=["Capture rate (uncurtailed)", "Capture rate (curtailed)"]),
                 use_container_width=True,
             )
+
+        range_overlay_chart = build_selected_range_hourly_overlay_chart(price_hourly, solar_hourly, forward_price_hourly, range_start, range_end)
+        if range_overlay_chart is not None:
+            subtle_subsection("Selected range hourly average overlay")
+            st.altair_chart(range_overlay_chart, use_container_width=True)
 
         hourly_profile = build_hourly_profile_table(price_hourly, range_start, range_end)
         if not hourly_profile.empty:
