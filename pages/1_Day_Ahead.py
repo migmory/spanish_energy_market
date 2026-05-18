@@ -2329,7 +2329,6 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forward_df:
                     alt.Chart(model_df).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3], color=color).encode(
                         x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
                         y=alt.Y("cum_count:Q", title=y_title),
-                        detail=alt.value(model),
                         tooltip=[
                             alt.Tooltip("model:N", title="2026 forecast"),
                             alt.Tooltip("month_name:N", title="Month"),
@@ -2501,7 +2500,6 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
                 alt.Chart(model_df).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3], color=color).encode(
                     x=alt.X("month_label:N", title=None, sort=full_order, axis=alt.Axis(labelAngle=0)),
                     y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
-                    detail=alt.value(model),
                     tooltip=[
                         alt.Tooltip("model:N", title="2026 forecast"),
                         alt.Tooltip("month_name:N", title="Month"),
