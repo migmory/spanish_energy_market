@@ -2286,12 +2286,20 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forward_df:
     layers = []
     if not negative_df.empty:
         years = sorted(negative_df["year"].unique().tolist())
-        colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
+        year_color_map = {
+            2021: "#1D4ED8",
+            2022: "#10B981",
+            2023: "#D97706",
+            2024: "#7C3AED",
+            2025: "#DC2626",
+            2026: BLUE_PRICE,
+        }
+        colors = [year_color_map.get(y, "#6B7280") for y in years]
         layers.append(
             alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
                 x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
                 y=alt.Y("cum_count:Q", title=y_title),
-                color=alt.Color("year:N", title="Actual year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
+                color=alt.Color("year:N", title="Actual year", scale=alt.Scale(domain=years, range=colors)),
                 detail="year:N",
                 tooltip=[
                     alt.Tooltip("year:N", title="Actual year"),
@@ -2438,21 +2446,39 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
         return None
 
     layers = []
-    if not curt_df.empty:
-        years = sorted(curt_df["year"].unique().tolist())
-        colors = [BLUE_PRICE, CORP_GREEN, YELLOW_DARK, "#7C3AED", "#DC2626", "#0EA5E9"]
-        plot = curt_df.copy()
+    full_order: list[str] = []
+
+    plot = curt_df.copy() if not curt_df.empty else pd.DataFrame()
+    if not plot.empty:
         plot["month_label"] = plot["month_name"] + " - " + plot["year"].astype(str)
+        plot = plot.sort_values(["year", "month_num"]).reset_index(drop=True)
+        full_order.extend(plot["month_label"].drop_duplicates().tolist())
+
+    fwd = pd.DataFrame()
+    if forward_df is not None and not forward_df.empty:
+        fwd = forward_df.copy()
+        fwd = fwd[fwd["year"].astype(int) == 2026].copy()
+        if not fwd.empty:
+            fwd["month_label"] = fwd["month_name"] + " - " + fwd["year"].astype(str)
+            fwd = fwd.sort_values(["year", "month_num"]).reset_index(drop=True)
+            for label in fwd["month_label"].drop_duplicates().tolist():
+                if label not in full_order:
+                    full_order.append(label)
+
+    if not plot.empty:
+        years = sorted(plot["year"].unique().tolist())
+        year_color_map = {2021: "#1D4ED8", 2022: "#10B981", 2023: "#D97706", 2024: "#7C3AED", 2025: "#10B981", 2026: "#F59E0B"}
+        colors = [year_color_map.get(y, "#6B7280") for y in years]
         layers.append(
             alt.Chart(plot).mark_bar(opacity=0.82).encode(
                 x=alt.X(
                     "month_label:N",
                     title=None,
-                    sort=plot.sort_values(["year", "month_num"])["month_label"].tolist(),
+                    sort=full_order,
                     axis=alt.Axis(labelAngle=0),
                 ),
                 y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
-                color=alt.Color("year:N", title="Actual year", scale=alt.Scale(domain=years, range=colors[:len(years)])),
+                color=alt.Color("year:N", title="Actual year", scale=alt.Scale(domain=years, range=colors)),
                 tooltip=[
                     alt.Tooltip("year:N", title="Actual year"),
                     alt.Tooltip("month_name:N", title="Month"),
@@ -2463,30 +2489,26 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
             )
         )
 
-    if forward_df is not None and not forward_df.empty:
-        fwd = forward_df.copy()
-        fwd = fwd[fwd["year"].astype(str) == "2026"].copy()
-        if not fwd.empty:
-            fwd["month_label"] = fwd["month_name"] + " - " + fwd["year"].astype(str)
-            model_order = [m for m in ["Aurora", "Baringa"] if m in fwd["model"].unique().tolist()]
-            other_models = [m for m in sorted(fwd["model"].astype(str).unique().tolist()) if m not in model_order]
-            model_order.extend(other_models)
-            fwd_colors = [AURORA_COLOR if m == "Aurora" else BARINGA_COLOR if m == "Baringa" else "#111827" for m in model_order]
-            layers.append(
-                alt.Chart(fwd).mark_line(point=True, strokeWidth=3.2).encode(
-                    x=alt.X("month_label:N", title=None, sort=fwd.sort_values(["year", "month_num"])["month_label"].drop_duplicates().tolist(), axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
-                    color=alt.Color("model:N", title="2026 forecast", scale=alt.Scale(domain=model_order, range=fwd_colors)),
-                    detail="model:N",
-                    tooltip=[
-                        alt.Tooltip("model:N", title="2026 forecast"),
-                        alt.Tooltip("month_name:N", title="Month"),
-                        alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
-                        alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
-                        alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
-                    ],
-                )
+    if not fwd.empty:
+        model_order = [m for m in ["Aurora", "Baringa"] if m in fwd["model"].unique().tolist()]
+        other_models = [m for m in sorted(fwd["model"].astype(str).unique().tolist()) if m not in model_order]
+        model_order.extend(other_models)
+        fwd_colors = [AURORA_COLOR if m == "Aurora" else BARINGA_COLOR if m == "Baringa" else "#111827" for m in model_order]
+        layers.append(
+            alt.Chart(fwd).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3]).encode(
+                x=alt.X("month_label:N", title=None, sort=full_order, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+                color=alt.Color("model:N", title="2026 forecast", scale=alt.Scale(domain=model_order, range=fwd_colors)),
+                detail="model:N",
+                tooltip=[
+                    alt.Tooltip("model:N", title="2026 forecast"),
+                    alt.Tooltip("month_name:N", title="Month"),
+                    alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
+                    alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
+                    alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
+                ],
             )
+        )
 
     chart = alt.layer(*layers).properties(height=330)
     return apply_common_chart_style(chart, height=330)
@@ -2789,8 +2811,7 @@ def build_selected_range_hourly_overlay_chart(
     start_d: date,
     end_d: date,
 ):
-    cols = ["hour", "hour_label", "series", "value", "axis"]
-    frames = []
+    price_frames = []
 
     actual_price = price_hourly[(price_hourly["datetime"].dt.date >= start_d) & (price_hourly["datetime"].dt.date <= end_d)].copy()
     if not actual_price.empty:
@@ -2799,18 +2820,7 @@ def build_selected_range_hourly_overlay_chart(
         ap["hour_label"] = ap["hour"].map(lambda x: f"{int(x):02d}:00")
         ap["series"] = "Actual price"
         ap["value"] = ap["price"]
-        ap["axis"] = "Price (€/MWh)"
-        frames.append(ap[cols])
-
-    actual_solar = solar_hourly[(solar_hourly["datetime"].dt.date >= start_d) & (solar_hourly["datetime"].dt.date <= end_d)].copy()
-    if not actual_solar.empty:
-        actual_solar["hour"] = actual_solar["datetime"].dt.hour
-        sp = actual_solar.groupby("hour", as_index=False)["solar_best_mw"].mean()
-        sp["hour_label"] = sp["hour"].map(lambda x: f"{int(x):02d}:00")
-        sp["series"] = "Avg solar generation"
-        sp["value"] = sp["solar_best_mw"]
-        sp["axis"] = "Solar generation (MW)"
-        frames.append(sp[cols])
+        price_frames.append(ap[["hour", "hour_label", "series", "value"]])
 
     if start_d.year == 2026 and end_d.year == 2026 and forward_prices is not None and not forward_prices.empty:
         fp = _forward_2026_only(forward_prices)
@@ -2826,64 +2836,66 @@ def build_selected_range_hourly_overlay_chart(
             mp["hour_label"] = mp["hour"].map(lambda x: f"{int(x):02d}:00")
             mp["series"] = f"{model} price"
             mp["value"] = mp["price"]
-            mp["axis"] = "Price (€/MWh)"
-            frames.append(mp[cols])
+            price_frames.append(mp[["hour", "hour_label", "series", "value"]])
 
-    if not frames:
+    price_plot = pd.concat(price_frames, ignore_index=True) if price_frames else pd.DataFrame(columns=["hour", "hour_label", "series", "value"])
+
+    solar_plot = pd.DataFrame(columns=["hour", "hour_label", "solar_generation_mw"])
+    actual_solar = solar_hourly[(solar_hourly["datetime"].dt.date >= start_d) & (solar_hourly["datetime"].dt.date <= end_d)].copy()
+    if not actual_solar.empty:
+        actual_solar["hour"] = actual_solar["datetime"].dt.hour
+        solar_plot = actual_solar.groupby("hour", as_index=False)["solar_best_mw"].mean()
+        solar_plot["hour_label"] = solar_plot["hour"].map(lambda x: f"{int(x):02d}:00")
+        solar_plot = solar_plot.rename(columns={"solar_best_mw": "solar_generation_mw"})
+
+    if price_plot.empty and solar_plot.empty:
         return None
 
-    plot = pd.concat(frames, ignore_index=True)
-    plot["series"] = pd.Categorical(
-        plot["series"],
-        categories=["Actual price", "Aurora price", "Baringa price", "Avg solar generation"],
-        ordered=True,
-    )
-
-    price_plot = plot[plot["axis"] == "Price (€/MWh)"].copy()
-    solar_plot = plot[plot["axis"] == "Solar generation (MW)"].copy()
-
+    hour_order = [f"{h:02d}:00" for h in range(24)]
     color_scale = alt.Scale(
-        domain=["Actual price", "Aurora price", "Baringa price", "Avg solar generation"],
-        range=["#111827", AURORA_COLOR, BARINGA_COLOR, GREEN_RENEWABLES],
+        domain=["Actual price", "Aurora price", "Baringa price"],
+        range=[BLUE_PRICE, AURORA_COLOR, BARINGA_COLOR],
     )
 
     line_dash_scale = alt.Scale(
-        domain=["Actual price", "Aurora price", "Baringa price", "Avg solar generation"],
-        range=[[1, 0], [7, 3], [7, 3], [4, 3]],
+        domain=["Actual price", "Aurora price", "Baringa price"],
+        range=[[1, 0], [7, 3], [7, 3]],
     )
 
-    base = alt.Chart(price_plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("hour_label:N", sort=[f"{h:02d}:00" for h in range(24)], axis=alt.Axis(title="Hour", labelAngle=0)),
-        y=alt.Y("value:Q", title="Price (€/MWh)"),
-        color=alt.Color("series:N", title="Series", scale=color_scale),
-        strokeDash=alt.StrokeDash("series:N", scale=line_dash_scale, legend=None),
-        tooltip=[
-            alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("hour_label:N", title="Hour"),
-            alt.Tooltip("value:Q", title="Value", format=",.2f"),
-        ],
-    ) if not price_plot.empty else None
+    layers = []
+    if not solar_plot.empty:
+        solar_area = alt.Chart(solar_plot).mark_area(opacity=0.35, color="#FACC15").encode(
+            x=alt.X("hour_label:N", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
+            y=alt.Y("solar_generation_mw:Q", title="Solar generation (MW)"),
+            tooltip=[
+                alt.Tooltip("hour_label:N", title="Hour"),
+                alt.Tooltip("solar_generation_mw:Q", title="Average solar generation", format=",.0f"),
+            ],
+        )
+        layers.append(solar_area)
 
-    solar_line = alt.Chart(solar_plot).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("hour_label:N", sort=[f"{h:02d}:00" for h in range(24)], axis=alt.Axis(title="Hour", labelAngle=0)),
-        y=alt.Y("value:Q", title="Solar generation (MW)"),
-        color=alt.Color("series:N", title="Series", scale=color_scale),
-        strokeDash=alt.StrokeDash("series:N", scale=line_dash_scale, legend=None),
-        tooltip=[
-            alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("hour_label:N", title="Hour"),
-            alt.Tooltip("value:Q", title="Value", format=",.2f"),
-        ],
-    ) if not solar_plot.empty else None
+    if not price_plot.empty:
+        price_lines = alt.Chart(price_plot).mark_line(point=True, strokeWidth=3).encode(
+            x=alt.X("hour_label:N", sort=hour_order, axis=alt.Axis(title="Hour", labelAngle=0)),
+            y=alt.Y("value:Q", title="Price (€/MWh)"),
+            color=alt.Color("series:N", title="Price series", scale=color_scale),
+            strokeDash=alt.StrokeDash("series:N", scale=line_dash_scale, legend=None),
+            tooltip=[
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("hour_label:N", title="Hour"),
+                alt.Tooltip("value:Q", title="Average price", format=",.2f"),
+            ],
+        )
+        layers.append(price_lines)
 
-    if base is not None and solar_line is not None:
-        chart = alt.layer(base, solar_line).resolve_scale(y="independent").properties(height=340, title="Selected range: hourly average price and solar profile")
-        return apply_common_chart_style(chart, height=340)
-    if base is not None:
-        return apply_common_chart_style(base.properties(height=340, title="Selected range: hourly average price profile"), height=340)
-    if solar_line is not None:
-        return apply_common_chart_style(solar_line.properties(height=340, title="Selected range: hourly average solar profile"), height=340)
-    return None
+    if not layers:
+        return None
+
+    chart = alt.layer(*layers).resolve_scale(y="independent").properties(
+        height=340,
+        title="Selected range: hourly average price and solar profile",
+    )
+    return apply_common_chart_style(chart, height=340)
 
 
 def compute_forward_period_metrics(forward_prices: pd.DataFrame, solar_hourly: pd.DataFrame, start_d: date, end_d: date) -> pd.DataFrame:
@@ -3647,19 +3659,6 @@ try:
         if range_overlay_chart is not None:
             subtle_subsection("Selected range hourly average overlay")
             st.altair_chart(range_overlay_chart, use_container_width=True)
-
-        hourly_profile = build_hourly_profile_table(price_hourly, range_start, range_end)
-        if not hourly_profile.empty:
-            profile_chart = alt.Chart(hourly_profile).mark_line(point=True, strokeWidth=3, color=BLUE_PRICE).encode(
-                x=alt.X("hour_label:N", sort=hourly_profile["hour_label"].tolist(), axis=alt.Axis(title="Hour", labelAngle=0)),
-                y=alt.Y("Average price (€/MWh):Q", title="Average price (€/MWh)"),
-                tooltip=[
-                    alt.Tooltip("hour_label:N", title="Hour"),
-                    alt.Tooltip("Average price (€/MWh):Q", title="Average price", format=",.2f"),
-                ],
-            )
-            st.altair_chart(apply_common_chart_style(profile_chart.properties(height=320), height=320), use_container_width=True)
-            st.dataframe(styled_df(hourly_profile[["hour", "Average price (€/MWh)"]]), use_container_width=True)
 
     section_header("OMIE hourly price heatmap (24x365)")
     available_price_years = sorted(price_hourly["datetime"].dt.year.unique().tolist()) if not price_hourly.empty else []
