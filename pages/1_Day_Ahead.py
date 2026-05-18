@@ -2283,26 +2283,33 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forward_df:
     chart_title = "Cumulative negative price hours" if is_negative_only else "Cumulative zero and negative price hours"
     tooltip_title = "Cumulative negative hours" if is_negative_only else "Cumulative zero / negative hours"
 
+    year_color_map = {
+        2021: "#1D4ED8",
+        2022: "#10B981",
+        2023: "#D97706",
+        2024: "#7C3AED",
+        2025: "#DC2626",
+        2026: BLUE_PRICE,
+    }
+
     layers = []
+    legend_domain = []
+    legend_range = []
+
     if not negative_df.empty:
-        years = sorted(negative_df["year"].unique().tolist())
-        year_color_map = {
-            2021: "#1D4ED8",
-            2022: "#10B981",
-            2023: "#D97706",
-            2024: "#7C3AED",
-            2025: "#DC2626",
-            2026: BLUE_PRICE,
-        }
-        colors = [year_color_map.get(y, "#6B7280") for y in years]
+        actual = negative_df.copy()
+        actual["series"] = actual["year"].astype(str)
+        for y in sorted(actual["year"].unique().tolist()):
+            legend_domain.append(str(y))
+            legend_range.append(year_color_map.get(int(y), "#6B7280"))
         layers.append(
-            alt.Chart(negative_df).mark_line(point=True, strokeWidth=3).encode(
+            alt.Chart(actual).mark_line(point=True, strokeWidth=3).encode(
                 x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
                 y=alt.Y("cum_count:Q", title=y_title),
-                color=alt.Color("year:N", title="Actual year", scale=alt.Scale(domain=years, range=colors)),
-                detail="year:N",
+                color=alt.Color("series:N", title="Actual year", scale=alt.Scale(domain=legend_domain, range=legend_range)),
+                detail="series:N",
                 tooltip=[
-                    alt.Tooltip("year:N", title="Actual year"),
+                    alt.Tooltip("series:N", title="Actual year"),
                     alt.Tooltip("month_name:N", title="Month"),
                     alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
                 ],
@@ -2313,23 +2320,23 @@ def build_negative_price_chart(negative_df: pd.DataFrame, mode: str, forward_df:
         fwd = forward_df.copy()
         fwd = fwd[fwd["year"].astype(str) == "2026"].copy()
         if not fwd.empty:
-            model_order = [m for m in ["Aurora", "Baringa"] if m in fwd["model"].unique().tolist()]
-            other_models = [m for m in sorted(fwd["model"].astype(str).unique().tolist()) if m not in model_order]
-            model_order.extend(other_models)
-            fwd_colors = [AURORA_COLOR if m == "Aurora" else BARINGA_COLOR if m == "Baringa" else "#111827" for m in model_order]
-            layers.append(
-                alt.Chart(fwd).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3]).encode(
-                    x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
-                    y=alt.Y("cum_count:Q", title=y_title),
-                    color=alt.Color("model:N", title="2026 forecast", scale=alt.Scale(domain=model_order, range=fwd_colors)),
-                    detail="model:N",
-                    tooltip=[
-                        alt.Tooltip("model:N", title="2026 forecast"),
-                        alt.Tooltip("month_name:N", title="Month"),
-                        alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
-                    ],
+            for model in ["Aurora", "Baringa"]:
+                model_df = fwd[fwd["model"] == model].copy()
+                if model_df.empty:
+                    continue
+                color = AURORA_COLOR if model == "Aurora" else BARINGA_COLOR if model == "Baringa" else "#111827"
+                layers.append(
+                    alt.Chart(model_df).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3], color=color).encode(
+                        x=alt.X("month_num:O", sort=list(range(1, 13)), axis=alt.Axis(title=None, labelAngle=0, labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]")),
+                        y=alt.Y("cum_count:Q", title=y_title),
+                        detail=alt.value(model),
+                        tooltip=[
+                            alt.Tooltip("model:N", title="2026 forecast"),
+                            alt.Tooltip("month_name:N", title="Month"),
+                            alt.Tooltip("cum_count:Q", title=tooltip_title, format=",.0f"),
+                        ],
+                    )
                 )
-            )
 
     chart = alt.layer(*layers).properties(height=330, title=chart_title)
     return apply_common_chart_style(chart, height=330)
@@ -2467,16 +2474,11 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
 
     if not plot.empty:
         years = sorted(plot["year"].unique().tolist())
-        year_color_map = {2021: "#1D4ED8", 2022: "#10B981", 2023: "#D97706", 2024: "#7C3AED", 2025: "#10B981", 2026: "#F59E0B"}
+        year_color_map = {2021: "#1D4ED8", 2022: "#10B981", 2023: "#D97706", 2024: "#8B5CF6", 2025: "#34D399", 2026: "#F59E0B"}
         colors = [year_color_map.get(y, "#6B7280") for y in years]
         layers.append(
             alt.Chart(plot).mark_bar(opacity=0.82).encode(
-                x=alt.X(
-                    "month_label:N",
-                    title=None,
-                    sort=full_order,
-                    axis=alt.Axis(labelAngle=0),
-                ),
+                x=alt.X("month_label:N", title=None, sort=full_order, axis=alt.Axis(labelAngle=0)),
                 y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
                 color=alt.Color("year:N", title="Actual year", scale=alt.Scale(domain=years, range=colors)),
                 tooltip=[
@@ -2490,25 +2492,25 @@ def build_economic_curtailment_chart(curt_df: pd.DataFrame, forward_df: pd.DataF
         )
 
     if not fwd.empty:
-        model_order = [m for m in ["Aurora", "Baringa"] if m in fwd["model"].unique().tolist()]
-        other_models = [m for m in sorted(fwd["model"].astype(str).unique().tolist()) if m not in model_order]
-        model_order.extend(other_models)
-        fwd_colors = [AURORA_COLOR if m == "Aurora" else BARINGA_COLOR if m == "Baringa" else "#111827" for m in model_order]
-        layers.append(
-            alt.Chart(fwd).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3]).encode(
-                x=alt.X("month_label:N", title=None, sort=full_order, axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
-                color=alt.Color("model:N", title="2026 forecast", scale=alt.Scale(domain=model_order, range=fwd_colors)),
-                detail="model:N",
-                tooltip=[
-                    alt.Tooltip("model:N", title="2026 forecast"),
-                    alt.Tooltip("month_name:N", title="Month"),
-                    alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
-                    alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
-                    alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
-                ],
+        for model in ["Aurora", "Baringa"]:
+            model_df = fwd[fwd["model"] == model].copy()
+            if model_df.empty:
+                continue
+            color = AURORA_COLOR if model == "Aurora" else BARINGA_COLOR if model == "Baringa" else "#111827"
+            layers.append(
+                alt.Chart(model_df).mark_line(point=True, strokeWidth=3.2, strokeDash=[7, 3], color=color).encode(
+                    x=alt.X("month_label:N", title=None, sort=full_order, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+                    detail=alt.value(model),
+                    tooltip=[
+                        alt.Tooltip("model:N", title="2026 forecast"),
+                        alt.Tooltip("month_name:N", title="Month"),
+                        alt.Tooltip("affected_production_mwh:Q", title="Affected P48 (MWh)", format=",.0f"),
+                        alt.Tooltip("total_production_mwh:Q", title="Total P48 (MWh)", format=",.0f"),
+                        alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
+                    ],
+                )
             )
-        )
 
     chart = alt.layer(*layers).properties(height=330)
     return apply_common_chart_style(chart, height=330)
