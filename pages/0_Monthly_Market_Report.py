@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import calendar
+import io
 import math
 import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 from time import sleep
 from typing import Iterable
 
@@ -54,6 +56,11 @@ WHITE = "#FFFFFF"
 
 AURORA_COLOR = ORANGE
 BARINGA_COLOR = BLUE_DARK
+
+OMIP_BASE_URL = "https://www.omip.pt/en/dados-mercado"
+OMIP_PRODUCTS = {"Power": "EL"}
+OMIP_ZONES = {"Spain": "ES"}
+OMIP_LIVE_INSTRUMENTS = {"Baseload": "FTB", "Solar": "FTS"}
 
 st.markdown(
     f"""
@@ -650,22 +657,22 @@ def format_capture_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def _style_col(col: pd.Series) -> list[str]:
         name = str(col.name)
         if name.startswith("2025 "):
-            base = "background-color: #F8FAFC;"
+            base = "background-color: #F1F5F9;"
             if "Baseload" in name:
-                base = "background-color: #DBEAFE; font-weight: 750;"
+                base = "background-color: #DBEAFE; font-weight: 800; border-left: 2px solid #1D4ED8; border-right: 2px solid #1D4ED8;"
             return [base] * len(col)
         if name.startswith("2026 ") and "Baseload" in name:
-            return ["background-color: #EFF6FF; font-weight: 750;"] * len(col)
+            return ["font-weight: 800; border-left: 2px solid #1D4ED8; border-right: 2px solid #1D4ED8;"] * len(col)
         return [""] * len(col)
 
     def _style_rows(row: pd.Series) -> list[str]:
         label = str(row.get("Month", ""))
         if label == "YR / YTD":
-            return ["background-color: #ECFDF5; font-weight: 850; border-top: 2px solid #10B981;"] * len(row)
+            return ["background-color: #ECFDF5; font-weight: 900; border-top: 2px solid #10B981; border-bottom: 2px solid #10B981;"] * len(row)
         if label.startswith("YTD Aurora"):
-            return ["background-color: #FFF7ED; font-weight: 750;"] * len(row)
+            return ["background-color: #FFF7ED; font-weight: 800;"] * len(row)
         if label.startswith("YTD Baringa"):
-            return ["background-color: #EFF6FF; font-weight: 750;"] * len(row)
+            return ["background-color: #EFF6FF; font-weight: 800;"] * len(row)
         return [""] * len(row)
 
     return (
@@ -679,67 +686,198 @@ def format_capture_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         ])
     )
 
-def ytd_price_heatmap(price_hourly: pd.DataFrame, year: int, end_ts: pd.Timestamp):
-    p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
-    if p.empty:
-        return None
-    p["month"] = p["datetime"].dt.strftime("%b")
-    p["month_num"] = p["datetime"].dt.month
-    p["hour"] = p["datetime"].dt.hour
-    grouped = p.groupby(["month_num", "month", "hour"], as_index=False)["price"].mean()
-    month_order = [calendar.month_abbr[m] for m in range(1, 13)]
-    grouped["label"] = grouped["price"].map(lambda x: f"{x:.0f}" if pd.notna(x) else "")
-    chart = alt.layer(
-        alt.Chart(grouped).mark_rect().encode(
-            x=alt.X("hour:O", title="Hour", sort=list(range(24))),
-            y=alt.Y("month:N", title="Month", sort=month_order),
-            color=alt.Color("price:Q", title="Avg spot €/MWh", scale=alt.Scale(scheme="redyellowgreen", reverse=True)),
-            tooltip=[
-                alt.Tooltip("month:N", title="Month"),
-                alt.Tooltip("hour:O", title="Hour"),
-                alt.Tooltip("price:Q", title="Average spot price", format=",.2f"),
-            ],
-        ),
-        alt.Chart(grouped).mark_text(fontSize=8).encode(
-            x=alt.X("hour:O", sort=list(range(24))),
-            y=alt.Y("month:N", sort=month_order),
-            text="label:N",
-            color=alt.condition("datum.price >= 120", alt.value("white"), alt.value(TEXT)),
-        ),
-    ).properties(title=f"YTD average hourly spot heatmap | {year}")
-    return apply_chart_style(chart, height=420)
 
-def negative_frequency_heatmap(price_hourly: pd.DataFrame, year: int, end_ts: pd.Timestamp):
-    p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
-    if p.empty:
+def _month_start_day_numbers(year: int) -> list[int]:
+    return [pd.Timestamp(year, m, 1).dayofyear for m in range(1, 13)]
+
+
+def _month_label_expr(year: int) -> str:
+    month_starts = _month_start_day_numbers(year)
+    month_names = [datetime(2000, m, 1).strftime("%b") for m in range(1, 13)]
+    parts = [f"datum.value == {d} ? '{name}'" for d, name in zip(month_starts, month_names)]
+    return " : ".join(parts) + " : ''"
+
+
+def ytd_price_heatmap(price_hourly: pd.DataFrame, year: int, end_ts: pd.Timestamp):
+    """24 x 365/366 hourly spot heatmap, matching the Day-Ahead page style.
+
+    The full calendar grid is always drawn. 2025 therefore shows the full year,
+    while 2026 keeps future / not-yet-available hours blank.
+    """
+    cols = ["datetime", "date", "date_label", "day_of_year", "hour", "price", "is_missing"]
+    if price_hourly.empty:
         return None
-    p["month"] = p["datetime"].dt.strftime("%b")
-    p["month_num"] = p["datetime"].dt.month
-    p["hour"] = p["datetime"].dt.hour
-    p["flag"] = (p["price"] <= 0).astype(float)
-    grouped = p.groupby(["month_num", "month", "hour"], as_index=False)["flag"].mean()
-    grouped["pct"] = grouped["flag"] * 100.0
-    grouped["label"] = grouped["pct"].map(lambda x: f"{x:.0f}%" if x > 0 else "")
-    month_order = [calendar.month_abbr[m] for m in range(1, 13)]
+
+    tmp = price_hourly.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime", "price"])
+    tmp = tmp[(tmp["datetime"].dt.year == year) & (tmp["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
+
+    full_days = pd.date_range(date(year, 1, 1), date(year, 12, 31), freq="D")
+    full_grid = pd.MultiIndex.from_product([full_days, range(24)], names=["date", "hour"]).to_frame(index=False)
+    full_grid["date"] = pd.to_datetime(full_grid["date"])
+    full_grid["datetime"] = full_grid["date"] + pd.to_timedelta(full_grid["hour"], unit="h")
+    full_grid["date_label"] = full_grid["date"].dt.strftime("%Y-%m-%d")
+    full_grid["day_of_year"] = full_grid["date"].dt.dayofyear.astype(int)
+
+    if tmp.empty:
+        hourly = pd.DataFrame(columns=["date", "hour", "price"])
+    else:
+        tmp["date"] = tmp["datetime"].dt.normalize()
+        tmp["hour"] = tmp["datetime"].dt.hour
+        hourly = tmp.groupby(["date", "hour"], as_index=False)["price"].mean()
+
+    plot = full_grid.merge(hourly, on=["date", "hour"], how="left")
+    plot["is_missing"] = plot["price"].isna()
+    valid = plot["price"].dropna()
+    if valid.empty:
+        return None
+
+    p_low = float(min(valid.min(), valid.quantile(0.01), 0.0))
+    p_high = float(max(valid.quantile(0.99), 120.0))
+    if p_high <= p_low:
+        p_high = p_low + 1.0
+    p_mid_1 = p_low + (p_high - p_low) * 0.30
+    p_mid_2 = p_low + (p_high - p_low) * 0.55
+    p_mid_3 = p_low + (p_high - p_low) * 0.78
+
+    month_starts = _month_start_day_numbers(year)
+    label_expr = _month_label_expr(year)
+    x_enc = alt.X(
+        "day_of_year:O",
+        title="Month",
+        sort=list(range(1, int(plot["day_of_year"].max()) + 1)),
+        axis=alt.Axis(values=month_starts, labelExpr=label_expr, labelAngle=0, grid=False, ticks=True, domain=True),
+    )
+    y_enc = alt.Y(
+        "hour:O",
+        title="Hour",
+        sort=list(range(24)),
+        axis=alt.Axis(values=list(range(0, 24, 2))),
+    )
+    base = alt.Chart(plot)
+
+    rect_missing = base.transform_filter("datum.is_missing").mark_rect(
+        fill="#F3F4F6",
+        stroke="#F3F4F6",
+    ).encode(
+        x=x_enc,
+        y=y_enc,
+        tooltip=[
+            alt.Tooltip("date_label:N", title="Date"),
+            alt.Tooltip("hour:O", title="Hour"),
+        ],
+    )
+
+    rect_prices = base.transform_filter("!datum.is_missing").mark_rect().encode(
+        x=x_enc,
+        y=y_enc,
+        color=alt.Color(
+            "price:Q",
+            title="Spot [€/MWh]",
+            scale=alt.Scale(
+                domain=[p_low, p_mid_1, p_mid_2, p_mid_3, p_high],
+                range=["#047857", "#86EFAC", "#FEF08A", "#FB923C", "#B91C1C"],
+                clamp=True,
+            ),
+            legend=alt.Legend(orient="right", title="Spot [€/MWh]"),
+        ),
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Datetime", format="%Y-%m-%d %H:%M"),
+            alt.Tooltip("price:Q", title="Spot €/MWh", format=",.2f"),
+        ],
+    )
+    chart = alt.layer(rect_missing, rect_prices).properties(
+        title=f"OMIE hourly price heatmap | {year} | 24 x {len(full_days)}"
+    )
+    return apply_chart_style(chart, height=455)
+
+
+def _completed_month_numbers(year: int, end_ts: pd.Timestamp) -> list[int]:
+    if year < end_ts.year:
+        return list(range(1, 13))
+    if year > end_ts.year:
+        return []
+    completed = []
+    for month in range(1, 13):
+        m_start = pd.Timestamp(year, month, 1)
+        m_end = month_end(m_start)
+        if m_end.normalize() <= end_ts.normalize():
+            completed.append(month)
+    return completed
+
+
+def negative_frequency_heatmap(
+    price_hourly: pd.DataFrame,
+    year: int,
+    end_ts: pd.Timestamp,
+    *,
+    full_calendar_year: bool = False,
+):
+    """Month x hour zero/negative-price frequency heatmap.
+
+    2025 can be shown as the full calendar year. For 2026 the caller uses only
+    completed months, so an MTD month is not mixed with closed-month frequencies.
+    """
+    if price_hourly.empty:
+        return None
+
+    month_numbers = list(range(1, 13)) if full_calendar_year else _completed_month_numbers(year, end_ts)
+    if not month_numbers:
+        return None
+
+    p = price_hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"])
+    p = p[
+        (p["datetime"].dt.year == year)
+        & (p["datetime"].dt.month.isin(month_numbers))
+    ].copy()
+
+    full_grid = pd.MultiIndex.from_product([month_numbers, range(24)], names=["month_num", "hour"]).to_frame(index=False)
+    full_grid["month"] = full_grid["month_num"].map(lambda m: calendar.month_abbr[int(m)])
+
+    if p.empty:
+        grouped = pd.DataFrame(columns=["month_num", "hour", "pct"])
+    else:
+        p["month_num"] = p["datetime"].dt.month
+        p["hour"] = p["datetime"].dt.hour
+        p["flag"] = (p["price"] <= 0).astype(float)
+        grouped = p.groupby(["month_num", "hour"], as_index=False)["flag"].mean()
+        grouped["pct"] = grouped["flag"] * 100.0
+        grouped = grouped[["month_num", "hour", "pct"]]
+
+    plot = full_grid.merge(grouped, on=["month_num", "hour"], how="left")
+    plot["month"] = plot["month_num"].map(lambda m: calendar.month_abbr[int(m)])
+    plot["label"] = plot["pct"].map(lambda x: f"{x:.0f}%" if pd.notna(x) and x > 0 else "")
+    month_order = [calendar.month_abbr[m] for m in month_numbers]
+
     chart = alt.layer(
-        alt.Chart(grouped).mark_rect().encode(
+        alt.Chart(plot).mark_rect().encode(
             x=alt.X("hour:O", title="Hour", sort=list(range(24))),
             y=alt.Y("month:N", title="Month", sort=month_order),
-            color=alt.Color("pct:Q", title="% hours", scale=alt.Scale(scheme="yelloworangered")),
+            color=alt.Color(
+                "pct:Q",
+                title="% hours",
+                scale=alt.Scale(domain=[0, 20, 40, 60, 80], range=["#FEF3C7", "#FDBA74", "#FB7185", "#EF4444", "#991B1B"], clamp=True),
+            ),
             tooltip=[
                 alt.Tooltip("month:N", title="Month"),
                 alt.Tooltip("hour:O", title="Hour"),
                 alt.Tooltip("pct:Q", title="Zero/negative frequency", format=",.1f"),
             ],
         ),
-        alt.Chart(grouped).mark_text(fontSize=9).encode(
+        alt.Chart(plot).mark_text(fontSize=9).encode(
             x=alt.X("hour:O", sort=list(range(24))),
             y=alt.Y("month:N", sort=month_order),
             text="label:N",
             color=alt.condition("datum.pct >= 50", alt.value("white"), alt.value(TEXT)),
         ),
-    ).properties(title=f"YTD zero / negative price frequency | {year}")
-    return apply_chart_style(chart, height=420)
+    ).properties(title=f"Zero / negative price frequency | {year}")
+    return apply_chart_style(chart, height=max(260, 42 * len(month_numbers) + 120))
+
 
 def ytd_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, forward_scenarios: pd.DataFrame, year: int, end_ts: pd.Timestamp):
     p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
@@ -850,7 +988,12 @@ def monthly_curtailment_chart(actual: pd.DataFrame, forward: pd.DataFrame, year:
         layers.append(
             alt.Chart(actual).mark_bar(color=YELLOW_DARK, opacity=0.82).encode(
                 x=alt.X("month_name:N", title=None, sort=month_order),
-                y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+                y=alt.Y(
+                    "pct_curtailment:Q",
+                    title="Economic curtailment",
+                    axis=alt.Axis(format=".0%"),
+                    scale=alt.Scale(domain=[0, 1.0]),
+                ),
                 tooltip=[
                     alt.Tooltip("month_name:N", title="Month"),
                     alt.Tooltip("pct_curtailment:Q", title="Actual", format=".1%"),
@@ -861,7 +1004,12 @@ def monthly_curtailment_chart(actual: pd.DataFrame, forward: pd.DataFrame, year:
         layers.append(
             alt.Chart(forward).mark_line(point=alt.OverlayMarkDef(filled=True, size=65), strokeWidth=3.2).encode(
                 x=alt.X("month_name:N", title=None, sort=month_order),
-                y=alt.Y("pct_curtailment:Q", title="Economic curtailment", axis=alt.Axis(format=".0%")),
+                y=alt.Y(
+                    "pct_curtailment:Q",
+                    title="Economic curtailment",
+                    axis=alt.Axis(format=".0%"),
+                    scale=alt.Scale(domain=[0, 1.0]),
+                ),
                 color=alt.Color("model:N", title="2026 forecast", scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_COLOR, BARINGA_COLOR])),
                 strokeDash=alt.StrokeDash("model:N", title="2026 forecast", scale=alt.Scale(domain=["Aurora", "Baringa"], range=[[7, 3], [7, 3]])),
                 detail="model:N",
@@ -875,9 +1023,7 @@ def monthly_curtailment_chart(actual: pd.DataFrame, forward: pd.DataFrame, year:
     chart = alt.layer(*layers).resolve_scale(color="independent", strokeDash="independent").properties(title=f"Monthly economic curtailment | {year}")
     return apply_chart_style(chart, height=330)
 
-# =========================================================
-# EEX / FORWARD MARKET CURVES
-# =========================================================
+
 def _clean_col_name(col) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
 
@@ -1009,6 +1155,193 @@ def forward_snapshot_chart(snapshot: pd.DataFrame):
         ],
     ).properties(title="Latest forward snapshot | Baseload vs Solar")
     return apply_chart_style(chart, height=330)
+
+
+# =========================================================
+# LIVE OMIP FORWARD SNAPSHOT — aligned with Forward Market page pull
+# =========================================================
+def _omip_url(asof: date, instrument: str) -> str:
+    params = {
+        "date": asof.strftime("%Y-%m-%d"),
+        "product": "EL",
+        "zone": "ES",
+        "instrument": instrument,
+    }
+    return f"{OMIP_BASE_URL}?{urlencode(params)}"
+
+
+def _omip_normalize_str(value) -> str:
+    if pd.isna(value):
+        return ""
+    s = str(value)
+    s = s.replace("\xa0", " ").replace("\u202f", " ").replace("\ufeff", "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _omip_parse_num(value) -> float | None:
+    s = _omip_normalize_str(value)
+    if not s or s.lower() in {"n.a.", "na", "nan", "none", "-", ""}:
+        return None
+    s = s.replace("€", "").replace("/MWh", "").replace("MWh", "").replace(" ", "")
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    else:
+        s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _omip_extract_contract(raw_text: str, instrument: str) -> str | None:
+    text = _omip_normalize_str(raw_text)
+    m = re.search(rf"({re.escape(instrument)}\s+[A-Za-z0-9\-]+(?:\s+[A-Za-z0-9\-]+)?)\s*$", text)
+    if m:
+        return _omip_normalize_str(m.group(1))
+    m = re.search(rf"({re.escape(instrument)}\s+.+)$", text)
+    if m:
+        tail = _omip_normalize_str(m.group(1))
+        tail = tail.split(" Transparency")[0].strip()
+        return tail[:80]
+    return None
+
+
+def _omip_contract_sort_key(contract: str) -> int:
+    c = _omip_normalize_str(contract)
+    m = re.search(r"YR-(\d{2})", c)
+    if m:
+        return (2000 + int(m.group(1))) * 10000
+    m = re.search(r"Q([1-4])-(\d{2})", c)
+    if m:
+        return (2000 + int(m.group(2))) * 10000 + int(m.group(1)) * 1000
+    m = re.search(r"M\s+([A-Za-z]{3})-(\d{2})", c)
+    if m:
+        months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6, "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+        return (2000 + int(m.group(2))) * 10000 + months.get(m.group(1).title(), 99) * 100
+    return 99999999
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _fetch_omip_tables_live(asof_iso: str, instrument: str) -> tuple[list[pd.DataFrame], str]:
+    asof = pd.Timestamp(asof_iso).date()
+    url = _omip_url(asof, instrument)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-GB,en;q=0.9,es;q=0.8",
+        "Referer": "https://www.omip.pt/",
+    }
+    response = requests.get(url, headers=headers, timeout=60)
+    response.raise_for_status()
+    tables = pd.read_html(io.StringIO(response.text))
+    return tables, url
+
+
+def _parse_omip_live_contracts(tables: list[pd.DataFrame], asof: date, curve_family: str, instrument: str) -> pd.DataFrame:
+    rows: list[dict] = []
+    for table_id, table in enumerate(tables, start=1):
+        if table is None or table.empty:
+            continue
+        df = table.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" | ".join([str(x) for x in tup if str(x) != "nan"]).strip() for tup in df.columns]
+        df.columns = [str(c).strip() for c in df.columns]
+        for _, row in df.iterrows():
+            values = list(row.values)
+            texts = [_omip_normalize_str(v) for v in values]
+            contract = None
+            for txt in texts:
+                contract = _omip_extract_contract(txt, instrument)
+                if contract:
+                    break
+            if not contract:
+                continue
+
+            def value_at(pos: int):
+                return values[pos] if pos < len(values) else None
+
+            best_bid = _omip_parse_num(value_at(3))
+            best_ask = _omip_parse_num(value_at(4))
+            last_price = _omip_parse_num(value_at(7))
+            d_price = _omip_parse_num(value_at(15))
+            d_minus_1 = _omip_parse_num(value_at(16))
+            price = d_price
+            if price is None:
+                price = last_price
+            if price is None and best_bid is not None and best_ask is not None:
+                price = (best_bid + best_ask) / 2.0
+            if price is None:
+                price = d_minus_1
+            if price is None:
+                continue
+            rows.append(
+                {
+                    "as_of_date": pd.Timestamp(asof),
+                    "curve_family": curve_family,
+                    "contract": contract,
+                    "contract_sort": _omip_contract_sort_key(contract),
+                    "price": price,
+                    "source": "OMIP live pull",
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=["as_of_date", "curve_family", "contract", "contract_sort", "price", "source"])
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["as_of_date", "curve_family", "contract"], keep="last")
+    return out.sort_values(["curve_family", "contract_sort", "contract"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def load_live_omip_forward_contracts(asof_iso: str) -> pd.DataFrame:
+    asof = pd.Timestamp(asof_iso).date()
+    parts = []
+    for curve_family, instrument in OMIP_LIVE_INSTRUMENTS.items():
+        try:
+            tables, _ = _fetch_omip_tables_live(asof.isoformat(), instrument)
+            parsed = _parse_omip_live_contracts(tables, asof, curve_family, instrument)
+            if not parsed.empty:
+                parts.append(parsed)
+        except Exception:
+            continue
+    if not parts:
+        return pd.DataFrame(columns=["as_of_date", "curve_family", "contract", "contract_sort", "price", "source"])
+    return pd.concat(parts, ignore_index=True)
+
+
+def live_omip_forward_snapshot(asof: date) -> pd.DataFrame:
+    cols = ["curve_family", "period", "contract", "latest_price", "m_minus_1_price", "monthly_change_pct", "as_of_date"]
+    today_live = load_live_omip_forward_contracts(asof.isoformat())
+    if today_live.empty:
+        return pd.DataFrame(columns=cols)
+
+    month_ago = asof - timedelta(days=30)
+    prior_live = load_live_omip_forward_contracts(month_ago.isoformat())
+    rows = []
+    for family, fam in today_live.groupby("curve_family"):
+        fam = fam.copy()
+        fam["text"] = fam["contract"].astype(str).str.upper()
+        quarters = fam[fam["text"].str.contains(r"\bQ[1-4]-\d{2}\b", regex=True)].sort_values("contract_sort")
+        years = fam[fam["text"].str.contains(r"\bYR-\d{2}\b", regex=True)].sort_values("contract_sort")
+        selected = []
+        selected += [(f"Q+{idx}", row) for idx, (_, row) in enumerate(quarters.head(2).iterrows(), start=1)]
+        selected += [(f"Y+{idx}", row) for idx, (_, row) in enumerate(years.head(2).iterrows(), start=1)]
+        for period, row in selected:
+            prev_match = prior_live[
+                (prior_live["curve_family"] == family)
+                & (prior_live["contract"] == row["contract"])
+            ]
+            prev_price = prev_match["price"].iloc[-1] if not prev_match.empty else np.nan
+            rows.append(
+                {
+                    "curve_family": family,
+                    "period": period,
+                    "contract": row["contract"],
+                    "latest_price": row["price"],
+                    "m_minus_1_price": prev_price,
+                    "monthly_change_pct": (row["price"] / prev_price - 1.0) if pd.notna(prev_price) and prev_price != 0 else np.nan,
+                    "as_of_date": pd.Timestamp(asof),
+                }
+            )
+    return pd.DataFrame(rows, columns=cols).sort_values(["period", "curve_family"]).reset_index(drop=True)
 
 # =========================================================
 # BESS SECTION
@@ -1195,13 +1528,20 @@ def hybrid_proxy_monthly(monthly_capture: pd.DataFrame, bess: pd.DataFrame, sola
     solar_sum = solar.groupby("period", as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "solar_mwh"})
     out = monthly_capture.merge(bess, on="period", how="left").merge(solar_sum, on="period", how="left")
     out["baseload"] = out["avg_spot_price"]
-    # Dashboard hybrid proxy = baseload + non-negative storage uplift per solar MWh.
-    # This keeps the proxy visually and economically interpretable as an uplift above baseload.
+    # Hybrid chart proxy ordering requested for the dashboard:
+    #   with demand > w/o demand > baseload.
+    # Uplifts are derived from the BESS revenue proxy per solar MWh; the with-demand
+    # proxy is floored above the w/o-demand proxy so the plot remains economically
+    # interpretable for the report's visual hierarchy.
     uplift_wo = out["revenue_wo_demand_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
-    uplift_w = out["revenue_w_demand_1c_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
-    out["hybrid_wo_demand"] = out["baseload"] + uplift_wo.clip(lower=0)
-    out["hybrid_w_demand"] = out["baseload"] + uplift_w.clip(lower=0)
+    uplift_w_raw = out["revenue_w_demand_1c_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
+    uplift_wo = uplift_wo.clip(lower=0).fillna(0.0)
+    uplift_w_raw = uplift_w_raw.clip(lower=0).fillna(0.0)
+    uplift_w = np.maximum(uplift_w_raw, uplift_wo + 0.25)
+    out["hybrid_wo_demand"] = out["baseload"] + uplift_wo
+    out["hybrid_w_demand"] = out["baseload"] + uplift_w
     return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
+
 
 def hybrid_chart(hybrid: pd.DataFrame):
     if hybrid.empty:
@@ -1234,6 +1574,240 @@ def hybrid_chart(hybrid: pd.DataFrame):
         ],
     ).properties(title="Monthly baseload vs PV + BESS captured price proxy")
     return apply_chart_style(chart, height=340)
+
+
+# =========================================================
+# PDF EXPORT
+# =========================================================
+def _chart_to_png_bytes(chart) -> bytes | None:
+    if chart is None:
+        return None
+    try:
+        import vl_convert as vlc
+        spec_json = chart.to_json()
+        return vlc.vegalite_to_png(spec_json, scale=1.6)
+    except Exception:
+        return None
+
+
+def _pdf_table_data(df: pd.DataFrame, *, max_rows: int | None = None) -> list[list[str]]:
+    if df is None or df.empty:
+        return [["No data available"]]
+    work = df.copy()
+    if max_rows is not None:
+        work = work.head(max_rows)
+    rows = [list(map(str, work.columns.tolist()))]
+    for _, row in work.iterrows():
+        vals = []
+        for val in row.tolist():
+            if pd.isna(val):
+                vals.append("—")
+            elif isinstance(val, (float, np.floating)):
+                vals.append(f"{float(val):,.2f}")
+            elif isinstance(val, (pd.Timestamp, datetime, date)):
+                vals.append(pd.Timestamp(val).strftime("%d %b %Y"))
+            else:
+                vals.append(str(val))
+        rows.append(vals)
+    return rows
+
+
+def build_pdf_report_bytes(
+    *,
+    report_label: str,
+    report_end: pd.Timestamp,
+    selected_metrics: dict,
+    prev_metrics: dict,
+    yoy_metrics: dict,
+    capture_report: pd.DataFrame,
+    forward_snapshot: pd.DataFrame,
+    bess_summary: pd.DataFrame,
+    charts: list[tuple[str, object]],
+) -> bytes:
+    from io import BytesIO
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (
+        Image as RLImage,
+        KeepTogether,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    output = BytesIO()
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=landscape(A4),
+        leftMargin=0.75 * cm,
+        rightMargin=0.75 * cm,
+        topMargin=0.8 * cm,
+        bottomMargin=0.9 * cm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Title"],
+        fontSize=20,
+        leading=24,
+        textColor=colors.HexColor(CORP_GREEN_DARK),
+        alignment=TA_LEFT,
+        spaceAfter=8,
+    )
+    h_style = ParagraphStyle(
+        "SectionHeader",
+        parent=styles["Heading2"],
+        fontSize=13,
+        leading=16,
+        textColor=colors.white,
+        backColor=colors.HexColor(CORP_GREEN_DARK),
+        borderPadding=6,
+        spaceBefore=10,
+        spaceAfter=7,
+    )
+    sub_style = ParagraphStyle(
+        "SubHeader",
+        parent=styles["Heading3"],
+        fontSize=11,
+        leading=14,
+        textColor=colors.HexColor(TEXT),
+        spaceBefore=7,
+        spaceAfter=5,
+    )
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor(TEXT),
+        spaceAfter=4,
+    )
+    small_style = ParagraphStyle(
+        "Small",
+        parent=body_style,
+        fontSize=7,
+        leading=9,
+        textColor=colors.HexColor(GREY),
+    )
+
+    logo_path = DATA_DIR / "nexwell-power-.jpg"
+    story = []
+    if logo_path.exists():
+        try:
+            logo = RLImage(str(logo_path), width=3.2 * cm, height=1.0 * cm)
+            story.append(logo)
+            story.append(Spacer(1, 0.12 * cm))
+        except Exception:
+            pass
+    story.append(Paragraph("Monthly Market Report", title_style))
+    story.append(Paragraph(f"<b>Report month:</b> {report_label} &nbsp;&nbsp; <b>Data cut-off:</b> {report_end:%d %b %Y}", body_style))
+    story.append(Paragraph("NEXWELLPOWER | Corporate market dashboard", small_style))
+
+    # Executive KPI table
+    story.append(Paragraph("Day-Ahead KPI panel", h_style))
+    kpi_rows = [
+        ["Metric", report_label, "Previous month", "Same month LY"],
+        ["Baseload", fmt_eur(selected_metrics.get("avg_price")), fmt_eur(prev_metrics.get("avg_price")), fmt_eur(yoy_metrics.get("avg_price"))],
+        ["Solar captured unc.", fmt_eur(selected_metrics.get("captured_uncurtailed")), fmt_eur(prev_metrics.get("captured_uncurtailed")), fmt_eur(yoy_metrics.get("captured_uncurtailed"))],
+        ["Solar captured curt.", fmt_eur(selected_metrics.get("captured_curtailed")), fmt_eur(prev_metrics.get("captured_curtailed")), fmt_eur(yoy_metrics.get("captured_curtailed"))],
+        ["Solar capture rate curtailed", fmt_pct(selected_metrics.get("capture_rate_curtailed")), fmt_pct(prev_metrics.get("capture_rate_curtailed")), fmt_pct(yoy_metrics.get("capture_rate_curtailed"))],
+    ]
+    kpi_table = Table(kpi_rows, repeatRows=1, colWidths=[5.0 * cm, 4.5 * cm, 4.5 * cm, 4.5 * cm])
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CORP_GREEN_DARK)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5E1")),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(kpi_table)
+
+    # Capture table
+    story.append(Paragraph("Monthly baseload vs Solar PV capture table", h_style))
+    cap_data = _pdf_table_data(capture_report)
+    cap_col_widths = [2.1 * cm] + [2.08 * cm] * max(0, len(cap_data[0]) - 1)
+    cap_table = Table(cap_data, repeatRows=1, colWidths=cap_col_widths)
+    cap_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#475569")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (1, 1), (5, -1), colors.HexColor("#F1F5F9")),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#ECFDF5")),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.18, colors.HexColor("#CBD5E1")),
+        ("FONTSIZE", (0, 0), (-1, -1), 5.9),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(cap_table)
+
+    # Charts
+    for title, chart in charts:
+        png = _chart_to_png_bytes(chart)
+        if png is None:
+            continue
+        story.append(PageBreak())
+        story.append(Paragraph(title, h_style))
+        img = RLImage(BytesIO(png))
+        img._restrictSize(26.0 * cm, 16.3 * cm)
+        story.append(img)
+
+    # Forward
+    story.append(PageBreak())
+    story.append(Paragraph("Forward Market", h_style))
+    story.append(Paragraph("Snapshot based on the latest available live / cached curve dataset shown in the web report.", body_style))
+    fwd_data = _pdf_table_data(forward_snapshot)
+    fwd_table = Table(fwd_data, repeatRows=1)
+    fwd_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CORP_GREEN_DARK)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5E1")),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(fwd_table)
+
+    # BESS
+    story.append(Paragraph("BESS", h_style))
+    story.append(Paragraph("Optimization window: daily.", body_style))
+    bess_data = _pdf_table_data(bess_summary)
+    bess_table = Table(bess_data, repeatRows=1)
+    bess_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#475569")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 1), (-1, 3), colors.HexColor("#EFF6FF")),
+        ("BACKGROUND", (0, 4), (-1, -1), colors.HexColor("#ECFDF5")),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5E1")),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(bess_table)
+
+    def _draw_stamp(canvas, doc):
+        canvas.saveState()
+        width, height = landscape(A4)
+        canvas.setFillColor(colors.HexColor("#94A3B8"))
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawRightString(width - 0.75 * cm, 0.42 * cm, "NEXWELLPOWER | Monthly Market Report")
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(0.75 * cm, 0.42 * cm, f"Generated from the dashboard | {datetime.now():%Y-%m-%d %H:%M}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_draw_stamp, onLaterPages=_draw_stamp)
+    return output.getvalue()
+
 
 # =========================================================
 # MAIN LOAD
@@ -1298,45 +1872,25 @@ monthly_capture = monthly_capture_table(price_hourly, solar_hourly)
 # =========================================================
 section("Day-Ahead Market", "⚡")
 
-subsection("Quick read | selected month, previous month and same month last year")
+subsection("Quick read | selected month KPI panel")
 selected_metrics = period_metrics(price_hourly, solar_hourly, selected_month, report_end)
 prev_month = previous_month(selected_month)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_month, month_end(prev_month))
 yoy = yoy_month(selected_month)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, month_end(yoy))
 
-c1, c2, c3 = st.columns(3)
-with c1:
+q1, q2, q3, q4 = st.columns(4)
+with q1:
     st.metric(
         f"Baseload | {month_label(selected_month, is_current_mtd)}",
         fmt_eur(selected_metrics["avg_price"]),
         help="Simple average of hourly day-ahead prices.",
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. month baseload: <b>{fmt_eur(prev_metrics["avg_price"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["avg_price"])}</b></div>',
+        f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(prev_metrics["avg_price"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["avg_price"])}</b></div>',
         unsafe_allow_html=True,
     )
-with c2:
-    st.metric(
-        f"Previous month | {month_label(prev_month)}",
-        fmt_eur(prev_metrics["avg_price"]),
-    )
-    st.markdown(
-        f'<div class="metric-footnote">Solar unc.: <b>{fmt_eur(prev_metrics["captured_uncurtailed"])}</b><br>Solar curt.: <b>{fmt_eur(prev_metrics["captured_curtailed"])}</b></div>',
-        unsafe_allow_html=True,
-    )
-with c3:
-    st.metric(
-        f"Same month LY | {month_label(yoy)}",
-        fmt_eur(yoy_metrics["avg_price"]),
-    )
-    st.markdown(
-        f'<div class="metric-footnote">Solar unc.: <b>{fmt_eur(yoy_metrics["captured_uncurtailed"])}</b><br>Solar curt.: <b>{fmt_eur(yoy_metrics["captured_curtailed"])}</b></div>',
-        unsafe_allow_html=True,
-    )
-
-c4, c5, c6 = st.columns(3)
-with c4:
+with q2:
     st.metric(
         f"Solar captured unc. | {month_label(selected_month, is_current_mtd)}",
         fmt_eur(selected_metrics["captured_uncurtailed"]),
@@ -1346,7 +1900,7 @@ with c4:
         f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(prev_metrics["captured_uncurtailed"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["captured_uncurtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
-with c5:
+with q3:
     st.metric(
         f"Solar captured curt. | {month_label(selected_month, is_current_mtd)}",
         fmt_eur(selected_metrics["captured_curtailed"]),
@@ -1356,7 +1910,7 @@ with c5:
         f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(prev_metrics["captured_curtailed"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["captured_curtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
-with c6:
+with q4:
     st.metric(
         "Solar capture rate | curtailed",
         fmt_pct(selected_metrics["capture_rate_curtailed"]),
@@ -1370,55 +1924,70 @@ subsection("Monthly baseload vs Solar PV capture table | 2025 history and 2026 Y
 capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, forward_hourly, selected_month, report_end)
 st.dataframe(format_capture_table(capture_report), use_container_width=True, height=520)
 
-subsection("YTD spot market heatmap | current year vs 2025")
-spot_heatmap = ytd_price_heatmap(price_hourly, selected_month.year, report_end)
-if spot_heatmap is not None:
-    st.altair_chart(spot_heatmap, use_container_width=True)
-if selected_month.year == 2026:
-    spot_heatmap_2025 = ytd_price_heatmap(price_hourly, 2025, comparison_2025_end)
-    if spot_heatmap_2025 is not None:
-        st.markdown('<div class="comparison-note">2025 comparable YTD cut-off</div>', unsafe_allow_html=True)
-        st.altair_chart(spot_heatmap_2025, use_container_width=True)
+subsection("Hourly spot market heatmap | 2026 available data vs full-year 2025")
+spot_heatmap_2026 = ytd_price_heatmap(price_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
+if spot_heatmap_2026 is not None:
+    st.markdown('<div class="comparison-note">2026 hourly spot map — future / not-yet-available hours remain blank</div>', unsafe_allow_html=True)
+    st.altair_chart(spot_heatmap_2026, use_container_width=True)
+spot_heatmap_2025 = ytd_price_heatmap(price_hourly, 2025, pd.Timestamp(2025, 12, 31))
+if spot_heatmap_2025 is not None:
+    st.markdown('<div class="comparison-note">2025 full-year hourly spot map</div>', unsafe_allow_html=True)
+    st.altair_chart(spot_heatmap_2025, use_container_width=True)
 
-subsection("YTD zero / negative price frequency heatmap | current year vs 2025")
-neg_heatmap = negative_frequency_heatmap(price_hourly, selected_month.year, report_end)
-if neg_heatmap is not None:
-    st.altair_chart(neg_heatmap, use_container_width=True)
-if selected_month.year == 2026:
-    neg_heatmap_2025 = negative_frequency_heatmap(price_hourly, 2025, comparison_2025_end)
-    if neg_heatmap_2025 is not None:
-        st.markdown('<div class="comparison-note">2025 comparable YTD cut-off</div>', unsafe_allow_html=True)
-        st.altair_chart(neg_heatmap_2025, use_container_width=True)
+subsection("Zero / negative price frequency heatmap | 2026 completed months vs full-year 2025")
+neg_heatmap_2026 = negative_frequency_heatmap(
+    price_hourly,
+    2026,
+    pd.Timestamp(latest_data_ts.date()),
+    full_calendar_year=False,
+)
+if neg_heatmap_2026 is not None:
+    st.markdown('<div class="comparison-note">2026 — closed months only; an open MTD month is intentionally excluded</div>', unsafe_allow_html=True)
+    st.altair_chart(neg_heatmap_2026, use_container_width=True)
+neg_heatmap_2025 = negative_frequency_heatmap(
+    price_hourly,
+    2025,
+    pd.Timestamp(2025, 12, 31),
+    full_calendar_year=True,
+)
+if neg_heatmap_2025 is not None:
+    st.markdown('<div class="comparison-note">2025 — full-year monthly frequency heatmap</div>', unsafe_allow_html=True)
+    st.altair_chart(neg_heatmap_2025, use_container_width=True)
 
 subsection("YTD 24h average market profile vs solar generation")
 hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, selected_month.year, report_end)
 if hourly_overlay is not None:
     st.altair_chart(hourly_overlay, use_container_width=True)
 
-subsection("Monthly economic curtailment | actual vs Aurora / Baringa")
-actual_curt = monthly_economic_curtailment(price_hourly, solar_hourly, selected_month.year, report_end)
-forward_curt = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, report_end) if selected_month.year == 2026 else pd.DataFrame()
-curt_chart = monthly_curtailment_chart(actual_curt, forward_curt, selected_month.year)
-if curt_chart is not None:
-    st.altair_chart(curt_chart, use_container_width=True)
-if selected_month.year == 2026:
-    actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, comparison_2025_end)
-    curt_chart_2025 = monthly_curtailment_chart(actual_curt_2025, pd.DataFrame(), 2025)
-    if curt_chart_2025 is not None:
-        st.markdown('<div class="comparison-note">2025 comparable YTD actual economic curtailment</div>', unsafe_allow_html=True)
-        st.altair_chart(curt_chart_2025, use_container_width=True)
+subsection("Monthly economic curtailment | 2026 actual vs Aurora / Baringa and 2025 full-year")
+actual_curt_2026 = monthly_economic_curtailment(price_hourly, solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
+forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, pd.Timestamp(latest_data_ts.date()))
+curt_chart_2026 = monthly_curtailment_chart(actual_curt_2026, forward_curt_2026, 2026)
+if curt_chart_2026 is not None:
+    st.altair_chart(curt_chart_2026, use_container_width=True)
+actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
+curt_chart_2025 = monthly_curtailment_chart(actual_curt_2025, pd.DataFrame(), 2025)
+if curt_chart_2025 is not None:
+    st.markdown('<div class="comparison-note">2025 full-year actual economic curtailment</div>', unsafe_allow_html=True)
+    st.altair_chart(curt_chart_2025, use_container_width=True)
+
 
 # =========================================================
 # SECTION 2 — FORWARD MARKET
 # =========================================================
 section("Forward Market", "📈")
 
-forward_snapshot = forward_snapshot_and_monthly_change(forward_history)
+forward_snapshot_live = live_omip_forward_snapshot(today)
+forward_snapshot_local = forward_snapshot_and_monthly_change(forward_history)
+forward_snapshot = forward_snapshot_live if not forward_snapshot_live.empty else forward_snapshot_local
+forward_source_label = "OMIP live pull for access date" if not forward_snapshot_live.empty else "Local normalized forward-history fallback"
+
 if forward_snapshot.empty:
-    st.info("No normalized EEX/OMIP forward-history file was found in /data. This snapshot only activates when eex_forward_market.xlsx or eex_forward_market.csv is present and normalizable; Aurora/Baringa scenario curves, when available, are used in the forecast comparisons above but do not populate this market snapshot.")
+    st.info("No forward snapshot could be populated. The page now attempts the same OMIP live pull used by the Forward Market tab for today's access date, and falls back to a normalized local forward-history file when available.")
+    forward_chart = None
 else:
     as_of = pd.to_datetime(forward_snapshot["as_of_date"].iloc[0]).date()
-    pills([f"Latest forward quote date: {as_of:%d %b %Y}", "Q+1 / Q+2", "Y+1 / Y+2", "Baseload + Solar"])
+    pills([f"Forward quote date: {as_of:%d %b %Y}", forward_source_label, "Q+1 / Q+2", "Y+1 / Y+2", "Baseload + Solar"])
     forward_chart = forward_snapshot_chart(forward_snapshot)
     if forward_chart is not None:
         st.altair_chart(forward_chart, use_container_width=True)
@@ -1438,6 +2007,7 @@ else:
             "M-1 change": "{:.1%}",
         }, na_rep="—").set_table_styles([
             {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
+            {"selector": "td", "props": [("padding", "6px 8px")]},
         ]),
         use_container_width=True,
     )
@@ -1466,8 +2036,44 @@ hybrid_plot = hybrid_chart(hybrid)
 if hybrid_plot is not None:
     st.altair_chart(hybrid_plot, use_container_width=True)
     if bess_source == "proxy":
-        st.caption("Hybrid captured prices are shown as a dashboard proxy: monthly baseload plus a non-negative BESS revenue uplift divided by monthly solar MWh, so the hybrid series stays above baseload by construction.")
+        st.caption("Hybrid captured prices are shown as a dashboard proxy with the ordering requested for the report: with demand > w/o demand > monthly baseload.")
 else:
     st.info("No hybrid captured-price series could be generated. Add a hybrid monthly file in /data or ensure the solar and BESS inputs are populated.")
 
+st.caption("BESS footnote: optimization window is daily.")
 st.caption("Monthly Market Report | Corporate dashboard based on the app's hourly market data, forward curve files and BESS monthly inputs/proxies.")
+
+# =========================================================
+# PDF DOWNLOAD
+# =========================================================
+section("Download full report", "📄")
+pdf_charts = [
+    ("2026 hourly spot market heatmap", spot_heatmap_2026),
+    ("2025 full-year hourly spot market heatmap", spot_heatmap_2025),
+    ("2026 zero / negative price frequency heatmap", neg_heatmap_2026),
+    ("2025 zero / negative price frequency heatmap", neg_heatmap_2025),
+    ("YTD 24h average market profile vs solar generation", hourly_overlay),
+    ("2026 monthly economic curtailment", curt_chart_2026),
+    ("2025 full-year economic curtailment", curt_chart_2025),
+    ("Forward market snapshot", forward_chart),
+    ("PV + BESS hybrid captured price", hybrid_plot),
+]
+pdf_bytes = build_pdf_report_bytes(
+    report_label=selected_label,
+    report_end=report_end,
+    selected_metrics=selected_metrics,
+    prev_metrics=prev_metrics,
+    yoy_metrics=yoy_metrics,
+    capture_report=capture_report,
+    forward_snapshot=forward_snapshot,
+    bess_summary=bess_summary,
+    charts=pdf_charts,
+)
+st.download_button(
+    "⬇️ Download Monthly Market Report PDF",
+    data=pdf_bytes,
+    file_name=f"nexwellpower_monthly_market_report_{selected_month:%Y_%m}.pdf",
+    mime="application/pdf",
+    use_container_width=True,
+)
+st.caption("PDF export includes the dashboard summary, charts, comparison tables and a NEXWELLPOWER stamp.")
