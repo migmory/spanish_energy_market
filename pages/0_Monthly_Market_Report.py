@@ -1068,12 +1068,12 @@ def _negative_event_cumulative_chart_frame(
         source=series_label or str(year),
     )
     if counts.empty:
-        return pd.DataFrame(columns=["month_num", "Month", "Series", "Curve type", "Cum. hours"])
+        return pd.DataFrame(columns=["month_num", "Month", "Series", "Curve type", "cum_hours"])
     out = counts[["month_num", "Month", metric]].copy()
     out["Series"] = series_label or str(year)
     out["Curve type"] = curve_type
-    out["Cum. hours"] = out[metric].cumsum()
-    return out[["month_num", "Month", "Series", "Curve type", "Cum. hours"]]
+    out["cum_hours"] = pd.to_numeric(out[metric], errors="coerce").fillna(0).cumsum()
+    return out[["month_num", "Month", "Series", "Curve type", "cum_hours"]]
 
 
 def negative_zero_price_overlay_chart(
@@ -1140,7 +1140,7 @@ def negative_zero_price_overlay_chart(
                 labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]",
             ),
         ),
-        y=alt.Y("Cum. hours:Q", title="Cumulative hours"),
+        y=alt.Y("cum_hours:Q", title="Cumulative hours"),
         color=alt.Color(
             "Series:N",
             title="Series",
@@ -1156,7 +1156,7 @@ def negative_zero_price_overlay_chart(
             alt.Tooltip("Series:N", title="Series"),
             alt.Tooltip("Curve type:N", title="Type"),
             alt.Tooltip("Month:N", title="Month"),
-            alt.Tooltip("Cum. hours:Q", title="Cumulative hours", format=",.0f"),
+            alt.Tooltip("cum_hours:Q", title="Cumulative hours", format=",.0f"),
         ],
     ).properties(title=title)
     return apply_chart_style(chart, height=360)
@@ -1262,6 +1262,154 @@ def style_negative_zero_summary_table(df: pd.DataFrame) -> pd.io.formats.style.S
             {"selector": "td", "props": [("padding", "5px 7px")]},
         ])
     )
+
+
+def negative_zero_summary_2025_table(
+    price_hourly: pd.DataFrame,
+) -> pd.DataFrame:
+    """2025 monthly actual table plus full-year total."""
+    actual = _negative_event_monthly_counts(
+        price_hourly,
+        year=2025,
+        end_ts=pd.Timestamp(2025, 12, 31),
+        source="2025 actual",
+    )
+    month_index = pd.DataFrame({
+        "month_num": list(range(1, 13)),
+        "Month": [calendar.month_abbr[m] for m in range(1, 13)],
+    })
+    if actual.empty:
+        out = month_index.copy()
+        out["Negative hours"] = 0
+        out["Zero / negative hours"] = 0
+    else:
+        out = month_index.merge(
+            actual[["month_num", "Negative hours", "Zero / negative hours"]],
+            on="month_num",
+            how="left",
+        )
+        out["Negative hours"] = pd.to_numeric(out["Negative hours"], errors="coerce").fillna(0).astype(int)
+        out["Zero / negative hours"] = pd.to_numeric(out["Zero / negative hours"], errors="coerce").fillna(0).astype(int)
+    total = pd.DataFrame([{
+        "month_num": 99,
+        "Month": "TOTAL 2025",
+        "Negative hours": int(out["Negative hours"].sum()),
+        "Zero / negative hours": int(out["Zero / negative hours"].sum()),
+    }])
+    out = pd.concat([out, total], ignore_index=True)
+    return out[["Month", "Negative hours", "Zero / negative hours"]]
+
+
+def negative_zero_summary_2026_scenario_table(
+    price_hourly: pd.DataFrame,
+    forward_scenarios: pd.DataFrame,
+    report_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """2026 monthly actual + Aurora + Baringa, with YTD benchmark footer."""
+    report_end = pd.Timestamp(report_end)
+    latest_month = int(report_end.month) if report_end.year == 2026 else 12
+    month_nums = list(range(1, latest_month + 1))
+    month_labels = [calendar.month_abbr[m] for m in month_nums]
+    if report_end.year == 2026 and latest_month in month_nums:
+        month_labels[-1] = f"{month_labels[-1]} (MTD)"
+
+    base = pd.DataFrame({"month_num": month_nums, "Month": month_labels})
+
+    def _metric_block(df: pd.DataFrame, source_name: str, model: str | None = None) -> pd.DataFrame:
+        counts = _negative_event_monthly_counts(
+            df,
+            year=2026,
+            end_ts=report_end,
+            model=model,
+            source=source_name,
+        )
+        if counts.empty:
+            out = base[["month_num"]].copy()
+            out["Negative hours"] = 0
+            out["Zero / negative hours"] = 0
+            return out
+        out = base[["month_num"]].merge(
+            counts[["month_num", "Negative hours", "Zero / negative hours"]],
+            on="month_num",
+            how="left",
+        )
+        out["Negative hours"] = pd.to_numeric(out["Negative hours"], errors="coerce").fillna(0).astype(int)
+        out["Zero / negative hours"] = pd.to_numeric(out["Zero / negative hours"], errors="coerce").fillna(0).astype(int)
+        return out
+
+    actual = _metric_block(price_hourly, "2026 actual")
+    aurora = _metric_block(forward_scenarios, "Aurora", model="Aurora") if forward_scenarios is not None else _metric_block(pd.DataFrame(), "Aurora", model="Aurora")
+    baringa = _metric_block(forward_scenarios, "Baringa", model="Baringa") if forward_scenarios is not None else _metric_block(pd.DataFrame(), "Baringa", model="Baringa")
+
+    out = base[["month_num", "Month"]].copy()
+    out["Actual | Neg."] = actual["Negative hours"].astype(int)
+    out["Actual | Zero/Neg."] = actual["Zero / negative hours"].astype(int)
+    out["Aurora | Neg."] = aurora["Negative hours"].astype(int)
+    out["Aurora | Zero/Neg."] = aurora["Zero / negative hours"].astype(int)
+    out["Baringa | Neg."] = baringa["Negative hours"].astype(int)
+    out["Baringa | Zero/Neg."] = baringa["Zero / negative hours"].astype(int)
+
+    total = {
+        "month_num": 199,
+        "Month": "YTD 2026",
+        "Actual | Neg.": int(out["Actual | Neg."].sum()),
+        "Actual | Zero/Neg.": int(out["Actual | Zero/Neg."].sum()),
+        "Aurora | Neg.": int(out["Aurora | Neg."].sum()),
+        "Aurora | Zero/Neg.": int(out["Aurora | Zero/Neg."].sum()),
+        "Baringa | Neg.": int(out["Baringa | Neg."].sum()),
+        "Baringa | Zero/Neg.": int(out["Baringa | Zero/Neg."].sum()),
+    }
+    out = pd.concat([out, pd.DataFrame([total])], ignore_index=True)
+    return out.drop(columns=["month_num"], errors="ignore")
+
+
+def style_negative_zero_2025_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def _row_style(row: pd.Series) -> list[str]:
+        total = "TOTAL" in str(row.get("Month", ""))
+        css = "background-color: #F8FAFC;"
+        if total:
+            css += " font-weight: 900; border-top: 2px solid #94A3B8; background-color: #E2E8F0;"
+        return [css] * len(row)
+
+    return (
+        df.style
+        .format({
+            "Negative hours": "{:,.0f}",
+            "Zero / negative hours": "{:,.0f}",
+        }, na_rep="—")
+        .apply(_row_style, axis=1)
+        .set_properties(**{"text-align": "center"})
+        .set_table_styles([
+            {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
+            {"selector": "td", "props": [("padding", "5px 7px")]},
+        ])
+    )
+
+
+def style_negative_zero_2026_scenario_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    actual_cols = [c for c in df.columns if c.startswith("Actual |")]
+    aurora_cols = [c for c in df.columns if c.startswith("Aurora |")]
+    baringa_cols = [c for c in df.columns if c.startswith("Baringa |")]
+
+    def _row_style(row: pd.Series) -> list[str]:
+        is_total = "YTD" in str(row.get("Month", ""))
+        base = "font-weight: 900; border-top: 2px solid #94A3B8;" if is_total else ""
+        return [base] * len(row)
+
+    styler = (
+        df.style
+        .format({c: "{:,.0f}" for c in df.columns if c != "Month"}, na_rep="—")
+        .apply(_row_style, axis=1)
+        .set_properties(**{"text-align": "center"})
+        .set_properties(subset=actual_cols, **{"background-color": "#F0F9FF"})
+        .set_properties(subset=aurora_cols, **{"background-color": "#FFF7ED"})
+        .set_properties(subset=baringa_cols, **{"background-color": "#EFF6FF"})
+        .set_table_styles([
+            {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center"), ("font-size", "0.88rem")]},
+            {"selector": "td", "props": [("padding", "5px 6px"), ("font-size", "0.88rem")]},
+        ])
+    )
+    return styler
 
 def ytd_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, forward_scenarios: pd.DataFrame, year: int, end_ts: pd.Timestamp):
     p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
@@ -2714,16 +2862,29 @@ negative_summary = negative_zero_summary_table(
     forward_hourly,
     pd.Timestamp(latest_data_ts.date()),
 )
-neg_left, neg_right = st.columns([2.05, 1.15])
-with neg_left:
-    if negative_overlay_chart is not None:
-        st.altair_chart(negative_overlay_chart, use_container_width=True)
-with neg_right:
-    st.markdown('<div class="comparison-note">Monthly count table: 2025 actual, 2026 actual YTD and YTD scenario benchmark</div>', unsafe_allow_html=True)
-    if not negative_summary.empty:
-        st.dataframe(style_negative_zero_summary_table(negative_summary), use_container_width=True, height=520)
+negative_summary_2025 = negative_zero_summary_2025_table(price_hourly)
+negative_summary_2026 = negative_zero_summary_2026_scenario_table(
+    price_hourly,
+    forward_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+)
+
+if negative_overlay_chart is not None:
+    st.altair_chart(negative_overlay_chart, use_container_width=True)
+
+neg_2025_col, neg_2026_col = st.columns([1.0, 1.65])
+with neg_2025_col:
+    st.markdown('<div class="comparison-note">2025 actual | monthly counts and full-year total</div>', unsafe_allow_html=True)
+    if not negative_summary_2025.empty:
+        st.dataframe(style_negative_zero_2025_table(negative_summary_2025), use_container_width=True, height=520)
     else:
-        st.info("No negative-price summary could be calculated from the available hourly prices.")
+        st.info("No 2025 negative-price summary could be calculated.")
+with neg_2026_col:
+    st.markdown('<div class="comparison-note">2026 actual + Aurora + Baringa | monthly counts and YTD benchmark</div>', unsafe_allow_html=True)
+    if not negative_summary_2026.empty:
+        st.dataframe(style_negative_zero_2026_scenario_table(negative_summary_2026), use_container_width=True, height=520)
+    else:
+        st.info("No 2026 scenario negative-price summary could be calculated.")
 
 subsection("YTD 24h average market profile vs solar generation")
 hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, selected_month.year, report_end)
