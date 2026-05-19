@@ -16,6 +16,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import requests
+import pulp
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -273,6 +274,15 @@ HYBRID_MONTHLY_CANDIDATES = [
     DATA_DIR / "pv_bess_hybrid_monthly.xlsx",
     DATA_DIR / "pv_bess_hybrid_monthly.csv",
 ]
+
+BESS_REPORT_SOLAR_PROFILE_XLSX = DATA_DIR / "profile_production_1y_hourly.xlsx"
+BESS_REPORT_DATA_XLSX = DATA_DIR / "data.xlsx"
+BESS_REPORT_CAPACITY_MWH = 4.0
+BESS_REPORT_C_RATE = 0.25
+BESS_REPORT_POWER_MW = BESS_REPORT_CAPACITY_MWH * BESS_REPORT_C_RATE
+BESS_REPORT_ETA_CH = 0.93
+BESS_REPORT_ETA_DIS = 0.93
+BESS_REPORT_CYCLE_LIMIT = 1.0
 
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
@@ -1156,6 +1166,53 @@ def forward_snapshot_chart(snapshot: pd.DataFrame):
     ).properties(title="Latest forward snapshot | Baseload vs Solar")
     return apply_chart_style(chart, height=330)
 
+def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
+    """Historical forward quote lines for the latest selected Q+1/Q+2/Y+1/Y+2 contracts."""
+    if history.empty or snapshot.empty:
+        return None
+    h = history.copy()
+    h["as_of_date"] = pd.to_datetime(h["as_of_date"], errors="coerce")
+    h["price"] = pd.to_numeric(h["price"], errors="coerce")
+    h = h.dropna(subset=["as_of_date", "price", "curve_family", "contract"])
+    selected = snapshot[["curve_family", "period", "contract"]].drop_duplicates().copy()
+    plot = h.merge(selected, on=["curve_family", "contract"], how="inner")
+    if plot.empty:
+        return None
+    plot["series"] = plot["curve_family"].astype(str) + " " + plot["period"].astype(str)
+    series_order = []
+    for period in ["Q+1", "Q+2", "Y+1", "Y+2"]:
+        for fam in ["Baseload", "Solar"]:
+            series = f"{fam} {period}"
+            if series in plot["series"].unique().tolist():
+                series_order.append(series)
+    if not series_order:
+        series_order = sorted(plot["series"].dropna().unique().tolist())
+    palette = [
+        BLUE, "#3B82F6", BLUE_DARK, "#2563EB",
+        YELLOW_DARK, "#F59E0B", "#B45309", "#FBBF24",
+    ]
+    color_range = [palette[i % len(palette)] for i in range(len(series_order))]
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2.8).encode(
+        x=alt.X("as_of_date:T", title="Quote date", axis=alt.Axis(format="%b-%y", labelAngle=-35)),
+        y=alt.Y("price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        color=alt.Color("series:N", title="Forward series", scale=alt.Scale(domain=series_order, range=color_range)),
+        strokeDash=alt.StrokeDash(
+            "curve_family:N",
+            title="Curve type",
+            scale=alt.Scale(domain=["Baseload", "Solar"], range=[[1, 0], [7, 3]]),
+        ),
+        detail="series:N",
+        tooltip=[
+            alt.Tooltip("as_of_date:T", title="Quote date", format="%Y-%m-%d"),
+            alt.Tooltip("curve_family:N", title="Curve"),
+            alt.Tooltip("period:N", title="Bucket"),
+            alt.Tooltip("contract:N", title="Contract"),
+            alt.Tooltip("price:Q", title="Price", format=",.2f"),
+        ],
+    ).properties(title="Forward quote history | Selected Q+1 / Q+2 / Y+1 / Y+2")
+    return apply_chart_style(chart, height=380)
+
+
 
 # =========================================================
 # LIVE OMIP FORWARD SNAPSHOT — aligned with Forward Market page pull
@@ -1519,27 +1576,232 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         ])
     )
 
-def hybrid_proxy_monthly(monthly_capture: pd.DataFrame, bess: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
+def _load_hybrid_monthly_file() -> pd.DataFrame:
+    """Optional dedicated monthly hybrid capture file."""
+    raw = _load_optional_table(HYBRID_MONTHLY_CANDIDATES)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    df.columns = [_clean_col_name(c) for c in df.columns]
+    period_col = _first_existing(df.columns.tolist(), ["period", "month", "date", "datetime"])
+    wo_col = _first_existing(df.columns.tolist(), ["hybrid_wo_demand", "captured_hybrid_wo_demand", "captured_hybrid_without_demand"])
+    w_col = _first_existing(df.columns.tolist(), ["hybrid_w_demand", "captured_hybrid_w_demand", "captured_hybrid_with_demand"])
+    if period_col is None or wo_col is None or w_col is None:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["period"] = pd.to_datetime(df[period_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    out["hybrid_wo_demand"] = pd.to_numeric(df[wo_col], errors="coerce")
+    out["hybrid_w_demand"] = pd.to_numeric(df[w_col], errors="coerce")
+    return out.dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
+
+
+def _load_bess_report_solar_profile() -> pd.DataFrame:
+    if not BESS_REPORT_SOLAR_PROFILE_XLSX.exists():
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    try:
+        df = pd.read_excel(BESS_REPORT_SOLAR_PROFILE_XLSX)
+    except Exception:
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    if df.empty:
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    norm = {_clean_col_name(c): c for c in df.columns}
+    key = _first_existing(list(norm.keys()), ["generation", "generacion", "gen"])
+    if key is None:
+        return pd.DataFrame(columns=["hour_of_year", "generation"])
+    out = pd.DataFrame({"generation": pd.to_numeric(df[norm[key]], errors="coerce").fillna(0.0)})
+    out["hour_of_year"] = np.arange(1, len(out) + 1)
+    return out[["hour_of_year", "generation"]]
+
+
+def _load_bess_report_consumption_profile() -> pd.DataFrame:
+    if not BESS_REPORT_DATA_XLSX.exists():
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    try:
+        df = pd.read_excel(BESS_REPORT_DATA_XLSX)
+    except Exception:
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    if df.empty:
+        return pd.DataFrame(columns=["hour_of_year", "consumption"])
+    cols = list(df.columns)
+    if len(cols) >= 6:
+        df = df.rename(columns={cols[5]: "consumption"})
+    if "consumption" not in df.columns:
+        norm = {_clean_col_name(c): c for c in df.columns}
+        key = _first_existing(list(norm.keys()), ["consumption", "consumo", "load"])
+        if key is None:
+            return pd.DataFrame(columns=["hour_of_year", "consumption"])
+        df = df.rename(columns={norm[key]: "consumption"})
+    out = pd.DataFrame({"consumption": pd.to_numeric(df["consumption"], errors="coerce").fillna(0.0)})
+    out["hour_of_year"] = np.arange(1, len(out) + 1)
+    return out[["hour_of_year", "consumption"]]
+
+
+def _bess_report_dataset(price_hourly: pd.DataFrame, mode: str) -> pd.DataFrame:
+    p = price_hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"])
+    p = p[p["datetime"].dt.year >= 2025].sort_values("datetime").copy()
+    if p.empty:
+        return pd.DataFrame(columns=["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"])
+
+    p["year"] = p["datetime"].dt.year
+    p["hour_of_year"] = (p["datetime"].dt.dayofyear - 1) * 24 + p["datetime"].dt.hour + 1
+    p["timestamp"] = p["datetime"]
+    p["dia"] = p["datetime"].dt.date
+    p["hora"] = p["datetime"].dt.hour + 1
+    p["omie_venta"] = p["price"]
+
+    solar = _load_bess_report_solar_profile()
+    if solar.empty:
+        return pd.DataFrame(columns=["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"])
+    p = p.merge(solar, on="hour_of_year", how="left")
+    p["generacion"] = pd.to_numeric(p["generation"], errors="coerce").fillna(0.0) * BESS_REPORT_POWER_MW
+
+    if mode == "with_demand":
+        consumption = _load_bess_report_consumption_profile()
+        if consumption.empty:
+            p["consumo"] = 0.0
+        else:
+            p = p.merge(consumption, on="hour_of_year", how="left")
+            p["consumo"] = pd.to_numeric(p["consumption"], errors="coerce").fillna(0.0)
+        p["omie_compra"] = p["omie_venta"]
+    else:
+        p["consumo"] = 0.0
+        p["omie_compra"] = 1000.0
+
+    return p[["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"]].copy()
+
+
+def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
+    """Daily LP based on the BESS-tab logic, fixed to Monthly Report assumptions."""
+    df_day = df_day.sort_values("hora").reset_index(drop=True).copy()
+    n = len(df_day)
+    if n == 0:
+        return pd.DataFrame()
+
+    sell = df_day["omie_venta"].astype(float).tolist()
+    buy = df_day["omie_compra"].astype(float).tolist()
+    generation = df_day["generacion"].astype(float).tolist()
+    consumption = df_day["consumo"].astype(float).tolist()
+
+    max_power = BESS_REPORT_POWER_MW
+    max_grid_flow = max(max_power, 1e-9)
+
+    model = pulp.LpProblem("monthly_report_bess_daily_optimization", pulp.LpMaximize)
+    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
+    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
+    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
+    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
+    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
+    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
+    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
+    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
+    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
+    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
+
+    model += soc[0] == 0.0
+    model += soc[n] == 0.0
+
+    for t in range(n):
+        model += g_to_batt[t] + grid_charge[t] <= max_power * is_charging[t]
+        model += batt_for_load[t] + batt_for_sell[t] <= max_power * (1 - is_charging[t])
+        model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
+        model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
+        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == generation[t]
+        model += consumption[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
+        model += soc[t + 1] == (
+            soc[t]
+            + BESS_REPORT_ETA_CH * (g_to_batt[t] + grid_charge[t])
+            - (1 / BESS_REPORT_ETA_DIS) * (batt_for_load[t] + batt_for_sell[t])
+        )
+        model += soc[t] <= BESS_REPORT_CAPACITY_MWH
+
+    model += soc[n] <= BESS_REPORT_CAPACITY_MWH
+    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= BESS_REPORT_CYCLE_LIMIT * BESS_REPORT_CAPACITY_MWH / max(BESS_REPORT_ETA_CH, 1e-9)
+    model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n))
+    model += pulp.lpSum(
+        g_to_grid[t] * sell[t]
+        + batt_for_sell[t] * sell[t]
+        - grid_purchase[t] * buy[t]
+        - grid_charge[t] * buy[t]
+        for t in range(n)
+    )
+
+    model.solve(pulp.PULP_CBC_CMD(msg=False))
+
+    def vals(var_dict):
+        return [pulp.value(var_dict[i]) if pulp.value(var_dict[i]) is not None else 0.0 for i in range(n)]
+
+    res = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(df_day["timestamp"]).values,
+            "omie_venta": sell,
+            "g_to_grid": vals(g_to_grid),
+            "grid_charge": vals(grid_charge),
+            "batt_for_sell": vals(batt_for_sell),
+        }
+    )
+    res["hybrid_profile_mwh"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
+    res["hybrid_revenue_eur"] = res["hybrid_profile_mwh"] * res["omie_venta"]
+    return res
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _compute_bess_hybrid_capture_from_model(price_hourly: pd.DataFrame) -> pd.DataFrame:
+    """Return monthly captured hybrid prices for w/o-demand and with-demand report scenarios."""
+    monthly_parts = []
+    for mode, target in [("without_demand", "hybrid_wo_demand"), ("with_demand", "hybrid_w_demand")]:
+        data = _bess_report_dataset(price_hourly, mode)
+        if data.empty:
+            continue
+        dispatch_parts = []
+        for _, day in data.groupby(pd.to_datetime(data["dia"])):
+            result = _optimize_bess_report_day(day)
+            if not result.empty:
+                dispatch_parts.append(result)
+        if not dispatch_parts:
+            continue
+        dispatch = pd.concat(dispatch_parts, ignore_index=True)
+        dispatch["period"] = pd.to_datetime(dispatch["datetime"]).dt.to_period("M").dt.to_timestamp()
+        monthly = (
+            dispatch.groupby("period", as_index=False)
+            .agg(
+                hybrid_profile_mwh=("hybrid_profile_mwh", "sum"),
+                hybrid_revenue_eur=("hybrid_revenue_eur", "sum"),
+            )
+        )
+        monthly[target] = np.where(
+            monthly["hybrid_profile_mwh"] != 0,
+            monthly["hybrid_revenue_eur"] / monthly["hybrid_profile_mwh"],
+            np.nan,
+        )
+        monthly_parts.append(monthly[["period", target]])
+
+    if not monthly_parts:
+        return pd.DataFrame(columns=["period", "hybrid_wo_demand", "hybrid_w_demand"])
+    out = monthly_parts[0]
+    for part in monthly_parts[1:]:
+        out = out.merge(part, on="period", how="outer")
+    return out.sort_values("period").reset_index(drop=True)
+
+
+def load_or_build_hybrid_capture_monthly(price_hourly: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    dedicated = _load_hybrid_monthly_file()
+    if not dedicated.empty:
+        return dedicated, "file"
+    modeled = _compute_bess_hybrid_capture_from_model(price_hourly)
+    if not modeled.empty:
+        return modeled, "model"
+    return pd.DataFrame(columns=["period", "hybrid_wo_demand", "hybrid_w_demand"]), "unavailable"
+
+
+def hybrid_actual_monthly(monthly_capture: pd.DataFrame, hybrid_capture: pd.DataFrame) -> pd.DataFrame:
     cols = ["period", "baseload", "hybrid_wo_demand", "hybrid_w_demand"]
-    if monthly_capture.empty or bess.empty or solar_hourly.empty:
+    if monthly_capture.empty or hybrid_capture.empty:
         return pd.DataFrame(columns=cols)
-    solar = solar_hourly.copy()
-    solar["period"] = solar["datetime"].dt.to_period("M").dt.to_timestamp()
-    solar_sum = solar.groupby("period", as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "solar_mwh"})
-    out = monthly_capture.merge(bess, on="period", how="left").merge(solar_sum, on="period", how="left")
-    out["baseload"] = out["avg_spot_price"]
-    # Hybrid chart proxy ordering requested for the dashboard:
-    #   with demand > w/o demand > baseload.
-    # Uplifts are derived from the BESS revenue proxy per solar MWh; the with-demand
-    # proxy is floored above the w/o-demand proxy so the plot remains economically
-    # interpretable for the report's visual hierarchy.
-    uplift_wo = out["revenue_wo_demand_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
-    uplift_w_raw = out["revenue_w_demand_1c_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
-    uplift_wo = uplift_wo.clip(lower=0).fillna(0.0)
-    uplift_w_raw = uplift_w_raw.clip(lower=0).fillna(0.0)
-    uplift_w = np.maximum(uplift_w_raw, uplift_wo + 0.25)
-    out["hybrid_wo_demand"] = out["baseload"] + uplift_wo
-    out["hybrid_w_demand"] = out["baseload"] + uplift_w
+    out = monthly_capture[["period", "avg_spot_price"]].copy().rename(columns={"avg_spot_price": "baseload"})
+    out = out.merge(hybrid_capture, on="period", how="left")
     return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
 
 
@@ -1549,31 +1811,38 @@ def hybrid_chart(hybrid: pd.DataFrame):
     h = hybrid[hybrid["period"] >= pd.Timestamp(2025, 1, 1)].copy()
     if h.empty:
         return None
-    long = h.melt(id_vars=["period"], value_vars=["baseload", "hybrid_wo_demand", "hybrid_w_demand"], var_name="series", value_name="value").dropna(subset=["value"])
+    long = h.melt(
+        id_vars=["period"],
+        value_vars=["baseload", "hybrid_wo_demand", "hybrid_w_demand"],
+        var_name="series",
+        value_name="value",
+    ).dropna(subset=["value"])
     names = {
         "baseload": "Monthly baseload",
-        "hybrid_wo_demand": "PV + BESS hybrid, w/o demand",
-        "hybrid_w_demand": "PV + BESS hybrid, with demand",
+        "hybrid_wo_demand": "Captured Hybrid w/o demand | 1c/day",
+        "hybrid_w_demand": "Captured Hybrid w. demand | 1c/day",
     }
     long["series"] = long["series"].map(names)
     chart = alt.Chart(long).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("period:T", title=None, axis=alt.Axis(format="%b-%y", labelAngle=-35)),
-        y=alt.Y("value:Q", title="€/MWh"),
-        color=alt.Color("series:N", title="Series", scale=alt.Scale(
-            domain=list(names.values()),
-            range=[BLUE, YELLOW_DARK, CORP_GREEN],
-        )),
-        strokeDash=alt.StrokeDash("series:N", title="Series", scale=alt.Scale(
-            domain=list(names.values()),
-            range=[[1, 0], [6, 3], [3, 2]],
-        )),
+        y=alt.Y("value:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "series:N",
+            title="Series",
+            scale=alt.Scale(domain=list(names.values()), range=[BLUE, YELLOW_DARK, CORP_GREEN]),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N",
+            title="Series",
+            scale=alt.Scale(domain=list(names.values()), range=[[1, 0], [6, 3], [3, 2]]),
+        ),
         tooltip=[
             alt.Tooltip("period:T", title="Month", format="%b %Y"),
             alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("value:Q", title="Price", format=",.2f"),
+            alt.Tooltip("value:Q", title="Captured price", format=",.2f"),
         ],
-    ).properties(title="Monthly baseload vs PV + BESS captured price proxy")
-    return apply_chart_style(chart, height=340)
+    ).properties(title="Monthly baseload vs BESS-model captured hybrid price")
+    return apply_chart_style(chart, height=360)
 
 
 # =========================================================
@@ -1585,7 +1854,7 @@ def _chart_to_png_bytes(chart) -> bytes | None:
     try:
         import vl_convert as vlc
         spec_json = chart.to_json()
-        return vlc.vegalite_to_png(spec_json, scale=1.6)
+        return vlc.vegalite_to_png(spec_json, scale=2.8)
     except Exception:
         return None
 
@@ -1759,7 +2028,7 @@ def build_pdf_report_bytes(
         story.append(PageBreak())
         story.append(Paragraph(title, h_style))
         img = RLImage(BytesIO(png))
-        img._restrictSize(26.0 * cm, 16.3 * cm)
+        img._restrictSize(26.2 * cm, 14.6 * cm)
         story.append(img)
 
     # Forward
@@ -1780,7 +2049,7 @@ def build_pdf_report_bytes(
 
     # BESS
     story.append(Paragraph("BESS", h_style))
-    story.append(Paragraph("Optimization window: daily.", body_style))
+    story.append(Paragraph("Optimization window: daily. Hybrid captured-price chart assumptions: maximum 1 cycle/day, 4h BESS (4.0 MWh / 1.0 MW), and separate w/o demand / w. demand model runs.", body_style))
     bess_data = _pdf_table_data(bess_summary)
     bess_table = Table(bess_data, repeatRows=1)
     bess_table.setStyle(TableStyle([
@@ -1988,7 +2257,10 @@ if forward_snapshot.empty:
 else:
     as_of = pd.to_datetime(forward_snapshot["as_of_date"].iloc[0]).date()
     pills([f"Forward quote date: {as_of:%d %b %Y}", forward_source_label, "Q+1 / Q+2", "Y+1 / Y+2", "Baseload + Solar"])
-    forward_chart = forward_snapshot_chart(forward_snapshot)
+    forward_history_chart = forward_history_line_chart(forward_history, forward_snapshot)
+    forward_chart = forward_history_chart if forward_history_chart is not None else forward_snapshot_chart(forward_snapshot)
+    if forward_history_chart is not None:
+        st.caption("Historical quote lines use the normalized forward-history dataset where available; the table below keeps the latest quote and M-1 variation.")
     if forward_chart is not None:
         st.altair_chart(forward_chart, use_container_width=True)
     forward_display = forward_snapshot.copy()
@@ -2030,17 +2302,22 @@ if bess_summary.empty:
 else:
     st.dataframe(format_bess_summary(bess_summary), use_container_width=True)
 
-subsection("PV + BESS hybrid captured price vs monthly baseload")
-hybrid = hybrid_proxy_monthly(monthly_capture, bess_monthly, solar_hourly)
+subsection("Monthly BESS-model captured hybrid price vs monthly baseload")
+hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(price_hourly)
+hybrid = hybrid_actual_monthly(monthly_capture, hybrid_capture_monthly)
 hybrid_plot = hybrid_chart(hybrid)
 if hybrid_plot is not None:
     st.altair_chart(hybrid_plot, use_container_width=True)
-    if bess_source == "proxy":
-        st.caption("Hybrid captured prices are shown as a dashboard proxy with the ordering requested for the report: with demand > w/o demand > monthly baseload.")
+    source_note = "dedicated monthly hybrid capture input file" if hybrid_source == "file" else "daily BESS optimisation model embedded in this report"
+    st.caption(
+        f"Hybrid captured price source: {source_note}. Assumptions: daily optimization window, maximum 1 cycle/day, "
+        f"4h BESS (4.0 MWh / 1.0 MW), ηch={BESS_REPORT_ETA_CH:.0%}, ηdis={BESS_REPORT_ETA_DIS:.0%}. "
+        "The w/o-demand and w.-demand series are calculated independently with the BESS captured-price logic."
+    )
 else:
-    st.info("No hybrid captured-price series could be generated. Add a hybrid monthly file in /data or ensure the solar and BESS inputs are populated.")
+    st.info("Hybrid captured-price series could not be generated. Add a dedicated hybrid monthly file in /data or ensure the default BESS profile files are available.")
 
-st.caption("BESS footnote: optimization window is daily.")
+st.caption("BESS footnote: optimization window is daily; monthly hybrid captured-price comparison uses max 1 cycle/day.")
 st.caption("Monthly Market Report | Corporate dashboard based on the app's hourly market data, forward curve files and BESS monthly inputs/proxies.")
 
 # =========================================================
@@ -2055,8 +2332,8 @@ pdf_charts = [
     ("YTD 24h average market profile vs solar generation", hourly_overlay),
     ("2026 monthly economic curtailment", curt_chart_2026),
     ("2025 full-year economic curtailment", curt_chart_2025),
-    ("Forward market snapshot", forward_chart),
-    ("PV + BESS hybrid captured price", hybrid_plot),
+    ("Forward market history / latest snapshot", forward_chart),
+    ("BESS-model hybrid captured price", hybrid_plot),
 ]
 pdf_bytes = build_pdf_report_bytes(
     report_label=selected_label,
