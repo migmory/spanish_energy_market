@@ -145,6 +145,19 @@ st.markdown(
     div[data-testid="stMetricLabel"] {{
         font-weight: 720;
     }}
+    .metric-footnote {{
+        color: #64748B;
+        font-size: 0.78rem;
+        line-height: 1.35;
+        margin-top: -0.35rem;
+        margin-bottom: 0.55rem;
+    }}
+    .comparison-note {{
+        color: #475569;
+        font-size: 0.82rem;
+        margin-top: 0.15rem;
+        margin-bottom: 0.35rem;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -221,6 +234,13 @@ def previous_month(ts: pd.Timestamp) -> pd.Timestamp:
 
 def yoy_month(ts: pd.Timestamp) -> pd.Timestamp:
     return pd.Timestamp(ts.year - 1, ts.month, 1)
+
+def comparable_ytd_end(end_ts: pd.Timestamp, target_year: int) -> pd.Timestamp:
+    """Return the same month/day cut-off in another year, with leap-day safety."""
+    try:
+        return pd.Timestamp(target_year, end_ts.month, end_ts.day)
+    except ValueError:
+        return pd.Timestamp(target_year, end_ts.month, 1) + pd.offsets.MonthEnd(0)
 
 def values_equal_month(series: pd.Series, ts: pd.Timestamp) -> pd.Series:
     return (series.dt.year == ts.year) & (series.dt.month == ts.month)
@@ -550,7 +570,14 @@ def annual_capture_metrics(price_hourly: pd.DataFrame, solar_hourly: pd.DataFram
     end = end_ts if end_ts is not None else pd.Timestamp(year, 12, 31)
     return period_metrics(price_hourly, solar_hourly, start, end)
 
-def build_report_capture_table(monthly: pd.DataFrame, price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, report_month: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
+def build_report_capture_table(
+    monthly: pd.DataFrame,
+    price_hourly: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    forward_scenarios: pd.DataFrame,
+    report_month: pd.Timestamp,
+    report_end: pd.Timestamp,
+) -> pd.DataFrame:
     month_names = [calendar.month_abbr[m] for m in range(1, 13)]
     rows = []
     monthly = monthly.copy()
@@ -572,7 +599,8 @@ def build_report_capture_table(monthly: pd.DataFrame, price_hourly: pd.DataFrame
                 for col in ["Baseload", "Solar unc.", "Rate unc.", "Solar curt.", "Rate curt."]:
                     row[f"{prefix} {col}"] = np.nan
         rows.append(row)
-    # Annual/YTD row
+
+    # Annual / YTD actuals
     yr25 = annual_capture_metrics(price_hourly, solar_hourly, 2025)
     ytd26_end = report_end if report_month.year == 2026 else pd.Timestamp(2026, 12, 31)
     ytd26 = annual_capture_metrics(price_hourly, solar_hourly, 2026, end_ts=ytd26_end)
@@ -584,6 +612,31 @@ def build_report_capture_table(monthly: pd.DataFrame, price_hourly: pd.DataFrame
         final[f"{prefix} Solar curt."] = metrics["captured_curtailed"]
         final[f"{prefix} Rate curt."] = metrics["capture_rate_curtailed"]
     rows.append(final)
+
+    # 2026 YTD forecast rows for direct Aurora / Baringa comparison
+    if report_month.year == 2026 and forward_scenarios is not None and not forward_scenarios.empty:
+        for model in ["Aurora", "Baringa"]:
+            f = forward_scenarios[
+                (forward_scenarios["model"] == model)
+                & (forward_scenarios["datetime"].dt.year == 2026)
+                & (forward_scenarios["datetime"] <= ytd26_end + pd.Timedelta(days=1))
+            ][["datetime", "price"]].copy()
+            row = {"Month": f"YTD {model}"}
+            for col in ["Baseload", "Solar unc.", "Rate unc.", "Solar curt.", "Rate curt."]:
+                row[f"2025 {col}"] = np.nan
+            metrics = annual_capture_metrics(f, solar_hourly, 2026, end_ts=ytd26_end) if not f.empty else {
+                "avg_price": None,
+                "captured_uncurtailed": None,
+                "capture_rate_uncurtailed": None,
+                "captured_curtailed": None,
+                "capture_rate_curtailed": None,
+            }
+            row["2026 Baseload"] = metrics["avg_price"]
+            row["2026 Solar unc."] = metrics["captured_uncurtailed"]
+            row["2026 Rate unc."] = metrics["capture_rate_uncurtailed"]
+            row["2026 Solar curt."] = metrics["captured_curtailed"]
+            row["2026 Rate curt."] = metrics["capture_rate_curtailed"]
+            rows.append(row)
     return pd.DataFrame(rows)
 
 def format_capture_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
@@ -593,8 +646,32 @@ def format_capture_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             fmt[col] = "{:.1%}"
         elif col != "Month":
             fmt[col] = "{:,.1f}"
+
+    def _style_col(col: pd.Series) -> list[str]:
+        name = str(col.name)
+        if name.startswith("2025 "):
+            base = "background-color: #F8FAFC;"
+            if "Baseload" in name:
+                base = "background-color: #DBEAFE; font-weight: 750;"
+            return [base] * len(col)
+        if name.startswith("2026 ") and "Baseload" in name:
+            return ["background-color: #EFF6FF; font-weight: 750;"] * len(col)
+        return [""] * len(col)
+
+    def _style_rows(row: pd.Series) -> list[str]:
+        label = str(row.get("Month", ""))
+        if label == "YR / YTD":
+            return ["background-color: #ECFDF5; font-weight: 850; border-top: 2px solid #10B981;"] * len(row)
+        if label.startswith("YTD Aurora"):
+            return ["background-color: #FFF7ED; font-weight: 750;"] * len(row)
+        if label.startswith("YTD Baringa"):
+            return ["background-color: #EFF6FF; font-weight: 750;"] * len(row)
+        return [""] * len(row)
+
     return (
         df.style.format(fmt, na_rep="—")
+        .apply(_style_col, axis=0)
+        .apply(_style_rows, axis=1)
         .set_properties(**{"text-align": "center"})
         .set_table_styles([
             {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
@@ -606,21 +683,31 @@ def ytd_price_heatmap(price_hourly: pd.DataFrame, year: int, end_ts: pd.Timestam
     p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
     if p.empty:
         return None
-    p["date"] = p["datetime"].dt.normalize()
-    p["date_label"] = p["date"].dt.strftime("%d-%b")
+    p["month"] = p["datetime"].dt.strftime("%b")
+    p["month_num"] = p["datetime"].dt.month
     p["hour"] = p["datetime"].dt.hour
-    daily = p.groupby(["date", "date_label", "hour"], as_index=False)["price"].mean()
-    chart = alt.Chart(daily).mark_rect().encode(
-        x=alt.X("date:T", title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-35)),
-        y=alt.Y("hour:O", title="Hour", sort=list(range(24))),
-        color=alt.Color("price:Q", title="Spot €/MWh", scale=alt.Scale(scheme="redyellowgreen", reverse=True)),
-        tooltip=[
-            alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-            alt.Tooltip("hour:O", title="Hour"),
-            alt.Tooltip("price:Q", title="Spot price", format=",.2f"),
-        ],
-    ).properties(title=f"YTD hourly spot heatmap | {year}")
-    return apply_chart_style(chart, height=430)
+    grouped = p.groupby(["month_num", "month", "hour"], as_index=False)["price"].mean()
+    month_order = [calendar.month_abbr[m] for m in range(1, 13)]
+    grouped["label"] = grouped["price"].map(lambda x: f"{x:.0f}" if pd.notna(x) else "")
+    chart = alt.layer(
+        alt.Chart(grouped).mark_rect().encode(
+            x=alt.X("hour:O", title="Hour", sort=list(range(24))),
+            y=alt.Y("month:N", title="Month", sort=month_order),
+            color=alt.Color("price:Q", title="Avg spot €/MWh", scale=alt.Scale(scheme="redyellowgreen", reverse=True)),
+            tooltip=[
+                alt.Tooltip("month:N", title="Month"),
+                alt.Tooltip("hour:O", title="Hour"),
+                alt.Tooltip("price:Q", title="Average spot price", format=",.2f"),
+            ],
+        ),
+        alt.Chart(grouped).mark_text(fontSize=8).encode(
+            x=alt.X("hour:O", sort=list(range(24))),
+            y=alt.Y("month:N", sort=month_order),
+            text="label:N",
+            color=alt.condition("datum.price >= 120", alt.value("white"), alt.value(TEXT)),
+        ),
+    ).properties(title=f"YTD average hourly spot heatmap | {year}")
+    return apply_chart_style(chart, height=420)
 
 def negative_frequency_heatmap(price_hourly: pd.DataFrame, year: int, end_ts: pd.Timestamp):
     p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
@@ -1076,11 +1163,22 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         if "Revenue" in metric:
             return fmt_mw_revenue(value)
         return fmt_eur(value)
+
     display = df.copy()
     for col in ["Selected month", "YTD", "Annualized", "Previous year"]:
         display[col] = display.apply(lambda r: _fmt(r["Metric"], r[col]), axis=1)
+
+    def _row_style(row: pd.Series) -> list[str]:
+        metric = str(row.get("Metric", ""))
+        if metric.startswith("TB"):
+            return ["background-color: #EFF6FF; font-weight: 750;"] * len(row)
+        if metric.startswith("Revenue"):
+            return ["background-color: #ECFDF5; font-weight: 750;"] * len(row)
+        return [""] * len(row)
+
     return (
         display.style
+        .apply(_row_style, axis=1)
         .set_properties(**{"text-align": "center"})
         .set_table_styles([
             {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
@@ -1097,8 +1195,12 @@ def hybrid_proxy_monthly(monthly_capture: pd.DataFrame, bess: pd.DataFrame, sola
     solar_sum = solar.groupby("period", as_index=False)["solar_best_mw"].sum().rename(columns={"solar_best_mw": "solar_mwh"})
     out = monthly_capture.merge(bess, on="period", how="left").merge(solar_sum, on="period", how="left")
     out["baseload"] = out["avg_spot_price"]
-    out["hybrid_wo_demand"] = out["captured_solar_price_curtailed"] + out["revenue_wo_demand_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
-    out["hybrid_w_demand"] = out["captured_solar_price_curtailed"] + out["revenue_w_demand_1c_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
+    # Dashboard hybrid proxy = baseload + non-negative storage uplift per solar MWh.
+    # This keeps the proxy visually and economically interpretable as an uplift above baseload.
+    uplift_wo = out["revenue_wo_demand_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
+    uplift_w = out["revenue_w_demand_1c_eur_mw"] / out["solar_mwh"].where(out["solar_mwh"] != 0)
+    out["hybrid_wo_demand"] = out["baseload"] + uplift_wo.clip(lower=0)
+    out["hybrid_w_demand"] = out["baseload"] + uplift_w.clip(lower=0)
     return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
 
 def hybrid_chart(hybrid: pd.DataFrame):
@@ -1176,6 +1278,7 @@ selected_month = month_starts[option_labels.index(selected_label)]
 is_current_mtd = selected_month.year == today.year and selected_month.month == today.month
 report_end = month_end(selected_month, today if is_current_mtd else None)
 report_end = min(report_end, pd.Timestamp(latest_data_ts.date()))
+comparison_2025_end = comparable_ytd_end(report_end, 2025)
 
 pills([
     f"Report month: {selected_label}",
@@ -1203,49 +1306,89 @@ yoy = yoy_month(selected_month)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, month_end(yoy))
 
 c1, c2, c3 = st.columns(3)
-c1.metric(
-    f"Baseload | {month_label(selected_month, is_current_mtd)}",
-    fmt_eur(selected_metrics["avg_price"]),
-    help="Simple average of hourly day-ahead prices.",
-)
-c2.metric(
-    f"Previous month | {month_label(prev_month)}",
-    fmt_eur(prev_metrics["avg_price"]),
-)
-c3.metric(
-    f"Same month LY | {month_label(yoy)}",
-    fmt_eur(yoy_metrics["avg_price"]),
-)
+with c1:
+    st.metric(
+        f"Baseload | {month_label(selected_month, is_current_mtd)}",
+        fmt_eur(selected_metrics["avg_price"]),
+        help="Simple average of hourly day-ahead prices.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Prev. month baseload: <b>{fmt_eur(prev_metrics["avg_price"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["avg_price"])}</b></div>',
+        unsafe_allow_html=True,
+    )
+with c2:
+    st.metric(
+        f"Previous month | {month_label(prev_month)}",
+        fmt_eur(prev_metrics["avg_price"]),
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Solar unc.: <b>{fmt_eur(prev_metrics["captured_uncurtailed"])}</b><br>Solar curt.: <b>{fmt_eur(prev_metrics["captured_curtailed"])}</b></div>',
+        unsafe_allow_html=True,
+    )
+with c3:
+    st.metric(
+        f"Same month LY | {month_label(yoy)}",
+        fmt_eur(yoy_metrics["avg_price"]),
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Solar unc.: <b>{fmt_eur(yoy_metrics["captured_uncurtailed"])}</b><br>Solar curt.: <b>{fmt_eur(yoy_metrics["captured_curtailed"])}</b></div>',
+        unsafe_allow_html=True,
+    )
 
 c4, c5, c6 = st.columns(3)
-c4.metric(
-    f"Solar captured unc. | {month_label(selected_month, is_current_mtd)}",
-    fmt_eur(selected_metrics["captured_uncurtailed"]),
-    help="Generation-weighted solar captured price including zero/negative hours.",
-)
-c5.metric(
-    f"Solar captured curt. | {month_label(selected_month, is_current_mtd)}",
-    fmt_eur(selected_metrics["captured_curtailed"]),
-    help="Generation-weighted solar captured price excluding zero/negative price hours.",
-)
-c6.metric(
-    "Solar capture rate | curtailed",
-    fmt_pct(selected_metrics["capture_rate_curtailed"]),
-)
+with c4:
+    st.metric(
+        f"Solar captured unc. | {month_label(selected_month, is_current_mtd)}",
+        fmt_eur(selected_metrics["captured_uncurtailed"]),
+        help="Generation-weighted solar captured price including zero/negative hours.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(prev_metrics["captured_uncurtailed"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["captured_uncurtailed"])}</b></div>',
+        unsafe_allow_html=True,
+    )
+with c5:
+    st.metric(
+        f"Solar captured curt. | {month_label(selected_month, is_current_mtd)}",
+        fmt_eur(selected_metrics["captured_curtailed"]),
+        help="Generation-weighted solar captured price excluding zero/negative price hours.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(prev_metrics["captured_curtailed"])}</b><br>Same month LY: <b>{fmt_eur(yoy_metrics["captured_curtailed"])}</b></div>',
+        unsafe_allow_html=True,
+    )
+with c6:
+    st.metric(
+        "Solar capture rate | curtailed",
+        fmt_pct(selected_metrics["capture_rate_curtailed"]),
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Prev. month: <b>{fmt_pct(prev_metrics["capture_rate_curtailed"])}</b><br>Same month LY: <b>{fmt_pct(yoy_metrics["capture_rate_curtailed"])}</b></div>',
+        unsafe_allow_html=True,
+    )
 
 subsection("Monthly baseload vs Solar PV capture table | 2025 history and 2026 YTD")
-capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, selected_month, report_end)
+capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, forward_hourly, selected_month, report_end)
 st.dataframe(format_capture_table(capture_report), use_container_width=True, height=520)
 
-subsection("YTD spot market heatmap")
+subsection("YTD spot market heatmap | current year vs 2025")
 spot_heatmap = ytd_price_heatmap(price_hourly, selected_month.year, report_end)
 if spot_heatmap is not None:
     st.altair_chart(spot_heatmap, use_container_width=True)
+if selected_month.year == 2026:
+    spot_heatmap_2025 = ytd_price_heatmap(price_hourly, 2025, comparison_2025_end)
+    if spot_heatmap_2025 is not None:
+        st.markdown('<div class="comparison-note">2025 comparable YTD cut-off</div>', unsafe_allow_html=True)
+        st.altair_chart(spot_heatmap_2025, use_container_width=True)
 
-subsection("YTD zero / negative price frequency heatmap")
+subsection("YTD zero / negative price frequency heatmap | current year vs 2025")
 neg_heatmap = negative_frequency_heatmap(price_hourly, selected_month.year, report_end)
 if neg_heatmap is not None:
     st.altair_chart(neg_heatmap, use_container_width=True)
+if selected_month.year == 2026:
+    neg_heatmap_2025 = negative_frequency_heatmap(price_hourly, 2025, comparison_2025_end)
+    if neg_heatmap_2025 is not None:
+        st.markdown('<div class="comparison-note">2025 comparable YTD cut-off</div>', unsafe_allow_html=True)
+        st.altair_chart(neg_heatmap_2025, use_container_width=True)
 
 subsection("YTD 24h average market profile vs solar generation")
 hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, selected_month.year, report_end)
@@ -1258,6 +1401,12 @@ forward_curt = monthly_economic_curtailment_forward(forward_hourly, solar_hourly
 curt_chart = monthly_curtailment_chart(actual_curt, forward_curt, selected_month.year)
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
+if selected_month.year == 2026:
+    actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, comparison_2025_end)
+    curt_chart_2025 = monthly_curtailment_chart(actual_curt_2025, pd.DataFrame(), 2025)
+    if curt_chart_2025 is not None:
+        st.markdown('<div class="comparison-note">2025 comparable YTD actual economic curtailment</div>', unsafe_allow_html=True)
+        st.altair_chart(curt_chart_2025, use_container_width=True)
 
 # =========================================================
 # SECTION 2 — FORWARD MARKET
@@ -1266,7 +1415,7 @@ section("Forward Market", "📈")
 
 forward_snapshot = forward_snapshot_and_monthly_change(forward_history)
 if forward_snapshot.empty:
-    st.info("No normalized EEX/OMIP forward file was found in /data. Add eex_forward_market.xlsx or eex_forward_market.csv to activate the forward snapshot.")
+    st.info("No normalized EEX/OMIP forward-history file was found in /data. This snapshot only activates when eex_forward_market.xlsx or eex_forward_market.csv is present and normalizable; Aurora/Baringa scenario curves, when available, are used in the forecast comparisons above but do not populate this market snapshot.")
 else:
     as_of = pd.to_datetime(forward_snapshot["as_of_date"].iloc[0]).date()
     pills([f"Latest forward quote date: {as_of:%d %b %Y}", "Q+1 / Q+2", "Y+1 / Y+2", "Baseload + Solar"])
@@ -1317,7 +1466,7 @@ hybrid_plot = hybrid_chart(hybrid)
 if hybrid_plot is not None:
     st.altair_chart(hybrid_plot, use_container_width=True)
     if bess_source == "proxy":
-        st.caption("Hybrid captured prices are shown as a proxy uplift over curtailed solar captured price using the monthly BESS revenue proxy divided by monthly solar MWh.")
+        st.caption("Hybrid captured prices are shown as a dashboard proxy: monthly baseload plus a non-negative BESS revenue uplift divided by monthly solar MWh, so the hybrid series stays above baseload by construction.")
 else:
     st.info("No hybrid captured-price series could be generated. Add a hybrid monthly file in /data or ensure the solar and BESS inputs are populated.")
 
