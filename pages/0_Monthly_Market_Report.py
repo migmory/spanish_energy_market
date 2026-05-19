@@ -1304,7 +1304,7 @@ def forward_snapshot_chart(snapshot: pd.DataFrame):
         x=alt.X("period:N", title=None, sort=period_order),
         xOffset=alt.XOffset("curve_family:N"),
         y=alt.Y("latest_price:Q", title="Latest quote (€/MWh)"),
-        color=alt.Color("curve_family:N", title="Curve", scale=alt.Scale(domain=["Baseload", "Solar"], range=[BLUE, YELLOW_DARK])),
+        color=alt.Color("curve_family:N", title="Curve", scale=alt.Scale(domain=["Baseload", "Solar"], range=[BLUE, YELLOW])),
         tooltip=[
             alt.Tooltip("curve_family:N", title="Curve"),
             alt.Tooltip("period:N", title="Period"),
@@ -2013,13 +2013,29 @@ def hybrid_chart(hybrid: pd.DataFrame):
 # =========================================================
 # PDF EXPORT
 # =========================================================
-def _chart_to_png_bytes(chart) -> bytes | None:
+def _chart_to_png_bytes(chart, *, title: str = "") -> bytes | None:
+    """Render Altair charts for PDF with a controlled landscape aspect ratio.
+
+    Streamlit can display very wide charts cleanly, but inserting those same specs
+    in a landscape-A4 PDF makes the image collapse into a thin strip. For PDF
+    export we force balanced pixel dimensions before rasterising.
+    """
     if chart is None:
         return None
     try:
         import vl_convert as vlc
-        spec_json = chart.to_json()
-        return vlc.vegalite_to_png(spec_json, scale=4.2)
+
+        title_l = (title or "").lower()
+        if "hourly spot market heatmap" in title_l:
+            pdf_width, pdf_height, scale = 1120, 520, 3.2
+        elif "zero / negative price frequency heatmap" in title_l:
+            pdf_width, pdf_height, scale = 1050, 470, 3.2
+        else:
+            pdf_width, pdf_height, scale = 1020, 500, 3.0
+
+        chart_pdf = chart.properties(width=pdf_width, height=pdf_height)
+        spec_json = chart_pdf.to_json()
+        return vlc.vegalite_to_png(spec_json, scale=scale)
     except Exception:
         return None
 
@@ -2187,13 +2203,13 @@ def build_pdf_report_bytes(
 
     # Charts
     for title, chart in charts:
-        png = _chart_to_png_bytes(chart)
+        png = _chart_to_png_bytes(chart, title=title)
         if png is None:
             continue
         story.append(PageBreak())
         story.append(Paragraph(title, h_style))
         img = RLImage(BytesIO(png))
-        img._restrictSize(26.2 * cm, 14.6 * cm)
+        img._restrictSize(27.0 * cm, 15.8 * cm)
         story.append(img)
 
     # Forward
@@ -2234,17 +2250,17 @@ def build_pdf_report_bytes(
         width, height = landscape(A4)
 
         # Clear, visible corporate seal in the upper-right corner.
-        badge_x = width - 5.55 * cm
+        badge_x = width - 6.30 * cm
         badge_y = height - 1.18 * cm
-        badge_w = 4.78 * cm
-        badge_h = 0.52 * cm
+        badge_w = 5.55 * cm
+        badge_h = 0.64 * cm
         canvas.setFillColor(colors.HexColor("#D1FAE5"))
         canvas.setStrokeColor(colors.HexColor(CORP_GREEN_DARK))
         canvas.setLineWidth(0.7)
         canvas.roundRect(badge_x, badge_y, badge_w, badge_h, 0.14 * cm, fill=1, stroke=1)
         canvas.setFillColor(colors.HexColor(CORP_GREEN_DARK))
-        canvas.setFont("Helvetica-Bold", 8.5)
-        canvas.drawCentredString(badge_x + badge_w / 2, badge_y + 0.17 * cm, "NEXWELL POWER")
+        canvas.setFont("Helvetica-Bold", 9.5)
+        canvas.drawCentredString(badge_x + badge_w / 2, badge_y + 0.22 * cm, "NEXWELL POWER")
 
         # Compact footer metadata.
         canvas.setFillColor(colors.HexColor("#64748B"))
