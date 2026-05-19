@@ -2369,11 +2369,38 @@ def hybrid_chart(hybrid: pd.DataFrame):
 
     h["period"] = pd.to_datetime(h["period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     h = h.dropna(subset=["period"]).drop_duplicates(subset=["period"], keep="last").sort_values("period")
-    h["period_label"] = h["period"].dt.strftime("%b-%y")
-    period_order = h["period_label"].tolist()
+    h["axis_label"] = h["period"].dt.strftime("%b-%y")
+    h["period_group"] = "Monthly"
 
-    long = h.melt(
-        id_vars=["period", "period_label"],
+    # Add summary points after the monthly series so the chart closes with
+    # FY 2025 and 2026 YTD values. These summaries use the monthly series
+    # already shown in the chart, preserving the report's visual convention.
+    summary_rows = []
+    for label, subset in [
+        ("FY 2025", h[h["period"].dt.year == 2025]),
+        ("YTD 2026", h[h["period"].dt.year == 2026]),
+    ]:
+        if subset.empty:
+            continue
+        summary_rows.append(
+            {
+                "period": subset["period"].max(),
+                "axis_label": label,
+                "period_group": "Summary",
+                "baseload": subset["baseload"].mean(skipna=True),
+                "hybrid_wo_demand": subset["hybrid_wo_demand"].mean(skipna=True),
+                "hybrid_w_demand": subset["hybrid_w_demand"].mean(skipna=True),
+            }
+        )
+
+    h_display = h[["period", "axis_label", "period_group", "baseload", "hybrid_wo_demand", "hybrid_w_demand"]].copy()
+    if summary_rows:
+        h_display = pd.concat([h_display, pd.DataFrame(summary_rows)], ignore_index=True)
+
+    period_order = h_display["axis_label"].tolist()
+
+    long = h_display.melt(
+        id_vars=["period", "axis_label", "period_group"],
         value_vars=["baseload", "hybrid_wo_demand", "hybrid_w_demand"],
         var_name="series",
         value_name="value",
@@ -2388,7 +2415,7 @@ def hybrid_chart(hybrid: pd.DataFrame):
 
     chart = alt.Chart(long).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X(
-            "period_label:N",
+            "axis_label:N",
             title=None,
             sort=period_order,
             axis=alt.Axis(labelAngle=-35),
@@ -2407,11 +2434,12 @@ def hybrid_chart(hybrid: pd.DataFrame):
             legend=None,
         ),
         tooltip=[
-            alt.Tooltip("period:T", title="Month", format="%b %Y"),
+            alt.Tooltip("axis_label:N", title="Period"),
+            alt.Tooltip("period_group:N", title="Type"),
             alt.Tooltip("series:N", title="Series"),
             alt.Tooltip("value:Q", title="Captured price", format=",.2f"),
         ],
-    ).properties(title="Monthly baseload vs BESS-model captured hybrid price")
+    ).properties(title="Monthly baseload vs BESS-model captured hybrid price | FY 2025 and YTD 2026 summary")
     return apply_chart_style(chart, height=360)
 
 
