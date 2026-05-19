@@ -2369,38 +2369,11 @@ def hybrid_chart(hybrid: pd.DataFrame):
 
     h["period"] = pd.to_datetime(h["period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     h = h.dropna(subset=["period"]).drop_duplicates(subset=["period"], keep="last").sort_values("period")
-    h["axis_label"] = h["period"].dt.strftime("%b-%y")
-    h["period_group"] = "Monthly"
+    h["period_label"] = h["period"].dt.strftime("%b-%y")
+    period_order = h["period_label"].tolist()
 
-    # Add summary points after the monthly series so the chart closes with
-    # FY 2025 and 2026 YTD values. These summaries use the monthly series
-    # already shown in the chart, preserving the report's visual convention.
-    summary_rows = []
-    for label, subset in [
-        ("FY 2025", h[h["period"].dt.year == 2025]),
-        ("YTD 2026", h[h["period"].dt.year == 2026]),
-    ]:
-        if subset.empty:
-            continue
-        summary_rows.append(
-            {
-                "period": subset["period"].max(),
-                "axis_label": label,
-                "period_group": "Summary",
-                "baseload": subset["baseload"].mean(skipna=True),
-                "hybrid_wo_demand": subset["hybrid_wo_demand"].mean(skipna=True),
-                "hybrid_w_demand": subset["hybrid_w_demand"].mean(skipna=True),
-            }
-        )
-
-    h_display = h[["period", "axis_label", "period_group", "baseload", "hybrid_wo_demand", "hybrid_w_demand"]].copy()
-    if summary_rows:
-        h_display = pd.concat([h_display, pd.DataFrame(summary_rows)], ignore_index=True)
-
-    period_order = h_display["axis_label"].tolist()
-
-    long = h_display.melt(
-        id_vars=["period", "axis_label", "period_group"],
+    long = h.melt(
+        id_vars=["period", "period_label"],
         value_vars=["baseload", "hybrid_wo_demand", "hybrid_w_demand"],
         var_name="series",
         value_name="value",
@@ -2415,7 +2388,7 @@ def hybrid_chart(hybrid: pd.DataFrame):
 
     chart = alt.Chart(long).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X(
-            "axis_label:N",
+            "period_label:N",
             title=None,
             sort=period_order,
             axis=alt.Axis(labelAngle=-35),
@@ -2434,13 +2407,73 @@ def hybrid_chart(hybrid: pd.DataFrame):
             legend=None,
         ),
         tooltip=[
-            alt.Tooltip("axis_label:N", title="Period"),
-            alt.Tooltip("period_group:N", title="Type"),
+            alt.Tooltip("period:T", title="Month", format="%b %Y"),
             alt.Tooltip("series:N", title="Series"),
             alt.Tooltip("value:Q", title="Captured price", format=",.2f"),
         ],
-    ).properties(title="Monthly baseload vs BESS-model captured hybrid price | FY 2025 and YTD 2026 summary")
+    ).properties(title="Monthly baseload vs BESS-model captured hybrid price")
     return apply_chart_style(chart, height=360)
+
+
+def _hybrid_summary_values(hybrid: pd.DataFrame, year: int) -> dict[str, float | None]:
+    """Return summary price levels for the BESS chart cards."""
+    if hybrid is None or hybrid.empty:
+        return {"baseload": None, "hybrid_wo_demand": None, "hybrid_w_demand": None}
+    h = hybrid.copy()
+    h["period"] = pd.to_datetime(h["period"], errors="coerce")
+    h = h.dropna(subset=["period"])
+    h = h[h["period"].dt.year == year].copy()
+    if h.empty:
+        return {"baseload": None, "hybrid_wo_demand": None, "hybrid_w_demand": None}
+    return {
+        "baseload": float(pd.to_numeric(h["baseload"], errors="coerce").mean()),
+        "hybrid_wo_demand": float(pd.to_numeric(h["hybrid_wo_demand"], errors="coerce").mean()),
+        "hybrid_w_demand": float(pd.to_numeric(h["hybrid_w_demand"], errors="coerce").mean()),
+    }
+
+
+def _fmt_hybrid_card_value(value: float | None) -> str:
+    return "—" if value is None or pd.isna(value) else f"{value:,.1f} €/MWh"
+
+
+def render_hybrid_summary_cards(hybrid: pd.DataFrame) -> None:
+    fy_2025 = _hybrid_summary_values(hybrid, 2025)
+    ytd_2026 = _hybrid_summary_values(hybrid, 2026)
+
+    def card_html(title: str, values: dict[str, float | None]) -> str:
+        return f"""
+        <div style="
+            border:1px solid #D9E7F3;
+            border-radius:16px;
+            padding:14px 16px;
+            background:linear-gradient(180deg, #FFFFFF 0%, #F8FBFF 100%);
+            box-shadow:0 4px 14px rgba(15, 23, 42, 0.04);
+            min-height:122px;
+        ">
+            <div style="font-weight:800; font-size:1.02rem; color:#0F172A; margin-bottom:10px;">{title}</div>
+            <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:10px;">
+                <div style="border-left:4px solid {BLUE}; padding-left:10px;">
+                    <div style="font-size:0.78rem; color:#64748B; font-weight:700;">Baseload</div>
+                    <div style="font-size:1.18rem; font-weight:850; color:#0F172A;">{_fmt_hybrid_card_value(values["baseload"])}</div>
+                </div>
+                <div style="border-left:4px solid {YELLOW_DARK}; padding-left:10px;">
+                    <div style="font-size:0.78rem; color:#64748B; font-weight:700;">Hybrid w/o demand</div>
+                    <div style="font-size:1.18rem; font-weight:850; color:#0F172A;">{_fmt_hybrid_card_value(values["hybrid_wo_demand"])}</div>
+                </div>
+                <div style="border-left:4px solid {CORP_GREEN}; padding-left:10px;">
+                    <div style="font-size:0.78rem; color:#64748B; font-weight:700;">Hybrid w. demand</div>
+                    <div style="font-size:1.18rem; font-weight:850; color:#0F172A;">{_fmt_hybrid_card_value(values["hybrid_w_demand"])}</div>
+                </div>
+            </div>
+        </div>
+        """
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown(card_html("2025 full-year summary", fy_2025), unsafe_allow_html=True)
+    with right:
+        st.markdown(card_html("2026 YTD summary", ytd_2026), unsafe_allow_html=True)
+    st.caption("Summary cards show the average of the monthly values displayed in the chart.")
 
 
 
@@ -2974,10 +3007,8 @@ else:
 section("BESS", "🔋")
 
 bess_monthly, bess_source = load_or_build_bess_monthly(price_hourly, solar_hourly)
-if bess_source == "proxy":
-    card_note("BESS values are generated with a dashboard proxy when no dedicated BESS monthly input file is found. The proxy uses hourly spot prices, Top/Bottom spreads and a simplified 4h arbitrage logic with RTE = 85%.")
-else:
-    card_note("BESS values are being read from the dedicated monthly BESS file in /data.")
+# Keep the BESS section clean in the report view.
+# Source/methodology details are already reflected in the tables, chart caption and PDF content.
 
 subsection("Top-Bottom spreads and BESS revenue overview")
 bess_summary = bess_summary_table(bess_monthly, selected_month, report_end)
@@ -2989,6 +3020,8 @@ else:
 subsection("Monthly BESS-model captured hybrid price vs monthly baseload")
 hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(price_hourly)
 hybrid = hybrid_actual_monthly(monthly_capture, hybrid_capture_monthly)
+if not hybrid.empty:
+    render_hybrid_summary_cards(hybrid)
 hybrid_plot = hybrid_chart(hybrid)
 if hybrid_plot is not None:
     st.altair_chart(hybrid_plot, use_container_width=True)
