@@ -557,7 +557,7 @@ def build_report_capture_table(monthly: pd.DataFrame, price_hourly: pd.DataFrame
     monthly["year"] = monthly["period"].dt.year
     monthly["month_num"] = monthly["period"].dt.month
     for m in range(1, 13):
-        row = {"Month": month_names[m]}
+        row = {"Month": month_names[m - 1]}
         for year in [2025, 2026]:
             hit = monthly[(monthly["year"] == year) & (monthly["month_num"] == m)]
             prefix = str(year)
