@@ -1005,6 +1005,264 @@ def negative_frequency_heatmap(
     return apply_chart_style(chart, height=max(260, 42 * len(month_numbers) + 120))
 
 
+
+def _negative_event_monthly_counts(
+    hourly: pd.DataFrame,
+    *,
+    year: int,
+    end_ts: pd.Timestamp | None = None,
+    model: str | None = None,
+    source: str = "Actual",
+) -> pd.DataFrame:
+    """Monthly hours with negative and zero/negative prices."""
+    cols = ["month_num", "Month", "Source", "Negative hours", "Zero / negative hours"]
+    if hourly is None or hourly.empty:
+        return pd.DataFrame(columns=cols)
+
+    p = hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"])
+    p = p[p["datetime"].dt.year == year].copy()
+    if model is not None and "model" in p.columns:
+        p = p[p["model"].astype(str) == str(model)].copy()
+    if end_ts is not None:
+        p = p[p["datetime"] <= pd.Timestamp(end_ts) + pd.Timedelta(days=1)].copy()
+    if p.empty:
+        return pd.DataFrame(columns=cols)
+
+    p["month_num"] = p["datetime"].dt.month
+    p["negative_flag"] = (p["price"] < 0).astype(int)
+    p["zero_negative_flag"] = (p["price"] <= 0).astype(int)
+    grouped = (
+        p.groupby("month_num", as_index=False)
+        .agg(
+            **{
+                "Negative hours": ("negative_flag", "sum"),
+                "Zero / negative hours": ("zero_negative_flag", "sum"),
+            }
+        )
+        .sort_values("month_num")
+        .reset_index(drop=True)
+    )
+    grouped["Month"] = grouped["month_num"].map(lambda m: calendar.month_abbr[int(m)])
+    grouped["Source"] = source
+    return grouped[cols]
+
+
+def _negative_event_cumulative_chart_frame(
+    hourly: pd.DataFrame,
+    *,
+    year: int,
+    metric: str,
+    end_ts: pd.Timestamp | None = None,
+    model: str | None = None,
+    series_label: str | None = None,
+    curve_type: str = "Actual",
+) -> pd.DataFrame:
+    counts = _negative_event_monthly_counts(
+        hourly,
+        year=year,
+        end_ts=end_ts,
+        model=model,
+        source=series_label or str(year),
+    )
+    if counts.empty:
+        return pd.DataFrame(columns=["month_num", "Month", "Series", "Curve type", "Cum. hours"])
+    out = counts[["month_num", "Month", metric]].copy()
+    out["Series"] = series_label or str(year)
+    out["Curve type"] = curve_type
+    out["Cum. hours"] = out[metric].cumsum()
+    return out[["month_num", "Month", "Series", "Curve type", "Cum. hours"]]
+
+
+def negative_zero_price_overlay_chart(
+    price_hourly: pd.DataFrame,
+    forward_scenarios: pd.DataFrame,
+    report_end: pd.Timestamp,
+    metric_label: str,
+):
+    """Overlay annual cumulative counts plus 2026 Aurora/Baringa forecasts."""
+    metric = "Negative hours" if metric_label == "Only negative prices" else "Zero / negative hours"
+    frames: list[pd.DataFrame] = []
+    actual_years = sorted(
+        [int(y) for y in pd.to_datetime(price_hourly.get("datetime"), errors="coerce").dt.year.dropna().unique().tolist()]
+    ) if not price_hourly.empty else []
+    actual_years = [y for y in actual_years if 2021 <= y <= 2026]
+    for yr in actual_years:
+        end = report_end if yr == 2026 else pd.Timestamp(yr, 12, 31)
+        frame = _negative_event_cumulative_chart_frame(
+            price_hourly,
+            year=yr,
+            metric=metric,
+            end_ts=end,
+            series_label=str(yr),
+            curve_type="Actual",
+        )
+        if not frame.empty:
+            frames.append(frame)
+
+    if forward_scenarios is not None and not forward_scenarios.empty:
+        for model in ["Aurora", "Baringa"]:
+            frame = _negative_event_cumulative_chart_frame(
+                forward_scenarios,
+                year=2026,
+                metric=metric,
+                end_ts=None,
+                model=model,
+                series_label=model,
+                curve_type="Forecast",
+            )
+            if not frame.empty:
+                frames.append(frame)
+
+    if not frames:
+        return None
+    plot = pd.concat(frames, ignore_index=True)
+    series_order = [str(y) for y in actual_years] + [m for m in ["Aurora", "Baringa"] if m in plot["Series"].astype(str).unique().tolist()]
+    actual_palette = {
+        "2021": "#2563EB",
+        "2022": "#10B981",
+        "2023": "#D97706",
+        "2024": "#7C3AED",
+        "2025": "#DC2626",
+        "2026": "#0EA5E9",
+    }
+    palette = [actual_palette.get(s, GREY) if s not in {"Aurora", "Baringa"} else (AURORA_COLOR if s == "Aurora" else BARINGA_COLOR) for s in series_order]
+    title = "Cumulative negative-price hours" if metric == "Negative hours" else "Cumulative zero / negative-price hours"
+    chart = alt.Chart(plot).mark_line(point=alt.OverlayMarkDef(filled=True, size=54), strokeWidth=2.8).encode(
+        x=alt.X(
+            "month_num:O",
+            sort=list(range(1, 13)),
+            axis=alt.Axis(
+                title=None,
+                labelAngle=0,
+                labelExpr="['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value-1]",
+            ),
+        ),
+        y=alt.Y("Cum. hours:Q", title="Cumulative hours"),
+        color=alt.Color(
+            "Series:N",
+            title="Series",
+            scale=alt.Scale(domain=series_order, range=palette),
+            legend=alt.Legend(symbolStrokeWidth=3),
+        ),
+        strokeDash=alt.StrokeDash(
+            "Curve type:N",
+            title="Line style",
+            scale=alt.Scale(domain=["Actual", "Forecast"], range=[[1, 0], [7, 3]]),
+        ),
+        tooltip=[
+            alt.Tooltip("Series:N", title="Series"),
+            alt.Tooltip("Curve type:N", title="Type"),
+            alt.Tooltip("Month:N", title="Month"),
+            alt.Tooltip("Cum. hours:Q", title="Cumulative hours", format=",.0f"),
+        ],
+    ).properties(title=title)
+    return apply_chart_style(chart, height=360)
+
+
+def negative_zero_summary_table(
+    price_hourly: pd.DataFrame,
+    forward_scenarios: pd.DataFrame,
+    report_end: pd.Timestamp,
+) -> pd.DataFrame:
+    rows: list[pd.DataFrame] = []
+
+    actual_2025 = _negative_event_monthly_counts(
+        price_hourly,
+        year=2025,
+        end_ts=pd.Timestamp(2025, 12, 31),
+        source="2025 actual",
+    )
+    if not actual_2025.empty:
+        rows.append(actual_2025)
+        rows.append(pd.DataFrame([{
+            "month_num": 99,
+            "Month": "TOTAL 2025",
+            "Source": "2025 actual",
+            "Negative hours": int(actual_2025["Negative hours"].sum()),
+            "Zero / negative hours": int(actual_2025["Zero / negative hours"].sum()),
+        }]))
+
+    actual_2026 = _negative_event_monthly_counts(
+        price_hourly,
+        year=2026,
+        end_ts=report_end,
+        source="2026 actual",
+    )
+    if not actual_2026.empty:
+        actual_2026 = actual_2026.copy()
+        if report_end.year == 2026 and report_end.month in actual_2026["month_num"].tolist():
+            actual_2026.loc[actual_2026["month_num"] == report_end.month, "Month"] = actual_2026.loc[
+                actual_2026["month_num"] == report_end.month, "Month"
+            ].astype(str) + " (MTD)"
+        rows.append(actual_2026)
+        rows.append(pd.DataFrame([{
+            "month_num": 199,
+            "Month": "YTD 2026",
+            "Source": "2026 actual",
+            "Negative hours": int(actual_2026["Negative hours"].sum()),
+            "Zero / negative hours": int(actual_2026["Zero / negative hours"].sum()),
+        }]))
+
+    if forward_scenarios is not None and not forward_scenarios.empty:
+        for model in ["Aurora", "Baringa"]:
+            f = _negative_event_monthly_counts(
+                forward_scenarios,
+                year=2026,
+                end_ts=report_end,
+                model=model,
+                source=f"YTD {model}",
+            )
+            if not f.empty:
+                rows.append(pd.DataFrame([{
+                    "month_num": 299 if model == "Aurora" else 300,
+                    "Month": f"YTD {model}",
+                    "Source": model,
+                    "Negative hours": int(f["Negative hours"].sum()),
+                    "Zero / negative hours": int(f["Zero / negative hours"].sum()),
+                }]))
+
+    if not rows:
+        return pd.DataFrame(columns=["Month", "Source", "Negative hours", "Zero / negative hours"])
+    out = pd.concat(rows, ignore_index=True)
+    out = out.sort_values(["month_num", "Source"]).reset_index(drop=True)
+    return out[["Month", "Source", "Negative hours", "Zero / negative hours"]]
+
+
+def style_negative_zero_summary_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def _row_style(row: pd.Series) -> list[str]:
+        src = str(row.get("Source", ""))
+        month = str(row.get("Month", ""))
+        if src == "Aurora":
+            return ["background-color: #FFF7ED; font-weight: 800;"] * len(row)
+        if src == "Baringa":
+            return ["background-color: #EFF6FF; font-weight: 800;"] * len(row)
+        if src == "2026 actual":
+            base = "background-color: #F0F9FF;"
+        elif src == "2025 actual":
+            base = "background-color: #F8FAFC;"
+        else:
+            base = ""
+        if "TOTAL" in month or "YTD" in month:
+            base += " font-weight: 900; border-top: 2px solid #CBD5E1;"
+        return [base] * len(row)
+
+    return (
+        df.style
+        .format({
+            "Negative hours": "{:,.0f}",
+            "Zero / negative hours": "{:,.0f}",
+        }, na_rep="—")
+        .apply(_row_style, axis=1)
+        .set_properties(**{"text-align": "center"})
+        .set_table_styles([
+            {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
+            {"selector": "td", "props": [("padding", "5px 7px")]},
+        ])
+    )
+
 def ytd_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, forward_scenarios: pd.DataFrame, year: int, end_ts: pd.Timestamp):
     p = price_hourly[(price_hourly["datetime"].dt.year == year) & (price_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
     s = solar_hourly[(solar_hourly["datetime"].dt.year == year) & (solar_hourly["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
@@ -2070,6 +2328,7 @@ def build_pdf_report_bytes(
     prev_metrics: dict,
     yoy_metrics: dict,
     capture_report: pd.DataFrame,
+    negative_summary: pd.DataFrame,
     forward_snapshot: pd.DataFrame,
     bess_summary: pd.DataFrame,
     charts: list[tuple[str, object]],
@@ -2200,6 +2459,22 @@ def build_pdf_report_bytes(
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(cap_table)
+
+    # Negative / zero-price summary
+    story.append(Paragraph("Negative and zero-price hours", h_style))
+    negative_data = _pdf_table_data(negative_summary)
+    negative_table = Table(negative_data, repeatRows=1)
+    negative_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#475569")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("GRID", (0, 0), (-1, -1), 0.18, colors.HexColor("#CBD5E1")),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.2),
+        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(negative_table)
 
     # Charts
     for title, chart in charts:
@@ -2419,6 +2694,37 @@ if neg_heatmap_2025 is not None:
     st.markdown('<div class="comparison-note">2025 — full-year monthly frequency heatmap</div>', unsafe_allow_html=True)
     st.altair_chart(neg_heatmap_2025, use_container_width=True)
 
+
+subsection("Negative and zero-price hours | annual overlap and 2026 scenario benchmark")
+negative_metric_choice = st.radio(
+    "Negative-price line metric",
+    ["Only negative prices", "Zero and negative prices"],
+    horizontal=True,
+    index=0,
+    key="monthly_report_negative_price_metric",
+)
+negative_overlay_chart = negative_zero_price_overlay_chart(
+    price_hourly,
+    forward_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+    negative_metric_choice,
+)
+negative_summary = negative_zero_summary_table(
+    price_hourly,
+    forward_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+)
+neg_left, neg_right = st.columns([2.05, 1.15])
+with neg_left:
+    if negative_overlay_chart is not None:
+        st.altair_chart(negative_overlay_chart, use_container_width=True)
+with neg_right:
+    st.markdown('<div class="comparison-note">Monthly count table: 2025 actual, 2026 actual YTD and YTD scenario benchmark</div>', unsafe_allow_html=True)
+    if not negative_summary.empty:
+        st.dataframe(style_negative_zero_summary_table(negative_summary), use_container_width=True, height=520)
+    else:
+        st.info("No negative-price summary could be calculated from the available hourly prices.")
+
 subsection("YTD 24h average market profile vs solar generation")
 hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, selected_month.year, report_end)
 if hourly_overlay is not None:
@@ -2523,6 +2829,7 @@ for _year, _end in [(2026, pd.Timestamp(latest_data_ts.date())), (2025, pd.Times
 pdf_charts = pdf_spot_heatmaps + [
     ("2026 zero / negative price frequency heatmap", neg_heatmap_2026),
     ("2025 zero / negative price frequency heatmap", neg_heatmap_2025),
+    ("Negative / zero-price cumulative hours | scenario overlay", negative_overlay_chart),
     ("YTD 24h average market profile vs solar generation", hourly_overlay),
     ("2026 monthly economic curtailment", curt_chart_2026),
     ("2025 full-year economic curtailment", curt_chart_2025),
@@ -2536,6 +2843,7 @@ pdf_bytes = build_pdf_report_bytes(
     prev_metrics=prev_metrics,
     yoy_metrics=yoy_metrics,
     capture_report=capture_report,
+    negative_summary=negative_summary,
     forward_snapshot=forward_snapshot,
     bess_summary=bess_summary,
     charts=pdf_charts,
