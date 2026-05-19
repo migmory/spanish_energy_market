@@ -804,6 +804,122 @@ def ytd_price_heatmap(price_hourly: pd.DataFrame, year: int, end_ts: pd.Timestam
     return apply_chart_style(chart, height=455)
 
 
+def pdf_hourly_spot_heatmap_segment(
+    price_hourly: pd.DataFrame,
+    year: int,
+    month_start_num: int,
+    month_end_num: int,
+    end_ts: pd.Timestamp,
+):
+    """PDF-friendly hourly spot heatmap split into shorter calendar blocks.
+
+    Full-year 24 x 365 heatmaps are excellent on the web, but become too flat in
+    landscape A4 PDF. This helper keeps the same hourly granularity while splitting
+    the year into multi-month segments so the rendered image remains legible.
+    """
+    if price_hourly.empty:
+        return None
+
+    seg_start = pd.Timestamp(year, month_start_num, 1)
+    seg_end = pd.Timestamp(year, month_end_num, calendar.monthrange(year, month_end_num)[1])
+
+    tmp = price_hourly.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp["price"] = pd.to_numeric(tmp["price"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime", "price"])
+    tmp = tmp[
+        (tmp["datetime"] >= seg_start)
+        & (tmp["datetime"] <= min(seg_end + pd.Timedelta(hours=23), end_ts + pd.Timedelta(days=1)))
+    ].copy()
+
+    full_days = pd.date_range(seg_start.normalize(), seg_end.normalize(), freq="D")
+    if len(full_days) == 0:
+        return None
+    full_grid = pd.MultiIndex.from_product([full_days, range(24)], names=["date", "hour"]).to_frame(index=False)
+    full_grid["date"] = pd.to_datetime(full_grid["date"])
+    full_grid["datetime"] = full_grid["date"] + pd.to_timedelta(full_grid["hour"], unit="h")
+    full_grid["date_label"] = full_grid["date"].dt.strftime("%Y-%m-%d")
+    full_grid["segment_day"] = (full_grid["date"] - full_grid["date"].min()).dt.days + 1
+
+    if tmp.empty:
+        hourly = pd.DataFrame(columns=["date", "hour", "price"])
+    else:
+        tmp["date"] = tmp["datetime"].dt.normalize()
+        tmp["hour"] = tmp["datetime"].dt.hour
+        hourly = tmp.groupby(["date", "hour"], as_index=False)["price"].mean()
+
+    plot = full_grid.merge(hourly, on=["date", "hour"], how="left")
+    plot["is_missing"] = plot["price"].isna()
+    valid = plot["price"].dropna()
+    if valid.empty:
+        return None
+
+    p_low = float(min(valid.min(), valid.quantile(0.01), 0.0))
+    p_high = float(max(valid.quantile(0.99), 120.0))
+    if p_high <= p_low:
+        p_high = p_low + 1.0
+    p_mid_1 = p_low + (p_high - p_low) * 0.30
+    p_mid_2 = p_low + (p_high - p_low) * 0.55
+    p_mid_3 = p_low + (p_high - p_low) * 0.78
+
+    month_ticks = []
+    month_labels = []
+    for m in range(month_start_num, month_end_num + 1):
+        tick = int((pd.Timestamp(year, m, 1) - seg_start).days + 1)
+        month_ticks.append(tick)
+        month_labels.append(calendar.month_abbr[m])
+    label_expr = " : ".join([f"datum.value == {tick} ? '{label}'" for tick, label in zip(month_ticks, month_labels)]) + " : ''"
+
+    x_enc = alt.X(
+        "segment_day:O",
+        title="Month",
+        sort=list(range(1, int(plot["segment_day"].max()) + 1)),
+        axis=alt.Axis(values=month_ticks, labelExpr=label_expr, labelAngle=0, grid=False, ticks=True, domain=True),
+    )
+    y_enc = alt.Y(
+        "hour:O",
+        title="Hour",
+        sort=list(range(24)),
+        axis=alt.Axis(values=list(range(0, 24, 2))),
+    )
+    base = alt.Chart(plot)
+
+    rect_missing = base.transform_filter("datum.is_missing").mark_rect(
+        fill="#F3F4F6",
+        stroke="#F3F4F6",
+    ).encode(
+        x=x_enc,
+        y=y_enc,
+        tooltip=[
+            alt.Tooltip("date_label:N", title="Date"),
+            alt.Tooltip("hour:O", title="Hour"),
+        ],
+    )
+
+    rect_prices = base.transform_filter("!datum.is_missing").mark_rect().encode(
+        x=x_enc,
+        y=y_enc,
+        color=alt.Color(
+            "price:Q",
+            title="Spot [€/MWh]",
+            scale=alt.Scale(
+                domain=[p_low, p_mid_1, p_mid_2, p_mid_3, p_high],
+                range=["#047857", "#86EFAC", "#FEF08A", "#FB923C", "#B91C1C"],
+                clamp=True,
+            ),
+            legend=alt.Legend(orient="right", title="Spot [€/MWh]"),
+        ),
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Datetime", format="%Y-%m-%d %H:%M"),
+            alt.Tooltip("price:Q", title="Spot €/MWh", format=",.2f"),
+        ],
+    )
+    chart = alt.layer(rect_missing, rect_prices).properties(
+        title=f"OMIE hourly price heatmap | {year} | {calendar.month_abbr[month_start_num]}-{calendar.month_abbr[month_end_num]}"
+    )
+    return apply_chart_style(chart, height=510)
+
+
 def _completed_month_numbers(year: int, end_ts: pd.Timestamp) -> list[int]:
     if year < end_ts.year:
         return list(range(1, 13))
@@ -1146,6 +1262,39 @@ def forward_snapshot_and_monthly_change(history: pd.DataFrame) -> pd.DataFrame:
     out["monthly_change_pct"] = (out["latest_price"] / out["m_minus_1_price"] - 1.0)
     out["as_of_date"] = latest_date
     return out[cols].sort_values(["period", "curve_family"]).reset_index(drop=True)
+
+def style_forward_snapshot_table(df: pd.DataFrame):
+    def shade_curve(row: pd.Series):
+        curve = str(row.get("Curve", "")).strip().lower()
+        if curve == "baseload":
+            base = "background-color: #EAF2FF;"
+        elif curve == "solar":
+            base = "background-color: #FFF4CC;"
+        else:
+            base = ""
+        styles = [base for _ in row.index]
+        for i, col in enumerate(row.index):
+            if col in {"Latest quote", "Quote one month ago"}:
+                if curve == "baseload":
+                    styles[i] = base + " font-weight: 700; color: #1D4ED8;"
+                elif curve == "solar":
+                    styles[i] = base + " font-weight: 700; color: #9A6700;"
+        return styles
+
+    return (
+        df.style
+        .format({
+            "Latest quote": "{:,.2f}",
+            "Quote one month ago": "{:,.2f}",
+            "M-1 change": "{:.1%}",
+        }, na_rep="—")
+        .apply(shade_curve, axis=1)
+        .set_table_styles([
+            {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
+            {"selector": "td", "props": [("padding", "6px 8px")]},
+        ])
+    )
+
 
 def forward_snapshot_chart(snapshot: pd.DataFrame):
     if snapshot.empty:
@@ -1811,30 +1960,45 @@ def hybrid_chart(hybrid: pd.DataFrame):
     h = hybrid[hybrid["period"] >= pd.Timestamp(2025, 1, 1)].copy()
     if h.empty:
         return None
+
+    h["period"] = pd.to_datetime(h["period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    h = h.dropna(subset=["period"]).drop_duplicates(subset=["period"], keep="last").sort_values("period")
+    h["period_label"] = h["period"].dt.strftime("%b-%y")
+    period_order = h["period_label"].tolist()
+
     long = h.melt(
-        id_vars=["period"],
+        id_vars=["period", "period_label"],
         value_vars=["baseload", "hybrid_wo_demand", "hybrid_w_demand"],
         var_name="series",
         value_name="value",
     ).dropna(subset=["value"])
+
     names = {
-        "baseload": "Monthly baseload",
-        "hybrid_wo_demand": "Captured Hybrid w/o demand | 1c/day",
-        "hybrid_w_demand": "Captured Hybrid w. demand | 1c/day",
+        "baseload": "Baseload",
+        "hybrid_wo_demand": "Hybrid w/o demand",
+        "hybrid_w_demand": "Hybrid w. demand",
     }
     long["series"] = long["series"].map(names)
+
     chart = alt.Chart(long).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("period:T", title=None, axis=alt.Axis(format="%b-%y", labelAngle=-35)),
+        x=alt.X(
+            "period_label:N",
+            title=None,
+            sort=period_order,
+            axis=alt.Axis(labelAngle=-35),
+        ),
         y=alt.Y("value:Q", title="€/MWh", scale=alt.Scale(zero=False)),
         color=alt.Color(
             "series:N",
             title="Series",
             scale=alt.Scale(domain=list(names.values()), range=[BLUE, YELLOW_DARK, CORP_GREEN]),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=260, titleLimit=260, symbolLimit=260),
         ),
         strokeDash=alt.StrokeDash(
             "series:N",
             title="Series",
             scale=alt.Scale(domain=list(names.values()), range=[[1, 0], [6, 3], [3, 2]]),
+            legend=None,
         ),
         tooltip=[
             alt.Tooltip("period:T", title="Month", format="%b %Y"),
@@ -1843,6 +2007,7 @@ def hybrid_chart(hybrid: pd.DataFrame):
         ],
     ).properties(title="Monthly baseload vs BESS-model captured hybrid price")
     return apply_chart_style(chart, height=360)
+
 
 
 # =========================================================
@@ -1854,7 +2019,7 @@ def _chart_to_png_bytes(chart) -> bytes | None:
     try:
         import vl_convert as vlc
         spec_json = chart.to_json()
-        return vlc.vegalite_to_png(spec_json, scale=2.8)
+        return vlc.vegalite_to_png(spec_json, scale=4.2)
     except Exception:
         return None
 
@@ -2067,9 +2232,24 @@ def build_pdf_report_bytes(
     def _draw_stamp(canvas, doc):
         canvas.saveState()
         width, height = landscape(A4)
-        canvas.setFillColor(colors.HexColor("#94A3B8"))
+
+        # Clear, visible corporate seal in the upper-right corner.
+        badge_x = width - 5.55 * cm
+        badge_y = height - 1.18 * cm
+        badge_w = 4.78 * cm
+        badge_h = 0.52 * cm
+        canvas.setFillColor(colors.HexColor("#D1FAE5"))
+        canvas.setStrokeColor(colors.HexColor(CORP_GREEN_DARK))
+        canvas.setLineWidth(0.7)
+        canvas.roundRect(badge_x, badge_y, badge_w, badge_h, 0.14 * cm, fill=1, stroke=1)
+        canvas.setFillColor(colors.HexColor(CORP_GREEN_DARK))
+        canvas.setFont("Helvetica-Bold", 8.5)
+        canvas.drawCentredString(badge_x + badge_w / 2, badge_y + 0.17 * cm, "NEXWELL POWER")
+
+        # Compact footer metadata.
+        canvas.setFillColor(colors.HexColor("#64748B"))
         canvas.setFont("Helvetica-Bold", 7)
-        canvas.drawRightString(width - 0.75 * cm, 0.42 * cm, "NEXWELLPOWER | Monthly Market Report")
+        canvas.drawRightString(width - 0.75 * cm, 0.42 * cm, "Monthly Market Report")
         canvas.setFont("Helvetica", 7)
         canvas.drawString(0.75 * cm, 0.42 * cm, f"Generated from the dashboard | {datetime.now():%Y-%m-%d %H:%M}")
         canvas.restoreState()
@@ -2273,14 +2453,7 @@ else:
         "m_minus_1_price": "Quote one month ago",
     })
     st.dataframe(
-        forward_display.style.format({
-            "Latest quote": "{:,.2f}",
-            "Quote one month ago": "{:,.2f}",
-            "M-1 change": "{:.1%}",
-        }, na_rep="—").set_table_styles([
-            {"selector": "th", "props": [("background-color", "#475569"), ("color", "white"), ("font-weight", "bold"), ("text-align", "center")]},
-            {"selector": "td", "props": [("padding", "6px 8px")]},
-        ]),
+        style_forward_snapshot_table(forward_display),
         use_container_width=True,
     )
 
@@ -2324,9 +2497,14 @@ st.caption("Monthly Market Report | Corporate dashboard based on the app's hourl
 # PDF DOWNLOAD
 # =========================================================
 section("Download full report", "📄")
-pdf_charts = [
-    ("2026 hourly spot market heatmap", spot_heatmap_2026),
-    ("2025 full-year hourly spot market heatmap", spot_heatmap_2025),
+pdf_spot_heatmaps = []
+for _year, _end in [(2026, pd.Timestamp(latest_data_ts.date())), (2025, pd.Timestamp(2025, 12, 31))]:
+    for _m0, _m1 in [(1, 3), (4, 6), (7, 9), (10, 12)]:
+        _seg = pdf_hourly_spot_heatmap_segment(price_hourly, _year, _m0, _m1, _end)
+        if _seg is not None:
+            pdf_spot_heatmaps.append((f"{_year} hourly spot market heatmap | {calendar.month_abbr[_m0]}-{calendar.month_abbr[_m1]}", _seg))
+
+pdf_charts = pdf_spot_heatmaps + [
     ("2026 zero / negative price frequency heatmap", neg_heatmap_2026),
     ("2025 zero / negative price frequency heatmap", neg_heatmap_2025),
     ("YTD 24h average market profile vs solar generation", hourly_overlay),
@@ -2353,4 +2531,3 @@ st.download_button(
     mime="application/pdf",
     use_container_width=True,
 )
-st.caption("PDF export includes the dashboard summary, charts, comparison tables and a NEXWELLPOWER stamp.")
