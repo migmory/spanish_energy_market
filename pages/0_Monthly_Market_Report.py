@@ -2812,6 +2812,38 @@ def zero_negative_hours_in_period(price_hourly: pd.DataFrame, start_ts: pd.Times
     return int((values <= 0).sum())
 
 
+def economic_curtailment_period_value(
+    price_hourly: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    if price_hourly is None or price_hourly.empty or solar_hourly is None or solar_hourly.empty:
+        return None
+    p = price_hourly[
+        (price_hourly["datetime"] >= start_ts)
+        & (price_hourly["datetime"] < end_ts + pd.Timedelta(days=1))
+    ][["datetime", "price"]].copy()
+    s = solar_hourly[
+        (solar_hourly["datetime"] >= start_ts)
+        & (solar_hourly["datetime"] < end_ts + pd.Timedelta(days=1))
+    ][["datetime", "solar_best_mw"]].copy()
+    if p.empty or s.empty:
+        return None
+    merged = p.merge(s, on="datetime", how="inner")
+    merged["solar_best_mw"] = pd.to_numeric(merged["solar_best_mw"], errors="coerce")
+    merged["price"] = pd.to_numeric(merged["price"], errors="coerce")
+    merged = merged.dropna(subset=["solar_best_mw", "price"]).copy()
+    merged = merged[merged["solar_best_mw"] > 0].copy()
+    if merged.empty:
+        return None
+    total = float(merged["solar_best_mw"].sum())
+    if total <= 0:
+        return None
+    affected = float(merged.loc[merged["price"] <= 0, "solar_best_mw"].sum())
+    return affected / total
+
+
 def economic_curtailment_ytd_value(
     price_hourly: pd.DataFrame,
     solar_hourly: pd.DataFrame,
@@ -3850,6 +3882,19 @@ tb4_prev = top_bottom_summary(price_hourly, prev_month, month_end(prev_month)).g
 tb4_yoy = top_bottom_summary(price_hourly, yoy, month_end(yoy)).get("TB4")
 zero_neg_selected = zero_negative_hours_in_period(price_hourly, selected_month, report_end)
 zero_neg_prev = zero_negative_hours_in_period(price_hourly, prev_month, month_end(prev_month))
+curt_selected = economic_curtailment_period_value(price_hourly, solar_hourly, selected_month, report_end)
+curt_prev = economic_curtailment_period_value(price_hourly, solar_hourly, prev_month, month_end(prev_month))
+
+kpi_generation_current = build_generation_month_metrics(
+    historical_mix_daily,
+    live_mix_daily if not live_mix_daily.empty else live_mix_monthly,
+    selected_month,
+)
+kpi_generation_prev = build_generation_month_metrics(
+    historical_mix_daily,
+    live_mix_daily if not live_mix_daily.empty else live_mix_monthly,
+    prev_month,
+)
 
 k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5)
 with k2_1:
@@ -3873,11 +3918,38 @@ with k2_2:
         unsafe_allow_html=True,
     )
 with k2_3:
-    st.empty()
+    st.metric(
+        f"Economic curtailment | {month_label(selected_month, is_current_mtd)}",
+        fmt_pct(curt_selected),
+        help="Share of solar generation produced during zero or negative day-ahead price hours.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">{delta_pp_arrow_html(curt_selected, curt_prev, "prev. month")}<br>Prev. month: <b>{fmt_pct(curt_prev)}</b></div>',
+        unsafe_allow_html=True,
+    )
 with k2_4:
-    st.empty()
+    st.metric(
+        f"☀️ Solar injected | {month_label(selected_month, is_current_mtd)}",
+        fmt_gwh(kpi_generation_current.get("solar_gwh")),
+        help="Solar PV + solar thermal injected generation for the selected month.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">{delta_arrow_html(kpi_generation_current.get("solar_gwh"), kpi_generation_prev.get("solar_gwh"), "prev. month")}<br>Prev. month: <b>{fmt_gwh(kpi_generation_prev.get("solar_gwh"))}</b></div>',
+        unsafe_allow_html=True,
+    )
 with k2_5:
-    st.empty()
+    st.markdown(
+        f"""
+        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.15rem;">
+            <div style="font-weight:700; margin-bottom:0.35rem;">Other injected generation</div>
+            <div style="margin-bottom:0.42rem;">💨 Wind: <b>{fmt_gwh(kpi_generation_current.get("wind_gwh"))}</b><br>
+                {delta_arrow_html(kpi_generation_current.get("wind_gwh"), kpi_generation_prev.get("wind_gwh"), "prev. month")}</div>
+            <div>💧 Hydro: <b>{fmt_gwh(kpi_generation_current.get("hydro_gwh"))}</b><br>
+                {delta_arrow_html(kpi_generation_current.get("hydro_gwh"), kpi_generation_prev.get("hydro_gwh"), "prev. month")}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 subsection("Monthly baseload vs Solar PV capture table | 2025 history and 2026 YTD")
 capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, forward_hourly, selected_month, report_end)
