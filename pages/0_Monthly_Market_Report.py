@@ -4172,6 +4172,8 @@ with q5:
     )
 
 
+st.markdown('<div style="height: 14px;"></div>', unsafe_allow_html=True)
+
 tb4_selected = top_bottom_summary(price_hourly, selected_month, report_end).get("TB4")
 tb4_prev = top_bottom_summary(price_hourly, prev_month, month_end(prev_month)).get("TB4")
 tb4_yoy = top_bottom_summary(price_hourly, yoy, month_end(yoy)).get("TB4")
