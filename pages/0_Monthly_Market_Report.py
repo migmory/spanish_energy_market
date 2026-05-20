@@ -2193,6 +2193,233 @@ def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
     return apply_chart_style(chart, height=380)
 
 
+def _forward_visible_periods() -> list[str]:
+    return ["Y+1", "Y+2", "Q+1", "Q+3"]
+
+
+def _forward_contract_short(contract: str) -> str:
+    return re.sub(r"^(?:FTB|FTS)\s+", "", str(contract).strip())
+
+
+def _forward_clean_mapping(snapshot: pd.DataFrame) -> list[str]:
+    if snapshot.empty:
+        return []
+    work = snapshot[snapshot["period"].isin(_forward_visible_periods())][["period", "contract"]].dropna().copy()
+    if work.empty:
+        return []
+    work["contract_short"] = work["contract"].map(_forward_contract_short)
+    work = work[["period", "contract_short"]].drop_duplicates().copy()
+    period_order = {p: i for i, p in enumerate(_forward_visible_periods())}
+    work["order"] = work["period"].map(period_order)
+    work = work.sort_values(["order", "contract_short"])
+    return [f"{row['period']} = {row['contract_short']}" for _, row in work.iterrows()]
+
+
+def _forward_monthly_quote_dates(history: pd.DataFrame, access_date: date, months: int = 10) -> pd.DataFrame:
+    periods = pd.period_range(end=pd.Timestamp(access_date).to_period("M"), periods=months, freq="M")
+    hist = history.copy()
+    if not hist.empty:
+        hist["as_of_date"] = pd.to_datetime(hist["as_of_date"], errors="coerce")
+        hist = hist.dropna(subset=["as_of_date"]).copy()
+        hist["quote_period"] = hist["as_of_date"].dt.to_period("M")
+    rows = []
+    for period in periods:
+        if period == pd.Timestamp(access_date).to_period("M"):
+            rows.append({
+                "quote_month": period.to_timestamp(),
+                "quote_month_label": period.to_timestamp().strftime("%b-%Y"),
+                "as_of_date": pd.Timestamp(access_date),
+                "date_source": "access-date OMIP live pull",
+            })
+            continue
+        if hist.empty:
+            as_of = pd.NaT
+        else:
+            candidates = hist[hist["quote_period"] == period]
+            as_of = candidates["as_of_date"].max() if not candidates.empty else pd.NaT
+        rows.append({
+            "quote_month": period.to_timestamp(),
+            "quote_month_label": period.to_timestamp().strftime("%b-%Y"),
+            "as_of_date": as_of,
+            "date_source": "last cached quote date in month" if pd.notna(as_of) else "missing",
+        })
+    return pd.DataFrame(rows)
+
+
+def _forward_snapshot_contract_selector(snapshot: pd.DataFrame) -> pd.DataFrame:
+    if snapshot.empty:
+        return pd.DataFrame(columns=["curve_family", "period", "contract"])
+    return (
+        snapshot[snapshot["period"].isin(_forward_visible_periods())][["curve_family", "period", "contract"]]
+        .dropna()
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+def forward_monthly_closing_evolution(
+    history: pd.DataFrame,
+    latest_snapshot: pd.DataFrame,
+    access_date: date,
+    months: int = 10,
+) -> pd.DataFrame:
+    """Trace latest selected Y/Q contracts through the last monthly quote dates."""
+    selected = _forward_snapshot_contract_selector(latest_snapshot)
+    cols = [
+        "quote_month",
+        "quote_month_label",
+        "as_of_date",
+        "curve_family",
+        "period",
+        "contract",
+        "price",
+        "date_source",
+        "price_source",
+    ]
+    if selected.empty:
+        return pd.DataFrame(columns=cols)
+
+    quote_dates = _forward_monthly_quote_dates(history, access_date, months=months)
+    hist = history.copy()
+    if not hist.empty:
+        hist["as_of_date"] = pd.to_datetime(hist["as_of_date"], errors="coerce")
+        hist["price"] = pd.to_numeric(hist["price"], errors="coerce")
+        hist = hist.dropna(subset=["as_of_date", "price"]).copy()
+
+    latest_live_contracts = load_live_omip_forward_contracts(pd.Timestamp(access_date).date().isoformat())
+    rows = []
+
+    for _, qrow in quote_dates.iterrows():
+        as_of = pd.to_datetime(qrow["as_of_date"], errors="coerce")
+        if pd.isna(as_of):
+            continue
+
+        month_hist = hist[hist["as_of_date"] == as_of].copy() if not hist.empty else pd.DataFrame()
+        live_backfill = pd.DataFrame()
+
+        for _, sel in selected.iterrows():
+            family = sel["curve_family"]
+            contract = sel["contract"]
+            period = sel["period"]
+            price = None
+            price_source = None
+
+            # Current report month: use the same live access-date pull as the latest snapshot.
+            if pd.Timestamp(as_of).date() == pd.Timestamp(access_date).date():
+                live_match = latest_live_contracts[
+                    (latest_live_contracts["curve_family"] == family)
+                    & (latest_live_contracts["contract"] == contract)
+                ]
+                if not live_match.empty:
+                    price = pd.to_numeric(live_match["price"], errors="coerce").dropna()
+                    if not price.empty:
+                        price = float(price.iloc[-1])
+                        price_source = "OMIP live access-date pull"
+
+            # Earlier months: first try normalized history.
+            if price is None and not month_hist.empty:
+                hist_match = month_hist[
+                    (month_hist["curve_family"] == family)
+                    & (month_hist["contract"] == contract)
+                ]
+                if not hist_match.empty:
+                    hist_price = pd.to_numeric(hist_match["price"], errors="coerce").dropna()
+                    if not hist_price.empty:
+                        price = float(hist_price.iloc[-1])
+                        price_source = "normalized forward-history file"
+
+            # Earlier months: if cache misses this same contract, pull OMIP for that exact historical date.
+            if price is None:
+                if live_backfill.empty:
+                    live_backfill = load_live_omip_forward_contracts(pd.Timestamp(as_of).date().isoformat())
+                live_match = live_backfill[
+                    (live_backfill["curve_family"] == family)
+                    & (live_backfill["contract"] == contract)
+                ] if not live_backfill.empty else pd.DataFrame()
+                if not live_match.empty:
+                    live_price = pd.to_numeric(live_match["price"], errors="coerce").dropna()
+                    if not live_price.empty:
+                        price = float(live_price.iloc[-1])
+                        price_source = "historical OMIP date pull"
+
+            if price is None:
+                continue
+
+            rows.append({
+                "quote_month": qrow["quote_month"],
+                "quote_month_label": qrow["quote_month_label"],
+                "as_of_date": pd.Timestamp(as_of),
+                "curve_family": family,
+                "period": period,
+                "contract": contract,
+                "price": price,
+                "date_source": qrow["date_source"],
+                "price_source": price_source,
+            })
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def forward_monthly_closing_evolution_chart(evolution: pd.DataFrame):
+    if evolution.empty:
+        return None
+    plot = evolution.copy()
+    plot["delivery_name"] = plot["period"].astype(str) + " = " + plot["contract"].map(_forward_contract_short)
+    plot["series"] = plot["curve_family"].astype(str) + " | " + plot["delivery_name"].astype(str)
+    quote_order = (
+        plot[["quote_month", "quote_month_label"]]
+        .drop_duplicates()
+        .sort_values("quote_month")["quote_month_label"]
+        .tolist()
+    )
+    period_order = _forward_visible_periods()
+    delivery_domain = []
+    color_range = []
+    palette_map = {
+        "Y+1": "#047857",
+        "Y+2": "#34D399",
+        "Q+1": "#6D28D9",
+        "Q+3": "#C4B5FD",
+    }
+    for period in period_order:
+        vals = plot.loc[plot["period"] == period, "delivery_name"].dropna().drop_duplicates().tolist()
+        if vals:
+            delivery_domain.append(vals[0])
+            color_range.append(palette_map[period])
+
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X(
+            "quote_month_label:N",
+            sort=quote_order,
+            title="Quote month — last available monthly close",
+            axis=alt.Axis(labelAngle=-30),
+        ),
+        y=alt.Y("price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "delivery_name:N",
+            title="Delivery tracked",
+            scale=alt.Scale(domain=delivery_domain, range=color_range),
+            legend=alt.Legend(labelLimit=260, symbolLimit=260),
+        ),
+        strokeDash=alt.StrokeDash(
+            "curve_family:N",
+            title="Curve",
+            scale=alt.Scale(domain=["Baseload", "Solar"], range=[[1, 0], [7, 3]]),
+        ),
+        detail="series:N",
+        tooltip=[
+            alt.Tooltip("quote_month_label:N", title="Quote month"),
+            alt.Tooltip("as_of_date:T", title="Quote date", format="%Y-%m-%d"),
+            alt.Tooltip("curve_family:N", title="Curve"),
+            alt.Tooltip("period:N", title="Relative label"),
+            alt.Tooltip("contract:N", title="Tracked contract"),
+            alt.Tooltip("price:Q", title="Price", format=",.2f"),
+            alt.Tooltip("price_source:N", title="Source"),
+        ],
+    ).properties(title="Forward monthly closing evolution | Last 10 monthly closes")
+    return apply_chart_style(chart, height=420)
+
+
 
 # =========================================================
 # LIVE OMIP FORWARD SNAPSHOT — aligned with Forward Market page pull
@@ -2949,16 +3176,19 @@ def build_bess_with_demand_daily_strategy_chart(dispatch: pd.DataFrame):
         .rename(columns={"generacion": "value"})
         .assign(series="Solar generation")
     )
-    profile_line = alt.Chart(profile_long).mark_line(point=False, strokeWidth=2.4, strokeDash=[5, 3]).encode(
+    profile_area = alt.Chart(profile_long).mark_area(
+        opacity=0.28,
+        color="#FDE68A",
+        line={"color": "#D97706", "strokeWidth": 1.8},
+    ).encode(
         x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
         y=alt.Y("value:Q", title="Battery flow / solar generation (MWh): discharge + / charge −"),
-        color=alt.Color("series:N", title="Solar profile", scale=alt.Scale(domain=["Solar generation"], range=[YELLOW_DARK])),
         tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Profile"), alt.Tooltip("value:Q", title="MWh", format=",.3f")],
     )
 
-    # Battery flow bars and solar generation line share the left y-axis.
+    # Battery flow bars and solar generation area share the left y-axis.
     # Spot price remains on the independent right y-axis.
-    flow_and_solar = alt.layer(bars_chart, profile_line)
+    flow_and_solar = alt.layer(profile_area, bars_chart)
 
     price_line = alt.Chart(d).mark_line(point=True, strokeWidth=2.6, color=BLUE_DARK).encode(
         x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
@@ -3515,21 +3745,22 @@ if forward_snapshot.empty:
 else:
     as_of = pd.to_datetime(forward_snapshot["as_of_date"].iloc[0]).date()
     pills([f"Forward quote date: {as_of:%d %b %Y}", forward_source_label, "Q+1 / Q+3", "Y+1 / Y+2", "Baseload + Solar"])
-    visible_mapping = (
-        forward_snapshot[forward_snapshot["period"].isin(["Y+1", "Y+2", "Q+1", "Q+3"])][["period", "contract"]]
-        .drop_duplicates()
-        .copy()
+    clean_mapping = _forward_clean_mapping(forward_snapshot)
+    if clean_mapping:
+        st.caption("Tracked deliveries: " + ", ".join(clean_mapping) + ".")
+
+    forward_evolution = forward_monthly_closing_evolution(
+        forward_history,
+        forward_snapshot,
+        as_of,
+        months=10,
     )
-    if not visible_mapping.empty:
-        mapping_text = ", ".join(
-            f"{row['period']} = {str(row['contract']).replace('FTB ', '').replace('FTS ', '')}"
-            for _, row in visible_mapping.iterrows()
-        )
-        st.caption(f"Tracked deliveries in the forward history: {mapping_text}.")
-    forward_history_chart = forward_history_line_chart(forward_history, forward_snapshot)
-    forward_chart = forward_history_chart if forward_history_chart is not None else forward_snapshot_chart(forward_snapshot)
-    if forward_history_chart is not None:
-        st.caption("Historical quote lines use the normalized forward-history dataset where available; the table below keeps the latest quote and M-1 variation.")
+    forward_chart = forward_monthly_closing_evolution_chart(forward_evolution)
+    if forward_chart is None:
+        forward_chart = forward_snapshot_chart(forward_snapshot)
+        st.caption("Monthly close evolution could not be populated fully, so the latest snapshot is shown instead.")
+    else:
+        st.caption("Evolution uses the last available close in each of the last 10 quote months, tracking the same latest Y/Q delivery contracts backwards through time.")
     if forward_chart is not None:
         st.altair_chart(forward_chart, use_container_width=True)
     forward_display = forward_snapshot.copy()
