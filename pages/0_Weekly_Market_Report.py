@@ -236,6 +236,28 @@ def fmt_gwh(value: float | int | None, decimals: int = 1) -> str:
         return "—"
     return f"{float(value):,.{decimals}f} GWh"
 
+
+def fmt_hours(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{int(round(float(value))):,} h"
+
+
+def delta_pp_arrow_html(current: float | int | None, previous: float | int | None, reference_label: str) -> str:
+    if current is None or previous is None or pd.isna(current) or pd.isna(previous):
+        return f'<span style="color:#94A3B8;">→ n/a vs {reference_label}</span>'
+    diff = float(current) - float(previous)
+    if diff > 0:
+        arrow = "↑"
+        color = "#16A34A"
+    elif diff < 0:
+        arrow = "↓"
+        color = "#DC2626"
+    else:
+        arrow = "→"
+        color = "#64748B"
+    return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_pp(diff)} vs {reference_label}</span>'
+
 def fmt_change_pct(value: float | int | None, decimals: int = 1) -> str:
     if value is None or pd.isna(value):
         return "—"
@@ -2468,7 +2490,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
             alt.Chart(actual_plot)
             .mark_bar()
             .encode(
-                x=alt.X("month_name:N", title=None, sort=month_order),
+                x=alt.X("month_name:N", title=None, sort=month_order, scale=alt.Scale(paddingInner=0.38, paddingOuter=0.12)),
                 xOffset=alt.XOffset(
                     "Series:N",
                     sort=["2025 actual", "2026 actual"],
@@ -3252,6 +3274,70 @@ def top_bottom_summary(price_hourly: pd.DataFrame, start_ts: pd.Timestamp, end_t
         daily = top_bottom_spread_daily(p, h)
         out[f"TB{h}"] = None if daily.empty else float(daily["spread"].mean())
     return out
+
+
+def zero_negative_hours_in_period(price_hourly: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> int | None:
+    if price_hourly is None or price_hourly.empty:
+        return None
+    p = price_hourly[
+        (price_hourly["datetime"] >= start_ts)
+        & (price_hourly["datetime"] < end_ts + pd.Timedelta(days=1))
+    ].copy()
+    if p.empty:
+        return None
+    values = pd.to_numeric(p["price"], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return int((values <= 0).sum())
+
+
+def economic_curtailment_ytd_value(
+    price_hourly: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    year: int,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    if price_hourly is None or price_hourly.empty or solar_hourly is None or solar_hourly.empty:
+        return None
+    p = price_hourly[
+        (price_hourly["datetime"].dt.year == year)
+        & (price_hourly["datetime"] < end_ts + pd.Timedelta(days=1))
+    ][["datetime", "price"]].copy()
+    s = solar_hourly[
+        (solar_hourly["datetime"].dt.year == year)
+        & (solar_hourly["datetime"] < end_ts + pd.Timedelta(days=1))
+    ][["datetime", "solar_best_mw"]].copy()
+    if p.empty or s.empty:
+        return None
+    merged = p.merge(s, on="datetime", how="inner")
+    merged["solar_best_mw"] = pd.to_numeric(merged["solar_best_mw"], errors="coerce")
+    merged["price"] = pd.to_numeric(merged["price"], errors="coerce")
+    merged = merged.dropna(subset=["solar_best_mw", "price"]).copy()
+    merged = merged[merged["solar_best_mw"] > 0].copy()
+    if merged.empty:
+        return None
+    total = float(merged["solar_best_mw"].sum())
+    if total <= 0:
+        return None
+    affected = float(merged.loc[merged["price"] <= 0, "solar_best_mw"].sum())
+    return affected / total
+
+
+def economic_curtailment_ytd_forecast_value(
+    forward_scenarios: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    model: str,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    if forward_scenarios is None or forward_scenarios.empty:
+        return None
+    f = forward_scenarios[
+        (forward_scenarios["model"] == model)
+        & (forward_scenarios["datetime"].dt.year == 2026)
+    ][["datetime", "price"]].copy()
+    if f.empty:
+        return None
+    return economic_curtailment_ytd_value(f, solar_hourly, 2026, end_ts)
 
 def bess_monthly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
     cols = ["period", "tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw", "revenue_w_demand_1_4c_eur_mw"]
@@ -4314,7 +4400,7 @@ with q4:
         fmt_pct(selected_metrics["capture_rate_uncurtailed"]),
     )
     st.markdown(
-        f'<div class="metric-footnote">{arrow_pp_text(selected_metrics["capture_rate_uncurtailed"] - prev_metrics["capture_rate_uncurtailed"] if selected_metrics["capture_rate_uncurtailed"] is not None and prev_metrics["capture_rate_uncurtailed"] is not None and not pd.isna(selected_metrics["capture_rate_uncurtailed"]) and not pd.isna(prev_metrics["capture_rate_uncurtailed"]) else None)} vs prev. week<br>Prev. week: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same week LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
+        f'<div class="metric-footnote">{delta_pp_arrow_html(selected_metrics["capture_rate_uncurtailed"], prev_metrics["capture_rate_uncurtailed"], "prev. week")}<br>Prev. week: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same week LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q5:
@@ -4327,6 +4413,41 @@ with q5:
         f'<div class="metric-footnote">{delta_arrow_html(mibgas_selected, mibgas_prev, "prev. week")}<br>Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
         unsafe_allow_html=True,
     )
+
+
+tb4_selected = top_bottom_summary(price_hourly, selected_week, report_end).get("TB4")
+tb4_prev = top_bottom_summary(price_hourly, prev_week, week_end(prev_week)).get("TB4")
+tb4_yoy = top_bottom_summary(price_hourly, yoy, week_end(yoy)).get("TB4")
+zero_neg_selected = zero_negative_hours_in_period(price_hourly, selected_week, report_end)
+zero_neg_prev = zero_negative_hours_in_period(price_hourly, prev_week, week_end(prev_week))
+
+k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5)
+with k2_1:
+    st.metric(
+        f"Market spread TB4 | {week_label(selected_week, is_current_wtd)}",
+        fmt_eur(tb4_selected),
+        help="Average daily Top-4 minus Bottom-4 spread of hourly day-ahead prices.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">{delta_arrow_html(tb4_selected, tb4_prev, "prev. week")}<br>Prev. week: <b>{fmt_eur(tb4_prev)}</b><br>Same week LY: <b>{fmt_eur(tb4_yoy)}</b></div>',
+        unsafe_allow_html=True,
+    )
+with k2_2:
+    st.metric(
+        f"Zero / negative price hours | {week_label(selected_week, is_current_wtd)}",
+        fmt_hours(zero_neg_selected),
+        help="Number of selected-period day-ahead hours with price less than or equal to zero.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">{delta_arrow_html(zero_neg_selected, zero_neg_prev, "prev. week")}<br>Prev. week: <b>{fmt_hours(zero_neg_prev)}</b></div>',
+        unsafe_allow_html=True,
+    )
+with k2_3:
+    st.empty()
+with k2_4:
+    st.empty()
+with k2_5:
+    st.empty()
 
 subsection("Monthly baseload vs Solar PV capture table | 2025 history and 2026 YTD")
 capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, forward_hourly, selected_month, report_end)
@@ -4412,6 +4533,33 @@ if hourly_overlay is not None:
     st.altair_chart(hourly_overlay, use_container_width=True)
 
 subsection("Actual economic curtailment (%) vs forecasts Aurora / Baringa")
+
+ytd_curt_actual = economic_curtailment_ytd_value(
+    price_hourly,
+    solar_hourly,
+    2026,
+    pd.Timestamp(latest_data_ts.date()),
+)
+ytd_curt_aurora = economic_curtailment_ytd_forecast_value(
+    forward_hourly,
+    solar_hourly,
+    "Aurora",
+    pd.Timestamp(latest_data_ts.date()),
+)
+ytd_curt_baringa = economic_curtailment_ytd_forecast_value(
+    forward_hourly,
+    solar_hourly,
+    "Baringa",
+    pd.Timestamp(latest_data_ts.date()),
+)
+yc1, yc2, yc3 = st.columns(3)
+with yc1:
+    st.metric("YTD 2026 actual economic curtailment", fmt_pct(ytd_curt_actual))
+with yc2:
+    st.metric("YTD Aurora economic curtailment", fmt_pct(ytd_curt_aurora))
+with yc3:
+    st.metric("YTD Baringa economic curtailment", fmt_pct(ytd_curt_baringa))
+
 actual_curt_2026 = monthly_economic_curtailment(price_hourly, solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
 forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, pd.Timestamp(latest_data_ts.date()))
 actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
@@ -4567,8 +4715,7 @@ pdf_charts = pdf_spot_heatmaps + [
     ("2025 zero / negative price frequency heatmap", neg_heatmap_2025),
     ("Negative / zero-price cumulative hours | scenario overlay", negative_overlay_chart),
     ("YTD 24h average market profile vs solar generation", hourly_overlay),
-    ("2026 monthly economic curtailment", curt_chart_2026),
-    ("2025 full-year economic curtailment", curt_chart_2025),
+    ("Actual economic curtailment (%) vs forecasts Aurora / Baringa", curt_chart),
     ("Forward market history / latest snapshot", forward_chart),
     ("BESS-model hybrid captured price", hybrid_plot),
 ]
