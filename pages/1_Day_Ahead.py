@@ -3793,14 +3793,23 @@ try:
                 daily_end = st.date_input("Daily range end", value=daily_max, min_value=daily_min, max_value=daily_max, key="mix_daily_end")
             day_range = (daily_start, daily_end)
 
+        # For 2026 monthly renewable shares, prefer the daily mix already loaded in `mix_daily`
+        # and aggregate it to month level. The REE monthly widget can return a structure that
+        # produced an artificially low % RE in the chart. Keep the monthly endpoint only as a
+        # fallback when no 2026 daily mix is available.
         mix_source_df = mix_daily
         if granularity == "Monthly" and year_sel >= 2026:
-            monthly_live = load_live_2026_mix_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
-            if not monthly_live.empty:
-                mix_source_df = pd.concat([
-                    mix_daily[mix_daily["datetime"].dt.year < 2026],
-                    monthly_live,
-                ], ignore_index=True)
+            has_live_daily_for_year = (
+                not mix_daily.empty
+                and (mix_daily["datetime"].dt.year == year_sel).any()
+            )
+            if not has_live_daily_for_year:
+                monthly_live = load_live_2026_mix_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
+                if not monthly_live.empty:
+                    mix_source_df = pd.concat([
+                        mix_daily[mix_daily["datetime"].dt.year < 2026],
+                        monthly_live,
+                    ], ignore_index=True)
         mix_period = build_energy_mix_period(mix_source_df, granularity, year_sel=year_sel, day_range=day_range)
         if granularity == "Monthly" and year_sel >= 2026:
             demand_live_monthly = load_live_2026_demand_monthly_from_ree(date(year_sel, 1, 1), max_refresh_day())
@@ -3828,10 +3837,13 @@ try:
         mix_chart = build_energy_mix_period_chart(mix_period, None)
         if mix_chart is not None:
             st.altair_chart(mix_chart, use_container_width=True)
-            st.caption("Línea verde = % RE (eje derecho 0%-100%).")
+            st.caption("Línea verde = % RE (eje derecho 0%-100%). Para 2026 mensual, la serie prioriza el mix diario agregado a mes y usa el widget mensual solo como fallback.")
 
         subtle_subsection("Monthly renewables summary")
-        monthly_renewables_table = build_monthly_renewables_table(mix_daily)
+        # Use the same preferred source as the monthly chart so the table and
+        # green % RE line reconcile for 2026.
+        monthly_renewables_source = mix_source_df if granularity == "Monthly" else mix_daily
+        monthly_renewables_table = build_monthly_renewables_table(monthly_renewables_source)
         if not monthly_renewables_table.empty:
             sel_year = st.selectbox("Year for monthly renewables table", sorted(pd.to_datetime(monthly_renewables_table["Month"], format="%b - %Y").dt.year.unique().tolist()), index=len(sorted(pd.to_datetime(monthly_renewables_table["Month"], format="%b - %Y").dt.year.unique().tolist())) - 1)
             mt = monthly_renewables_table.copy()
