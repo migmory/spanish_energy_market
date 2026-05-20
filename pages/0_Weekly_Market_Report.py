@@ -3383,6 +3383,7 @@ def bess_monthly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -
         "revenue_w_demand_standalone_cycles_eur_mw",
         "standalone_cycles_day_avg",
         "revenue_standalone_eur_mw",
+        "captured_spread_standalone_eur_mwh",
     ]
     if price_hourly.empty:
         return pd.DataFrame(columns=cols)
@@ -3426,6 +3427,7 @@ def bess_monthly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -
             "revenue_w_demand_standalone_cycles_eur_mw": np.nan,
             "standalone_cycles_day_avg": np.nan,
             "revenue_standalone_eur_mw": np.nan,
+            "captured_spread_standalone_eur_mwh": np.nan,
         })
     return pd.DataFrame(rows, columns=cols).sort_values("period").reset_index(drop=True)
 
@@ -3438,22 +3440,28 @@ def bess_weekly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) ->
         "revenue_w_demand_standalone_cycles_eur_mw",
         "standalone_cycles_day_avg",
         "revenue_standalone_eur_mw",
+        "captured_spread_standalone_eur_mwh",
     ]
     if price_hourly.empty:
         return pd.DataFrame(columns=cols)
+
     p = price_hourly.copy()
     p["period"] = p["datetime"].map(week_start)
-    rows = []
+    spread_rows = []
     for period, g in p.groupby("period"):
         tb = top_bottom_summary(g, period, week_end(period))
-        rows.append({
+        spread_rows.append({
             "period": period,
             "tb1": tb["TB1"],
             "tb2": tb["TB2"],
             "tb4": tb["TB4"],
         })
-    spreads = pd.DataFrame(rows)
+    spreads = pd.DataFrame(spread_rows)
+
+    # All BESS revenue rows come from the daily LP model so they are
+    # consistent with the BESS tab assumptions and fair-value accounting.
     modeled = _compute_bess_weekly_revenue_metrics_from_model(price_hourly)
+
     if spreads.empty and modeled.empty:
         return pd.DataFrame(columns=cols)
     if spreads.empty:
@@ -3467,6 +3475,7 @@ def bess_weekly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) ->
                 out[col] = np.nan
     else:
         out = spreads.merge(modeled, on="period", how="outer")
+
     for col in cols:
         if col not in out.columns:
             out[col] = np.nan
@@ -3489,11 +3498,11 @@ def bess_summary_table_weekly(bess: pd.DataFrame, report_week: pd.Timestamp, rep
         ("TB4", "tb4", "eur"),
         ("TB2", "tb2", "eur"),
         ("TB1", "tb1", "eur"),
-        ("Revenue w/o demand", "revenue_wo_demand_eur_mw", "rev"),
+        ("Revenue w/o demand 1.0c", "revenue_wo_demand_eur_mw", "rev"),
         ("Revenue w. demand 1.0c", "revenue_w_demand_1c_eur_mw", "rev"),
-        ("Revenue w. demand | same c/day as standalone", "revenue_w_demand_standalone_cycles_eur_mw", "rev"),
-        ("Standalone cycles/day avg | no cycle cap", "standalone_cycles_day_avg", "cycles"),
         ("Revenue standalone | no cycle cap", "revenue_standalone_eur_mw", "rev"),
+        ("Standalone cycles/day avg | no cycle cap", "standalone_cycles_day_avg", "cycles"),
+        ("Captured spread standalone | no cycle cap", "captured_spread_standalone_eur_mwh", "spread"),
     ]
     days_elapsed = max((report_end - pd.Timestamp(report_week.year, 1, 1)).days + 1, 1)
     rows = []
@@ -3542,6 +3551,7 @@ def normalize_bess_table(raw: pd.DataFrame) -> pd.DataFrame:
         "revenue_w_demand_standalone_cycles_eur_mw",
         "standalone_cycles_day_avg",
         "revenue_standalone_eur_mw",
+        "captured_spread_standalone_eur_mwh",
     ]
     if raw is None or raw.empty:
         return pd.DataFrame(columns=proxy_cols)
@@ -3574,6 +3584,12 @@ def normalize_bess_table(raw: pd.DataFrame) -> pd.DataFrame:
             "standalone_revenue_eur_mw",
             "revenue_bess_standalone_eur_mw",
         ],
+        "captured_spread_standalone_eur_mwh": [
+            "captured_spread_standalone_eur_mwh",
+            "standalone_captured_spread_eur_mwh",
+            "captured_spread_eur_mwh",
+            "captured_spread",
+        ],
     }
     for target, candidates in mapping.items():
         col = _first_existing(df.columns.tolist(), candidates)
@@ -3586,33 +3602,13 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
     if not normalized.empty:
         return normalized, "file"
 
-    spreads = bess_monthly_proxy(price_hourly, solar_hourly)
+    # Top-bottom spreads are simple market-price metrics.
+    spreads = bess_monthly_proxy(price_hourly, solar_hourly)[["period", "tb1", "tb2", "tb4"]].copy()
+
+    # All BESS revenue rows come from the daily LP model so they are
+    # consistent with the BESS tab assumptions and fair-value accounting.
     modeled = _compute_bess_monthly_revenue_metrics_from_model(price_hourly)
-    if spreads.empty and modeled.empty:
-        return pd.DataFrame(columns=[
-            "period", "tb1", "tb2", "tb4",
-            "revenue_wo_demand_eur_mw",
-            "revenue_w_demand_1c_eur_mw",
-            "revenue_w_demand_standalone_cycles_eur_mw",
-            "standalone_cycles_day_avg",
-            "revenue_standalone_eur_mw",
-        ]), "unavailable"
-    if spreads.empty:
-        out = modeled.copy()
-        for col in ["tb1", "tb2", "tb4"]:
-            out[col] = np.nan
-    elif modeled.empty:
-        out = spreads[["period", "tb1", "tb2", "tb4"]].copy()
-        for col in [
-            "revenue_wo_demand_eur_mw",
-            "revenue_w_demand_1c_eur_mw",
-            "revenue_w_demand_standalone_cycles_eur_mw",
-            "standalone_cycles_day_avg",
-            "revenue_standalone_eur_mw",
-        ]:
-            out[col] = np.nan
-    else:
-        out = spreads[["period", "tb1", "tb2", "tb4"]].merge(modeled, on="period", how="outer")
+
     wanted = [
         "period", "tb1", "tb2", "tb4",
         "revenue_wo_demand_eur_mw",
@@ -3620,11 +3616,27 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
         "revenue_w_demand_standalone_cycles_eur_mw",
         "standalone_cycles_day_avg",
         "revenue_standalone_eur_mw",
+        "captured_spread_standalone_eur_mwh",
     ]
+
+    if spreads.empty and modeled.empty:
+        return pd.DataFrame(columns=wanted), "unavailable"
+    if spreads.empty:
+        out = modeled.copy()
+        for col in ["tb1", "tb2", "tb4"]:
+            out[col] = np.nan
+    elif modeled.empty:
+        out = spreads.copy()
+        for col in wanted:
+            if col not in out.columns:
+                out[col] = np.nan
+    else:
+        out = spreads.merge(modeled, on="period", how="outer")
+
     for col in wanted:
         if col not in out.columns:
             out[col] = np.nan
-    return out[wanted].dropna(subset=["period"]).sort_values("period").reset_index(drop=True), "model"
+    return out[wanted].dropna(subset=["period"]).sort_values("period").reset_index(drop=True), "daily_bess_model"
 
 def bess_summary_table(bess: pd.DataFrame, report_month: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
     cols = ["Metric", "Selected week", "YTD", "Annualized", "Previous year"]
@@ -3640,7 +3652,7 @@ def bess_summary_table(bess: pd.DataFrame, report_month: pd.Timestamp, report_en
         ("TB4", "tb4", "eur"),
         ("TB2", "tb2", "eur"),
         ("TB1", "tb1", "eur"),
-        ("Revenue w/o demand", "revenue_wo_demand_eur_mw", "rev"),
+        ("Revenue w/o demand 1.0c", "revenue_wo_demand_eur_mw", "rev"),
         ("Revenue w. demand 1.0c", "revenue_w_demand_1c_eur_mw", "rev"),
         ("Revenue w. demand 1.4c", "revenue_w_demand_1_4c_eur_mw", "rev"),
     ]
@@ -3676,10 +3688,12 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
     def _row_style(row: pd.Series) -> list[str]:
         metric = str(row.get("Metric", ""))
-        if metric.startswith("TB"):
+        if metric.startswith("TB") or metric.startswith("Captured spread"):
             return ["background-color: #EFF6FF; font-weight: 750;"] * len(row)
-        if metric.startswith("Revenue") or metric.startswith("Standalone"):
+        if metric.startswith("Revenue"):
             return ["background-color: #ECFDF5; font-weight: 750;"] * len(row)
+        if metric.startswith("Standalone cycles"):
+            return ["background-color: #F8FAFC; font-weight: 700; color: #475569;"] * len(row)
         return [""] * len(row)
 
     return (
@@ -3918,12 +3932,16 @@ def _period_revenue_summary_from_dispatch(
     period_mode: str,
     revenue_col: str,
     include_cycles: bool = False,
+    include_captured_spread: bool = False,
 ) -> pd.DataFrame:
     output_cols = ["period", revenue_col]
     if include_cycles:
         output_cols.append("standalone_cycles_day_avg")
+    if include_captured_spread:
+        output_cols.append("captured_spread_standalone_eur_mwh")
     if dispatch is None or dispatch.empty:
         return pd.DataFrame(columns=output_cols)
+
     d = dispatch.copy()
     d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
     d = d.dropna(subset=["datetime"]).copy()
@@ -3933,13 +3951,34 @@ def _period_revenue_summary_from_dispatch(
         d["period"] = d["datetime"].map(week_start)
     else:
         raise ValueError(f"Unknown BESS period mode: {period_mode}")
+
     d["day"] = d["datetime"].dt.normalize()
+    d["charge_mwh_for_spread"] = (
+        pd.to_numeric(d.get("charge_from_pv_mwh", 0.0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(d.get("charge_from_grid_mwh", 0.0), errors="coerce").fillna(0.0)
+    )
+    d["discharge_mwh_for_spread"] = pd.to_numeric(d.get("discharge_to_market_mwh", 0.0), errors="coerce").fillna(0.0)
+    d["charge_cost_eur_for_spread"] = (
+        pd.to_numeric(d.get("charge_from_pv_mwh", 0.0), errors="coerce").fillna(0.0)
+        * pd.to_numeric(d.get("omie_venta", 0.0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(d.get("charge_from_grid_mwh", 0.0), errors="coerce").fillna(0.0)
+        * pd.to_numeric(d.get("omie_compra", 0.0), errors="coerce").fillna(0.0)
+    )
+    d["sell_revenue_eur_for_spread"] = (
+        pd.to_numeric(d.get("discharge_to_market_mwh", 0.0), errors="coerce").fillna(0.0)
+        * pd.to_numeric(d.get("omie_venta", 0.0), errors="coerce").fillna(0.0)
+    )
+
     grouped = (
         d.groupby("period", as_index=False)
         .agg(
             bess_revenue_eur=("bess_revenue_eur", "sum"),
             discharge_total_mwh=("discharge_total_mwh", "sum"),
             days=("day", "nunique"),
+            charge_mwh_for_spread=("charge_mwh_for_spread", "sum"),
+            discharge_mwh_for_spread=("discharge_mwh_for_spread", "sum"),
+            charge_cost_eur_for_spread=("charge_cost_eur_for_spread", "sum"),
+            sell_revenue_eur_for_spread=("sell_revenue_eur_for_spread", "sum"),
         )
     )
     grouped[revenue_col] = np.where(
@@ -3956,6 +3995,18 @@ def _period_revenue_summary_from_dispatch(
             / grouped["days"],
             np.nan,
         )
+    if include_captured_spread:
+        avg_buy = np.where(
+            grouped["charge_mwh_for_spread"] > 0,
+            grouped["charge_cost_eur_for_spread"] / grouped["charge_mwh_for_spread"],
+            np.nan,
+        )
+        avg_sell = np.where(
+            grouped["discharge_mwh_for_spread"] > 0,
+            grouped["sell_revenue_eur_for_spread"] / grouped["discharge_mwh_for_spread"],
+            np.nan,
+        )
+        grouped["captured_spread_standalone_eur_mwh"] = avg_sell - avg_buy
     return grouped[output_cols].sort_values("period").reset_index(drop=True)
 
 
@@ -4018,6 +4069,7 @@ def _compute_bess_monthly_revenue_metrics_from_model(price_hourly: pd.DataFrame)
         "revenue_w_demand_standalone_cycles_eur_mw",
         "standalone_cycles_day_avg",
         "revenue_standalone_eur_mw",
+        "captured_spread_standalone_eur_mwh",
     ]
     without_dispatch = _bess_dispatch_from_model(price_hourly, "without_demand", BESS_REPORT_CYCLE_LIMIT)
     with_dispatch = _bess_dispatch_from_model(price_hourly, "with_demand", BESS_REPORT_CYCLE_LIMIT)
@@ -4038,6 +4090,7 @@ def _compute_bess_monthly_revenue_metrics_from_model(price_hourly: pd.DataFrame)
         period_mode="monthly",
         revenue_col="revenue_standalone_eur_mw",
         include_cycles=True,
+        include_captured_spread=True,
     )
     with_same_cycles = _with_demand_revenue_at_standalone_cycles(
         price_hourly,
@@ -4087,6 +4140,7 @@ def _compute_bess_weekly_revenue_metrics_from_model(price_hourly: pd.DataFrame) 
         period_mode="weekly",
         revenue_col="revenue_standalone_eur_mw",
         include_cycles=True,
+        include_captured_spread=True,
     )
     with_same_cycles = _with_demand_revenue_at_standalone_cycles(
         price_hourly,
@@ -5064,7 +5118,7 @@ if hybrid_plot is not None:
     source_note = "dedicated monthly hybrid capture input file" if hybrid_source == "file" else "daily BESS optimisation model embedded in this report"
     st.caption(
         f"Hybrid captured price source: {source_note}. Assumptions: daily optimization window, maximum 1 cycle/day, "
-        f"4h BESS (4.0 MWh / 1.0 MW), ηch={BESS_REPORT_ETA_CH:.0%}, ηdis={BESS_REPORT_ETA_DIS:.0%}. "
+        f"4h BESS (4.0 MWh / 1.0 MW), undegraded capacity, ηch={BESS_REPORT_ETA_CH:.0%}, ηdis={BESS_REPORT_ETA_DIS:.0%}. "
         "The w/o-demand and w.-demand series are calculated independently with the BESS captured-price logic."
     )
 else:
@@ -5091,9 +5145,9 @@ else:
         bess_day_chart = build_bess_with_demand_daily_strategy_chart(bess_day_dispatch)
         if bess_day_chart is not None:
             st.altair_chart(bess_day_chart, use_container_width=True)
-        st.caption("Daily BESS strategy example: with-demand model, daily optimization window, max 1 cycle/day, 4h BESS (4.0 MWh / 1.0 MW).")
+        st.caption("Daily BESS strategy example: with-demand model, daily optimization window, max 1 cycle/day, 4h BESS (4.0 MWh / 1.0 MW), undegraded capacity.")
 
-st.caption("BESS footnote: optimization window is daily; monthly hybrid captured-price comparison uses max 1 cycle/day.")
+st.caption("BESS footnote: optimization window is daily; revenue rows use the daily BESS optimization model, including fair-value accounting for PV charging; monthly hybrid captured-price comparison uses max 1 cycle/day; BESS capacity is assumed undegraded.")
 st.caption("Weekly Market Report | Corporate dashboard based on the app's hourly market data, forward curve files and BESS monthly inputs/proxies.")
 
 # =========================================================
