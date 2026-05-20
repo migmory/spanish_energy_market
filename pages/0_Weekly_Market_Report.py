@@ -5,6 +5,8 @@ import io
 import math
 import os
 import re
+import stat
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -19,6 +21,11 @@ import requests
 import pulp
 import streamlit as st
 from dotenv import load_dotenv
+
+try:
+    import paramiko
+except Exception:
+    paramiko = None
 
 try:
     alt.data_transformers.disable_max_rows()
@@ -615,13 +622,205 @@ def _standardize_mibgas_raw(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols].reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
+
+def _mibgas_get_secret(name: str, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def _mibgas_load_private_key():
+    if paramiko is None:
+        raise ValueError("paramiko is not installed.")
+    key_text = _mibgas_get_secret("MIBGAS_SFTP_KEY")
+    if not key_text:
+        return None
+    key_file = io.StringIO(str(key_text))
+    last_error = None
+    for key_name in ["Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey"]:
+        loader = getattr(paramiko, key_name, None)
+        if loader is None:
+            continue
+        try:
+            key_file.seek(0)
+            return loader.from_private_key(key_file)
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f"Could not load private key from Streamlit Secrets: {last_error}")
+
+
+def _mibgas_connect_sftp():
+    if paramiko is None:
+        raise ValueError("paramiko is not installed. Add 'paramiko' to requirements.txt.")
+    host = _mibgas_get_secret("MIBGAS_SFTP_HOST", "secureftpbucket.omie.es")
+    port = int(_mibgas_get_secret("MIBGAS_SFTP_PORT", 22))
+    user = _mibgas_get_secret("MIBGAS_SFTP_USER")
+    password = _mibgas_get_secret("MIBGAS_SFTP_PASSWORD")
+    key = _mibgas_load_private_key()
+    if not user:
+        raise ValueError("MIBGAS_SFTP_USER is missing in Streamlit Secrets.")
+    if key is None and not password:
+        raise ValueError("MIBGAS_SFTP_KEY or MIBGAS_SFTP_PASSWORD is missing in Streamlit Secrets.")
+    transport = paramiko.Transport((host, port))
+    if key is not None:
+        transport.connect(username=user, pkey=key)
+    else:
+        transport.connect(username=user, password=password)
+    return paramiko.SFTPClient.from_transport(transport), transport
+
+
+def _mibgas_sftp_dir_exists(sftp, path: str) -> bool:
+    try:
+        attr = sftp.stat(path)
+        return stat.S_ISDIR(attr.st_mode)
+    except Exception:
+        return False
+
+
+def _mibgas_find_year_dir(sftp, year: int) -> str:
+    configured = str(_mibgas_get_secret("MIBGAS_SFTP_BASE_PATH", "/MIBGAS")).rstrip("/")
+    candidates = [
+        f"{configured}/AGNO_{year}",
+        f"/MIBGAS/AGNO_{year}",
+        f"MIBGAS/AGNO_{year}",
+        f"/secureftpbucket.omie.es/MIBGAS/AGNO_{year}",
+        f"secureftpbucket.omie.es/MIBGAS/AGNO_{year}",
+        f"/AGNO_{year}",
+        f"AGNO_{year}",
+    ]
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.replace("//", "/")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _mibgas_sftp_dir_exists(sftp, candidate):
+            return candidate
+    raise ValueError(f"Could not find AGNO_{year} directory. Tried: {candidates}")
+
+
+def _mibgas_read_remote_excel_or_zip(sftp, remote_path: str, filename: str) -> pd.DataFrame:
+    with sftp.open(remote_path, "rb") as handle:
+        content = handle.read()
+    lower = filename.lower()
+    frames: list[pd.DataFrame] = []
+
+    if lower.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(content), sheet_name=MIBGAS_TARGET_SHEET)
+        return _standardize_mibgas_raw(df)
+
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(content)) as zipped:
+            for inner in zipped.namelist():
+                if not inner.lower().endswith((".xlsx", ".xls")):
+                    continue
+                try:
+                    with zipped.open(inner) as nested:
+                        df = pd.read_excel(io.BytesIO(nested.read()), sheet_name=MIBGAS_TARGET_SHEET)
+                    parsed = _standardize_mibgas_raw(df)
+                    if not parsed.empty:
+                        frames.append(parsed)
+                except Exception:
+                    continue
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _refresh_mibgas_2026_cache_for_report() -> pd.DataFrame:
+    """Pull 2026 MIBGAS files from SFTP and refresh the local cache used by reports."""
+    cols = ["trading_day", "product", "area", "delivery_start", "delivery_end", "reference_price_eur_mwh"]
+    try:
+        sftp, transport = _mibgas_connect_sftp()
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+    frames: list[pd.DataFrame] = []
+    try:
+        year_dir = _mibgas_find_year_dir(sftp, 2026)
+        candidate_dirs = [year_dir, f"{year_dir}/XLS", f"{year_dir}/CSV"]
+        for remote_dir in candidate_dirs:
+            try:
+                items = sftp.listdir_attr(remote_dir)
+            except Exception:
+                continue
+            for item in items:
+                if not stat.S_ISREG(item.st_mode):
+                    continue
+                filename = item.filename
+                lower = filename.lower()
+                if not lower.endswith((".xlsx", ".xls", ".zip")):
+                    continue
+                if "mibgas" not in lower and "gas" not in lower:
+                    continue
+                remote_path = f"{remote_dir}/{filename}"
+                try:
+                    parsed = _mibgas_read_remote_excel_or_zip(sftp, remote_path, filename)
+                    if not parsed.empty:
+                        frames.append(parsed)
+                except Exception:
+                    continue
+    finally:
+        try:
+            sftp.close()
+            transport.close()
+        except Exception:
+            pass
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    out["trading_day"] = pd.to_datetime(out["trading_day"], errors="coerce")
+    out = out[out["trading_day"].dt.year == 2026].copy()
+    out = out.drop_duplicates(
+        subset=["trading_day", "product", "area", "delivery_start", "delivery_end"],
+        keep="last",
+    )
+    out = out.sort_values(["trading_day", "product"]).reset_index(drop=True)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out.to_csv(MIBGAS_CACHE_FILE, index=False)
+    except Exception:
+        pass
+    return out
+
+
+def _mibgas_raw_to_actuals(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["delivery_day", "price"])
+    work = raw.copy()
+    work["reference_price_eur_mwh"] = pd.to_numeric(work["reference_price_eur_mwh"], errors="coerce")
+    actuals = work[
+        (work["product"] == "GDAES_D+1")
+        & (work["area"].fillna("ES") == "ES")
+    ].copy()
+    actuals["delivery_day"] = (
+        pd.to_datetime(actuals["delivery_start"], errors="coerce")
+        .combine_first(pd.to_datetime(actuals["trading_day"], errors="coerce"))
+    )
+    actuals["price"] = actuals["reference_price_eur_mwh"]
+    actuals = actuals.dropna(subset=["delivery_day", "price"]).copy()
+    return (
+        actuals[["delivery_day", "price"]]
+        .drop_duplicates(subset=["delivery_day"], keep="last")
+        .sort_values("delivery_day")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
 def load_mibgas_actuals_for_report() -> pd.DataFrame:
     parts: list[pd.DataFrame] = []
     for path in sorted(DATA_DIR.glob(MIBGAS_LOCAL_PATTERN)):
         try:
             xls = pd.ExcelFile(path)
-            sheet = MIBGAS_TARGET_SHEET if MIBGAS_TARGET_SHEET in xls.sheet_names else next((s for s in xls.sheet_names if "PVB" in str(s).upper() and "VTP" in str(s).upper()), None)
+            sheet = MIBGAS_TARGET_SHEET if MIBGAS_TARGET_SHEET in xls.sheet_names else next(
+                (s for s in xls.sheet_names if "PVB" in str(s).upper() and "VTP" in str(s).upper()),
+                None,
+            )
             if sheet is None:
                 continue
             parsed = _standardize_mibgas_raw(pd.read_excel(path, sheet_name=sheet))
@@ -629,6 +828,7 @@ def load_mibgas_actuals_for_report() -> pd.DataFrame:
                 parts.append(parsed)
         except Exception:
             continue
+
     if MIBGAS_CACHE_FILE.exists():
         try:
             cache = pd.read_csv(MIBGAS_CACHE_FILE)
@@ -637,15 +837,25 @@ def load_mibgas_actuals_for_report() -> pd.DataFrame:
                 parts.append(parsed)
         except Exception:
             pass
-    if not parts:
-        return pd.DataFrame(columns=["trading_day", "price"])
-    raw = pd.concat(parts, ignore_index=True)
-    raw["reference_price_eur_mwh"] = pd.to_numeric(raw["reference_price_eur_mwh"], errors="coerce")
-    actuals = raw[(raw["product"] == "GDAES_D+1") & (raw["area"].fillna("ES") == "ES")].copy()
-    actuals["delivery_day"] = pd.to_datetime(actuals["delivery_start"], errors="coerce").combine_first(pd.to_datetime(actuals["trading_day"], errors="coerce"))
-    actuals["price"] = actuals["reference_price_eur_mwh"]
-    actuals = actuals.dropna(subset=["delivery_day", "price"]).copy()
-    return actuals[["delivery_day", "price"]].drop_duplicates(subset=["delivery_day"], keep="last").sort_values("delivery_day").reset_index(drop=True)
+
+    raw = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    actuals = _mibgas_raw_to_actuals(raw)
+
+    # Reports previously depended only on the local/cache MIBGAS files.
+    # If the 2026 cache has not reached the recent delivery dates, weekly KPI cards
+    # can show "—" even though the MIBGAS page can fetch live SFTP data.
+    # Refresh the 2026 cache here when it looks stale.
+    max_delivery = pd.to_datetime(actuals["delivery_day"], errors="coerce").max() if not actuals.empty else pd.NaT
+    refresh_cutoff = pd.Timestamp(date.today() - timedelta(days=2))
+    needs_refresh = pd.isna(max_delivery) or max_delivery < refresh_cutoff
+
+    if needs_refresh:
+        live_raw = _refresh_mibgas_2026_cache_for_report()
+        if live_raw is not None and not live_raw.empty:
+            raw = pd.concat([raw, live_raw], ignore_index=True) if not raw.empty else live_raw
+            actuals = _mibgas_raw_to_actuals(raw)
+
+    return actuals
 
 
 def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float | None:
