@@ -729,6 +729,62 @@ def load_live_2026_mix_monthly_for_report(start_day: date, end_day: date) -> pd.
     return df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_mix_daily_for_report(start_day: date, end_day: date) -> pd.DataFrame:
+    """Daily REE generation-mix pull used for monthly RE-share metrics.
+
+    The monthly REE widget was producing a suspiciously low renewable share in the
+    monthly report. This daily path mirrors the Day Ahead energy-mix logic more
+    closely: fetch daily technology rows, normalize, aggregate hydro once, and
+    let the selected-month metrics sum those daily values.
+    """
+    cols = ["datetime", "technology", "energy_mwh", "data_source"]
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=cols)
+    try:
+        payload = fetch_ree_widget_for_report("generacion", "estructura-generacion", start_day, end_day, time_trunc="day")
+        df = parse_ree_included_series_for_report(payload)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
+    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+    df["energy_mwh"] = _normalize_ree_energy_to_mwh(df["value"])
+    df["data_source"] = "REE API"
+    df = df.dropna(subset=["datetime", "technology", "energy_mwh"]).copy()
+    df = df[df["technology"].isin(DETAILED_MIX_TECHS)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Collapse any repeated technology/day observations first.
+    df = (
+        df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"]
+        .sum()
+        .sort_values(["datetime", "technology"])
+        .reset_index(drop=True)
+    )
+
+    # Match the Day Ahead treatment of hydro: consolidate individual hydro families once.
+    hydro_techs = ["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"]
+    hydro = (
+        df[df["technology"].isin(hydro_techs)]
+        .groupby(["datetime", "data_source"], as_index=False)["energy_mwh"]
+        .sum()
+    )
+    hydro["technology"] = "Hydro"
+    non_hydro = df[~df["technology"].isin(hydro_techs)].copy()
+    out = pd.concat([non_hydro[cols], hydro[cols]], ignore_index=True)
+    return (
+        out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"]
+        .sum()
+        .sort_values(["datetime", "technology"])
+        .reset_index(drop=True)
+    )
+
+
 def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_live: pd.DataFrame, target_month: pd.Timestamp) -> dict[str, float | None]:
     if target_month.year <= 2025:
         mix = mix_daily_hist.copy()
@@ -3242,6 +3298,7 @@ monthly_capture = monthly_capture_table(price_hourly, solar_hourly)
 mibgas_actuals = load_mibgas_actuals_for_report()
 historical_mix_daily = load_historical_generation_mix_daily_for_report()
 live_mix_monthly = load_live_2026_mix_monthly_for_report(date(2026, 1, 1), today)
+live_mix_daily = load_live_2026_mix_daily_for_report(date(2026, 1, 1), today)
 
 # =========================================================
 # SECTION 1 — DAY AHEAD
@@ -3405,8 +3462,8 @@ if curt_chart_2025 is not None:
     st.altair_chart(curt_chart_2025, use_container_width=True)
 
 subsection("Monthly generation injection and renewable share | selected month vs previous month")
-selected_generation_metrics = build_generation_month_metrics(historical_mix_daily, live_mix_monthly, selected_month)
-previous_generation_metrics = build_generation_month_metrics(historical_mix_daily, live_mix_monthly, prev_month)
+selected_generation_metrics = build_generation_month_metrics(historical_mix_daily, live_mix_daily if not live_mix_daily.empty else live_mix_monthly, selected_month)
+previous_generation_metrics = build_generation_month_metrics(historical_mix_daily, live_mix_daily if not live_mix_daily.empty else live_mix_monthly, prev_month)
 generation_comparison = build_generation_month_comparison_table(
     selected_generation_metrics,
     previous_generation_metrics,
@@ -3414,7 +3471,7 @@ generation_comparison = build_generation_month_comparison_table(
     month_label(prev_month, False),
 )
 st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
-st.caption("Solar = Solar PV + Solar thermal. Renewable share is calculated from detailed technology rows only, excluding any aggregate REE summary rows to avoid double-counting total generation.")
+st.caption("Solar = Solar PV + Solar thermal. For 2026, the renewable-share metric now uses the REE daily generation-mix pull aggregated to the selected month, with a monthly-widget fallback only if the daily pull is unavailable.")
 
 
 # =========================================================
