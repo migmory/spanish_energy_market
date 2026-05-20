@@ -738,7 +738,6 @@ def _mibgas_read_remote_excel_or_zip(sftp, remote_path: str, filename: str) -> p
     return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False, ttl=1800)
 def _refresh_mibgas_2026_cache_for_report() -> pd.DataFrame:
     """Pull 2026 MIBGAS files from SFTP and refresh the local cache used by reports."""
     cols = ["trading_day", "product", "area", "delivery_start", "delivery_end", "reference_price_eur_mwh"]
@@ -925,6 +924,8 @@ def mibgas_mean_with_requested_window_refresh(
             return value, base
 
     # If the on-disk cache is still missing the week, refresh from SFTP.
+    # This refresh is intentionally uncached, matching the need to recover recent weeks
+    # even after a previous transient SFTP/cache miss in the report page.
     live_raw = _refresh_mibgas_2026_cache_for_report()
     if live_raw is not None and not live_raw.empty:
         refreshed = _mibgas_raw_to_actuals(live_raw)
@@ -4115,12 +4116,8 @@ with q5:
         fmt_eur(mibgas_selected),
         help="Weekly average GDAES D+1 MIBGAS reference price by delivery day, using the MIBGAS files/cache available to the app.",
     )
-    mibgas_extra_note = (
-        "<br><span style='color:#B91C1C;'>Selected week not found in the report cache after direct cache re-read and live refresh.</span>"
-        if mibgas_selected is None else ""
-    )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b>{mibgas_extra_note}</div>',
+        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
         unsafe_allow_html=True,
     )
 
