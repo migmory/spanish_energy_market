@@ -333,8 +333,16 @@ LOCAL_MIX_TECH_MAP = {
 }
 
 RENEWABLE_TECHS = {
-    "Hydro", "Pumped hydro", "Wind", "Solar PV", "Solar thermal",
-    "Other renewables", "Biomass", "Biogas",
+    "Hydro",
+    "Hydro UGH",
+    "Hydro non-UGH",
+    "Pumped hydro",
+    "Wind",
+    "Solar PV",
+    "Solar thermal",
+    "Other renewables",
+    "Biomass",
+    "Biogas",
 }
 
 # =========================================================
@@ -685,9 +693,14 @@ def load_live_2026_mix_monthly_for_report(start_day: date, end_day: date) -> pd.
     df["energy_mwh"] = _normalize_ree_energy_to_mwh(df["value"])
     df["data_source"] = "REE API"
     df = df.dropna(subset=["datetime", "technology", "energy_mwh"]).copy()
-    hydro = df[df["technology"].isin(["Hydro", "Pumped hydro"])].groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
+    hydro_techs = ["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"]
+    hydro = (
+        df[df["technology"].isin(hydro_techs)]
+        .groupby(["datetime", "data_source"], as_index=False)["energy_mwh"]
+        .sum()
+    )
     hydro["technology"] = "Hydro"
-    non_hydro = df[~df["technology"].isin(["Hydro", "Pumped hydro"])].copy()
+    non_hydro = df[~df["technology"].isin(hydro_techs)].copy()
     df = pd.concat([non_hydro[["datetime", "technology", "energy_mwh", "data_source"]], hydro], ignore_index=True)
     return df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
 
@@ -2823,14 +2836,15 @@ def build_bess_with_demand_daily_strategy_chart(dispatch: pd.DataFrame):
         tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Flow"), alt.Tooltip("flow_mwh:Q", title="MWh", format=",.3f")],
     )
 
-    profile_long = pd.concat([
-        d[["hour_label", "generacion"]].rename(columns={"generacion": "value"}).assign(series="Solar generation"),
-        d[["hour_label", "consumo"]].rename(columns={"consumo": "value"}).assign(series="Demand"),
-    ], ignore_index=True)
+    profile_long = (
+        d[["hour_label", "generacion"]]
+        .rename(columns={"generacion": "value"})
+        .assign(series="Solar generation")
+    )
     profile_line = alt.Chart(profile_long).mark_line(point=False, strokeWidth=2.2, strokeDash=[5, 3]).encode(
         x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("value:Q", title="Solar / demand profile (MWh)"),
-        color=alt.Color("series:N", title="Profile", scale=alt.Scale(domain=["Solar generation", "Demand"], range=[YELLOW_DARK, GREY])),
+        y=alt.Y("value:Q", title="Solar profile (MWh)"),
+        color=alt.Color("series:N", title="Profile", scale=alt.Scale(domain=["Solar generation"], range=[YELLOW_DARK])),
         tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Profile"), alt.Tooltip("value:Q", title="MWh", format=",.3f")],
     )
 
