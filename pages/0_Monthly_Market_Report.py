@@ -817,11 +817,11 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
 
 def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str) -> pd.DataFrame:
     specs = [
-        ("Renewable generation share", "re_share", "share"),
-        ("Solar injected", "solar_gwh", "gwh"),
-        ("Wind injected", "wind_gwh", "gwh"),
-        ("Hydro injected", "hydro_gwh", "gwh"),
-        ("Nuclear injected", "nuclear_gwh", "gwh"),
+        ("🌱 Renewable generation share", "re_share", "share"),
+        ("☀️ Solar injected", "solar_gwh", "gwh"),
+        ("💨 Wind injected", "wind_gwh", "gwh"),
+        ("💧 Hydro injected", "hydro_gwh", "gwh"),
+        ("⚛️ Nuclear injected", "nuclear_gwh", "gwh"),
     ]
     rows = []
     for label, key, kind in specs:
@@ -2043,8 +2043,11 @@ def classify_contracts(latest: pd.DataFrame) -> pd.DataFrame:
         fam["contract_text"] = fam["contract"].astype(str).str.upper()
         quarters = fam[fam["contract_text"].str.contains(r"\bQ[1-4]\b", regex=True)].sort_values("contract_sort")
         years = fam[~fam["contract_text"].str.contains(r"\bQ[1-4]\b", regex=True)].sort_values("contract_sort")
-        for idx, (_, row) in enumerate(quarters.head(2).iterrows(), start=1):
-            rows.append({"curve_family": family, "period": f"Q+{idx}", "contract": row["contract"], "price": row["price"], "contract_sort": row["contract_sort"]})
+        quarter_rows = list(quarters.head(3).iterrows())
+        for position, q_label in [(1, "Q+1"), (3, "Q+3")]:
+            if len(quarter_rows) >= position:
+                _, row = quarter_rows[position - 1]
+                rows.append({"curve_family": family, "period": q_label, "contract": row["contract"], "price": row["price"], "contract_sort": row["contract_sort"]})
         for idx, (_, row) in enumerate(years.head(2).iterrows(), start=1):
             rows.append({"curve_family": family, "period": f"Y+{idx}", "contract": row["contract"], "price": row["price"], "contract_sort": row["contract_sort"]})
     return pd.DataFrame(rows)
@@ -2109,7 +2112,7 @@ def style_forward_snapshot_table(df: pd.DataFrame):
 def forward_snapshot_chart(snapshot: pd.DataFrame):
     if snapshot.empty:
         return None
-    period_order = ["Q+1", "Q+2", "Y+1", "Y+2"]
+    period_order = ["Y+1", "Y+2", "Q+1", "Q+3"]
     chart = alt.Chart(snapshot).mark_bar().encode(
         x=alt.X("period:N", title=None, sort=period_order),
         xOffset=alt.XOffset("curve_family:N"),
@@ -2126,35 +2129,53 @@ def forward_snapshot_chart(snapshot: pd.DataFrame):
     return apply_chart_style(chart, height=330)
 
 def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
-    """Historical forward quote lines for the latest selected Q+1/Q+2/Y+1/Y+2 contracts."""
+    """Historical forward quote lines for latest selected Y+1/Y+2/Q+1/Q+3 delivery contracts."""
     if history.empty or snapshot.empty:
         return None
     h = history.copy()
     h["as_of_date"] = pd.to_datetime(h["as_of_date"], errors="coerce")
     h["price"] = pd.to_numeric(h["price"], errors="coerce")
     h = h.dropna(subset=["as_of_date", "price", "curve_family", "contract"])
-    selected = snapshot[["curve_family", "period", "contract"]].drop_duplicates().copy()
+    selected = snapshot[snapshot["period"].isin(["Y+1", "Y+2", "Q+1", "Q+3"])][["curve_family", "period", "contract"]].drop_duplicates().copy()
     plot = h.merge(selected, on=["curve_family", "contract"], how="inner")
     if plot.empty:
         return None
-    plot["series"] = plot["curve_family"].astype(str) + " " + plot["period"].astype(str)
-    series_order = []
-    for period in ["Q+1", "Q+2", "Y+1", "Y+2"]:
-        for fam in ["Baseload", "Solar"]:
-            series = f"{fam} {period}"
-            if series in plot["series"].unique().tolist():
-                series_order.append(series)
-    if not series_order:
-        series_order = sorted(plot["series"].dropna().unique().tolist())
-    palette = [
-        BLUE, "#3B82F6", BLUE_DARK, "#2563EB",
-        YELLOW_DARK, "#F59E0B", "#B45309", "#FBBF24",
+
+    plot["delivery_name"] = (
+        plot["period"].astype(str)
+        + " = "
+        + plot["contract"].astype(str).str.replace(r"^(?:FTB|FTS)\s+", "", regex=True)
+    )
+    plot["series"] = plot["curve_family"].astype(str) + " | " + plot["delivery_name"].astype(str)
+
+    period_order = ["Y+1", "Y+2", "Q+1", "Q+3"]
+    delivery_domain = []
+    for period in period_order:
+        vals = plot.loc[plot["period"] == period, "delivery_name"].dropna().drop_duplicates().tolist()
+        if vals:
+            delivery_domain.append(vals[0])
+
+    palette_map = {
+        "Y+1": "#047857",
+        "Y+2": "#34D399",
+        "Q+1": "#6D28D9",
+        "Q+3": "#C4B5FD",
+    }
+    color_range = [
+        palette_map[period]
+        for period in period_order
+        if not plot.loc[plot["period"] == period, "delivery_name"].dropna().empty
     ]
-    color_range = [palette[i % len(palette)] for i in range(len(series_order))]
+
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2.8).encode(
         x=alt.X("as_of_date:T", title="Quote date", axis=alt.Axis(format="%b-%y", labelAngle=-35)),
         y=alt.Y("price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
-        color=alt.Color("series:N", title="Forward series", scale=alt.Scale(domain=series_order, range=color_range)),
+        color=alt.Color(
+            "delivery_name:N",
+            title="Delivery tracked",
+            scale=alt.Scale(domain=delivery_domain, range=color_range),
+            legend=alt.Legend(labelLimit=260, symbolLimit=260),
+        ),
         strokeDash=alt.StrokeDash(
             "curve_family:N",
             title="Curve type",
@@ -2164,11 +2185,11 @@ def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
         tooltip=[
             alt.Tooltip("as_of_date:T", title="Quote date", format="%Y-%m-%d"),
             alt.Tooltip("curve_family:N", title="Curve"),
-            alt.Tooltip("period:N", title="Bucket"),
-            alt.Tooltip("contract:N", title="Contract"),
+            alt.Tooltip("period:N", title="Relative label"),
+            alt.Tooltip("contract:N", title="Tracked contract"),
             alt.Tooltip("price:Q", title="Price", format=",.2f"),
         ],
-    ).properties(title="Forward quote history | Selected Q+1 / Q+2 / Y+1 / Y+2")
+    ).properties(title="Forward quote history | Y+1 / Y+2 / Q+1 / Q+3 same-contract view")
     return apply_chart_style(chart, height=380)
 
 
@@ -2338,7 +2359,11 @@ def live_omip_forward_snapshot(asof: date) -> pd.DataFrame:
         quarters = fam[fam["text"].str.contains(r"\bQ[1-4]-\d{2}\b", regex=True)].sort_values("contract_sort")
         years = fam[fam["text"].str.contains(r"\bYR-\d{2}\b", regex=True)].sort_values("contract_sort")
         selected = []
-        selected += [(f"Q+{idx}", row) for idx, (_, row) in enumerate(quarters.head(2).iterrows(), start=1)]
+        quarter_rows = list(quarters.head(3).iterrows())
+        for position, q_label in [(1, "Q+1"), (3, "Q+3")]:
+            if len(quarter_rows) >= position:
+                _, q_row = quarter_rows[position - 1]
+                selected.append((q_label, q_row))
         selected += [(f"Y+{idx}", row) for idx, (_, row) in enumerate(years.head(2).iterrows(), start=1)]
         for period, row in selected:
             prev_match = prior_live[
@@ -3489,7 +3514,18 @@ if forward_snapshot.empty:
     forward_chart = None
 else:
     as_of = pd.to_datetime(forward_snapshot["as_of_date"].iloc[0]).date()
-    pills([f"Forward quote date: {as_of:%d %b %Y}", forward_source_label, "Q+1 / Q+2", "Y+1 / Y+2", "Baseload + Solar"])
+    pills([f"Forward quote date: {as_of:%d %b %Y}", forward_source_label, "Q+1 / Q+3", "Y+1 / Y+2", "Baseload + Solar"])
+    visible_mapping = (
+        forward_snapshot[forward_snapshot["period"].isin(["Y+1", "Y+2", "Q+1", "Q+3"])][["period", "contract"]]
+        .drop_duplicates()
+        .copy()
+    )
+    if not visible_mapping.empty:
+        mapping_text = ", ".join(
+            f"{row['period']} = {str(row['contract']).replace('FTB ', '').replace('FTS ', '')}"
+            for _, row in visible_mapping.iterrows()
+        )
+        st.caption(f"Tracked deliveries in the forward history: {mapping_text}.")
     forward_history_chart = forward_history_line_chart(forward_history, forward_snapshot)
     forward_chart = forward_history_chart if forward_history_chart is not None else forward_snapshot_chart(forward_snapshot)
     if forward_history_chart is not None:
