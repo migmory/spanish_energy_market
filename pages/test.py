@@ -370,15 +370,14 @@ def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.Dat
     """
     Build a same-contract historical backtrace.
 
-    The relative labels Y+1, Y+2, Q+1, Q+2 and Q+3 are defined only once:
-    from the latest monthly closing quote available in the selected window.
-    Then, for every previous monthly closing date, we retrieve the historical
-    quote of those exact delivery contracts.
+    The latest monthly close fixes the delivery mapping:
+        Y+1, Y+2, Q+1, Q+2, Q+3
+    The chart then tracks those exact delivery contracts backwards through the
+    last close of each prior month.
 
-    Example at 20-May-2026:
-        Q+1 = Q3-26
-    The chart then connects Q3-26 on 20-May with Q3-26 on the last quote of
-    Apr-2026, Mar-2026, etc. It does NOT roll Q+1 backwards month by month.
+    If the historical cache does not contain a required Q/Y contract for one of
+    those monthly close dates, the page performs a cached OMIP live pull for that
+    specific historical market date and fills the missing point when OMIP returns it.
     """
     quotes = monthly_last_quote_dates(df, months)
     valid_quotes = quotes.dropna(subset=["market_date"]).copy()
@@ -389,7 +388,6 @@ def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.Dat
     if pd.isna(latest_market_date):
         return pd.DataFrame(), pd.DataFrame()
 
-    # Freeze the delivery mapping at the latest monthly close.
     fixed_labels = relative_labels(latest_market_date)
 
     rows = []
@@ -402,6 +400,7 @@ def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.Dat
                 "Quote month": quote_month.strftime("%b-%Y"),
                 "Last market date": "—",
                 "Status": "No data",
+                "Historical OMIP backfill": "Not attempted",
                 "Y+1": fixed_labels["Y+1"],
                 "Y+2": fixed_labels["Y+2"],
                 "Q+1": fixed_labels["Q+1"],
@@ -411,10 +410,38 @@ def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.Dat
             continue
 
         snap = df[df["market_date"] == market_date].copy()
+        required_pairs = {(curve, label) for label in fixed_labels.values() for curve in ["Baseload", "Solar"]}
+        existing_pairs = set(
+            zip(
+                snap["curve"].astype(str),
+                snap["delivery_label"].astype(str),
+            )
+        ) if not snap.empty else set()
+        missing_pairs_before = required_pairs - existing_pairs
+
+        backfill_status = "Cache complete"
+        if missing_pairs_before:
+            live_snap = parse_live_snapshot(market_date)
+            if not live_snap.empty:
+                snap = pd.concat([snap, live_snap], ignore_index=True)
+                snap = snap.drop_duplicates(subset=["curve", "delivery_label", "contract"], keep="last")
+                existing_pairs_after = set(
+                    zip(
+                        snap["curve"].astype(str),
+                        snap["delivery_label"].astype(str),
+                    )
+                )
+                missing_pairs_after = required_pairs - existing_pairs_after
+                filled_count = len(missing_pairs_before) - len(missing_pairs_after)
+                backfill_status = f"OMIP date pull filled {filled_count}/{len(missing_pairs_before)} missing points"
+            else:
+                backfill_status = "OMIP date pull returned no usable rows"
+
         diagnostics.append({
             "Quote month": quote_month.strftime("%b-%Y"),
             "Last market date": market_date.strftime("%Y-%m-%d"),
             "Status": "Loaded",
+            "Historical OMIP backfill": backfill_status,
             "Y+1": fixed_labels["Y+1"],
             "Y+2": fixed_labels["Y+2"],
             "Q+1": fixed_labels["Q+1"],
@@ -624,5 +651,6 @@ with st.expander("Underlying chart points"):
 
 st.caption(
     "The x-axis is the monthly quotation snapshot, not the delivery month. "
-    "Delivery labels are frozen at the latest monthly close: e.g. if Q+1 = Q3-26 in May-2026, the line shows how Q3-26 quoted at the last close of Apr-2026, Mar-2026, etc."
+    "Delivery labels are frozen at the latest monthly close: e.g. if Q+1 = Q3-26 in May-2026, the line shows how Q3-26 quoted at the last close of Apr-2026, Mar-2026, etc. "
+    "Where the local historical cache is missing those quarter contracts, the test page now attempts a cached OMIP pull for that historical month-end date."
 )
