@@ -1,84 +1,404 @@
-from datetime import date
-import requests
+from __future__ import annotations
+
+import re
+from pathlib import Path
+import pandas as pd
+import altair as alt
 import streamlit as st
 
-st.set_page_config(page_title="REE Installed Capacity Window Test", layout="wide")
-st.title("REE Installed Capacity - Window Test")
+try:
+    alt.data_transformers.disable_max_rows()
+except Exception:
+    pass
 
-REE_API_BASE = "https://apidatos.ree.es/es/datos"
+st.set_page_config(page_title="Test | Forward Monthly Closing", layout="wide")
 
-REE_PENINSULAR_PARAMS = {
-    "geo_trunc": "electric_system",
-    "geo_limit": "peninsular",
-    "geo_ids": "8741",
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data"
+CACHE_FILES = [
+    DATA_DIR / "omip_ES_EL_date_range2025_20260511.xlsx",
+    DATA_DIR / "eex_forward_market.xlsx",
+    DATA_DIR / "eex_forward_market.csv",
+]
+
+CORP_GREEN_DARK = "#0F766E"
+CORP_GREEN = "#10B981"
+BLUE = "#1D4ED8"
+SOLAR_YELLOW = "#F4C542"
+TEXT_GREY = "#64748B"
+
+TENORS = ["Y+1", "Y+2", "Q+1", "Q+2", "Q+3"]
+TENOR_COLORS = {
+    "Y+1": "#1D4ED8",
+    "Y+2": "#0F766E",
+    "Q+1": "#EA580C",
+    "Q+2": "#7C3AED",
+    "Q+3": "#DC2626",
 }
 
+def section(title: str) -> None:
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(90deg, {CORP_GREEN_DARK} 0%, {CORP_GREEN} 55%, #C7F0DD 100%);
+            color: white;
+            padding: 14px 18px;
+            border-radius: 14px;
+            font-weight: 850;
+            font-size: 1.35rem;
+            margin-top: 8px;
+            margin-bottom: 14px;
+        ">🧪 {title}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-def test_window(label: str, start_day: date, end_day: date):
-    url = f"{REE_API_BASE}/generacion/potencia-instalada"
+def subsection(title: str) -> None:
+    st.markdown(
+        f"""
+        <div style="
+            margin-top: 16px;
+            margin-bottom: 8px;
+            padding: 8px 12px;
+            color: #0F172A;
+            background: #F4FCF8;
+            border-left: 5px solid {CORP_GREEN};
+            font-size: 1.02rem;
+            font-weight: 800;
+            border-radius: 8px;
+        ">{title}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    params = {
-        "start_date": f"{start_day.isoformat()}T00:00",
-        "end_date": f"{end_day.isoformat()}T23:59",
-        "time_trunc": "month",
-        **REE_PENINSULAR_PARAMS,
+def chart_style(chart, height: int = 500):
+    return (
+        chart.properties(height=height)
+        .configure_view(stroke="#E5E7EB", fill="white")
+        .configure_axis(
+            grid=True,
+            gridColor="#E5E7EB",
+            domainColor="#CBD5E1",
+            tickColor="#CBD5E1",
+            labelColor="#111827",
+            titleColor="#111827",
+            labelFontSize=12,
+            titleFontSize=13,
+        )
+        .configure_legend(
+            orient="top",
+            direction="horizontal",
+            labelFontSize=12,
+            titleFontSize=12,
+            symbolStrokeWidth=3,
+        )
+    )
+
+def norm(x) -> str:
+    if pd.isna(x):
+        return ""
+    return re.sub(r"\s+", " ", str(x).replace("\xa0", " ")).strip()
+
+def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [norm(c).lower().replace(" ", "_") for c in out.columns]
+    return out
+
+def delivery_label(contract: str) -> str:
+    c = norm(contract)
+    m = re.search(r"\bYR-(\d{2})", c)
+    if m:
+        return f"YR{m.group(1)}"
+    m = re.search(r"\bQ([1-4])-(\d{2})", c)
+    if m:
+        return f"Q{m.group(1)}-{m.group(2)}"
+    return c
+
+def infer_curve(sheet, instrument, contract) -> str | None:
+    s = norm(sheet).lower()
+    i = norm(instrument).upper()
+    c = norm(contract).upper()
+    if "solar" in s or i == "FTS" or c.startswith("FTS "):
+        return "Solar"
+    if "base" in s or i == "FTB" or c.startswith("FTB "):
+        return "Baseload"
+    return None
+
+@st.cache_data(show_spinner=False)
+def load_cache() -> tuple[pd.DataFrame, str]:
+    for path in CACHE_FILES:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix.lower() == ".csv":
+                raw = pd.read_csv(path)
+            else:
+                xls = pd.ExcelFile(path)
+                sheet = "All curves" if "All curves" in xls.sheet_names else xls.sheet_names[0]
+                raw = pd.read_excel(xls, sheet_name=sheet)
+        except Exception:
+            continue
+
+        df = clean_cols(raw)
+        rename = {
+            "date": "market_date",
+            "market_date": "market_date",
+            "curve": "sheet",
+            "sheet": "sheet",
+            "instrument": "instrument",
+            "contract_name": "contract",
+            "contract": "contract",
+            "delivery_label": "delivery_label",
+            "curve_price": "curve_price",
+            "d_price": "d_price",
+            "d": "d_price",
+        }
+        df = df.rename(columns={c: rename[c] for c in df.columns if c in rename})
+
+        if "market_date" not in df.columns or "contract" not in df.columns:
+            continue
+        for col in ["sheet", "instrument", "delivery_label", "curve_price", "d_price"]:
+            if col not in df.columns:
+                df[col] = None
+
+        df["market_date"] = pd.to_datetime(df["market_date"], errors="coerce").dt.normalize()
+        df["contract"] = df["contract"].astype(str).map(norm)
+        df["sheet"] = df["sheet"].astype(str).map(norm)
+        df["instrument"] = df["instrument"].astype(str).map(norm)
+        df["curve_price"] = pd.to_numeric(df["curve_price"], errors="coerce")
+        df["d_price"] = pd.to_numeric(df["d_price"], errors="coerce")
+        df["price"] = df["curve_price"].combine_first(df["d_price"])
+        df["delivery_label"] = df["delivery_label"].astype(str).map(norm)
+        needs = df["delivery_label"].isin(["", "nan", "none", "None"])
+        df.loc[needs, "delivery_label"] = df.loc[needs, "contract"].map(delivery_label)
+        df["curve"] = df.apply(lambda r: infer_curve(r["sheet"], r["instrument"], r["contract"]), axis=1)
+        df = df.dropna(subset=["market_date", "price", "curve"])
+        df = df[df["curve"].isin(["Baseload", "Solar"])]
+        df = df[df["contract"].str.contains(r"^(?:FTB|FTS)\s+", regex=True, na=False)]
+        if not df.empty:
+            return df.reset_index(drop=True), path.name
+    return pd.DataFrame(), "No cache file found"
+
+def relative_labels(asof: pd.Timestamp) -> dict[str, str]:
+    current_q = ((asof.month - 1) // 3) + 1
+    labels = {
+        "Y+1": f"YR{(asof.year + 1) % 100:02d}",
+        "Y+2": f"YR{(asof.year + 2) % 100:02d}",
     }
+    q = current_q
+    y = asof.year
+    for n in range(1, 4):
+        q += 1
+        if q > 4:
+            q = 1
+            y += 1
+        labels[f"Q+{n}"] = f"Q{q}-{y % 100:02d}"
+    return labels
 
-    try:
-        resp = requests.get(url, params=params, timeout=60)
-
-        st.subheader(label)
-
-        st.write(
+def monthly_last_quote_dates(df: pd.DataFrame, months: int) -> pd.DataFrame:
+    latest_month = df["market_date"].max().to_period("M")
+    periods = pd.period_range(end=latest_month, periods=months, freq="M")
+    work = df.copy()
+    work["month"] = work["market_date"].dt.to_period("M")
+    rows = []
+    for period in periods:
+        temp = work[work["month"] == period]
+        rows.append(
             {
-                "status_code": resp.status_code,
-                "content_type": resp.headers.get("Content-Type"),
-                "url_called": resp.url,
+                "quote_month": period.to_timestamp(),
+                "market_date": temp["market_date"].max() if not temp.empty else pd.NaT,
             }
         )
+    return pd.DataFrame(rows)
 
-        try:
-            payload = resp.json()
+def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    quotes = monthly_last_quote_dates(df, months)
+    rows = []
+    diagnostics = []
+    for _, qrow in quotes.iterrows():
+        quote_month = pd.Timestamp(qrow["quote_month"])
+        market_date = pd.to_datetime(qrow["market_date"], errors="coerce")
+        if pd.isna(market_date):
+            diagnostics.append({"Quote month": quote_month.strftime("%b-%Y"), "Last market date": "—", "Status": "No data"})
+            continue
 
-            st.success("Valid JSON returned")
+        snap = df[df["market_date"] == market_date]
+        labels = relative_labels(market_date)
+        diagnostics.append({"Quote month": quote_month.strftime("%b-%Y"), "Last market date": market_date.strftime("%Y-%m-%d"), "Status": "Loaded"})
 
-            st.write(
-                {
-                    "top_level_keys": list(payload.keys()),
-                    "included_items": len(payload.get("included", []) or []),
-                }
-            )
+        for tenor, label in labels.items():
+            for curve in ["Baseload", "Solar"]:
+                selected = snap[(snap["curve"] == curve) & (snap["delivery_label"].astype(str) == label)]
+                if selected.empty:
+                    rows.append(
+                        {
+                            "quote_month": quote_month,
+                            "quote_month_label": quote_month.strftime("%b-%Y"),
+                            "market_date": market_date,
+                            "curve": curve,
+                            "tenor": tenor,
+                            "delivery_label": label,
+                            "contract": None,
+                            "price": None,
+                        }
+                    )
+                else:
+                    row = selected.iloc[0]
+                    rows.append(
+                        {
+                            "quote_month": quote_month,
+                            "quote_month_label": quote_month.strftime("%b-%Y"),
+                            "market_date": market_date,
+                            "curve": curve,
+                            "tenor": tenor,
+                            "delivery_label": label,
+                            "contract": row["contract"],
+                            "price": float(row["price"]),
+                        }
+                    )
+    return pd.DataFrame(rows), pd.DataFrame(diagnostics)
 
-            st.markdown("#### JSON preview")
-            st.json(payload)
+def build_chart(evolution: pd.DataFrame):
+    plot = evolution.dropna(subset=["price"]).copy()
+    if plot.empty:
+        return None
+    plot["series"] = plot["curve"] + " | " + plot["tenor"]
+    order = (
+        plot[["quote_month", "quote_month_label"]]
+        .drop_duplicates()
+        .sort_values("quote_month")["quote_month_label"]
+        .tolist()
+    )
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X(
+            "quote_month_label:N",
+            sort=order,
+            title="Quote month — last available market date in that month",
+            axis=alt.Axis(labelAngle=-30),
+        ),
+        y=alt.Y("price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "tenor:N",
+            title="Relative delivery",
+            sort=TENORS,
+            scale=alt.Scale(domain=TENORS, range=[TENOR_COLORS[t] for t in TENORS]),
+        ),
+        strokeDash=alt.StrokeDash(
+            "curve:N",
+            title="Curve",
+            sort=["Baseload", "Solar"],
+            scale=alt.Scale(domain=["Baseload", "Solar"], range=[[1, 0], [7, 3]]),
+        ),
+        shape=alt.Shape(
+            "curve:N",
+            title="Curve",
+            sort=["Baseload", "Solar"],
+            scale=alt.Scale(domain=["Baseload", "Solar"], range=["circle", "diamond"]),
+        ),
+        detail="series:N",
+        tooltip=[
+            alt.Tooltip("quote_month_label:N", title="Quote month"),
+            alt.Tooltip("market_date:T", title="Last market date", format="%Y-%m-%d"),
+            alt.Tooltip("curve:N", title="Curve"),
+            alt.Tooltip("tenor:N", title="Relative delivery"),
+            alt.Tooltip("delivery_label:N", title="Delivery contract"),
+            alt.Tooltip("contract:N", title="OMIP contract"),
+            alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
+        ],
+    ).properties(title="Last monthly OMIP quote evolution | Baseload vs Solar")
+    return chart_style(chart, height=520)
 
-        except Exception as e:
-            st.error(f"No valid JSON: {type(e).__name__}: {e}")
+def latest_table(evolution: pd.DataFrame):
+    if evolution.empty:
+        return pd.DataFrame()
+    latest_month = evolution["quote_month"].max()
+    out = evolution[evolution["quote_month"] == latest_month].copy()
+    out["Market date"] = pd.to_datetime(out["market_date"]).dt.strftime("%Y-%m-%d")
+    out = out.rename(
+        columns={
+            "curve": "Curve",
+            "tenor": "Relative delivery",
+            "delivery_label": "Delivery label",
+            "contract": "OMIP contract",
+            "price": "Price €/MWh",
+        }
+    )
+    return out[["Relative delivery", "Curve", "Delivery label", "OMIP contract", "Market date", "Price €/MWh"]]
 
-            st.markdown("#### Response preview")
-            st.code(resp.text[:3000])
-
-    except Exception as e:
-        st.error(f"Request failed: {type(e).__name__}: {e}")
-
-
-st.markdown("### Run endpoint window tests")
-
-if st.button("Run window tests", type="primary"):
-    test_window(
-        "1. Jan-Apr 2026",
-        date(2026, 1, 1),
-        date(2026, 4, 30),
+def style_table(df: pd.DataFrame):
+    if df.empty:
+        return df
+    def row_style(row):
+        if row["Curve"] == "Baseload":
+            return ["background-color: #EEF5FF;"] * len(row)
+        if row["Curve"] == "Solar":
+            return ["background-color: #FFF7CC;"] * len(row)
+        return [""] * len(row)
+    return (
+        df.style
+        .format({"Price €/MWh": "{:,.2f}"})
+        .apply(row_style, axis=1)
+        .set_table_styles(
+            [
+                {"selector": "th", "props": [("background-color", "#334155"), ("color", "white"), ("font-weight", "800")]},
+                {"selector": "td", "props": [("padding", "7px 8px")]},
+            ]
+        )
     )
 
-    test_window(
-        "2. Jan-12 May 2026",
-        date(2026, 1, 1),
-        date(2026, 5, 12),
-    )
+# =========================================================
+# PAGE
+# =========================================================
+section("Forward monthly closing evolution")
+st.caption(
+    "Prototype for the Monthly Report forward block. "
+    "Each monthly point uses the last available OMIP market date in that calendar month, "
+    "then rolls the delivery references to Y+1, Y+2, Q+1, Q+2 and Q+3."
+)
 
-    test_window(
-        "3. April 2026 only",
-        date(2026, 4, 1),
-        date(2026, 4, 30),
-    )
+cache, source_name = load_cache()
+if cache.empty:
+    st.error("No usable OMIP cache found in `/data`.")
+    st.stop()
+
+c1, c2 = st.columns([1, 2])
+with c1:
+    months = st.slider("Months to display", min_value=6, max_value=18, value=10, step=1)
+with c2:
+    st.info(f"Forward source: `{source_name}`")
+
+evolution, diagnostics = build_evolution(cache, months)
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Quote months loaded", int((diagnostics["Status"] == "Loaded").sum()) if not diagnostics.empty else 0)
+m2.metric("Price points plotted", int(evolution["price"].notna().sum()) if not evolution.empty else 0)
+m3.metric("Missing contract-month cells", int(evolution["price"].isna().sum()) if not evolution.empty else 0)
+
+subsection("Evolution chart")
+chart = build_chart(evolution)
+if chart is not None:
+    st.altair_chart(chart, use_container_width=True)
+else:
+    st.warning("No matching Y+1/Y+2/Q+1/Q+2/Q+3 quotations could be plotted.")
+
+subsection("Latest monthly closing snapshot")
+table = latest_table(evolution)
+if not table.empty:
+    st.dataframe(style_table(table), use_container_width=True, hide_index=True)
+else:
+    st.info("No latest snapshot available.")
+
+with st.expander("Quote-date diagnostics"):
+    st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+
+with st.expander("Underlying chart points"):
+    show = evolution.copy()
+    if not show.empty:
+        show["quote_month"] = pd.to_datetime(show["quote_month"]).dt.strftime("%b-%Y")
+        show["market_date"] = pd.to_datetime(show["market_date"]).dt.strftime("%Y-%m-%d")
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+st.caption(
+    "The x-axis is the monthly quotation snapshot, not the delivery month. "
+    "Delivery labels roll forward every month, so Q+1 and Y+1 remain relative contracts."
+)
