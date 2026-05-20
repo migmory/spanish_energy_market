@@ -241,10 +241,51 @@ def fmt_change_pct(value: float | int | None, decimals: int = 1) -> str:
         return "—"
     return f"{float(value):+.{decimals}%}"
 
+
+def pct_change_vs(current: float | int | None, previous: float | int | None) -> float | None:
+    if current is None or previous is None or pd.isna(current) or pd.isna(previous):
+        return None
+    prev = float(previous)
+    if abs(prev) < 1e-12:
+        return None
+    return float(current) / prev - 1.0
+
+
+def delta_arrow_html(current: float | int | None, previous: float | int | None, reference_label: str) -> str:
+    delta = pct_change_vs(current, previous)
+    if delta is None or pd.isna(delta):
+        return f'<span style="color:#94A3B8;">→ n/a vs {reference_label}</span>'
+    if delta > 0:
+        arrow = '↑'
+        color = '#16A34A'
+    elif delta < 0:
+        arrow = '↓'
+        color = '#DC2626'
+    else:
+        arrow = '→'
+        color = '#64748B'
+    return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_change_pct(delta)} vs {reference_label}</span>'
+
 def fmt_pp(value: float | int | None, decimals: int = 1) -> str:
     if value is None or pd.isna(value):
         return "—"
     return f"{float(value) * 100:+.{decimals}f} pp"
+
+
+def arrow_change_pct_text(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "→ —"
+    v = float(value)
+    arrow = "↑" if v > 0 else "↓" if v < 0 else "→"
+    return f"{arrow} {fmt_change_pct(v, decimals)}"
+
+
+def arrow_pp_text(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "→ —"
+    v = float(value)
+    arrow = "↑" if v > 0 else "↓" if v < 0 else "→"
+    return f"{arrow} {fmt_pp(v, decimals)}"
 
 def month_label(ts: pd.Timestamp, mtd: bool = False) -> str:
     label = ts.strftime("%b %Y")
@@ -1308,17 +1349,26 @@ def build_generation_month_comparison_table(current: dict[str, float | None], pr
         prev = previous.get(key)
         if kind == "share":
             curr_display, prev_display = fmt_pct(curr), fmt_pct(prev)
-            diff_display = fmt_pp(None if curr is None or prev is None else curr - prev)
+            share_diff = None if curr is None or prev is None else curr - prev
+            diff_display = arrow_pp_text(share_diff)
         else:
             curr_display, prev_display = fmt_gwh(curr), fmt_gwh(prev)
             diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
-            diff_display = fmt_change_pct(diff)
+            diff_display = arrow_change_pct_text(diff)
         rows.append({"Metric": label, current_label: curr_display, previous_label: prev_display, "Diff vs prev.": diff_display})
     return pd.DataFrame(rows)
 
 
 def style_generation_comparison_table(df: pd.DataFrame):
-    return (
+    def color_diff_column(value):
+        s = str(value or "").strip()
+        if s.startswith("↑"):
+            return "color: #16A34A; font-weight: 800;"
+        if s.startswith("↓"):
+            return "color: #DC2626; font-weight: 800;"
+        return "color: #64748B; font-weight: 700;"
+
+    styler = (
         df.style
         .set_properties(**{"font-size": "0.92rem", "padding": "8px 10px"})
         .set_table_styles([
@@ -1326,6 +1376,9 @@ def style_generation_comparison_table(df: pd.DataFrame):
             {"selector": "tbody td:first-child", "props": [("font-weight", "800"), ("background-color", "#F8FFFC")]},
         ])
     )
+    if "Diff vs prev." in df.columns:
+        styler = styler.map(color_diff_column, subset=["Diff vs prev."])
+    return styler
 
 # =========================================================
 # FORWARD HOURLY SCENARIOS (AURORA / BARINGA)
@@ -2394,39 +2447,74 @@ def monthly_economic_curtailment_forward(forward_scenarios: pd.DataFrame, solar_
         return pd.DataFrame(columns=["model", "month_num", "month_name", "pct_curtailment"])
     return pd.concat(frames, ignore_index=True)
 
-def monthly_curtailment_chart(actual: pd.DataFrame, forward: pd.DataFrame, year: int):
-    if actual.empty and forward.empty:
+def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFrame, forward_2026: pd.DataFrame):
+    if actual_2025.empty and actual_2026.empty and forward_2026.empty:
         return None
     month_order = [calendar.month_abbr[m] for m in range(1, 13)]
     layers = []
-    if not actual.empty:
+
+    actual_frames = []
+    if actual_2025 is not None and not actual_2025.empty:
+        a25 = actual_2025.copy()
+        a25["Series"] = "2025 actual"
+        actual_frames.append(a25[["month_num", "month_name", "pct_curtailment", "Series"]])
+    if actual_2026 is not None and not actual_2026.empty:
+        a26 = actual_2026.copy()
+        a26["Series"] = "2026 actual"
+        actual_frames.append(a26[["month_num", "month_name", "pct_curtailment", "Series"]])
+    if actual_frames:
+        actual_plot = pd.concat(actual_frames, ignore_index=True)
         layers.append(
-            alt.Chart(actual).mark_bar(color=YELLOW_DARK, opacity=0.82).encode(
+            alt.Chart(actual_plot)
+            .mark_bar()
+            .encode(
                 x=alt.X("month_name:N", title=None, sort=month_order),
+                xOffset=alt.XOffset(
+                    "Series:N",
+                    sort=["2025 actual", "2026 actual"],
+                    scale=alt.Scale(paddingInner=0, paddingOuter=0),
+                ),
                 y=alt.Y(
                     "pct_curtailment:Q",
-                    title="Economic curtailment",
+                    title="Economic curtailment (%)",
                     axis=alt.Axis(format=".0%"),
                     scale=alt.Scale(domain=[0, 1.0]),
                 ),
+                color=alt.Color(
+                    "Series:N",
+                    title="Actual",
+                    scale=alt.Scale(domain=["2025 actual", "2026 actual"], range=["#F7C948", YELLOW_DARK]),
+                ),
                 tooltip=[
+                    alt.Tooltip("Series:N", title="Series"),
                     alt.Tooltip("month_name:N", title="Month"),
-                    alt.Tooltip("pct_curtailment:Q", title="Actual", format=".1%"),
+                    alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
                 ],
             )
         )
-    if not forward.empty and year == 2026:
+
+    if forward_2026 is not None and not forward_2026.empty:
         layers.append(
-            alt.Chart(forward).mark_line(point=alt.OverlayMarkDef(filled=True, size=65), strokeWidth=3.2).encode(
+            alt.Chart(forward_2026)
+            .mark_line(point=alt.OverlayMarkDef(filled=True, size=65), strokeWidth=3.0)
+            .encode(
                 x=alt.X("month_name:N", title=None, sort=month_order),
                 y=alt.Y(
                     "pct_curtailment:Q",
-                    title="Economic curtailment",
+                    title="Economic curtailment (%)",
                     axis=alt.Axis(format=".0%"),
                     scale=alt.Scale(domain=[0, 1.0]),
                 ),
-                color=alt.Color("model:N", title="2026 forecast", scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_COLOR, BARINGA_COLOR])),
-                strokeDash=alt.StrokeDash("model:N", title="2026 forecast", scale=alt.Scale(domain=["Aurora", "Baringa"], range=[[7, 3], [7, 3]])),
+                color=alt.Color(
+                    "model:N",
+                    title="Forecast",
+                    scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_COLOR, BARINGA_COLOR]),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "model:N",
+                    title="Forecast",
+                    scale=alt.Scale(domain=["Aurora", "Baringa"], range=[[7, 3], [3, 2]]),
+                ),
                 detail="model:N",
                 tooltip=[
                     alt.Tooltip("model:N", title="Model"),
@@ -2435,8 +2523,12 @@ def monthly_curtailment_chart(actual: pd.DataFrame, forward: pd.DataFrame, year:
                 ],
             )
         )
-    chart = alt.layer(*layers).resolve_scale(color="independent", strokeDash="independent").properties(title=f"Monthly economic curtailment | {year}")
-    return apply_chart_style(chart, height=330)
+
+    chart = alt.layer(*layers).resolve_scale(color="independent", strokeDash="independent").properties(
+        title="Actual economic curtailment (%) vs forecasts Aurora / Baringa"
+    )
+    return apply_chart_style(chart, height=360)
+
 
 
 def _clean_col_name(col) -> str:
@@ -2571,6 +2663,14 @@ def style_forward_snapshot_table(df: pd.DataFrame):
                     styles[i] = base + " font-weight: 700; color: #1D4ED8;"
                 elif curve == "solar":
                     styles[i] = base + " font-weight: 700; color: #9A6700;"
+            elif col == "M-1 change":
+                change = pd.to_numeric(row.get("M-1 change"), errors="coerce")
+                if pd.notna(change) and change > 0:
+                    styles[i] = base + " font-weight: 800; color: #16A34A;"
+                elif pd.notna(change) and change < 0:
+                    styles[i] = base + " font-weight: 800; color: #DC2626;"
+                else:
+                    styles[i] = base + " font-weight: 700; color: #64748B;"
         return styles
 
     return (
@@ -2578,7 +2678,7 @@ def style_forward_snapshot_table(df: pd.DataFrame):
         .format({
             "Latest quote": "{:,.2f}",
             "Quote one month ago": "{:,.2f}",
-            "M-1 change": "{:.1%}",
+            "M-1 change": lambda v: arrow_change_pct_text(v),
         }, na_rep="—")
         .apply(shade_curve, axis=1)
         .set_table_styles([
@@ -4185,7 +4285,7 @@ with q1:
         help="Simple average of hourly day-ahead prices.",
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(prev_metrics["avg_price"])}</b><br>Same week LY: <b>{fmt_eur(yoy_metrics["avg_price"])}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(selected_metrics["avg_price"], prev_metrics["avg_price"], "prev. week")}<br>Prev. week: <b>{fmt_eur(prev_metrics["avg_price"])}</b><br>Same week LY: <b>{fmt_eur(yoy_metrics["avg_price"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q2:
@@ -4195,7 +4295,7 @@ with q2:
         help="Generation-weighted solar captured price including zero/negative hours.",
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(prev_metrics["captured_uncurtailed"])}</b><br>Same week LY: <b>{fmt_eur(yoy_metrics["captured_uncurtailed"])}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(selected_metrics["captured_uncurtailed"], prev_metrics["captured_uncurtailed"], "prev. week")}<br>Prev. week: <b>{fmt_eur(prev_metrics["captured_uncurtailed"])}</b><br>Same week LY: <b>{fmt_eur(yoy_metrics["captured_uncurtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q3:
@@ -4205,16 +4305,16 @@ with q3:
         help="Generation-weighted solar captured price excluding zero/negative price hours.",
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(prev_metrics["captured_curtailed"])}</b><br>Same week LY: <b>{fmt_eur(yoy_metrics["captured_curtailed"])}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(selected_metrics["captured_curtailed"], prev_metrics["captured_curtailed"], "prev. week")}<br>Prev. week: <b>{fmt_eur(prev_metrics["captured_curtailed"])}</b><br>Same week LY: <b>{fmt_eur(yoy_metrics["captured_curtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q4:
     st.metric(
-        "Solar capture rate | curtailed",
-        fmt_pct(selected_metrics["capture_rate_curtailed"]),
+        "Solar capture rate | uncurtailed",
+        fmt_pct(selected_metrics["capture_rate_uncurtailed"]),
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_pct(prev_metrics["capture_rate_curtailed"])}</b><br>Same week LY: <b>{fmt_pct(yoy_metrics["capture_rate_curtailed"])}</b></div>',
+        f'<div class="metric-footnote">{arrow_pp_text(selected_metrics["capture_rate_uncurtailed"] - prev_metrics["capture_rate_uncurtailed"] if selected_metrics["capture_rate_uncurtailed"] is not None and prev_metrics["capture_rate_uncurtailed"] is not None and not pd.isna(selected_metrics["capture_rate_uncurtailed"]) and not pd.isna(prev_metrics["capture_rate_uncurtailed"]) else None)} vs prev. week<br>Prev. week: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same week LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q5:
@@ -4224,7 +4324,7 @@ with q5:
         help="Weekly average GDAES D+1 MIBGAS reference price by delivery day, using the MIBGAS files/cache available to the app.",
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(mibgas_selected, mibgas_prev, "prev. week")}<br>Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
         unsafe_allow_html=True,
     )
 
@@ -4311,17 +4411,14 @@ hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, 
 if hourly_overlay is not None:
     st.altair_chart(hourly_overlay, use_container_width=True)
 
-subsection("Monthly economic curtailment | 2026 actual vs Aurora / Baringa and 2025 full-year")
+subsection("Actual economic curtailment (%) vs forecasts Aurora / Baringa")
 actual_curt_2026 = monthly_economic_curtailment(price_hourly, solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
 forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, pd.Timestamp(latest_data_ts.date()))
-curt_chart_2026 = monthly_curtailment_chart(actual_curt_2026, forward_curt_2026, 2026)
-if curt_chart_2026 is not None:
-    st.altair_chart(curt_chart_2026, use_container_width=True)
 actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
-curt_chart_2025 = monthly_curtailment_chart(actual_curt_2025, pd.DataFrame(), 2025)
-if curt_chart_2025 is not None:
-    st.markdown('<div class="comparison-note">2025 full-year actual economic curtailment</div>', unsafe_allow_html=True)
-    st.altair_chart(curt_chart_2025, use_container_width=True)
+curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026)
+if curt_chart is not None:
+    st.altair_chart(curt_chart, use_container_width=True)
+
 
 subsection("Weekly generation injection and renewable share | selected week vs previous week")
 selected_generation_metrics = build_generation_week_metrics(
