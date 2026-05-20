@@ -3321,11 +3321,11 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
     if not normalized.empty:
         return normalized, "file"
 
-    # Preserve the report's existing proxy revenue methodology for:
-    #   - Revenue w/o demand
-    #   - Revenue w. demand 1.0c
-    # The model run below is only used to add the new standalone/no-cycle-cap outputs.
-    spreads_and_legacy_revenues = bess_monthly_proxy(price_hourly, solar_hourly)
+    # Top-bottom spreads are simple market-price metrics.
+    spreads = bess_monthly_proxy(price_hourly, solar_hourly)[["period", "tb1", "tb2", "tb4"]].copy()
+
+    # All BESS revenue rows come from the daily LP model so they are
+    # consistent with the BESS tab assumptions and fair-value accounting.
     modeled = _compute_bess_monthly_revenue_metrics_from_model(price_hourly)
 
     wanted = [
@@ -3337,40 +3337,25 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
         "revenue_standalone_eur_mw",
         "captured_spread_standalone_eur_mwh",
     ]
-    standalone_cols = [
-        "period",
-        "revenue_w_demand_standalone_cycles_eur_mw",
-        "standalone_cycles_day_avg",
-        "revenue_standalone_eur_mw",
-        "captured_spread_standalone_eur_mwh",
-    ]
 
-    if spreads_and_legacy_revenues.empty and modeled.empty:
+    if spreads.empty and modeled.empty:
         return pd.DataFrame(columns=wanted), "unavailable"
-
-    if spreads_and_legacy_revenues.empty:
-        out = modeled[standalone_cols].copy() if not modeled.empty else pd.DataFrame(columns=standalone_cols)
-        for col in ["tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw"]:
+    if spreads.empty:
+        out = modeled.copy()
+        for col in ["tb1", "tb2", "tb4"]:
             out[col] = np.nan
     elif modeled.empty:
-        out = spreads_and_legacy_revenues[
-            ["period", "tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw"]
-        ].copy()
-        for col in standalone_cols[1:]:
-            out[col] = np.nan
+        out = spreads.copy()
+        for col in wanted:
+            if col not in out.columns:
+                out[col] = np.nan
     else:
-        out = spreads_and_legacy_revenues[
-            ["period", "tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw"]
-        ].merge(
-            modeled[standalone_cols],
-            on="period",
-            how="outer",
-        )
+        out = spreads.merge(modeled, on="period", how="outer")
 
     for col in wanted:
         if col not in out.columns:
             out[col] = np.nan
-    return out[wanted].dropna(subset=["period"]).sort_values("period").reset_index(drop=True), "model_plus_legacy_proxy"
+    return out[wanted].dropna(subset=["period"]).sort_values("period").reset_index(drop=True), "daily_bess_model"
 
 def bess_summary_table(bess: pd.DataFrame, report_month: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
     cols = ["Metric", "Selected month", "YTD", "Annualized", "Previous year"]
@@ -4871,7 +4856,7 @@ else:
             st.altair_chart(bess_day_chart, use_container_width=True)
         st.caption("Daily BESS strategy example: with-demand model, daily optimization window, max 1 cycle/day, 4h BESS (4.0 MWh / 1.0 MW), undegraded capacity.")
 
-st.caption("BESS footnote: optimization window is daily; monthly hybrid captured-price comparison uses max 1 cycle/day; BESS capacity is assumed undegraded.")
+st.caption("BESS footnote: optimization window is daily; revenue rows use the daily BESS optimization model, including fair-value accounting for PV charging; monthly hybrid captured-price comparison uses max 1 cycle/day; BESS capacity is assumed undegraded.")
 st.caption("Monthly Market Report | Corporate dashboard based on the app's hourly market data, forward curve files and BESS monthly inputs/proxies.")
 
 # =========================================================
