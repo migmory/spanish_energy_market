@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
 import re
+from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
+import requests
 import pandas as pd
 import altair as alt
 import streamlit as st
@@ -15,6 +19,8 @@ st.set_page_config(page_title="Test | Forward Monthly Closing", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
+OMIP_BASE_URL = "https://www.omip.pt/en/dados-mercado"
+LIVE_CURRENT_MONTH_LOOKBACK_DAYS = 10
 CACHE_FILES = [
     DATA_DIR / "omip_ES_EL_date_range2025_20260511.xlsx",
     DATA_DIR / "eex_forward_market.xlsx",
@@ -124,6 +130,154 @@ def infer_curve(sheet, instrument, contract) -> str | None:
         return "Baseload"
     return None
 
+
+def omip_url(date_str: str, instrument: str) -> str:
+    params = {
+        "date": date_str,
+        "product": "EL",
+        "zone": "ES",
+        "instrument": instrument,
+    }
+    return f"{OMIP_BASE_URL}?{urlencode(params)}"
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_tables_live(date_str: str, instrument: str) -> list[pd.DataFrame]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-GB,en;q=0.9,es;q=0.8",
+        "Referer": "https://www.omip.pt/",
+    }
+    r = requests.get(omip_url(date_str, instrument), headers=headers, timeout=60)
+    r.raise_for_status()
+    return pd.read_html(io.StringIO(r.text))
+
+
+def parse_float(value) -> float | None:
+    s = norm(value)
+    if not s or s.lower() in {"nan", "none", "n.a.", "na", "-", ""}:
+        return None
+    s = s.replace("€", "").replace("/MWh", "").replace("MWh", "").replace(" ", "")
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    else:
+        s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def extract_live_contract_name(raw_text: str, instrument: str) -> str | None:
+    text = norm(raw_text)
+    m = re.search(rf"({re.escape(instrument)}\s+[A-Za-z0-9\-]+(?:\s+[A-Za-z0-9\-]+)?)\s*$", text)
+    if m:
+        return norm(m.group(1))
+    m = re.search(rf"({re.escape(instrument)}\s+.+)$", text)
+    if m:
+        tail = norm(m.group(1))
+        tail = tail.split(" Transparency")[0].strip()
+        return tail[:80]
+    return None
+
+
+def flatten_live_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            " | ".join([str(x) for x in tup if str(x) != "nan"]).strip()
+            for tup in out.columns
+        ]
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def parse_live_snapshot(asof: pd.Timestamp) -> pd.DataFrame:
+    parts = []
+    for curve, instrument in [("Baseload", "FTB"), ("Solar", "FTS")]:
+        try:
+            tables = fetch_tables_live(asof.strftime("%Y-%m-%d"), instrument)
+        except Exception:
+            tables = []
+        rows = []
+        for table in tables:
+            df = flatten_live_columns(table)
+            if df.empty:
+                continue
+            for _, row in df.iterrows():
+                vals = list(row.values)
+                texts = [norm(v) for v in vals]
+                contract = None
+                for txt in texts:
+                    maybe = extract_live_contract_name(txt, instrument)
+                    if maybe:
+                        contract = maybe
+                        break
+                if not contract:
+                    continue
+                def val_at(pos: int):
+                    return vals[pos] if pos < len(vals) else None
+                d_price = parse_float(val_at(15))
+                last_price = parse_float(val_at(7))
+                best_bid = parse_float(val_at(3))
+                best_ask = parse_float(val_at(4))
+                d_minus_1 = parse_float(val_at(16))
+                price = d_price
+                if price is None:
+                    price = last_price
+                if price is None and best_bid is not None and best_ask is not None:
+                    price = (best_bid + best_ask) / 2.0
+                if price is None:
+                    price = d_minus_1
+                if price is None:
+                    continue
+                rows.append(
+                    {
+                        "market_date": asof.normalize(),
+                        "sheet": curve,
+                        "instrument": instrument,
+                        "contract": contract,
+                        "delivery_label": delivery_label(contract),
+                        "curve": curve,
+                        "price": price,
+                        "curve_price": price,
+                        "d_price": d_price,
+                        "source": "live_omip",
+                    }
+                )
+        if rows:
+            parts.append(pd.DataFrame(rows))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def latest_live_snapshot_in_current_month(today_ts: pd.Timestamp) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    current_month = today_ts.to_period("M")
+    for offset in range(0, LIVE_CURRENT_MONTH_LOOKBACK_DAYS + 1):
+        candidate = (today_ts - pd.Timedelta(days=offset)).normalize()
+        if candidate.to_period("M") != current_month:
+            break
+        snap = parse_live_snapshot(candidate)
+        if not snap.empty:
+            return snap, candidate
+    return pd.DataFrame(), None
+
+
+def enrich_cache_with_live_current_month(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    if df.empty:
+        return df, "No live enrichment"
+    today_ts = pd.Timestamp(date.today())
+    cache_latest = pd.Timestamp(df["market_date"].max()).normalize()
+    # Only refresh the current quotation month if the cache is stale versus today.
+    if cache_latest.to_period("M") != today_ts.to_period("M") or cache_latest >= today_ts:
+        return df, "Current month already covered by cache"
+    live_snap, live_date = latest_live_snapshot_in_current_month(today_ts)
+    if live_snap.empty or live_date is None:
+        return df, "No live OMIP current-month snapshot found"
+    keep = df[df["market_date"] != live_date].copy()
+    out = pd.concat([keep, live_snap], ignore_index=True)
+    return out, f"Live OMIP current-month snapshot added: {live_date.strftime('%Y-%m-%d')}"
+
+
 @st.cache_data(show_spinner=False)
 def load_cache() -> tuple[pd.DataFrame, str]:
     for path in CACHE_FILES:
@@ -176,7 +330,8 @@ def load_cache() -> tuple[pd.DataFrame, str]:
         df = df[df["curve"].isin(["Baseload", "Solar"])]
         df = df[df["contract"].str.contains(r"^(?:FTB|FTS)\s+", regex=True, na=False)]
         if not df.empty:
-            return df.reset_index(drop=True), path.name
+            enriched, live_msg = enrich_cache_with_live_current_month(df.reset_index(drop=True))
+            return enriched.reset_index(drop=True), f"{path.name} | {live_msg}"
     return pd.DataFrame(), "No cache file found"
 
 def relative_labels(asof: pd.Timestamp) -> dict[str, str]:
@@ -224,7 +379,16 @@ def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.Dat
 
         snap = df[df["market_date"] == market_date]
         labels = relative_labels(market_date)
-        diagnostics.append({"Quote month": quote_month.strftime("%b-%Y"), "Last market date": market_date.strftime("%Y-%m-%d"), "Status": "Loaded"})
+        diagnostics.append({
+            "Quote month": quote_month.strftime("%b-%Y"),
+            "Last market date": market_date.strftime("%Y-%m-%d"),
+            "Status": "Loaded",
+            "Y+1": labels["Y+1"],
+            "Y+2": labels["Y+2"],
+            "Q+1": labels["Q+1"],
+            "Q+2": labels["Q+2"],
+            "Q+3": labels["Q+3"],
+        })
 
         for tenor, label in labels.items():
             for curve in ["Baseload", "Solar"]:
@@ -305,7 +469,7 @@ def build_chart(evolution: pd.DataFrame):
             alt.Tooltip("contract:N", title="OMIP contract"),
             alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
         ],
-    ).properties(title="Last monthly OMIP quote evolution | Baseload vs Solar")
+    ).properties(title="Last monthly OMIP quote evolution | Baseload vs Solar | Relative labels roll each month")
     return chart_style(chart, height=520)
 
 def latest_table(evolution: pd.DataFrame):
@@ -324,6 +488,18 @@ def latest_table(evolution: pd.DataFrame):
         }
     )
     return out[["Relative delivery", "Curve", "Delivery label", "OMIP contract", "Market date", "Price €/MWh"]]
+
+
+def latest_relative_delivery_mapping(evolution: pd.DataFrame) -> pd.DataFrame:
+    if evolution.empty:
+        return pd.DataFrame()
+    latest_month = evolution["quote_month"].max()
+    snap = evolution[evolution["quote_month"] == latest_month].copy()
+    cols = snap[["tenor", "delivery_label"]].drop_duplicates().rename(
+        columns={"tenor": "Relative label", "delivery_label": "Actual delivery contract"}
+    )
+    return cols.sort_values("Relative label").reset_index(drop=True)
+
 
 def style_table(df: pd.DataFrame):
     if df.empty:
@@ -368,6 +544,17 @@ with c2:
     st.info(f"Forward source: `{source_name}`")
 
 evolution, diagnostics = build_evolution(cache, months)
+
+mapping_df = latest_relative_delivery_mapping(evolution)
+if not mapping_df.empty:
+    latest_quote_date = pd.to_datetime(evolution["market_date"].max()).strftime("%Y-%m-%d")
+    st.caption(
+        f"Relative labels for the latest monthly close ({latest_quote_date}): "
+        + ", ".join(
+            f"{row['Relative label']} = {row['Actual delivery contract']}"
+            for _, row in mapping_df.iterrows()
+        )
+    )
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Quote months loaded", int((diagnostics["Status"] == "Loaded").sum()) if not diagnostics.empty else 0)
