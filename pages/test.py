@@ -367,32 +367,67 @@ def monthly_last_quote_dates(df: pd.DataFrame, months: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build a same-contract historical backtrace.
+
+    The relative labels Y+1, Y+2, Q+1, Q+2 and Q+3 are defined only once:
+    from the latest monthly closing quote available in the selected window.
+    Then, for every previous monthly closing date, we retrieve the historical
+    quote of those exact delivery contracts.
+
+    Example at 20-May-2026:
+        Q+1 = Q3-26
+    The chart then connects Q3-26 on 20-May with Q3-26 on the last quote of
+    Apr-2026, Mar-2026, etc. It does NOT roll Q+1 backwards month by month.
+    """
     quotes = monthly_last_quote_dates(df, months)
+    valid_quotes = quotes.dropna(subset=["market_date"]).copy()
+    if valid_quotes.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    latest_market_date = pd.to_datetime(valid_quotes["market_date"].max(), errors="coerce")
+    if pd.isna(latest_market_date):
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Freeze the delivery mapping at the latest monthly close.
+    fixed_labels = relative_labels(latest_market_date)
+
     rows = []
     diagnostics = []
     for _, qrow in quotes.iterrows():
         quote_month = pd.Timestamp(qrow["quote_month"])
         market_date = pd.to_datetime(qrow["market_date"], errors="coerce")
         if pd.isna(market_date):
-            diagnostics.append({"Quote month": quote_month.strftime("%b-%Y"), "Last market date": "—", "Status": "No data"})
+            diagnostics.append({
+                "Quote month": quote_month.strftime("%b-%Y"),
+                "Last market date": "—",
+                "Status": "No data",
+                "Y+1": fixed_labels["Y+1"],
+                "Y+2": fixed_labels["Y+2"],
+                "Q+1": fixed_labels["Q+1"],
+                "Q+2": fixed_labels["Q+2"],
+                "Q+3": fixed_labels["Q+3"],
+            })
             continue
 
-        snap = df[df["market_date"] == market_date]
-        labels = relative_labels(market_date)
+        snap = df[df["market_date"] == market_date].copy()
         diagnostics.append({
             "Quote month": quote_month.strftime("%b-%Y"),
             "Last market date": market_date.strftime("%Y-%m-%d"),
             "Status": "Loaded",
-            "Y+1": labels["Y+1"],
-            "Y+2": labels["Y+2"],
-            "Q+1": labels["Q+1"],
-            "Q+2": labels["Q+2"],
-            "Q+3": labels["Q+3"],
+            "Y+1": fixed_labels["Y+1"],
+            "Y+2": fixed_labels["Y+2"],
+            "Q+1": fixed_labels["Q+1"],
+            "Q+2": fixed_labels["Q+2"],
+            "Q+3": fixed_labels["Q+3"],
         })
 
-        for tenor, label in labels.items():
+        for tenor, label in fixed_labels.items():
             for curve in ["Baseload", "Solar"]:
-                selected = snap[(snap["curve"] == curve) & (snap["delivery_label"].astype(str) == label)]
+                selected = snap[
+                    (snap["curve"] == curve)
+                    & (snap["delivery_label"].astype(str) == label)
+                ].copy()
                 if selected.empty:
                     rows.append(
                         {
@@ -406,20 +441,22 @@ def build_evolution(df: pd.DataFrame, months: int) -> tuple[pd.DataFrame, pd.Dat
                             "price": None,
                         }
                     )
-                else:
-                    row = selected.iloc[0]
-                    rows.append(
-                        {
-                            "quote_month": quote_month,
-                            "quote_month_label": quote_month.strftime("%b-%Y"),
-                            "market_date": market_date,
-                            "curve": curve,
-                            "tenor": tenor,
-                            "delivery_label": label,
-                            "contract": row["contract"],
-                            "price": float(row["price"]),
-                        }
-                    )
+                    continue
+
+                row = selected.iloc[0]
+                rows.append(
+                    {
+                        "quote_month": quote_month,
+                        "quote_month_label": quote_month.strftime("%b-%Y"),
+                        "market_date": market_date,
+                        "curve": curve,
+                        "tenor": tenor,
+                        "delivery_label": label,
+                        "contract": row["contract"],
+                        "price": float(row["price"]),
+                    }
+                )
+
     return pd.DataFrame(rows), pd.DataFrame(diagnostics)
 
 def build_chart(evolution: pd.DataFrame):
@@ -469,7 +506,7 @@ def build_chart(evolution: pd.DataFrame):
             alt.Tooltip("contract:N", title="OMIP contract"),
             alt.Tooltip("price:Q", title="Price €/MWh", format=",.2f"),
         ],
-    ).properties(title="Last monthly OMIP quote evolution | Baseload vs Solar | Relative labels roll each month")
+    ).properties(title="Last monthly OMIP quote evolution | Same delivery contract backtrace from latest monthly close")
     return chart_style(chart, height=520)
 
 def latest_table(evolution: pd.DataFrame):
@@ -528,8 +565,8 @@ def style_table(df: pd.DataFrame):
 section("Forward monthly closing evolution")
 st.caption(
     "Prototype for the Monthly Report forward block. "
-    "Each monthly point uses the last available OMIP market date in that calendar month, "
-    "then rolls the delivery references to Y+1, Y+2, Q+1, Q+2 and Q+3."
+    "Each monthly point uses the last available OMIP market date in that calendar month. "
+    "Y+1, Y+2, Q+1, Q+2 and Q+3 are fixed using the latest monthly close, then traced backwards as the same delivery contracts."
 )
 
 cache, source_name = load_cache()
@@ -549,7 +586,7 @@ mapping_df = latest_relative_delivery_mapping(evolution)
 if not mapping_df.empty:
     latest_quote_date = pd.to_datetime(evolution["market_date"].max()).strftime("%Y-%m-%d")
     st.caption(
-        f"Relative labels for the latest monthly close ({latest_quote_date}): "
+        f"Fixed delivery mapping from the latest monthly close ({latest_quote_date}): "
         + ", ".join(
             f"{row['Relative label']} = {row['Actual delivery contract']}"
             for _, row in mapping_df.iterrows()
@@ -587,5 +624,5 @@ with st.expander("Underlying chart points"):
 
 st.caption(
     "The x-axis is the monthly quotation snapshot, not the delivery month. "
-    "Delivery labels roll forward every month, so Q+1 and Y+1 remain relative contracts."
+    "Delivery labels are frozen at the latest monthly close: e.g. if Q+1 = Q3-26 in May-2026, the line shows how Q3-26 quoted at the last close of Apr-2026, Mar-2026, etc."
 )
