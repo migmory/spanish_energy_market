@@ -18,8 +18,9 @@ pg = st.navigation(
         "Overview": [
             st.Page("pages/0_Home.py", title="Home", icon="🏠"),
         ],
-        "Monthly Reporting": [
+        "Reports": [
             st.Page("pages/0_Monthly_Market_Report.py", title="Monthly Market Report", icon="📊"),
+            st.Page("pages/0_Weekly_Market_Report.py", title="Weekly Market Report", icon="🗓️"),
         ],
         "Markets & Analytics": [
             st.Page("pages/1_Day_Ahead.py", title="Day Ahead", icon="⚡"),
