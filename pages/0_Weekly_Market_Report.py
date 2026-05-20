@@ -4163,7 +4163,11 @@ def _compute_bess_weekly_revenue_metrics_from_model(price_hourly: pd.DataFrame) 
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def _compute_bess_hybrid_capture_from_model(price_hourly: pd.DataFrame) -> pd.DataFrame:
-    """Return monthly captured hybrid prices for w/o-demand and with-demand report scenarios."""
+    """
+    Return monthly captured hybrid prices plus the underlying monthly
+    energy/revenue numerators needed to calculate correct full-year / YTD
+    captured prices over a selected range.
+    """
     monthly_parts = []
     for mode, target in [("without_demand", "hybrid_wo_demand"), ("with_demand", "hybrid_w_demand")]:
         data = _bess_report_dataset(price_hourly, mode)
@@ -4190,33 +4194,100 @@ def _compute_bess_hybrid_capture_from_model(price_hourly: pd.DataFrame) -> pd.Da
             monthly["hybrid_revenue_eur"] / monthly["hybrid_profile_mwh"],
             np.nan,
         )
-        monthly_parts.append(monthly[["period", target]])
+        monthly = monthly.rename(
+            columns={
+                "hybrid_profile_mwh": f"{target}_mwh",
+                "hybrid_revenue_eur": f"{target}_revenue_eur",
+            }
+        )
+        monthly_parts.append(
+            monthly[
+                [
+                    "period",
+                    target,
+                    f"{target}_mwh",
+                    f"{target}_revenue_eur",
+                ]
+            ]
+        )
 
+    empty_cols = [
+        "period",
+        "hybrid_wo_demand",
+        "hybrid_w_demand",
+        "hybrid_wo_demand_mwh",
+        "hybrid_wo_demand_revenue_eur",
+        "hybrid_w_demand_mwh",
+        "hybrid_w_demand_revenue_eur",
+    ]
     if not monthly_parts:
-        return pd.DataFrame(columns=["period", "hybrid_wo_demand", "hybrid_w_demand"])
+        return pd.DataFrame(columns=empty_cols)
     out = monthly_parts[0]
     for part in monthly_parts[1:]:
         out = out.merge(part, on="period", how="outer")
-    return out.sort_values("period").reset_index(drop=True)
+    for col in empty_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out[empty_cols].sort_values("period").reset_index(drop=True)
+
 
 
 def load_or_build_hybrid_capture_monthly(price_hourly: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     dedicated = _load_hybrid_monthly_file()
-    if not dedicated.empty:
-        return dedicated, "file"
     modeled = _compute_bess_hybrid_capture_from_model(price_hourly)
+
+    # Keep a dedicated monthly price file as the plotted monthly series where
+    # it exists, but enrich it with model MWh / revenue numerators so summary
+    # cards can still be calculated as true range-level captured prices.
+    if not dedicated.empty:
+        if not modeled.empty:
+            enrich_cols = [
+                "period",
+                "hybrid_wo_demand_mwh",
+                "hybrid_wo_demand_revenue_eur",
+                "hybrid_w_demand_mwh",
+                "hybrid_w_demand_revenue_eur",
+            ]
+            dedicated = dedicated.merge(modeled[enrich_cols], on="period", how="left")
+        return dedicated, "file"
+
     if not modeled.empty:
         return modeled, "model"
-    return pd.DataFrame(columns=["period", "hybrid_wo_demand", "hybrid_w_demand"]), "unavailable"
+
+    return pd.DataFrame(
+        columns=[
+            "period",
+            "hybrid_wo_demand",
+            "hybrid_w_demand",
+            "hybrid_wo_demand_mwh",
+            "hybrid_wo_demand_revenue_eur",
+            "hybrid_w_demand_mwh",
+            "hybrid_w_demand_revenue_eur",
+        ]
+    ), "unavailable"
+
 
 
 def hybrid_actual_monthly(monthly_capture: pd.DataFrame, hybrid_capture: pd.DataFrame) -> pd.DataFrame:
-    cols = ["period", "baseload", "hybrid_wo_demand", "hybrid_w_demand"]
+    base_cols = ["period", "baseload", "hybrid_wo_demand", "hybrid_w_demand"]
+    extra_cols = [
+        "hybrid_wo_demand_mwh",
+        "hybrid_wo_demand_revenue_eur",
+        "hybrid_w_demand_mwh",
+        "hybrid_w_demand_revenue_eur",
+    ]
     if monthly_capture.empty or hybrid_capture.empty:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=base_cols + extra_cols)
     out = monthly_capture[["period", "avg_spot_price"]].copy().rename(columns={"avg_spot_price": "baseload"})
-    out = out.merge(hybrid_capture, on="period", how="left")
-    return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
+    keep_hybrid_cols = ["period", "hybrid_wo_demand", "hybrid_w_demand"] + [
+        col for col in extra_cols if col in hybrid_capture.columns
+    ]
+    out = out.merge(hybrid_capture[keep_hybrid_cols], on="period", how="left")
+    for col in extra_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out[base_cols + extra_cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
+
 
 
 def hybrid_chart(hybrid: pd.DataFrame):
@@ -4274,30 +4345,81 @@ def hybrid_chart(hybrid: pd.DataFrame):
     return apply_chart_style(chart, height=360)
 
 
-def _hybrid_summary_values(hybrid: pd.DataFrame, year: int) -> dict[str, float | None]:
-    """Return summary price levels for the BESS chart cards."""
+def _period_baseload_average(
+    price_hourly: pd.DataFrame,
+    *,
+    year: int,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    if price_hourly is None or price_hourly.empty:
+        return None
+    start_ts = pd.Timestamp(year, 1, 1)
+    range_end = pd.Timestamp(year, 12, 31) if year == 2025 else pd.Timestamp(end_ts)
+    p = price_hourly[
+        (price_hourly["datetime"] >= start_ts)
+        & (price_hourly["datetime"] < range_end + pd.Timedelta(days=1))
+    ].copy()
+    values = pd.to_numeric(p["price"], errors="coerce").dropna()
+    return None if values.empty else float(values.mean())
+
+
+def _hybrid_summary_values(
+    hybrid: pd.DataFrame,
+    price_hourly: pd.DataFrame,
+    *,
+    year: int,
+    end_ts: pd.Timestamp,
+) -> dict[str, float | None]:
+    """
+    Return true range-level summary prices:
+      - Baseload = average hourly spot price over the range.
+      - Hybrid capture = sum(hybrid revenue) / sum(hybrid profile MWh)
+        over the full-year or YTD range, not the simple average of monthly
+        captured prices.
+    """
+    result = {
+        "baseload": _period_baseload_average(price_hourly, year=year, end_ts=end_ts),
+        "hybrid_wo_demand": None,
+        "hybrid_w_demand": None,
+    }
     if hybrid is None or hybrid.empty:
-        return {"baseload": None, "hybrid_wo_demand": None, "hybrid_w_demand": None}
+        return result
+
     h = hybrid.copy()
     h["period"] = pd.to_datetime(h["period"], errors="coerce")
     h = h.dropna(subset=["period"])
-    h = h[h["period"].dt.year == year].copy()
+    range_end = pd.Timestamp(year, 12, 31) if year == 2025 else pd.Timestamp(end_ts)
+    h = h[
+        (h["period"].dt.year == year)
+        & (h["period"] <= range_end.to_period("M").to_timestamp())
+    ].copy()
     if h.empty:
-        return {"baseload": None, "hybrid_wo_demand": None, "hybrid_w_demand": None}
-    return {
-        "baseload": float(pd.to_numeric(h["baseload"], errors="coerce").mean()),
-        "hybrid_wo_demand": float(pd.to_numeric(h["hybrid_wo_demand"], errors="coerce").mean()),
-        "hybrid_w_demand": float(pd.to_numeric(h["hybrid_w_demand"], errors="coerce").mean()),
-    }
+        return result
+
+    for label in ["hybrid_wo_demand", "hybrid_w_demand"]:
+        mwh_col = f"{label}_mwh"
+        rev_col = f"{label}_revenue_eur"
+        if mwh_col not in h.columns or rev_col not in h.columns:
+            continue
+        mwh = pd.to_numeric(h[mwh_col], errors="coerce").sum(min_count=1)
+        rev = pd.to_numeric(h[rev_col], errors="coerce").sum(min_count=1)
+        if pd.notna(mwh) and pd.notna(rev) and float(mwh) != 0:
+            result[label] = float(rev) / float(mwh)
+    return result
+
 
 
 def _fmt_hybrid_card_value(value: float | None) -> str:
     return "—" if value is None or pd.isna(value) else f"{value:,.1f} €/MWh"
 
 
-def render_hybrid_summary_cards(hybrid: pd.DataFrame) -> None:
-    fy_2025 = _hybrid_summary_values(hybrid, 2025)
-    ytd_2026 = _hybrid_summary_values(hybrid, 2026)
+def render_hybrid_summary_cards(
+    hybrid: pd.DataFrame,
+    price_hourly: pd.DataFrame,
+    report_end: pd.Timestamp,
+) -> None:
+    fy_2025 = _hybrid_summary_values(hybrid, price_hourly, year=2025, end_ts=pd.Timestamp(2025, 12, 31))
+    ytd_2026 = _hybrid_summary_values(hybrid, price_hourly, year=2026, end_ts=report_end)
 
     def card_html(title: str, values: dict[str, float | None]) -> str:
         return f"""
@@ -4332,7 +4454,11 @@ def render_hybrid_summary_cards(hybrid: pd.DataFrame) -> None:
         st.markdown(card_html("2025 full-year summary", fy_2025), unsafe_allow_html=True)
     with right:
         st.markdown(card_html("2026 YTD summary", ytd_2026), unsafe_allow_html=True)
-    st.caption("Summary cards show the average of the monthly values displayed in the chart.")
+    st.caption(
+        "Summary cards use range-level calculations: baseload is the average hourly spot price over the full year / YTD range; "
+        "hybrid capture is total hybrid revenue divided by total hybrid profile MWh over the same range."
+    )
+
 
 
 
@@ -5111,7 +5237,7 @@ subsection("Monthly BESS-model captured hybrid price vs monthly baseload")
 hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(price_hourly)
 hybrid = hybrid_actual_monthly(monthly_capture, hybrid_capture_monthly)
 if not hybrid.empty:
-    render_hybrid_summary_cards(hybrid)
+    render_hybrid_summary_cards(hybrid, price_hourly, report_end)
 hybrid_plot = hybrid_chart(hybrid)
 if hybrid_plot is not None:
     st.altair_chart(hybrid_plot, use_container_width=True)
