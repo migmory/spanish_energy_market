@@ -258,6 +258,48 @@ def delta_pp_arrow_html(current: float | int | None, previous: float | int | Non
         color = "#64748B"
     return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_pp(diff)} vs {reference_label}</span>'
 
+
+def adverse_delta_arrow_html(current: float | int | None, previous: float | int | None, reference_label: str) -> str:
+    """
+    For adverse metrics such as zero/negative hours:
+      - increase = red
+      - decrease = green
+    """
+    delta = pct_change_vs(current, previous)
+    if delta is None or pd.isna(delta):
+        return f'<span style="color:#94A3B8;">→ n/a vs {reference_label}</span>'
+    if delta > 0:
+        arrow = "↑"
+        color = "#DC2626"
+    elif delta < 0:
+        arrow = "↓"
+        color = "#16A34A"
+    else:
+        arrow = "→"
+        color = "#64748B"
+    return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_change_pct(delta)} vs {reference_label}</span>'
+
+
+def adverse_delta_pp_arrow_html(current: float | int | None, previous: float | int | None, reference_label: str) -> str:
+    """
+    For adverse percentage-point metrics such as economic curtailment:
+      - increase = red
+      - decrease = green
+    """
+    if current is None or previous is None or pd.isna(current) or pd.isna(previous):
+        return f'<span style="color:#94A3B8;">→ n/a vs {reference_label}</span>'
+    diff = float(current) - float(previous)
+    if diff > 0:
+        arrow = "↑"
+        color = "#DC2626"
+    elif diff < 0:
+        arrow = "↓"
+        color = "#16A34A"
+    else:
+        arrow = "→"
+        color = "#64748B"
+    return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_pp(diff)} vs {reference_label}</span>'
+
 def fmt_change_pct(value: float | int | None, decimals: int = 1) -> str:
     if value is None or pd.isna(value):
         return "—"
@@ -3437,6 +3479,125 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         ])
     )
 
+
+
+def _bess_summary_numeric_value(df: pd.DataFrame, metric: str, column: str) -> float | None:
+    if df is None or df.empty or column not in df.columns:
+        return None
+    hit = df[df["Metric"] == metric]
+    if hit.empty:
+        return None
+    value = pd.to_numeric(hit.iloc[0][column], errors="coerce")
+    return None if pd.isna(value) else float(value)
+
+
+def render_bess_ytd_annualized_cards(
+    bess_summary: pd.DataFrame,
+    *,
+    report_year: int,
+    report_end: pd.Timestamp,
+) -> None:
+    """
+    Show annualized BESS revenue run-rates only when the report year is still YTD,
+    plus a clear standalone annualized cycles/year metric.
+    """
+    if bess_summary is None or bess_summary.empty:
+        return
+
+    report_end = pd.Timestamp(report_end)
+    year_end = pd.Timestamp(report_year, 12, 31)
+    if report_end >= year_end:
+        return
+
+    rev_wo_ytd = _bess_summary_numeric_value(bess_summary, "Revenue w/o demand 1.0c", "YTD")
+    rev_wo_ann = _bess_summary_numeric_value(bess_summary, "Revenue w/o demand 1.0c", "Annualized")
+    rev_w_ytd = _bess_summary_numeric_value(bess_summary, "Revenue w. demand 1.0c", "YTD")
+    rev_w_ann = _bess_summary_numeric_value(bess_summary, "Revenue w. demand 1.0c", "Annualized")
+    rev_st_ytd = _bess_summary_numeric_value(bess_summary, "Revenue standalone | no cycle cap", "YTD")
+    rev_st_ann = _bess_summary_numeric_value(bess_summary, "Revenue standalone | no cycle cap", "Annualized")
+
+    standalone_cycles_day_ytd = _bess_summary_numeric_value(
+        bess_summary,
+        "Standalone cycles/day avg | no cycle cap",
+        "YTD",
+    )
+    standalone_cycles_year_ann = (
+        standalone_cycles_day_ytd * 365.0
+        if standalone_cycles_day_ytd is not None
+        else None
+    )
+
+    def _rev_card(title: str, annualized: float | None, ytd: float | None, accent: str) -> str:
+        return f"""
+        <div style="
+            border:1px solid #D9E7F3;
+            border-radius:14px;
+            padding:12px 14px;
+            background:linear-gradient(180deg, #FFFFFF 0%, #F8FBFF 100%);
+            box-shadow:0 3px 10px rgba(15, 23, 42, 0.04);
+            min-height:112px;
+        ">
+            <div style="border-left:4px solid {accent}; padding-left:10px;">
+                <div style="font-size:0.78rem; color:#64748B; font-weight:700;">{title}</div>
+                <div style="font-size:1.22rem; font-weight:850; color:#0F172A;">{fmt_mw_revenue(annualized)}</div>
+                <div style="font-size:0.77rem; color:#475569; margin-top:4px;">YTD actual: <b>{fmt_mw_revenue(ytd)}</b></div>
+            </div>
+        </div>
+        """
+
+    def _cycles_card(cycles_year: float | None, cycles_day: float | None) -> str:
+        big = "—" if cycles_year is None or pd.isna(cycles_year) else f"{float(cycles_year):,.0f} cycles/year"
+        small = "—" if cycles_day is None or pd.isna(cycles_day) else f"{float(cycles_day):,.2f} c/day"
+        return f"""
+        <div style="
+            border:1px solid #D9E7F3;
+            border-radius:14px;
+            padding:12px 14px;
+            background:linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%);
+            box-shadow:0 3px 10px rgba(15, 23, 42, 0.04);
+            min-height:112px;
+        ">
+            <div style="border-left:4px solid #64748B; padding-left:10px;">
+                <div style="font-size:0.78rem; color:#64748B; font-weight:700;">Standalone no-cycle-cap annualized cycling</div>
+                <div style="font-size:1.22rem; font-weight:850; color:#0F172A;">{big}</div>
+                <div style="font-size:0.77rem; color:#475569; margin-top:4px;">YTD avg: <b>{small}</b></div>
+            </div>
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        <div style="
+            margin-top:10px;
+            margin-bottom:8px;
+            padding:8px 12px;
+            color:#0F172A;
+            background:#F4FCF8;
+            border-left:5px solid #10B981;
+            font-size:1.0rem;
+            font-weight:800;
+            border-radius:8px;
+        ">YTD BESS annualized revenue run-rate and standalone cycling | {report_year}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(_rev_card("Annualized revenue w/o demand 1.0c", rev_wo_ann, rev_wo_ytd, "#F59E0B"), unsafe_allow_html=True)
+    with c2:
+        st.markdown(_rev_card("Annualized revenue w. demand 1.0c", rev_w_ann, rev_w_ytd, "#10B981"), unsafe_allow_html=True)
+    with c3:
+        st.markdown(_rev_card("Annualized revenue standalone | no cycle cap", rev_st_ann, rev_st_ytd, "#1D4ED8"), unsafe_allow_html=True)
+    with c4:
+        st.markdown(_cycles_card(standalone_cycles_year_ann, standalone_cycles_day_ytd), unsafe_allow_html=True)
+
+    st.caption(
+        "Annualized revenues are scaled from YTD revenue using elapsed calendar days. "
+        "Standalone cycles/year is the YTD average cycles/day multiplied by 365."
+    )
+
+
 def _load_hybrid_monthly_file() -> pd.DataFrame:
     """Optional dedicated monthly hybrid capture file."""
     raw = _load_optional_table(HYBRID_MONTHLY_CANDIDATES)
@@ -4709,7 +4870,7 @@ with k2_2:
         help="Number of selected-period day-ahead hours with price less than or equal to zero.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_arrow_html(zero_neg_selected, zero_neg_prev, "prev. month")}<br>Prev. month: <b>{fmt_hours(zero_neg_prev)}</b></div>',
+        f'<div class="metric-footnote">{adverse_delta_arrow_html(zero_neg_selected, zero_neg_prev, "prev. month")}<br>Prev. month: <b>{fmt_hours(zero_neg_prev)}</b></div>',
         unsafe_allow_html=True,
     )
 with k2_3:
@@ -4719,7 +4880,7 @@ with k2_3:
         help="Share of solar generation produced during zero or negative day-ahead price hours.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_pp_arrow_html(curt_selected, curt_prev, "prev. month")}<br>Prev. month: <b>{fmt_pct(curt_prev)}</b></div>',
+        f'<div class="metric-footnote">{adverse_delta_pp_arrow_html(curt_selected, curt_prev, "prev. month")}<br>Prev. month: <b>{fmt_pct(curt_prev)}</b></div>',
         unsafe_allow_html=True,
     )
 with k2_4:
@@ -4941,6 +5102,11 @@ if bess_summary.empty:
     st.info("No BESS metrics are available.")
 else:
     st.dataframe(format_bess_summary(bess_summary), use_container_width=True)
+    render_bess_ytd_annualized_cards(
+        bess_summary,
+        report_year=selected_month.year,
+        report_end=report_end,
+    )
 
 subsection("Monthly BESS-model captured hybrid price vs monthly baseload")
 hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(price_hourly)
