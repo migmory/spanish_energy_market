@@ -345,6 +345,26 @@ RENEWABLE_TECHS = {
     "Biogas",
 }
 
+DETAILED_MIX_TECHS = {
+    "Nuclear",
+    "CCGT",
+    "Wind",
+    "Solar PV",
+    "Solar thermal",
+    "Hydro",
+    "Hydro UGH",
+    "Hydro non-UGH",
+    "Pumped hydro",
+    "CHP",
+    "Biomass",
+    "Biogas",
+    "Other renewables",
+    "Coal",
+    "Fuel + Gas",
+    "Steam turbine",
+    "Other non-renewables",
+}
+
 # =========================================================
 # HISTORICAL + LIVE DATA
 # =========================================================
@@ -693,6 +713,10 @@ def load_live_2026_mix_monthly_for_report(start_day: date, end_day: date) -> pd.
     df["energy_mwh"] = _normalize_ree_energy_to_mwh(df["value"])
     df["data_source"] = "REE API"
     df = df.dropna(subset=["datetime", "technology", "energy_mwh"]).copy()
+    # REE's monthly generation widget can expose aggregate rows in addition to
+    # the technology breakdown. Keep only detailed technologies here, otherwise
+    # total generation is double-counted and % renewables is artificially halved.
+    df = df[df["technology"].isin(DETAILED_MIX_TECHS)].copy()
     hydro_techs = ["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"]
     hydro = (
         df[df["technology"].isin(hydro_techs)]
@@ -716,6 +740,9 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
         if not mix.empty:
             mask = (mix["datetime"].dt.year == target_month.year) & (mix["datetime"].dt.month == target_month.month)
             mix = mix.loc[mask].copy()
+    if mix.empty:
+        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+    mix = mix[mix["technology"].isin(DETAILED_MIX_TECHS)].copy()
     if mix.empty:
         return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     grouped = mix.groupby("technology", as_index=False)["energy_mwh"].sum()
@@ -2831,7 +2858,7 @@ def build_bess_with_demand_daily_strategy_chart(dispatch: pd.DataFrame):
     )
     bars_chart = alt.Chart(bars).mark_bar(opacity=0.9).encode(
         x=alt.X("hour_label:N", title="Hour", sort=hours, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("flow_mwh:Q", title="Battery flow (MWh): discharge + / charge −"),
+        y=alt.Y("flow_mwh:Q", title="Battery flow / solar generation (MWh): discharge + / charge −"),
         color=alt.Color("series:N", title="BESS flow", scale=flow_colors),
         tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Flow"), alt.Tooltip("flow_mwh:Q", title="MWh", format=",.3f")],
     )
@@ -2841,12 +2868,16 @@ def build_bess_with_demand_daily_strategy_chart(dispatch: pd.DataFrame):
         .rename(columns={"generacion": "value"})
         .assign(series="Solar generation")
     )
-    profile_line = alt.Chart(profile_long).mark_line(point=False, strokeWidth=2.2, strokeDash=[5, 3]).encode(
+    profile_line = alt.Chart(profile_long).mark_line(point=False, strokeWidth=2.4, strokeDash=[5, 3]).encode(
         x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("value:Q", title="Solar profile (MWh)"),
-        color=alt.Color("series:N", title="Profile", scale=alt.Scale(domain=["Solar generation"], range=[YELLOW_DARK])),
+        y=alt.Y("value:Q", title="Battery flow / solar generation (MWh): discharge + / charge −"),
+        color=alt.Color("series:N", title="Solar profile", scale=alt.Scale(domain=["Solar generation"], range=[YELLOW_DARK])),
         tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Profile"), alt.Tooltip("value:Q", title="MWh", format=",.3f")],
     )
+
+    # Battery flow bars and solar generation line share the left y-axis.
+    # Spot price remains on the independent right y-axis.
+    flow_and_solar = alt.layer(bars_chart, profile_line)
 
     price_line = alt.Chart(d).mark_line(point=True, strokeWidth=2.6, color=BLUE_DARK).encode(
         x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
@@ -2854,7 +2885,7 @@ def build_bess_with_demand_daily_strategy_chart(dispatch: pd.DataFrame):
         tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("omie_venta:Q", title="Spot price", format=",.2f")],
     )
 
-    chart = alt.layer(bars_chart, profile_line, price_line).resolve_scale(y="independent", color="independent").properties(
+    chart = alt.layer(flow_and_solar, price_line).resolve_scale(y="independent", color="independent").properties(
         title="Selected-day BESS with demand strategy | 24h charge / discharge example",
         height=390,
     )
@@ -3383,7 +3414,7 @@ generation_comparison = build_generation_month_comparison_table(
     month_label(prev_month, False),
 )
 st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
-st.caption("Solar = Solar PV + Solar thermal. Renewable share is calculated over the total generation mix available for the month.")
+st.caption("Solar = Solar PV + Solar thermal. Renewable share is calculated from detailed technology rows only, excluding any aggregate REE summary rows to avoid double-counting total generation.")
 
 
 # =========================================================
