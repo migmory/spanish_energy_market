@@ -3373,7 +3373,7 @@ def bess_summary_table(bess: pd.DataFrame, report_month: pd.Timestamp, report_en
         ("TB4", "tb4", "eur"),
         ("TB2", "tb2", "eur"),
         ("TB1", "tb1", "eur"),
-        ("Revenue w/o demand", "revenue_wo_demand_eur_mw", "rev"),
+        ("Revenue w/o demand 1.0c", "revenue_wo_demand_eur_mw", "rev"),
         ("Revenue w. demand 1.0c", "revenue_w_demand_1c_eur_mw", "rev"),
         ("Revenue standalone | no cycle cap", "revenue_standalone_eur_mw", "rev"),
         ("Standalone cycles/day avg | no cycle cap", "standalone_cycles_day_avg", "cycles"),
