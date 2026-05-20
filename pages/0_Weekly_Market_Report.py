@@ -876,6 +876,113 @@ def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: p
     return None if values.empty else float(values.mean())
 
 
+def _mibgas_weekly_mean_from_standard_raw(
+    raw: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    """Compute the GDAES_D+1 weekly mean directly from standardized raw MIBGAS rows.
+
+    This mirrors the MIBGAS tab:
+      - filter Product = GDAES_D+1 and Area = ES,
+      - use First Day Delivery as the delivery-day axis,
+      - fall back to Trading day only when First Day Delivery is missing,
+      - take the arithmetic mean of Reference Price over the selected week.
+    """
+    if raw is None or raw.empty:
+        return None
+
+    work = raw.copy()
+    for col in ["trading_day", "delivery_start"]:
+        if col in work.columns:
+            work[col] = pd.to_datetime(work[col], errors="coerce")
+
+    if "reference_price_eur_mwh" not in work.columns:
+        return None
+
+    work["reference_price_eur_mwh"] = pd.to_numeric(
+        work["reference_price_eur_mwh"], errors="coerce"
+    )
+
+    if "area" not in work.columns:
+        work["area"] = "ES"
+
+    actuals = work[
+        (work["product"].astype(str).str.strip() == "GDAES_D+1")
+        & (work["area"].fillna("ES").astype(str).str.strip() == "ES")
+    ].copy()
+
+    if actuals.empty:
+        return None
+
+    actuals["delivery_day"] = actuals["delivery_start"].combine_first(actuals["trading_day"])
+    actuals = actuals.dropna(subset=["delivery_day", "reference_price_eur_mwh"]).copy()
+    if actuals.empty:
+        return None
+
+    mask = (
+        (actuals["delivery_day"] >= pd.Timestamp(start_ts))
+        & (actuals["delivery_day"] < pd.Timestamp(end_ts) + pd.Timedelta(days=1))
+    )
+    values = actuals.loc[mask, "reference_price_eur_mwh"].dropna()
+    return None if values.empty else float(values.mean())
+
+
+def _mibgas_weekly_mean_from_cache_exact(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    """Read `/data/mibgas_2026_cache.csv` in its already-standardized layout."""
+    if not MIBGAS_CACHE_FILE.exists():
+        return None
+    try:
+        cache = pd.read_csv(MIBGAS_CACHE_FILE)
+    except Exception:
+        return None
+
+    # Cache written by the MIBGAS tab is already standardized.
+    expected = {
+        "trading_day",
+        "product",
+        "area",
+        "delivery_start",
+        "reference_price_eur_mwh",
+    }
+    if not expected.issubset(set(cache.columns)):
+        # Fall back to the report's standardizer only if the cache is not already shaped.
+        cache = _standardize_mibgas_raw(cache)
+
+    return _mibgas_weekly_mean_from_standard_raw(cache, start_ts, end_ts)
+
+
+def mibgas_weekly_selected_value_exact(
+    fallback_actuals: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    """Selected-week MIBGAS value with parity-first resolution.
+
+    Resolution order:
+      1) direct read of the cache file used by the MIBGAS tab,
+      2) uncached SFTP refresh and direct computation from refreshed raw rows,
+      3) previous report fallback actuals.
+    """
+    direct_cache_value = _mibgas_weekly_mean_from_cache_exact(start_ts, end_ts)
+    if direct_cache_value is not None:
+        return direct_cache_value
+
+    refreshed_raw = _refresh_mibgas_2026_cache_for_report()
+    refreshed_value = _mibgas_weekly_mean_from_standard_raw(
+        refreshed_raw,
+        start_ts,
+        end_ts,
+    )
+    if refreshed_value is not None:
+        return refreshed_value
+
+    return mibgas_monthly_mean(fallback_actuals, start_ts, end_ts)
+
+
 def _reload_mibgas_actuals_direct_from_2026_cache() -> pd.DataFrame:
     """Read the on-disk 2026 MIBGAS cache directly, matching the MIBGAS tab fallback."""
     if not MIBGAS_CACHE_FILE.exists():
@@ -4062,7 +4169,7 @@ prev_week = previous_week(selected_week)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_week, week_end(prev_week))
 yoy = yoy_week(selected_week)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, week_end(yoy))
-mibgas_selected, mibgas_actuals = mibgas_mean_with_requested_window_refresh(
+mibgas_selected = mibgas_weekly_selected_value_exact(
     mibgas_actuals,
     selected_week,
     report_end,
