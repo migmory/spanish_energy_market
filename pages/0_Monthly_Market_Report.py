@@ -2215,6 +2215,26 @@ def _forward_clean_mapping(snapshot: pd.DataFrame) -> list[str]:
     return [f"{row['period']} = {row['contract_short']}" for _, row in work.iterrows()]
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
+def _latest_omip_month_close_date(period_label: str) -> pd.Timestamp | pd.NaT:
+    """Find the last OMIP date in a historical month that returns a usable power curve.
+
+    The normalized forward-history file is not always populated for all contracts/months.
+    For the Monthly Report we need a genuine 10-month closing evolution, so this helper
+    walks backwards from month-end and finds the latest date that OMIP can serve.
+    """
+    period = pd.Period(period_label, freq="M")
+    month_end = period.end_time.normalize()
+    # Try the last two calendar weeks of the month. Weekends/holidays usually return
+    # no usable rows, so the loop naturally lands on the last available trading date.
+    for offset in range(0, 15):
+        candidate = month_end - pd.Timedelta(days=offset)
+        snap = load_live_omip_forward_contracts(candidate.date().isoformat())
+        if not snap.empty:
+            return candidate.normalize()
+    return pd.NaT
+
+
 def _forward_monthly_quote_dates(history: pd.DataFrame, access_date: date, months: int = 10) -> pd.DataFrame:
     periods = pd.period_range(end=pd.Timestamp(access_date).to_period("M"), periods=months, freq="M")
     hist = history.copy()
@@ -2222,9 +2242,12 @@ def _forward_monthly_quote_dates(history: pd.DataFrame, access_date: date, month
         hist["as_of_date"] = pd.to_datetime(hist["as_of_date"], errors="coerce")
         hist = hist.dropna(subset=["as_of_date"]).copy()
         hist["quote_period"] = hist["as_of_date"].dt.to_period("M")
+
     rows = []
+    current_period = pd.Timestamp(access_date).to_period("M")
+
     for period in periods:
-        if period == pd.Timestamp(access_date).to_period("M"):
+        if period == current_period:
             rows.append({
                 "quote_month": period.to_timestamp(),
                 "quote_month_label": period.to_timestamp().strftime("%b-%Y"),
@@ -2232,17 +2255,31 @@ def _forward_monthly_quote_dates(history: pd.DataFrame, access_date: date, month
                 "date_source": "access-date OMIP live pull",
             })
             continue
-        if hist.empty:
-            as_of = pd.NaT
-        else:
+
+        as_of = pd.NaT
+        date_source = "missing"
+
+        # Prefer the normalized historical dataset when it has a quote in that month.
+        if not hist.empty:
             candidates = hist[hist["quote_period"] == period]
-            as_of = candidates["as_of_date"].max() if not candidates.empty else pd.NaT
+            if not candidates.empty:
+                as_of = candidates["as_of_date"].max()
+                date_source = "last cached quote date in month"
+
+        # If the local history is absent or incomplete, resolve a real OMIP month-close date.
+        if pd.isna(as_of):
+            live_month_close = _latest_omip_month_close_date(str(period))
+            if pd.notna(live_month_close):
+                as_of = live_month_close
+                date_source = "last available OMIP date found in month"
+
         rows.append({
             "quote_month": period.to_timestamp(),
             "quote_month_label": period.to_timestamp().strftime("%b-%Y"),
             "as_of_date": as_of,
-            "date_source": "last cached quote date in month" if pd.notna(as_of) else "missing",
+            "date_source": date_source,
         })
+
     return pd.DataFrame(rows)
 
 
@@ -3760,7 +3797,7 @@ else:
         forward_chart = forward_snapshot_chart(forward_snapshot)
         st.caption("Monthly close evolution could not be populated fully, so the latest snapshot is shown instead.")
     else:
-        st.caption("Evolution uses the last available close in each of the last 10 quote months, tracking the same latest Y/Q delivery contracts backwards through time.")
+        st.caption("Evolution uses the last available close in each of the last 10 quote months, tracking the same latest Y/Q delivery contracts backwards through time. If the local history misses a month-close, the report searches OMIP for that month’s last available trading date.")
     if forward_chart is not None:
         st.altair_chart(forward_chart, use_container_width=True)
     forward_display = forward_snapshot.copy()
