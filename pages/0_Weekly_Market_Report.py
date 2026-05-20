@@ -411,6 +411,7 @@ BESS_REPORT_POWER_MW = BESS_REPORT_CAPACITY_MWH * BESS_REPORT_C_RATE
 BESS_REPORT_ETA_CH = 0.93
 BESS_REPORT_ETA_DIS = 0.93
 BESS_REPORT_CYCLE_LIMIT = 1.0
+BESS_REPORT_UNRESTRICTED_CYCLE_FACTOR = 5.0  # Mirrors BESS-tab 'No limit cycles/day' setting.
 
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
@@ -3372,7 +3373,17 @@ def economic_curtailment_ytd_forecast_value(
     return economic_curtailment_ytd_value(f, solar_hourly, 2026, end_ts)
 
 def bess_monthly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
-    cols = ["period", "tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw", "revenue_w_demand_1_4c_eur_mw"]
+    cols = [
+        "period",
+        "tb1",
+        "tb2",
+        "tb4",
+        "revenue_wo_demand_eur_mw",
+        "revenue_w_demand_1c_eur_mw",
+        "revenue_w_demand_standalone_cycles_eur_mw",
+        "standalone_cycles_day_avg",
+        "revenue_standalone_eur_mw",
+    ]
     if price_hourly.empty:
         return pd.DataFrame(columns=cols)
     p = price_hourly.copy()
@@ -3400,7 +3411,6 @@ def bess_monthly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -
                 charge_pv = solar_day.head(4)["price"].sum() / rte
                 solar_rev = float(discharge - charge_pv)
                 day_revenues_solar.append(solar_rev)
-        days = max(len(day_revenues_grid), 1)
         grid_1c = float(np.nansum(day_revenues_grid))
         solar_wo = float(np.nansum(day_revenues_solar))
         rows.append({
@@ -3410,56 +3420,57 @@ def bess_monthly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -
             "tb4": tb["TB4"],
             "revenue_wo_demand_eur_mw": solar_wo,
             "revenue_w_demand_1c_eur_mw": grid_1c,
-            "revenue_w_demand_1_4c_eur_mw": grid_1c * 1.4,
+            # The old "1.4c" row was a hard-coded proxy (grid_1c * 1.4), not an actual
+            # unrestricted standalone cycle result. Leave these blank unless a dedicated
+            # BESS monthly input file provides real standalone / same-cycle metrics.
+            "revenue_w_demand_standalone_cycles_eur_mw": np.nan,
+            "standalone_cycles_day_avg": np.nan,
+            "revenue_standalone_eur_mw": np.nan,
         })
     return pd.DataFrame(rows, columns=cols).sort_values("period").reset_index(drop=True)
 
 
 def bess_weekly_proxy(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame) -> pd.DataFrame:
-    cols = ["period", "tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw", "revenue_w_demand_1_4c_eur_mw"]
+    cols = [
+        "period", "tb1", "tb2", "tb4",
+        "revenue_wo_demand_eur_mw",
+        "revenue_w_demand_1c_eur_mw",
+        "revenue_w_demand_standalone_cycles_eur_mw",
+        "standalone_cycles_day_avg",
+        "revenue_standalone_eur_mw",
+    ]
     if price_hourly.empty:
         return pd.DataFrame(columns=cols)
     p = price_hourly.copy()
     p["period"] = p["datetime"].map(week_start)
-    solar = solar_hourly.copy()
-    if not solar.empty:
-        solar["period"] = solar["datetime"].map(week_start)
     rows = []
-    rte = 0.85
     for period, g in p.groupby("period"):
-        s = solar[solar["period"] == period].copy() if not solar.empty else pd.DataFrame()
         tb = top_bottom_summary(g, period, week_end(period))
-        g = g.copy()
-        g["date"] = g["datetime"].dt.normalize()
-        day_revenues_grid = []
-        day_revenues_solar = []
-        for d, day in g.groupby("date"):
-            day_prices = day[["datetime", "price"]].dropna().sort_values("price")
-            if len(day_prices) < 8:
-                continue
-            charge_grid = day_prices.head(4)["price"].sum() / rte
-            discharge = day_prices.tail(4)["price"].sum()
-            grid_rev = float(discharge - charge_grid)
-            day_revenues_grid.append(grid_rev)
-            if not s.empty:
-                solar_day = s[s["datetime"].dt.normalize() == d].merge(day[["datetime", "price"]], on="datetime", how="inner")
-                solar_day = solar_day[solar_day["solar_best_mw"] > 0].sort_values("price")
-                if len(solar_day) >= 4:
-                    charge_pv = solar_day.head(4)["price"].sum() / rte
-                    solar_rev = float(discharge - charge_pv)
-                    day_revenues_solar.append(solar_rev)
-        grid_1c = float(np.nansum(day_revenues_grid))
-        solar_wo = float(np.nansum(day_revenues_solar))
         rows.append({
             "period": period,
             "tb1": tb["TB1"],
             "tb2": tb["TB2"],
             "tb4": tb["TB4"],
-            "revenue_wo_demand_eur_mw": solar_wo,
-            "revenue_w_demand_1c_eur_mw": grid_1c,
-            "revenue_w_demand_1_4c_eur_mw": grid_1c * 1.4,
         })
-    return pd.DataFrame(rows, columns=cols).sort_values("period").reset_index(drop=True)
+    spreads = pd.DataFrame(rows)
+    modeled = _compute_bess_weekly_revenue_metrics_from_model(price_hourly)
+    if spreads.empty and modeled.empty:
+        return pd.DataFrame(columns=cols)
+    if spreads.empty:
+        out = modeled.copy()
+        for col in ["tb1", "tb2", "tb4"]:
+            out[col] = np.nan
+    elif modeled.empty:
+        out = spreads.copy()
+        for col in cols:
+            if col not in out.columns:
+                out[col] = np.nan
+    else:
+        out = spreads.merge(modeled, on="period", how="outer")
+    for col in cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
 
 
 def bess_summary_table_weekly(bess: pd.DataFrame, report_week: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
@@ -3470,6 +3481,7 @@ def bess_summary_table_weekly(bess: pd.DataFrame, report_week: pd.Timestamp, rep
     b["period"] = pd.to_datetime(b["period"], errors="coerce")
     b = b.dropna(subset=["period"]).copy()
     b["year"] = b["period"].dt.year
+    
     selected = b[b["period"] == week_start(report_week)]
     ytd = b[(b["year"] == report_week.year) & (b["period"] <= week_start(report_week))]
     prev = b[b["year"] == report_week.year - 1]
@@ -3479,15 +3491,25 @@ def bess_summary_table_weekly(bess: pd.DataFrame, report_week: pd.Timestamp, rep
         ("TB1", "tb1", "eur"),
         ("Revenue w/o demand", "revenue_wo_demand_eur_mw", "rev"),
         ("Revenue w. demand 1.0c", "revenue_w_demand_1c_eur_mw", "rev"),
-        ("Revenue w. demand 1.4c", "revenue_w_demand_1_4c_eur_mw", "rev"),
+        ("Revenue w. demand | same c/day as standalone", "revenue_w_demand_standalone_cycles_eur_mw", "rev"),
+        ("Standalone cycles/day avg | no cycle cap", "standalone_cycles_day_avg", "cycles"),
+        ("Revenue standalone | no cycle cap", "revenue_standalone_eur_mw", "rev"),
     ]
     days_elapsed = max((report_end - pd.Timestamp(report_week.year, 1, 1)).days + 1, 1)
     rows = []
     for label, col, kind in metrics:
-        sel_val = selected[col].mean() if not selected.empty else np.nan
-        ytd_val = ytd[col].sum() if kind == "rev" else ytd[col].mean()
-        annualized = ytd_val * 365 / days_elapsed if kind == "rev" and pd.notna(ytd_val) else ytd_val
-        prev_val = prev[col].sum() if kind == "rev" else prev[col].mean()
+        if col not in b.columns:
+            sel_val = ytd_val = annualized = prev_val = np.nan
+        else:
+            sel_val = selected[col].mean() if not selected.empty else np.nan
+            if kind == "rev":
+                ytd_val = ytd[col].sum()
+                annualized = ytd_val * 365 / days_elapsed if pd.notna(ytd_val) else ytd_val
+                prev_val = prev[col].sum()
+            else:
+                ytd_val = ytd[col].mean()
+                annualized = ytd_val
+                prev_val = prev[col].mean()
         rows.append({
             "Metric": label,
             "Selected week": sel_val,
@@ -3510,7 +3532,17 @@ def _load_optional_table(paths: list[Path]) -> pd.DataFrame:
     return pd.DataFrame()
 
 def normalize_bess_table(raw: pd.DataFrame) -> pd.DataFrame:
-    proxy_cols = ["period", "tb1", "tb2", "tb4", "revenue_wo_demand_eur_mw", "revenue_w_demand_1c_eur_mw", "revenue_w_demand_1_4c_eur_mw"]
+    proxy_cols = [
+        "period",
+        "tb1",
+        "tb2",
+        "tb4",
+        "revenue_wo_demand_eur_mw",
+        "revenue_w_demand_1c_eur_mw",
+        "revenue_w_demand_standalone_cycles_eur_mw",
+        "standalone_cycles_day_avg",
+        "revenue_standalone_eur_mw",
+    ]
     if raw is None or raw.empty:
         return pd.DataFrame(columns=proxy_cols)
     df = raw.copy()
@@ -3526,7 +3558,22 @@ def normalize_bess_table(raw: pd.DataFrame) -> pd.DataFrame:
         "tb4": ["tb4", "top_bottom_4h", "spread_4h"],
         "revenue_wo_demand_eur_mw": ["revenue_wo_demand_eur_mw", "wo_demand_eur_mw", "revenue_without_demand"],
         "revenue_w_demand_1c_eur_mw": ["revenue_w_demand_1c_eur_mw", "w_demand_1c_eur_mw", "revenue_with_demand_1c"],
-        "revenue_w_demand_1_4c_eur_mw": ["revenue_w_demand_1_4c_eur_mw", "w_demand_1_4c_eur_mw", "revenue_with_demand_1_4c"],
+        "revenue_w_demand_standalone_cycles_eur_mw": [
+            "revenue_w_demand_standalone_cycles_eur_mw",
+            "revenue_with_demand_standalone_cycles",
+            "revenue_w_demand_same_cycles_as_standalone",
+        ],
+        "standalone_cycles_day_avg": [
+            "standalone_cycles_day_avg",
+            "standalone_cycles_per_day",
+            "cycles_day_avg_standalone",
+            "standalone_cycles",
+        ],
+        "revenue_standalone_eur_mw": [
+            "revenue_standalone_eur_mw",
+            "standalone_revenue_eur_mw",
+            "revenue_bess_standalone_eur_mw",
+        ],
     }
     for target, candidates in mapping.items():
         col = _first_existing(df.columns.tolist(), candidates)
@@ -3538,7 +3585,46 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
     normalized = normalize_bess_table(raw)
     if not normalized.empty:
         return normalized, "file"
-    return bess_monthly_proxy(price_hourly, solar_hourly), "proxy"
+
+    spreads = bess_monthly_proxy(price_hourly, solar_hourly)
+    modeled = _compute_bess_monthly_revenue_metrics_from_model(price_hourly)
+    if spreads.empty and modeled.empty:
+        return pd.DataFrame(columns=[
+            "period", "tb1", "tb2", "tb4",
+            "revenue_wo_demand_eur_mw",
+            "revenue_w_demand_1c_eur_mw",
+            "revenue_w_demand_standalone_cycles_eur_mw",
+            "standalone_cycles_day_avg",
+            "revenue_standalone_eur_mw",
+        ]), "unavailable"
+    if spreads.empty:
+        out = modeled.copy()
+        for col in ["tb1", "tb2", "tb4"]:
+            out[col] = np.nan
+    elif modeled.empty:
+        out = spreads[["period", "tb1", "tb2", "tb4"]].copy()
+        for col in [
+            "revenue_wo_demand_eur_mw",
+            "revenue_w_demand_1c_eur_mw",
+            "revenue_w_demand_standalone_cycles_eur_mw",
+            "standalone_cycles_day_avg",
+            "revenue_standalone_eur_mw",
+        ]:
+            out[col] = np.nan
+    else:
+        out = spreads[["period", "tb1", "tb2", "tb4"]].merge(modeled, on="period", how="outer")
+    wanted = [
+        "period", "tb1", "tb2", "tb4",
+        "revenue_wo_demand_eur_mw",
+        "revenue_w_demand_1c_eur_mw",
+        "revenue_w_demand_standalone_cycles_eur_mw",
+        "standalone_cycles_day_avg",
+        "revenue_standalone_eur_mw",
+    ]
+    for col in wanted:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out[wanted].dropna(subset=["period"]).sort_values("period").reset_index(drop=True), "model"
 
 def bess_summary_table(bess: pd.DataFrame, report_month: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
     cols = ["Metric", "Selected week", "YTD", "Annualized", "Previous year"]
@@ -3578,6 +3664,8 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def _fmt(metric: str, value):
         if pd.isna(value):
             return "—"
+        if "cycles/day" in metric.lower():
+            return f"{float(value):,.2f} c/day"
         if "Revenue" in metric:
             return fmt_mw_revenue(value)
         return fmt_eur(value)
@@ -3590,7 +3678,7 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         metric = str(row.get("Metric", ""))
         if metric.startswith("TB"):
             return ["background-color: #EFF6FF; font-weight: 750;"] * len(row)
-        if metric.startswith("Revenue"):
+        if metric.startswith("Revenue") or metric.startswith("Standalone"):
             return ["background-color: #ECFDF5; font-weight: 750;"] * len(row)
         return [""] * len(row)
 
@@ -3680,6 +3768,12 @@ def _bess_report_dataset(price_hourly: pd.DataFrame, mode: str) -> pd.DataFrame:
     p["hora"] = p["datetime"].dt.hour + 1
     p["omie_venta"] = p["price"]
 
+    if mode == "standalone":
+        p["generacion"] = 0.0
+        p["consumo"] = 0.0
+        p["omie_compra"] = p["omie_venta"]
+        return p[["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"]].copy()
+
     solar = _load_bess_report_solar_profile()
     if solar.empty:
         return pd.DataFrame(columns=["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"])
@@ -3694,15 +3788,20 @@ def _bess_report_dataset(price_hourly: pd.DataFrame, mode: str) -> pd.DataFrame:
             p = p.merge(consumption, on="hour_of_year", how="left")
             p["consumo"] = pd.to_numeric(p["consumption"], errors="coerce").fillna(0.0)
         p["omie_compra"] = p["omie_venta"]
-    else:
+    elif mode == "without_demand":
         p["consumo"] = 0.0
         p["omie_compra"] = 1000.0
+    else:
+        raise ValueError(f"Unknown BESS report mode: {mode}")
 
     return p[["timestamp", "dia", "hora", "year", "omie_venta", "omie_compra", "generacion", "consumo"]].copy()
 
 
-def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
-    """Daily LP based on the BESS-tab logic, fixed to Monthly Report assumptions."""
+def _optimize_bess_report_day(
+    df_day: pd.DataFrame,
+    cycle_limit_factor: float = BESS_REPORT_CYCLE_LIMIT,
+) -> pd.DataFrame:
+    """Daily LP based on the BESS-tab logic, fixed to report assumptions."""
     df_day = df_day.sort_values("hora").reset_index(drop=True).copy()
     n = len(df_day)
     if n == 0:
@@ -3712,6 +3811,7 @@ def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
     buy = df_day["omie_compra"].astype(float).tolist()
     generation = df_day["generacion"].astype(float).tolist()
     consumption = df_day["consumo"].astype(float).tolist()
+    cycle_factor = max(float(cycle_limit_factor), 0.0)
 
     max_power = BESS_REPORT_POWER_MW
     max_grid_flow = max(max_power, 1e-9)
@@ -3746,7 +3846,7 @@ def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
         model += soc[t] <= BESS_REPORT_CAPACITY_MWH
 
     model += soc[n] <= BESS_REPORT_CAPACITY_MWH
-    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= BESS_REPORT_CYCLE_LIMIT * BESS_REPORT_CAPACITY_MWH / max(BESS_REPORT_ETA_CH, 1e-9)
+    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= cycle_factor * BESS_REPORT_CAPACITY_MWH / max(BESS_REPORT_ETA_CH, 1e-9)
     model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n))
     model += pulp.lpSum(
         g_to_grid[t] * sell[t]
@@ -3766,6 +3866,7 @@ def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
             "datetime": pd.to_datetime(df_day["timestamp"]).values,
             "hour": pd.to_numeric(df_day["hora"], errors="coerce").astype(int).values,
             "omie_venta": sell,
+            "omie_compra": buy,
             "generacion": generation,
             "consumo": consumption,
             "g_to_grid": vals(g_to_grid),
@@ -3782,9 +3883,228 @@ def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
     res["charge_from_grid_mwh"] = res["grid_charge"]
     res["discharge_to_load_mwh"] = res["batt_for_load"]
     res["discharge_to_market_mwh"] = res["batt_for_sell"]
+    res["discharge_total_mwh"] = res["batt_for_load"] + res["batt_for_sell"]
     res["hybrid_profile_mwh"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
     res["hybrid_revenue_eur"] = res["hybrid_profile_mwh"] * res["omie_venta"]
+    res["bess_revenue_eur"] = (
+        -res["g_to_batt"] * res["omie_venta"]
+        -res["grid_charge"] * res["omie_compra"]
+        +res["batt_for_sell"] * res["omie_venta"]
+    )
     return res
+
+
+def _bess_dispatch_from_model(
+    price_hourly: pd.DataFrame,
+    mode: str,
+    cycle_limit_factor: float,
+) -> pd.DataFrame:
+    data = _bess_report_dataset(price_hourly, mode)
+    if data.empty:
+        return pd.DataFrame()
+    dispatch_parts = []
+    for _, day in data.groupby(pd.to_datetime(data["dia"])):
+        result = _optimize_bess_report_day(day, cycle_limit_factor=cycle_limit_factor)
+        if not result.empty:
+            dispatch_parts.append(result)
+    if not dispatch_parts:
+        return pd.DataFrame()
+    return pd.concat(dispatch_parts, ignore_index=True)
+
+
+def _period_revenue_summary_from_dispatch(
+    dispatch: pd.DataFrame,
+    *,
+    period_mode: str,
+    revenue_col: str,
+    include_cycles: bool = False,
+) -> pd.DataFrame:
+    output_cols = ["period", revenue_col]
+    if include_cycles:
+        output_cols.append("standalone_cycles_day_avg")
+    if dispatch is None or dispatch.empty:
+        return pd.DataFrame(columns=output_cols)
+    d = dispatch.copy()
+    d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+    d = d.dropna(subset=["datetime"]).copy()
+    if period_mode == "monthly":
+        d["period"] = d["datetime"].dt.to_period("M").dt.to_timestamp()
+    elif period_mode == "weekly":
+        d["period"] = d["datetime"].map(week_start)
+    else:
+        raise ValueError(f"Unknown BESS period mode: {period_mode}")
+    d["day"] = d["datetime"].dt.normalize()
+    grouped = (
+        d.groupby("period", as_index=False)
+        .agg(
+            bess_revenue_eur=("bess_revenue_eur", "sum"),
+            discharge_total_mwh=("discharge_total_mwh", "sum"),
+            days=("day", "nunique"),
+        )
+    )
+    grouped[revenue_col] = np.where(
+        BESS_REPORT_POWER_MW > 0,
+        grouped["bess_revenue_eur"] / BESS_REPORT_POWER_MW,
+        np.nan,
+    )
+    if include_cycles:
+        grouped["standalone_cycles_day_avg"] = np.where(
+            (grouped["days"] > 0) & (BESS_REPORT_CAPACITY_MWH > 0),
+            grouped["discharge_total_mwh"]
+            / max(BESS_REPORT_ETA_DIS, 1e-9)
+            / BESS_REPORT_CAPACITY_MWH
+            / grouped["days"],
+            np.nan,
+        )
+    return grouped[output_cols].sort_values("period").reset_index(drop=True)
+
+
+def _with_demand_revenue_at_standalone_cycles(
+    price_hourly: pd.DataFrame,
+    standalone_cycles: pd.DataFrame,
+    *,
+    period_mode: str,
+) -> pd.DataFrame:
+    output = pd.DataFrame(columns=["period", "revenue_w_demand_standalone_cycles_eur_mw"])
+    if standalone_cycles is None or standalone_cycles.empty:
+        return output
+    data = _bess_report_dataset(price_hourly, "with_demand")
+    if data.empty:
+        return output
+    data = data.copy()
+    data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce")
+    if period_mode == "monthly":
+        data["period"] = data["timestamp"].dt.to_period("M").dt.to_timestamp()
+    elif period_mode == "weekly":
+        data["period"] = data["timestamp"].map(week_start)
+    else:
+        raise ValueError(f"Unknown BESS period mode: {period_mode}")
+
+    factor_map = (
+        standalone_cycles[["period", "standalone_cycles_day_avg"]]
+        .dropna(subset=["period", "standalone_cycles_day_avg"])
+        .drop_duplicates(subset=["period"], keep="last")
+        .set_index("period")["standalone_cycles_day_avg"]
+        .to_dict()
+    )
+    rows = []
+    for period, period_df in data.groupby("period"):
+        factor = factor_map.get(period)
+        if factor is None or pd.isna(factor):
+            continue
+        dispatch_parts = []
+        for _, day in period_df.groupby(pd.to_datetime(period_df["dia"])):
+            result = _optimize_bess_report_day(day, cycle_limit_factor=max(float(factor), 0.0))
+            if not result.empty:
+                dispatch_parts.append(result)
+        if not dispatch_parts:
+            continue
+        dispatch = pd.concat(dispatch_parts, ignore_index=True)
+        revenue = float(pd.to_numeric(dispatch["bess_revenue_eur"], errors="coerce").sum())
+        revenue_per_mw = revenue / BESS_REPORT_POWER_MW if BESS_REPORT_POWER_MW > 0 else np.nan
+        rows.append({
+            "period": period,
+            "revenue_w_demand_standalone_cycles_eur_mw": revenue_per_mw,
+        })
+    return pd.DataFrame(rows, columns=output.columns).sort_values("period").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _compute_bess_monthly_revenue_metrics_from_model(price_hourly: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "period",
+        "revenue_wo_demand_eur_mw",
+        "revenue_w_demand_1c_eur_mw",
+        "revenue_w_demand_standalone_cycles_eur_mw",
+        "standalone_cycles_day_avg",
+        "revenue_standalone_eur_mw",
+    ]
+    without_dispatch = _bess_dispatch_from_model(price_hourly, "without_demand", BESS_REPORT_CYCLE_LIMIT)
+    with_dispatch = _bess_dispatch_from_model(price_hourly, "with_demand", BESS_REPORT_CYCLE_LIMIT)
+    standalone_dispatch = _bess_dispatch_from_model(price_hourly, "standalone", BESS_REPORT_UNRESTRICTED_CYCLE_FACTOR)
+
+    without_monthly = _period_revenue_summary_from_dispatch(
+        without_dispatch,
+        period_mode="monthly",
+        revenue_col="revenue_wo_demand_eur_mw",
+    )
+    with_monthly = _period_revenue_summary_from_dispatch(
+        with_dispatch,
+        period_mode="monthly",
+        revenue_col="revenue_w_demand_1c_eur_mw",
+    )
+    standalone_monthly = _period_revenue_summary_from_dispatch(
+        standalone_dispatch,
+        period_mode="monthly",
+        revenue_col="revenue_standalone_eur_mw",
+        include_cycles=True,
+    )
+    with_same_cycles = _with_demand_revenue_at_standalone_cycles(
+        price_hourly,
+        standalone_monthly,
+        period_mode="monthly",
+    )
+
+    parts = [without_monthly, with_monthly, with_same_cycles, standalone_monthly]
+    parts = [p for p in parts if p is not None and not p.empty]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    out = parts[0]
+    for part in parts[1:]:
+        out = out.merge(part, on="period", how="outer")
+    for col in cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _compute_bess_weekly_revenue_metrics_from_model(price_hourly: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "period",
+        "revenue_wo_demand_eur_mw",
+        "revenue_w_demand_1c_eur_mw",
+        "revenue_w_demand_standalone_cycles_eur_mw",
+        "standalone_cycles_day_avg",
+        "revenue_standalone_eur_mw",
+    ]
+    without_dispatch = _bess_dispatch_from_model(price_hourly, "without_demand", BESS_REPORT_CYCLE_LIMIT)
+    with_dispatch = _bess_dispatch_from_model(price_hourly, "with_demand", BESS_REPORT_CYCLE_LIMIT)
+    standalone_dispatch = _bess_dispatch_from_model(price_hourly, "standalone", BESS_REPORT_UNRESTRICTED_CYCLE_FACTOR)
+
+    without_weekly = _period_revenue_summary_from_dispatch(
+        without_dispatch,
+        period_mode="weekly",
+        revenue_col="revenue_wo_demand_eur_mw",
+    )
+    with_weekly = _period_revenue_summary_from_dispatch(
+        with_dispatch,
+        period_mode="weekly",
+        revenue_col="revenue_w_demand_1c_eur_mw",
+    )
+    standalone_weekly = _period_revenue_summary_from_dispatch(
+        standalone_dispatch,
+        period_mode="weekly",
+        revenue_col="revenue_standalone_eur_mw",
+        include_cycles=True,
+    )
+    with_same_cycles = _with_demand_revenue_at_standalone_cycles(
+        price_hourly,
+        standalone_weekly,
+        period_mode="weekly",
+    )
+
+    parts = [without_weekly, with_weekly, with_same_cycles, standalone_weekly]
+    parts = [p for p in parts if p is not None and not p.empty]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    out = parts[0]
+    for part in parts[1:]:
+        out = out.merge(part, on="period", how="outer")
+    for col in cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out[cols].dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
