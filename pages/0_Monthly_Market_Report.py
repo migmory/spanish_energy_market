@@ -5,6 +5,8 @@ import io
 import math
 import os
 import re
+import stat
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -19,6 +21,11 @@ import requests
 import pulp
 import streamlit as st
 from dotenv import load_dotenv
+
+try:
+    import paramiko
+except Exception:
+    paramiko = None
 
 try:
     alt.data_transformers.disable_max_rows()
@@ -619,6 +626,16 @@ def _standardize_mibgas_raw(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     work = df.copy()
     work.columns = [_clean_tabular_col(c) for c in work.columns]
+
+    # Some recent MIBGAS files expose the real header in row 0
+    # instead of in df.columns. Repair that layout before mapping fields.
+    if "product" not in work.columns or "trading_day" not in work.columns:
+        if len(work) > 0:
+            candidate_cols = [_clean_tabular_col(x) for x in work.iloc[0].tolist()]
+            if "product" in candidate_cols and "trading_day" in candidate_cols:
+                work = work.iloc[1:].copy()
+                work.columns = candidate_cols
+
     colmap = {
         "trading_day": _first_tabular_col(work.columns.tolist(), ["trading_day", "trading day"]),
         "product": _first_tabular_col(work.columns.tolist(), ["product"]),
@@ -640,13 +657,204 @@ def _standardize_mibgas_raw(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols].reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
+
+def _mibgas_get_secret(name: str, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def _mibgas_load_private_key():
+    if paramiko is None:
+        raise ValueError("paramiko is not installed.")
+    key_text = _mibgas_get_secret("MIBGAS_SFTP_KEY")
+    if not key_text:
+        return None
+    key_file = io.StringIO(str(key_text))
+    last_error = None
+    for key_name in ["Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey"]:
+        loader = getattr(paramiko, key_name, None)
+        if loader is None:
+            continue
+        try:
+            key_file.seek(0)
+            return loader.from_private_key(key_file)
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f"Could not load private key from Streamlit Secrets: {last_error}")
+
+
+def _mibgas_connect_sftp():
+    if paramiko is None:
+        raise ValueError("paramiko is not installed. Add 'paramiko' to requirements.txt.")
+    host = _mibgas_get_secret("MIBGAS_SFTP_HOST", "secureftpbucket.omie.es")
+    port = int(_mibgas_get_secret("MIBGAS_SFTP_PORT", 22))
+    user = _mibgas_get_secret("MIBGAS_SFTP_USER")
+    password = _mibgas_get_secret("MIBGAS_SFTP_PASSWORD")
+    key = _mibgas_load_private_key()
+    if not user:
+        raise ValueError("MIBGAS_SFTP_USER is missing in Streamlit Secrets.")
+    if key is None and not password:
+        raise ValueError("MIBGAS_SFTP_KEY or MIBGAS_SFTP_PASSWORD is missing in Streamlit Secrets.")
+    transport = paramiko.Transport((host, port))
+    if key is not None:
+        transport.connect(username=user, pkey=key)
+    else:
+        transport.connect(username=user, password=password)
+    return paramiko.SFTPClient.from_transport(transport), transport
+
+
+def _mibgas_sftp_dir_exists(sftp, path: str) -> bool:
+    try:
+        attr = sftp.stat(path)
+        return stat.S_ISDIR(attr.st_mode)
+    except Exception:
+        return False
+
+
+def _mibgas_find_year_dir(sftp, year: int) -> str:
+    configured = str(_mibgas_get_secret("MIBGAS_SFTP_BASE_PATH", "/MIBGAS")).rstrip("/")
+    candidates = [
+        f"{configured}/AGNO_{year}",
+        f"/MIBGAS/AGNO_{year}",
+        f"MIBGAS/AGNO_{year}",
+        f"/secureftpbucket.omie.es/MIBGAS/AGNO_{year}",
+        f"secureftpbucket.omie.es/MIBGAS/AGNO_{year}",
+        f"/AGNO_{year}",
+        f"AGNO_{year}",
+    ]
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.replace("//", "/")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _mibgas_sftp_dir_exists(sftp, candidate):
+            return candidate
+    raise ValueError(f"Could not find AGNO_{year} directory. Tried: {candidates}")
+
+
+def _mibgas_read_remote_excel_or_zip(sftp, remote_path: str, filename: str) -> pd.DataFrame:
+    with sftp.open(remote_path, "rb") as handle:
+        content = handle.read()
+    lower = filename.lower()
+    frames: list[pd.DataFrame] = []
+
+    if lower.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(content), sheet_name=MIBGAS_TARGET_SHEET)
+        return _standardize_mibgas_raw(df)
+
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(content)) as zipped:
+            for inner in zipped.namelist():
+                if not inner.lower().endswith((".xlsx", ".xls")):
+                    continue
+                try:
+                    with zipped.open(inner) as nested:
+                        df = pd.read_excel(io.BytesIO(nested.read()), sheet_name=MIBGAS_TARGET_SHEET)
+                    parsed = _standardize_mibgas_raw(df)
+                    if not parsed.empty:
+                        frames.append(parsed)
+                except Exception:
+                    continue
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    return pd.DataFrame()
+
+
+def _refresh_mibgas_2026_cache_for_report() -> pd.DataFrame:
+    """Pull 2026 MIBGAS files from SFTP and refresh the local cache used by reports."""
+    cols = ["trading_day", "product", "area", "delivery_start", "delivery_end", "reference_price_eur_mwh"]
+    try:
+        sftp, transport = _mibgas_connect_sftp()
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+    frames: list[pd.DataFrame] = []
+    try:
+        year_dir = _mibgas_find_year_dir(sftp, 2026)
+        candidate_dirs = [year_dir, f"{year_dir}/XLS", f"{year_dir}/CSV"]
+        for remote_dir in candidate_dirs:
+            try:
+                items = sftp.listdir_attr(remote_dir)
+            except Exception:
+                continue
+            for item in items:
+                if not stat.S_ISREG(item.st_mode):
+                    continue
+                filename = item.filename
+                lower = filename.lower()
+                if not lower.endswith((".xlsx", ".xls", ".zip")):
+                    continue
+                if "mibgas" not in lower and "gas" not in lower:
+                    continue
+                remote_path = f"{remote_dir}/{filename}"
+                try:
+                    parsed = _mibgas_read_remote_excel_or_zip(sftp, remote_path, filename)
+                    if not parsed.empty:
+                        frames.append(parsed)
+                except Exception:
+                    continue
+    finally:
+        try:
+            sftp.close()
+            transport.close()
+        except Exception:
+            pass
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    out["trading_day"] = pd.to_datetime(out["trading_day"], errors="coerce")
+    out = out[out["trading_day"].dt.year == 2026].copy()
+    out = out.drop_duplicates(
+        subset=["trading_day", "product", "area", "delivery_start", "delivery_end"],
+        keep="last",
+    )
+    out = out.sort_values(["trading_day", "product"]).reset_index(drop=True)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out.to_csv(MIBGAS_CACHE_FILE, index=False)
+    except Exception:
+        pass
+    return out
+
+
+def _mibgas_raw_to_actuals(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["delivery_day", "price"])
+    work = raw.copy()
+    work["reference_price_eur_mwh"] = pd.to_numeric(work["reference_price_eur_mwh"], errors="coerce")
+    actuals = work[
+        (work["product"] == "GDAES_D+1")
+        & (work["area"].fillna("ES") == "ES")
+    ].copy()
+    actuals["delivery_day"] = (
+        pd.to_datetime(actuals["delivery_start"], errors="coerce")
+        .combine_first(pd.to_datetime(actuals["trading_day"], errors="coerce"))
+    )
+    actuals["price"] = actuals["reference_price_eur_mwh"]
+    actuals = actuals.dropna(subset=["delivery_day", "price"]).copy()
+    return (
+        actuals[["delivery_day", "price"]]
+        .drop_duplicates(subset=["delivery_day"], keep="last")
+        .sort_values("delivery_day")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
 def load_mibgas_actuals_for_report() -> pd.DataFrame:
     parts: list[pd.DataFrame] = []
     for path in sorted(DATA_DIR.glob(MIBGAS_LOCAL_PATTERN)):
         try:
             xls = pd.ExcelFile(path)
-            sheet = MIBGAS_TARGET_SHEET if MIBGAS_TARGET_SHEET in xls.sheet_names else next((s for s in xls.sheet_names if "PVB" in str(s).upper() and "VTP" in str(s).upper()), None)
+            sheet = MIBGAS_TARGET_SHEET if MIBGAS_TARGET_SHEET in xls.sheet_names else next(
+                (s for s in xls.sheet_names if "PVB" in str(s).upper() and "VTP" in str(s).upper()),
+                None,
+            )
             if sheet is None:
                 continue
             parsed = _standardize_mibgas_raw(pd.read_excel(path, sheet_name=sheet))
@@ -654,6 +862,7 @@ def load_mibgas_actuals_for_report() -> pd.DataFrame:
                 parts.append(parsed)
         except Exception:
             continue
+
     if MIBGAS_CACHE_FILE.exists():
         try:
             cache = pd.read_csv(MIBGAS_CACHE_FILE)
@@ -662,15 +871,21 @@ def load_mibgas_actuals_for_report() -> pd.DataFrame:
                 parts.append(parsed)
         except Exception:
             pass
-    if not parts:
-        return pd.DataFrame(columns=["trading_day", "price"])
-    raw = pd.concat(parts, ignore_index=True)
-    raw["reference_price_eur_mwh"] = pd.to_numeric(raw["reference_price_eur_mwh"], errors="coerce")
-    actuals = raw[(raw["product"] == "GDAES_D+1") & (raw["area"].fillna("ES") == "ES")].copy()
-    actuals["delivery_day"] = pd.to_datetime(actuals["delivery_start"], errors="coerce").combine_first(pd.to_datetime(actuals["trading_day"], errors="coerce"))
-    actuals["price"] = actuals["reference_price_eur_mwh"]
-    actuals = actuals.dropna(subset=["delivery_day", "price"]).copy()
-    return actuals[["delivery_day", "price"]].drop_duplicates(subset=["delivery_day"], keep="last").sort_values("delivery_day").reset_index(drop=True)
+
+    raw = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    actuals = _mibgas_raw_to_actuals(raw)
+
+    max_delivery = pd.to_datetime(actuals["delivery_day"], errors="coerce").max() if not actuals.empty else pd.NaT
+    refresh_cutoff = pd.Timestamp(date.today() - timedelta(days=2))
+    needs_refresh = pd.isna(max_delivery) or max_delivery < refresh_cutoff
+
+    if needs_refresh:
+        live_raw = _refresh_mibgas_2026_cache_for_report()
+        if live_raw is not None and not live_raw.empty:
+            raw = pd.concat([raw, live_raw], ignore_index=True) if not raw.empty else live_raw
+            actuals = _mibgas_raw_to_actuals(raw)
+
+    return actuals
 
 
 def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float | None:
@@ -680,6 +895,86 @@ def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: p
     mask = (day >= start_ts) & (day < end_ts + pd.Timedelta(days=1))
     values = pd.to_numeric(actuals.loc[mask, "price"], errors="coerce").dropna()
     return None if values.empty else float(values.mean())
+
+
+def _mibgas_period_mean_from_standard_raw(
+    raw: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    if raw is None or raw.empty:
+        return None
+
+    work = raw.copy()
+    for col in ["trading_day", "delivery_start"]:
+        if col in work.columns:
+            work[col] = pd.to_datetime(work[col], errors="coerce")
+
+    if "reference_price_eur_mwh" not in work.columns:
+        return None
+
+    work["reference_price_eur_mwh"] = pd.to_numeric(work["reference_price_eur_mwh"], errors="coerce")
+
+    if "area" not in work.columns:
+        work["area"] = "ES"
+
+    actuals = work[
+        (work["product"].astype(str).str.strip() == "GDAES_D+1")
+        & (work["area"].fillna("ES").astype(str).str.strip() == "ES")
+    ].copy()
+
+    if actuals.empty:
+        return None
+
+    actuals["delivery_day"] = actuals["delivery_start"].combine_first(actuals["trading_day"])
+    actuals = actuals.dropna(subset=["delivery_day", "reference_price_eur_mwh"]).copy()
+    if actuals.empty:
+        return None
+
+    mask = (
+        (actuals["delivery_day"] >= pd.Timestamp(start_ts))
+        & (actuals["delivery_day"] < pd.Timestamp(end_ts) + pd.Timedelta(days=1))
+    )
+    values = actuals.loc[mask, "reference_price_eur_mwh"].dropna()
+    return None if values.empty else float(values.mean())
+
+
+def _mibgas_period_mean_from_cache_exact(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float | None:
+    if not MIBGAS_CACHE_FILE.exists():
+        return None
+    try:
+        cache = pd.read_csv(MIBGAS_CACHE_FILE)
+    except Exception:
+        return None
+
+    expected = {
+        "trading_day",
+        "product",
+        "area",
+        "delivery_start",
+        "reference_price_eur_mwh",
+    }
+    if not expected.issubset(set(cache.columns)):
+        cache = _standardize_mibgas_raw(cache)
+
+    return _mibgas_period_mean_from_standard_raw(cache, start_ts, end_ts)
+
+
+def mibgas_period_value_exact(
+    fallback_actuals: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> float | None:
+    direct_cache_value = _mibgas_period_mean_from_cache_exact(start_ts, end_ts)
+    if direct_cache_value is not None:
+        return direct_cache_value
+
+    refreshed_raw = _refresh_mibgas_2026_cache_for_report()
+    refreshed_value = _mibgas_period_mean_from_standard_raw(refreshed_raw, start_ts, end_ts)
+    if refreshed_value is not None:
+        return refreshed_value
+
+    return mibgas_monthly_mean(fallback_actuals, start_ts, end_ts)
 
 
 def _parse_mixed_date_for_mix(value):
@@ -3821,8 +4116,8 @@ prev_month = previous_month(selected_month)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_month, month_end(prev_month))
 yoy = yoy_month(selected_month)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, month_end(yoy))
-mibgas_selected = mibgas_monthly_mean(mibgas_actuals, selected_month, report_end)
-mibgas_prev = mibgas_monthly_mean(mibgas_actuals, prev_month, month_end(prev_month))
+mibgas_selected = mibgas_period_value_exact(mibgas_actuals, selected_month, report_end)
+mibgas_prev = mibgas_period_value_exact(mibgas_actuals, prev_month, month_end(prev_month))
 mibgas_yoy = mibgas_monthly_mean(mibgas_actuals, yoy, month_end(yoy))
 
 q1, q2, q3, q4, q5 = st.columns(5)
@@ -3876,9 +4171,6 @@ with q5:
         unsafe_allow_html=True,
     )
 
-
-
-st.markdown('<div style="height: 18px;"></div>', unsafe_allow_html=True)
 
 tb4_selected = top_bottom_summary(price_hourly, selected_month, report_end).get("TB4")
 tb4_prev = top_bottom_summary(price_hourly, prev_month, month_end(prev_month)).get("TB4")
