@@ -877,35 +877,83 @@ def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: p
     return None if values.empty else float(values.mean())
 
 
+def _reload_mibgas_actuals_direct_from_2026_cache() -> pd.DataFrame:
+    """Read the on-disk 2026 MIBGAS cache directly, matching the MIBGAS tab fallback."""
+    if not MIBGAS_CACHE_FILE.exists():
+        return pd.DataFrame(columns=["delivery_day", "price"])
+    try:
+        raw_cache = pd.read_csv(MIBGAS_CACHE_FILE)
+    except Exception:
+        return pd.DataFrame(columns=["delivery_day", "price"])
+    parsed = _standardize_mibgas_raw(raw_cache)
+    return _mibgas_raw_to_actuals(parsed)
+
+
 def mibgas_mean_with_requested_window_refresh(
     actuals: pd.DataFrame,
     start_ts: pd.Timestamp,
     end_ts: pd.Timestamp,
 ) -> tuple[float | None, pd.DataFrame]:
-    """Return MIBGAS average; if selected week is empty, attempt one live refresh."""
-    value = mibgas_monthly_mean(actuals, start_ts, end_ts)
+    """Return MIBGAS average, mirroring the MIBGAS tab as closely as possible.
+
+    Resolution order:
+      1) current report actuals in memory;
+      2) direct re-read of `/data/mibgas_2026_cache.csv`;
+      3) live SFTP refresh + cache rewrite;
+      4) direct re-read of cache again after refresh.
+
+    This targets weeks such as 11–17 May 2026 that are visible in the MIBGAS tab
+    but were missed by the Weekly Report's previously cached DataFrame.
+    """
+    base = actuals.copy() if actuals is not None and not actuals.empty else pd.DataFrame(columns=["delivery_day", "price"])
+
+    value = mibgas_monthly_mean(base, start_ts, end_ts)
     if value is not None:
-        return value, actuals
+        return value, base
 
+    # The dedicated MIBGAS page may already have refreshed this cache on disk.
+    cache_actuals = _reload_mibgas_actuals_direct_from_2026_cache()
+    if not cache_actuals.empty:
+        base = (
+            pd.concat([base, cache_actuals], ignore_index=True)
+            .drop_duplicates(subset=["delivery_day"], keep="last")
+            .sort_values("delivery_day")
+            .reset_index(drop=True)
+        )
+        value = mibgas_monthly_mean(base, start_ts, end_ts)
+        if value is not None:
+            return value, base
+
+    # If the on-disk cache is still missing the week, refresh from SFTP.
     live_raw = _refresh_mibgas_2026_cache_for_report()
-    if live_raw is None or live_raw.empty:
-        return None, actuals
+    if live_raw is not None and not live_raw.empty:
+        refreshed = _mibgas_raw_to_actuals(live_raw)
+        if not refreshed.empty:
+            base = (
+                pd.concat([base, refreshed], ignore_index=True)
+                .drop_duplicates(subset=["delivery_day"], keep="last")
+                .sort_values("delivery_day")
+                .reset_index(drop=True)
+            )
+            value = mibgas_monthly_mean(base, start_ts, end_ts)
+            if value is not None:
+                return value, base
 
-    refreshed = _mibgas_raw_to_actuals(live_raw)
-    if refreshed.empty:
-        return None, actuals
+    # Final direct cache read after refresh, in case the refresh wrote the CSV but
+    # the in-memory parser dropped rows unexpectedly.
+    cache_actuals = _reload_mibgas_actuals_direct_from_2026_cache()
+    if not cache_actuals.empty:
+        base = (
+            pd.concat([base, cache_actuals], ignore_index=True)
+            .drop_duplicates(subset=["delivery_day"], keep="last")
+            .sort_values("delivery_day")
+            .reset_index(drop=True)
+        )
+        value = mibgas_monthly_mean(base, start_ts, end_ts)
+        if value is not None:
+            return value, base
 
-    combined = (
-        pd.concat([actuals, refreshed], ignore_index=True)
-        if actuals is not None and not actuals.empty
-        else refreshed.copy()
-    )
-    combined = (
-        combined.drop_duplicates(subset=["delivery_day"], keep="last")
-        .sort_values("delivery_day")
-        .reset_index(drop=True)
-    )
-    return mibgas_monthly_mean(combined, start_ts, end_ts), combined
+    return None, base
 
 
 def _parse_mixed_date_for_mix(value):
@@ -4068,7 +4116,7 @@ with q5:
         help="Weekly average GDAES D+1 MIBGAS reference price by delivery day, using the MIBGAS files/cache available to the app.",
     )
     mibgas_extra_note = (
-        "<br><span style='color:#B91C1C;'>Selected week still missing after live refresh.</span>"
+        "<br><span style='color:#B91C1C;'>Selected week not found in the report cache after direct cache re-read and live refresh.</span>"
         if mibgas_selected is None else ""
     )
     st.markdown(
