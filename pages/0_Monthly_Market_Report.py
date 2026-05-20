@@ -264,6 +264,22 @@ def fmt_pp(value: float | int | None, decimals: int = 1) -> str:
         return "—"
     return f"{float(value) * 100:+.{decimals}f} pp"
 
+
+def arrow_change_pct_text(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "→ —"
+    v = float(value)
+    arrow = "↑" if v > 0 else "↓" if v < 0 else "→"
+    return f"{arrow} {fmt_change_pct(v, decimals)}"
+
+
+def arrow_pp_text(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "→ —"
+    v = float(value)
+    arrow = "↑" if v > 0 else "↓" if v < 0 else "→"
+    return f"{arrow} {fmt_pp(v, decimals)}"
+
 def month_label(ts: pd.Timestamp, mtd: bool = False) -> str:
     label = ts.strftime("%b %Y")
     return f"{label} (MTD)" if mtd else label
@@ -854,11 +870,12 @@ def build_generation_month_comparison_table(current: dict[str, float | None], pr
         prev = previous.get(key)
         if kind == "share":
             curr_display, prev_display = fmt_pct(curr), fmt_pct(prev)
-            diff_display = fmt_pp(None if curr is None or prev is None else curr - prev)
+            share_diff = None if curr is None or prev is None else curr - prev
+            diff_display = arrow_pp_text(share_diff)
         else:
             curr_display, prev_display = fmt_gwh(curr), fmt_gwh(prev)
             diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
-            diff_display = fmt_change_pct(diff)
+            diff_display = arrow_change_pct_text(diff)
         rows.append({"Metric": label, current_label: curr_display, previous_label: prev_display, "Diff vs prev.": diff_display})
     return pd.DataFrame(rows)
 
@@ -1959,10 +1976,14 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
         actual_plot = pd.concat(actual_frames, ignore_index=True)
         layers.append(
             alt.Chart(actual_plot)
-            .mark_bar(size=18)
+            .mark_bar()
             .encode(
                 x=alt.X("month_name:N", title=None, sort=month_order),
-                xOffset=alt.XOffset("Series:N", sort=["2025 actual", "2026 actual"]),
+                xOffset=alt.XOffset(
+                    "Series:N",
+                    sort=["2025 actual", "2026 actual"],
+                    scale=alt.Scale(paddingInner=0, paddingOuter=0),
+                ),
                 y=alt.Y(
                     "pct_curtailment:Q",
                     title="Economic curtailment (%)",
@@ -2159,7 +2180,7 @@ def style_forward_snapshot_table(df: pd.DataFrame):
         .format({
             "Latest quote": "{:,.2f}",
             "Quote one month ago": "{:,.2f}",
-            "M-1 change": "{:.1%}",
+            "M-1 change": lambda v: arrow_change_pct_text(v),
         }, na_rep="—")
         .apply(shade_curve, axis=1)
         .set_table_styles([
@@ -3704,7 +3725,7 @@ with q4:
         fmt_pct(selected_metrics["capture_rate_uncurtailed"]),
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. month: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same month LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(selected_metrics["capture_rate_uncurtailed"], prev_metrics["capture_rate_uncurtailed"], "prev. month")}<br>Prev. month: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same month LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q5:
@@ -3714,7 +3735,7 @@ with q5:
         help="Monthly average GDAES D+1 MIBGAS reference price by delivery day, using the MIBGAS files/cache available to the app.",
     )
     st.markdown(
-        f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(mibgas_prev)}</b><br>Same month LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(mibgas_selected, mibgas_prev, "prev. month")}<br>Prev. month: <b>{fmt_eur(mibgas_prev)}</b><br>Same month LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
         unsafe_allow_html=True,
     )
 
