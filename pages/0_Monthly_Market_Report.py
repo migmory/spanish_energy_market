@@ -223,6 +223,22 @@ def fmt_mw_revenue(value: float | int | None) -> str:
         return "—"
     return f"{float(value):,.0f} €/MW".replace(",", ".")
 
+
+def fmt_gwh(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.{decimals}f} GWh"
+
+def fmt_change_pct(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):+.{decimals}%}"
+
+def fmt_pp(value: float | int | None, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value) * 100:+.{decimals}f} pp"
+
 def month_label(ts: pd.Timestamp, mtd: bool = False) -> str:
     label = ts.strftime("%b %Y")
     return f"{label} (MTD)" if mtd else label
@@ -259,6 +275,10 @@ def values_equal_month(series: pd.Series, ts: pd.Timestamp) -> pd.Series:
 HIST_WORKBOOK_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_SOLAR_FILE = DATA_DIR / "p48solar_since21.csv"
+HIST_MIX_FILE = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
+MIBGAS_LOCAL_PATTERN = "MIBGAS_Data_*.xlsx"
+MIBGAS_CACHE_FILE = DATA_DIR / "mibgas_2026_cache.csv"
+MIBGAS_TARGET_SHEET = "Trading Data PVB&VTP"
 EEX_FORWARD_LOCAL_CSV = DATA_DIR / "eex_forward_market.csv"
 EEX_FORWARD_LOCAL_XLSX = DATA_DIR / "eex_forward_market.xlsx"
 
@@ -288,6 +308,34 @@ PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
 SOLAR_FORECAST_INDICATOR_ID = 542
 LIVE_START_DATE = date(2026, 1, 1)
+
+REE_API_BASE = "https://apidatos.ree.es/es/datos"
+REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+
+LOCAL_MIX_TECH_MAP = {
+    "Hidráulica": "Hydro",
+    "Hidroeólica": "Other renewables",
+    "Turbinación bombeo": "Pumped hydro",
+    "Nuclear": "Nuclear",
+    "Carbón": "Coal",
+    "Fuel + Gas": "Fuel + Gas",
+    "Turbina de vapor": "Steam turbine",
+    "Ciclo combinado": "CCGT",
+    "Eólica": "Wind",
+    "Solar fotovoltaica": "Solar PV",
+    "Solar térmica": "Solar thermal",
+    "Otras renovables": "Other renewables",
+    "Cogeneración": "CHP",
+    "Residuos no renovables": "Other non-renewables",
+    "Residuos renovables": "Biomass",
+    "Biogás": "Biogas",
+    "Biomasa": "Biomass",
+}
+
+RENEWABLE_TECHS = {
+    "Hydro", "Pumped hydro", "Wind", "Solar PV", "Solar thermal",
+    "Other renewables", "Biomass", "Biogas",
+}
 
 # =========================================================
 # HISTORICAL + LIVE DATA
@@ -443,6 +491,266 @@ def combine_hist_live(hist: pd.DataFrame, live: pd.DataFrame, subset: list[str])
     if out.empty:
         return out
     return out.sort_values(subset).drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+
+
+# =========================================================
+# MIBGAS MONTHLY KPI + ELECTRICITY MIX SUMMARY
+# =========================================================
+def _clean_tabular_col(col) -> str:
+    s = str(col).replace("\xa0", " ").replace("\n", " ").strip().lower()
+    repl = {"á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n", "[": "", "]": "", "(": "", ")": "", "%": "pct", "/": "_", "-": "_", ".": "_"}
+    for a, b in repl.items():
+        s = s.replace(a, b)
+    s = re.sub(r"\s+", "_", s)
+    return re.sub(r"_+", "_", s).strip("_")
+
+
+def _first_tabular_col(columns: list[str], candidates: list[str]) -> str | None:
+    normalised = {_clean_tabular_col(c): c for c in columns}
+    for cand in candidates:
+        key = _clean_tabular_col(cand)
+        if key in normalised:
+            return normalised[key]
+    return None
+
+
+def _to_number_mibgas(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+    s = series.astype(str).str.strip().str.replace("€", "", regex=False).str.replace(" ", "", regex=False).str.replace("\xa0", "", regex=False)
+    s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _standardize_mibgas_raw(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["trading_day", "product", "area", "delivery_start", "delivery_end", "reference_price_eur_mwh"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    work = df.copy()
+    work.columns = [_clean_tabular_col(c) for c in work.columns]
+    colmap = {
+        "trading_day": _first_tabular_col(work.columns.tolist(), ["trading_day", "trading day"]),
+        "product": _first_tabular_col(work.columns.tolist(), ["product"]),
+        "area": _first_tabular_col(work.columns.tolist(), ["area"]),
+        "delivery_start": _first_tabular_col(work.columns.tolist(), ["first_day_delivery", "first day delivery", "delivery_start"]),
+        "delivery_end": _first_tabular_col(work.columns.tolist(), ["last_day_delivery", "last day delivery", "delivery_end"]),
+        "reference_price": _first_tabular_col(work.columns.tolist(), ["reference_price_eur_mwh", "reference price eur mwh", "daily_reference_price_eur_mwh", "daily reference price eur mwh"]),
+    }
+    if colmap["trading_day"] is None or colmap["product"] is None:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame()
+    out["trading_day"] = pd.to_datetime(work[colmap["trading_day"]], dayfirst=True, errors="coerce")
+    out["product"] = work[colmap["product"]].astype(str).str.strip()
+    out["area"] = work[colmap["area"]].astype(str).str.strip() if colmap["area"] else "ES"
+    out["delivery_start"] = pd.to_datetime(work[colmap["delivery_start"]], dayfirst=True, errors="coerce") if colmap["delivery_start"] else pd.NaT
+    out["delivery_end"] = pd.to_datetime(work[colmap["delivery_end"]], dayfirst=True, errors="coerce") if colmap["delivery_end"] else pd.NaT
+    out["reference_price_eur_mwh"] = _to_number_mibgas(work[colmap["reference_price"]]) if colmap["reference_price"] else pd.NA
+    out = out.dropna(subset=["trading_day", "product"]).copy()
+    return out[cols].reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_mibgas_actuals_for_report() -> pd.DataFrame:
+    parts: list[pd.DataFrame] = []
+    for path in sorted(DATA_DIR.glob(MIBGAS_LOCAL_PATTERN)):
+        try:
+            xls = pd.ExcelFile(path)
+            sheet = MIBGAS_TARGET_SHEET if MIBGAS_TARGET_SHEET in xls.sheet_names else next((s for s in xls.sheet_names if "PVB" in str(s).upper() and "VTP" in str(s).upper()), None)
+            if sheet is None:
+                continue
+            parsed = _standardize_mibgas_raw(pd.read_excel(path, sheet_name=sheet))
+            if not parsed.empty:
+                parts.append(parsed)
+        except Exception:
+            continue
+    if MIBGAS_CACHE_FILE.exists():
+        try:
+            cache = pd.read_csv(MIBGAS_CACHE_FILE)
+            parsed = _standardize_mibgas_raw(cache)
+            if not parsed.empty:
+                parts.append(parsed)
+        except Exception:
+            pass
+    if not parts:
+        return pd.DataFrame(columns=["trading_day", "price"])
+    raw = pd.concat(parts, ignore_index=True)
+    raw["reference_price_eur_mwh"] = pd.to_numeric(raw["reference_price_eur_mwh"], errors="coerce")
+    actuals = raw[(raw["product"] == "GDAES_D+1") & (raw["area"].fillna("ES") == "ES")].copy()
+    actuals["delivery_day"] = pd.to_datetime(actuals["delivery_start"], errors="coerce").combine_first(pd.to_datetime(actuals["trading_day"], errors="coerce"))
+    actuals["price"] = actuals["reference_price_eur_mwh"]
+    actuals = actuals.dropna(subset=["delivery_day", "price"]).copy()
+    return actuals[["delivery_day", "price"]].drop_duplicates(subset=["delivery_day"], keep="last").sort_values("delivery_day").reset_index(drop=True)
+
+
+def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float | None:
+    if actuals is None or actuals.empty:
+        return None
+    day = pd.to_datetime(actuals["delivery_day"], errors="coerce")
+    mask = (day >= start_ts) & (day < end_ts + pd.Timedelta(days=1))
+    values = pd.to_numeric(actuals.loc[mask, "price"], errors="coerce").dropna()
+    return None if values.empty else float(values.mean())
+
+
+def _parse_mixed_date_for_mix(value):
+    if pd.isna(value):
+        return pd.NaT
+    s = str(value).strip()
+    if not s:
+        return pd.NaT
+    try:
+        dt = pd.to_datetime(s, utc=True, errors="raise")
+        return dt.tz_convert("Europe/Madrid").tz_localize(None).normalize()
+    except Exception:
+        pass
+    try:
+        return pd.to_datetime(s, dayfirst=True, errors="raise").normalize()
+    except Exception:
+        return pd.NaT
+
+
+@st.cache_data(show_spinner=False)
+def load_historical_generation_mix_daily_for_report() -> pd.DataFrame:
+    cols = ["datetime", "technology", "energy_mwh", "data_source"]
+    if not HIST_MIX_FILE.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        raw = pd.read_excel(HIST_MIX_FILE, sheet_name="data", header=None)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    if raw.shape[0] < 18 or raw.shape[1] < 2:
+        return pd.DataFrame(columns=cols)
+    dates = [_parse_mixed_date_for_mix(v) for v in raw.iloc[4, 1:].tolist()]
+    records: list[dict] = []
+    for _, row in raw.iloc[5:18, :].iterrows():
+        tech_raw = str(row.iloc[0]).strip()
+        tech = LOCAL_MIX_TECH_MAP.get(tech_raw, tech_raw)
+        values = pd.to_numeric(row.iloc[1:], errors="coerce")
+        for dt, val in zip(dates, values):
+            if pd.isna(dt) or pd.isna(val):
+                continue
+            records.append({"datetime": pd.Timestamp(dt).normalize(), "technology": tech, "energy_mwh": float(val) * 1000.0, "data_source": "Historical file"})
+    out = pd.DataFrame(records)
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    out = out[out["datetime"].dt.year.between(2022, 2025)].copy()
+    hydro = out[out["technology"] == "Hydro"].groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
+    hydro["technology"] = "Hydro"
+    non_hydro = out[out["technology"] != "Hydro"].copy()
+    out = pd.concat([non_hydro, hydro], ignore_index=True)
+    return out.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_ree_widget_for_report(category: str, widget: str, start_day: date, end_day: date, time_trunc: str = "month") -> dict:
+    params = {"start_date": f"{start_day.isoformat()}T00:00", "end_date": f"{end_day.isoformat()}T23:59", "time_trunc": time_trunc, **REE_PENINSULAR_PARAMS}
+    resp = requests.get(f"{REE_API_BASE}/{category}/{widget}", params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def parse_ree_included_series_for_report(payload: dict) -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            rows.append({"datetime": dt.tz_convert("Europe/Madrid").tz_localize(None), "title": str(title).strip(), "value": pd.to_numeric(val.get("value"), errors="coerce")})
+    return pd.DataFrame(rows)
+
+
+def _normalize_ree_energy_to_mwh(series: pd.Series) -> pd.Series:
+    vals = pd.to_numeric(series, errors="coerce")
+    max_abs = vals.abs().max(skipna=True) if not vals.empty else None
+    return vals * 1000.0 if pd.notna(max_abs) and max_abs < 10000 else vals
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_mix_monthly_for_report(start_day: date, end_day: date) -> pd.DataFrame:
+    cols = ["datetime", "technology", "energy_mwh", "data_source"]
+    start_day = max(start_day, LIVE_START_DATE)
+    if start_day > end_day:
+        return pd.DataFrame(columns=cols)
+    try:
+        payload = fetch_ree_widget_for_report("generacion", "estructura-generacion", start_day, end_day, time_trunc="month")
+        df = parse_ree_included_series_for_report(payload)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
+    df["energy_mwh"] = _normalize_ree_energy_to_mwh(df["value"])
+    df["data_source"] = "REE API"
+    df = df.dropna(subset=["datetime", "technology", "energy_mwh"]).copy()
+    hydro = df[df["technology"].isin(["Hydro", "Pumped hydro"])].groupby(["datetime", "data_source"], as_index=False)["energy_mwh"].sum()
+    hydro["technology"] = "Hydro"
+    non_hydro = df[~df["technology"].isin(["Hydro", "Pumped hydro"])].copy()
+    df = pd.concat([non_hydro[["datetime", "technology", "energy_mwh", "data_source"]], hydro], ignore_index=True)
+    return df.groupby(["datetime", "technology", "data_source"], as_index=False)["energy_mwh"].sum().sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+
+def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_live: pd.DataFrame, target_month: pd.Timestamp) -> dict[str, float | None]:
+    if target_month.year <= 2025:
+        mix = mix_daily_hist.copy()
+        if not mix.empty:
+            mask = (mix["datetime"].dt.year == target_month.year) & (mix["datetime"].dt.month == target_month.month)
+            mix = mix.loc[mask].copy()
+    else:
+        mix = mix_monthly_live.copy()
+        if not mix.empty:
+            mask = (mix["datetime"].dt.year == target_month.year) & (mix["datetime"].dt.month == target_month.month)
+            mix = mix.loc[mask].copy()
+    if mix.empty:
+        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+    grouped = mix.groupby("technology", as_index=False)["energy_mwh"].sum()
+    energy_map = dict(zip(grouped["technology"], grouped["energy_mwh"]))
+    total = float(grouped["energy_mwh"].sum()) if not grouped.empty else np.nan
+    renewables = float(grouped[grouped["technology"].isin(RENEWABLE_TECHS)]["energy_mwh"].sum()) if not grouped.empty else np.nan
+    solar_mwh = float(energy_map.get("Solar PV", 0.0) + energy_map.get("Solar thermal", 0.0))
+    return {
+        "re_share": None if not total or pd.isna(total) else renewables / total,
+        "solar_gwh": solar_mwh / 1000.0,
+        "wind_gwh": float(energy_map.get("Wind", 0.0)) / 1000.0,
+        "hydro_gwh": float(energy_map.get("Hydro", 0.0)) / 1000.0,
+        "nuclear_gwh": float(energy_map.get("Nuclear", 0.0)) / 1000.0,
+    }
+
+
+def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str) -> pd.DataFrame:
+    specs = [
+        ("Renewable generation share", "re_share", "share"),
+        ("Solar injected", "solar_gwh", "gwh"),
+        ("Wind injected", "wind_gwh", "gwh"),
+        ("Hydro injected", "hydro_gwh", "gwh"),
+        ("Nuclear injected", "nuclear_gwh", "gwh"),
+    ]
+    rows = []
+    for label, key, kind in specs:
+        curr = current.get(key)
+        prev = previous.get(key)
+        if kind == "share":
+            curr_display, prev_display = fmt_pct(curr), fmt_pct(prev)
+            diff_display = fmt_pp(None if curr is None or prev is None else curr - prev)
+        else:
+            curr_display, prev_display = fmt_gwh(curr), fmt_gwh(prev)
+            diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
+            diff_display = fmt_change_pct(diff)
+        rows.append({"Metric": label, current_label: curr_display, previous_label: prev_display, "Diff vs prev.": diff_display})
+    return pd.DataFrame(rows)
+
+
+def style_generation_comparison_table(df: pd.DataFrame):
+    return (
+        df.style
+        .set_properties(**{"font-size": "0.92rem", "padding": "8px 10px"})
+        .set_table_styles([
+            {"selector": "th", "props": [("background-color", "#0F766E"), ("color", "white"), ("font-weight", "800"), ("text-align", "center")]},
+            {"selector": "tbody td:first-child", "props": [("font-weight", "800"), ("background-color", "#F8FFFC")]},
+        ])
+    )
 
 # =========================================================
 # FORWARD HOURLY SCENARIOS (AURORA / BARINGA)
@@ -2291,12 +2599,24 @@ def _optimize_bess_report_day(df_day: pd.DataFrame) -> pd.DataFrame:
     res = pd.DataFrame(
         {
             "datetime": pd.to_datetime(df_day["timestamp"]).values,
+            "hour": pd.to_numeric(df_day["hora"], errors="coerce").astype(int).values,
             "omie_venta": sell,
+            "generacion": generation,
+            "consumo": consumption,
             "g_to_grid": vals(g_to_grid),
+            "g_to_batt": vals(g_to_batt),
+            "g_to_self": vals(g_to_self),
             "grid_charge": vals(grid_charge),
+            "batt_for_load": vals(batt_for_load),
             "batt_for_sell": vals(batt_for_sell),
+            "grid_purchase": vals(grid_purchase),
+            "soc": [pulp.value(soc[i + 1]) if pulp.value(soc[i + 1]) is not None else 0.0 for i in range(n)],
         }
     )
+    res["charge_from_pv_mwh"] = res["g_to_batt"]
+    res["charge_from_grid_mwh"] = res["grid_charge"]
+    res["discharge_to_load_mwh"] = res["batt_for_load"]
+    res["discharge_to_market_mwh"] = res["batt_for_sell"]
     res["hybrid_profile_mwh"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
     res["hybrid_revenue_eur"] = res["hybrid_profile_mwh"] * res["omie_venta"]
     return res
@@ -2475,6 +2795,65 @@ def render_hybrid_summary_cards(hybrid: pd.DataFrame) -> None:
         st.markdown(card_html("2026 YTD summary", ytd_2026), unsafe_allow_html=True)
     st.caption("Summary cards show the average of the monthly values displayed in the chart.")
 
+
+
+
+def build_bess_with_demand_daily_strategy_chart(dispatch: pd.DataFrame):
+    if dispatch is None or dispatch.empty:
+        return None
+    d = dispatch.copy().sort_values("hour")
+    d["hour_label"] = d["hour"].map(lambda h: f"{int(h):02d}:00")
+    hours = [f"{h:02d}:00" for h in range(1, 25)]
+
+    bars = pd.concat([
+        d[["hour_label", "charge_from_pv_mwh"]].rename(columns={"charge_from_pv_mwh": "flow_mwh"}).assign(series="Charge from PV", flow_mwh=lambda x: -x["flow_mwh"]),
+        d[["hour_label", "charge_from_grid_mwh"]].rename(columns={"charge_from_grid_mwh": "flow_mwh"}).assign(series="Charge from grid", flow_mwh=lambda x: -x["flow_mwh"]),
+        d[["hour_label", "discharge_to_load_mwh"]].rename(columns={"discharge_to_load_mwh": "flow_mwh"}).assign(series="Discharge to demand"),
+        d[["hour_label", "discharge_to_market_mwh"]].rename(columns={"discharge_to_market_mwh": "flow_mwh"}).assign(series="Discharge to market"),
+    ], ignore_index=True)
+
+    flow_colors = alt.Scale(
+        domain=["Charge from PV", "Charge from grid", "Discharge to demand", "Discharge to market"],
+        range=[RED, "#FCA5A5", "#0EA5E9", CORP_GREEN],
+    )
+    bars_chart = alt.Chart(bars).mark_bar(opacity=0.9).encode(
+        x=alt.X("hour_label:N", title="Hour", sort=hours, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("flow_mwh:Q", title="Battery flow (MWh): discharge + / charge −"),
+        color=alt.Color("series:N", title="BESS flow", scale=flow_colors),
+        tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Flow"), alt.Tooltip("flow_mwh:Q", title="MWh", format=",.3f")],
+    )
+
+    profile_long = pd.concat([
+        d[["hour_label", "generacion"]].rename(columns={"generacion": "value"}).assign(series="Solar generation"),
+        d[["hour_label", "consumo"]].rename(columns={"consumo": "value"}).assign(series="Demand"),
+    ], ignore_index=True)
+    profile_line = alt.Chart(profile_long).mark_line(point=False, strokeWidth=2.2, strokeDash=[5, 3]).encode(
+        x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("value:Q", title="Solar / demand profile (MWh)"),
+        color=alt.Color("series:N", title="Profile", scale=alt.Scale(domain=["Solar generation", "Demand"], range=[YELLOW_DARK, GREY])),
+        tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("series:N", title="Profile"), alt.Tooltip("value:Q", title="MWh", format=",.3f")],
+    )
+
+    price_line = alt.Chart(d).mark_line(point=True, strokeWidth=2.6, color=BLUE_DARK).encode(
+        x=alt.X("hour_label:N", sort=hours, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("omie_venta:Q", title="OMIE sell price (€/MWh)"),
+        tooltip=[alt.Tooltip("hour_label:N", title="Hour"), alt.Tooltip("omie_venta:Q", title="Spot price", format=",.2f")],
+    )
+
+    chart = alt.layer(bars_chart, profile_line, price_line).resolve_scale(y="independent", color="independent").properties(
+        title="Selected-day BESS with demand strategy | 24h charge / discharge example",
+        height=390,
+    )
+    return apply_chart_style(chart, height=390)
+
+
+def available_bess_days_for_month(price_hourly: pd.DataFrame, selected_month: pd.Timestamp, report_end: pd.Timestamp) -> list[date]:
+    if price_hourly is None or price_hourly.empty:
+        return []
+    dt = pd.to_datetime(price_hourly["datetime"], errors="coerce")
+    mask = (dt.dt.year == selected_month.year) & (dt.dt.month == selected_month.month) & (dt <= report_end + pd.Timedelta(days=1))
+    days = sorted(dt.loc[mask].dt.date.dropna().unique().tolist())
+    return days
 
 
 # =========================================================
@@ -2815,6 +3194,9 @@ if not token and today.year >= 2026:
     st.info("No ESIOS token was found in the environment, so live 2026 refresh may rely only on files already stored in /data.")
 
 monthly_capture = monthly_capture_table(price_hourly, solar_hourly)
+mibgas_actuals = load_mibgas_actuals_for_report()
+historical_mix_daily = load_historical_generation_mix_daily_for_report()
+live_mix_monthly = load_live_2026_mix_monthly_for_report(date(2026, 1, 1), today)
 
 # =========================================================
 # SECTION 1 — DAY AHEAD
@@ -2827,8 +3209,11 @@ prev_month = previous_month(selected_month)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_month, month_end(prev_month))
 yoy = yoy_month(selected_month)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, month_end(yoy))
+mibgas_selected = mibgas_monthly_mean(mibgas_actuals, selected_month, report_end)
+mibgas_prev = mibgas_monthly_mean(mibgas_actuals, prev_month, month_end(prev_month))
+mibgas_yoy = mibgas_monthly_mean(mibgas_actuals, yoy, month_end(yoy))
 
-q1, q2, q3, q4 = st.columns(4)
+q1, q2, q3, q4, q5 = st.columns(5)
 with q1:
     st.metric(
         f"Baseload | {month_label(selected_month, is_current_mtd)}",
@@ -2866,6 +3251,16 @@ with q4:
     )
     st.markdown(
         f'<div class="metric-footnote">Prev. month: <b>{fmt_pct(prev_metrics["capture_rate_curtailed"])}</b><br>Same month LY: <b>{fmt_pct(yoy_metrics["capture_rate_curtailed"])}</b></div>',
+        unsafe_allow_html=True,
+    )
+with q5:
+    st.metric(
+        f"MIBGAS D+1 | {month_label(selected_month, is_current_mtd)}",
+        fmt_eur(mibgas_selected),
+        help="Monthly average GDAES D+1 MIBGAS reference price by delivery day, using the MIBGAS files/cache available to the app.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">Prev. month: <b>{fmt_eur(mibgas_prev)}</b><br>Same month LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
         unsafe_allow_html=True,
     )
 
@@ -2964,6 +3359,18 @@ if curt_chart_2025 is not None:
     st.markdown('<div class="comparison-note">2025 full-year actual economic curtailment</div>', unsafe_allow_html=True)
     st.altair_chart(curt_chart_2025, use_container_width=True)
 
+subsection("Monthly generation injection and renewable share | selected month vs previous month")
+selected_generation_metrics = build_generation_month_metrics(historical_mix_daily, live_mix_monthly, selected_month)
+previous_generation_metrics = build_generation_month_metrics(historical_mix_daily, live_mix_monthly, prev_month)
+generation_comparison = build_generation_month_comparison_table(
+    selected_generation_metrics,
+    previous_generation_metrics,
+    month_label(selected_month, is_current_mtd),
+    month_label(prev_month, False),
+)
+st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
+st.caption("Solar = Solar PV + Solar thermal. Renewable share is calculated over the total generation mix available for the month.")
+
 
 # =========================================================
 # SECTION 2 — FORWARD MARKET
@@ -3033,6 +3440,29 @@ if hybrid_plot is not None:
     )
 else:
     st.info("Hybrid captured-price series could not be generated. Add a dedicated hybrid monthly file in /data or ensure the default BESS profile files are available.")
+
+subsection("Selected-day BESS with demand strategy | 24h charge / discharge example")
+available_bess_days = available_bess_days_for_month(price_hourly, selected_month, report_end)
+if not available_bess_days:
+    st.info("No hourly market days are available for the selected report month.")
+else:
+    selected_bess_day = st.selectbox(
+        "Choose a day within the selected report month",
+        options=available_bess_days,
+        index=len(available_bess_days) - 1,
+        format_func=lambda d: pd.Timestamp(d).strftime("%d %b %Y"),
+        key="monthly_report_bess_selected_day",
+    )
+    bess_with_demand_data = _bess_report_dataset(price_hourly, "with_demand")
+    day_df = bess_with_demand_data[pd.to_datetime(bess_with_demand_data["dia"]).dt.date == selected_bess_day].copy() if not bess_with_demand_data.empty else pd.DataFrame()
+    if day_df.empty:
+        st.info("The BESS with-demand strategy could not be built for the selected day.")
+    else:
+        bess_day_dispatch = _optimize_bess_report_day(day_df)
+        bess_day_chart = build_bess_with_demand_daily_strategy_chart(bess_day_dispatch)
+        if bess_day_chart is not None:
+            st.altair_chart(bess_day_chart, use_container_width=True)
+        st.caption("Daily BESS strategy example: with-demand model, daily optimization window, max 1 cycle/day, 4h BESS (4.0 MWh / 1.0 MW).")
 
 st.caption("BESS footnote: optimization window is daily; monthly hybrid captured-price comparison uses max 1 cycle/day.")
 st.caption("Monthly Market Report | Corporate dashboard based on the app's hourly market data, forward curve files and BESS monthly inputs/proxies.")
