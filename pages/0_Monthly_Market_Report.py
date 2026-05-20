@@ -881,7 +881,15 @@ def build_generation_month_comparison_table(current: dict[str, float | None], pr
 
 
 def style_generation_comparison_table(df: pd.DataFrame):
-    return (
+    def color_diff_column(value):
+        s = str(value or "").strip()
+        if s.startswith("↑"):
+            return "color: #16A34A; font-weight: 800;"
+        if s.startswith("↓"):
+            return "color: #DC2626; font-weight: 800;"
+        return "color: #64748B; font-weight: 700;"
+
+    styler = (
         df.style
         .set_properties(**{"font-size": "0.92rem", "padding": "8px 10px"})
         .set_table_styles([
@@ -889,6 +897,9 @@ def style_generation_comparison_table(df: pd.DataFrame):
             {"selector": "tbody td:first-child", "props": [("font-weight", "800"), ("background-color", "#F8FFFC")]},
         ])
     )
+    if "Diff vs prev." in df.columns:
+        styler = styler.map(color_diff_column, subset=["Diff vs prev."])
+    return styler
 
 # =========================================================
 # FORWARD HOURLY SCENARIOS (AURORA / BARINGA)
@@ -2173,6 +2184,14 @@ def style_forward_snapshot_table(df: pd.DataFrame):
                     styles[i] = base + " font-weight: 700; color: #1D4ED8;"
                 elif curve == "solar":
                     styles[i] = base + " font-weight: 700; color: #9A6700;"
+            elif col == "M-1 change":
+                change = pd.to_numeric(row.get("M-1 change"), errors="coerce")
+                if pd.notna(change) and change > 0:
+                    styles[i] = base + " font-weight: 800; color: #16A34A;"
+                elif pd.notna(change) and change < 0:
+                    styles[i] = base + " font-weight: 800; color: #DC2626;"
+                else:
+                    styles[i] = base + " font-weight: 700; color: #64748B;"
         return styles
 
     return (
@@ -3725,7 +3744,7 @@ with q4:
         fmt_pct(selected_metrics["capture_rate_uncurtailed"]),
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_arrow_html(selected_metrics["capture_rate_uncurtailed"], prev_metrics["capture_rate_uncurtailed"], "prev. month")}<br>Prev. month: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same month LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
+        f'<div class="metric-footnote">{arrow_pp_text(selected_metrics["capture_rate_uncurtailed"] - prev_metrics["capture_rate_uncurtailed"] if selected_metrics["capture_rate_uncurtailed"] is not None and prev_metrics["capture_rate_uncurtailed"] is not None and not pd.isna(selected_metrics["capture_rate_uncurtailed"]) and not pd.isna(prev_metrics["capture_rate_uncurtailed"]) else None)} vs prev. month<br>Prev. month: <b>{fmt_pct(prev_metrics["capture_rate_uncurtailed"])}</b><br>Same month LY: <b>{fmt_pct(yoy_metrics["capture_rate_uncurtailed"])}</b></div>',
         unsafe_allow_html=True,
     )
 with q5:
