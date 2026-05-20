@@ -601,6 +601,16 @@ def _standardize_mibgas_raw(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     work = df.copy()
     work.columns = [_clean_tabular_col(c) for c in work.columns]
+
+    # Some recent MIBGAS files expose the real header in row 0
+    # instead of in df.columns. Repair that layout before mapping fields.
+    if "product" not in work.columns or "trading_day" not in work.columns:
+        if len(work) > 0:
+            candidate_cols = [_clean_tabular_col(x) for x in work.iloc[0].tolist()]
+            if "product" in candidate_cols and "trading_day" in candidate_cols:
+                work = work.iloc[1:].copy()
+                work.columns = candidate_cols
+
     colmap = {
         "trading_day": _first_tabular_col(work.columns.tolist(), ["trading_day", "trading day"]),
         "product": _first_tabular_col(work.columns.tolist(), ["product"]),
@@ -865,6 +875,37 @@ def mibgas_monthly_mean(actuals: pd.DataFrame, start_ts: pd.Timestamp, end_ts: p
     mask = (day >= start_ts) & (day < end_ts + pd.Timedelta(days=1))
     values = pd.to_numeric(actuals.loc[mask, "price"], errors="coerce").dropna()
     return None if values.empty else float(values.mean())
+
+
+def mibgas_mean_with_requested_window_refresh(
+    actuals: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> tuple[float | None, pd.DataFrame]:
+    """Return MIBGAS average; if selected week is empty, attempt one live refresh."""
+    value = mibgas_monthly_mean(actuals, start_ts, end_ts)
+    if value is not None:
+        return value, actuals
+
+    live_raw = _refresh_mibgas_2026_cache_for_report()
+    if live_raw is None or live_raw.empty:
+        return None, actuals
+
+    refreshed = _mibgas_raw_to_actuals(live_raw)
+    if refreshed.empty:
+        return None, actuals
+
+    combined = (
+        pd.concat([actuals, refreshed], ignore_index=True)
+        if actuals is not None and not actuals.empty
+        else refreshed.copy()
+    )
+    combined = (
+        combined.drop_duplicates(subset=["delivery_day"], keep="last")
+        .sort_values("delivery_day")
+        .reset_index(drop=True)
+    )
+    return mibgas_monthly_mean(combined, start_ts, end_ts), combined
 
 
 def _parse_mixed_date_for_mix(value):
@@ -3972,7 +4013,11 @@ prev_week = previous_week(selected_week)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_week, week_end(prev_week))
 yoy = yoy_week(selected_week)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, week_end(yoy))
-mibgas_selected = mibgas_monthly_mean(mibgas_actuals, selected_week, report_end)
+mibgas_selected, mibgas_actuals = mibgas_mean_with_requested_window_refresh(
+    mibgas_actuals,
+    selected_week,
+    report_end,
+)
 mibgas_prev = mibgas_monthly_mean(mibgas_actuals, prev_week, week_end(prev_week))
 mibgas_yoy = mibgas_monthly_mean(mibgas_actuals, yoy, week_end(yoy))
 
@@ -4022,8 +4067,12 @@ with q5:
         fmt_eur(mibgas_selected),
         help="Weekly average GDAES D+1 MIBGAS reference price by delivery day, using the MIBGAS files/cache available to the app.",
     )
+    mibgas_extra_note = (
+        "<br><span style='color:#B91C1C;'>Selected week still missing after live refresh.</span>"
+        if mibgas_selected is None else ""
+    )
     st.markdown(
-        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b></div>',
+        f'<div class="metric-footnote">Prev. week: <b>{fmt_eur(mibgas_prev)}</b><br>Same week LY: <b>{fmt_eur(mibgas_yoy)}</b>{mibgas_extra_note}</div>',
         unsafe_allow_html=True,
     )
 
