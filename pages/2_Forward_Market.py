@@ -1268,14 +1268,15 @@ COUNTRY_INSTRUMENT_CANDIDATES = {
 }
 
 
-def country_comparison_candidate_instruments(country_name: str, variable_label: str) -> list[tuple[str, str]]:
+def country_comparison_candidate_instruments(country_name: str, variable_label: str = "Baseload") -> list[tuple[str, str]]:
+    """Country comparison is intentionally Baseload-only.
+
+    OMIP does not publish Solar contracts consistently across zones, so allowing
+    Solar here creates misleading empty comparisons. Spain/Solar remains available
+    in the main Forward Market block above.
+    """
     candidates_for_country = COUNTRY_INSTRUMENT_CANDIDATES.get(country_name, {})
-    if variable_label == "Baseload + Solar":
-        return (
-            candidates_for_country.get("Baseload", [("Baseload", "FTB")])
-            + candidates_for_country.get("Solar", [("Solar", "FTS")])
-        )
-    return candidates_for_country.get(variable_label, [(variable_label, INSTRUMENTS.get(f"{variable_label} - FTB", "FTB"))])
+    return candidates_for_country.get("Baseload", [("Baseload", "FTB")])
 
 
 def _cc_find_delivery_from_text(text: str) -> str | None:
@@ -1540,7 +1541,7 @@ def country_comparison_chart(df: pd.DataFrame, chart_type: str):
         return None
 
     plot = df.copy()
-    plot["series"] = plot["country"].astype(str) + " | " + plot["variable"].astype(str)
+    plot["series"] = plot["country"].astype(str)
 
     order = (
         plot[["delivery_label", "sort_key"]]
@@ -1557,7 +1558,7 @@ def country_comparison_chart(df: pd.DataFrame, chart_type: str):
             axis=alt.Axis(labelAngle=-35),
         ),
         y=alt.Y("curve_price:Q", title="Forward quote (€/MWh)", scale=alt.Scale(zero=False)),
-        color=alt.Color("series:N", title="Country / variable"),
+        color=alt.Color("series:N", title="Country"),
         tooltip=[
             alt.Tooltip("country:N", title="Country"),
             alt.Tooltip("variable:N", title="Variable"),
@@ -1615,11 +1616,13 @@ with st.expander("Configure country comparison", expanded=False):
             default=default_countries,
             key="cc_countries",
         )
-        cc_variable = st.selectbox(
+        cc_variable = "Baseload"
+        st.text_input(
             "Variable",
-            ["Baseload", "Solar", "Peak", "Baseload + Solar"],
-            index=0,
-            key="cc_variable",
+            value="Baseload",
+            disabled=True,
+            key="cc_variable_locked",
+            help="Country comparison is restricted to Baseload because OMIP Solar is not available consistently across countries.",
         )
 
     with cc3:
@@ -1630,7 +1633,7 @@ with st.expander("Configure country comparison", expanded=False):
             key="cc_maturity_label",
         )
         cc_max_contracts = st.slider(
-            "Max contracts per country / variable",
+            "Max contracts per country",
             min_value=3,
             max_value=25,
             value=10,
