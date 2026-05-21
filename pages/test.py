@@ -90,6 +90,29 @@ def headers(token: str) -> dict[str, str]:
     }
 
 
+def first_scalar(value):
+    """ESIOS sometimes returns scalar strings, lists, or small dicts depending on aggregation.
+    Convert those safely before pandas datetime parsing."""
+    if isinstance(value, list):
+        if not value:
+            return None
+        return first_scalar(value[0])
+    if isinstance(value, dict):
+        for key in ["datetime", "datetime_utc", "date", "value"]:
+            if key in value:
+                return first_scalar(value.get(key))
+        return None
+    return value
+
+
+def parse_esios_datetime_series(series: pd.Series) -> pd.Series:
+    cleaned = series.map(first_scalar)
+    try:
+        return pd.to_datetime(cleaned, errors="coerce", utc=True, format="mixed")
+    except TypeError:
+        return pd.to_datetime(cleaned, errors="coerce", utc=True)
+
+
 def request_esios_1293(
     *,
     token: str,
@@ -129,22 +152,24 @@ def request_esios_1293(
     for item in values:
         rows.append(
             {
-                "period_start": item.get("datetime"),
-                "value": item.get("value"),
-                "geo_id": item.get("geo_id") or (item.get("geo_ids", [None])[0] if isinstance(item.get("geo_ids"), list) and item.get("geo_ids") else None),
-                "geo_name": item.get("geo_name") or "Península",
-                "datetime_utc": item.get("datetime_utc"),
-                "tz_time": item.get("tz_time"),
+                "period_start": first_scalar(item.get("datetime") or item.get("datetime_utc") or item.get("date")),
+                "value": first_scalar(item.get("value")),
+                "geo_id": first_scalar(item.get("geo_id") or item.get("geoId") or item.get("geo_ids")),
+                "geo_name": first_scalar(item.get("geo_name") or item.get("geoName")) or "Península",
+                "datetime_utc": first_scalar(item.get("datetime_utc")),
+                "tz_time": first_scalar(item.get("tz_time")),
             }
         )
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df, {**info, "payload": payload}
-    df["period_start"] = pd.to_datetime(df["period_start"], errors="coerce")
+    df["period_start"] = parse_esios_datetime_series(df["period_start"])
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["period_start", "value"]).copy()
-    df["month"] = df["period_start"].dt.to_period("M").dt.to_timestamp()
+    if df.empty:
+        return df, {**info, "payload": payload, "parse_note": "Rows returned by API but datetime/value could not be parsed."}
+    df["month"] = df["period_start"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None).dt.to_period("M").dt.to_timestamp()
     return df.sort_values("month").reset_index(drop=True), {**info, "payload": payload}
 
 
