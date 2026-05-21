@@ -1205,14 +1205,12 @@ else:
 # This block is intentionally at the END of the page.
 # It only calls OMIP when the user clicks "Compare selected countries".
 #
-# Why this has its own loose parser:
-# - ES Baseload/Solar rows are often easy to identify because the contract cell
-#   contains FTB/FTS.
-# - Other OMIP zones can return the same visual table but with contract metadata
-#   encoded differently. The original parser then sees tables_found/raw_rows but
-#   rows_parsed=0.
-# - The loose parser below only runs as a fallback for this country-comparison
-#   block, so it does not alter the Spanish Baseload/Solar workflow above.
+# Important fix:
+# - The main Spain/Solar block uses Spain instruments FTB/FTS.
+# - Other zones can use different OMIP instrument codes. For example Germany
+#   Baseload uses FDB in the OMIP URL, not FTB.
+# - This block therefore maps country/variable to instrument candidates and
+#   only falls back when a candidate returns no parsed rows.
 
 def country_comparison_section_header(title: str) -> None:
     st.markdown(
@@ -1233,14 +1231,51 @@ def country_comparison_section_header(title: str) -> None:
     )
 
 
-def country_comparison_variable_to_instruments(variable_label: str) -> dict[str, str]:
-    if variable_label == "Baseload":
-        return {"Baseload": "FTB"}
-    if variable_label == "Solar":
-        return {"Solar": "FTS"}
-    if variable_label == "Peak":
-        return {"Peak": "FTP"}
-    return {"Baseload": "FTB", "Solar": "FTS"}
+# Country-specific OMIP instrument candidates.
+# Keep the first candidate as the expected production code and the others as
+# fallbacks because OMIP product availability can differ by country/curve.
+COUNTRY_INSTRUMENT_CANDIDATES = {
+    "Spain": {
+        "Baseload": [("Baseload", "FTB")],
+        "Solar": [("Solar", "FTS")],
+        "Peak": [("Peak", "FTP")],
+    },
+    "Spain-Portugal": {
+        "Baseload": [("Baseload", "FTB")],
+        "Solar": [("Solar", "FTS")],
+        "Peak": [("Peak", "FTP")],
+    },
+    "Portugal-Spain": {
+        "Baseload": [("Baseload", "FTB")],
+        "Solar": [("Solar", "FTS")],
+        "Peak": [("Peak", "FTP")],
+    },
+    "Germany": {
+        "Baseload": [("Baseload", "FDB"), ("Baseload", "FTB")],
+        "Solar": [("Solar", "FDS"), ("Solar", "FTS")],
+        "Peak": [("Peak", "FDP"), ("Peak", "FTP")],
+    },
+    "France": {
+        "Baseload": [("Baseload", "FFB"), ("Baseload", "FDB"), ("Baseload", "FTB")],
+        "Solar": [("Solar", "FFS"), ("Solar", "FDS"), ("Solar", "FTS")],
+        "Peak": [("Peak", "FFP"), ("Peak", "FDP"), ("Peak", "FTP")],
+    },
+    "Portugal": {
+        "Baseload": [("Baseload", "FPB"), ("Baseload", "FTB")],
+        "Solar": [("Solar", "FPS"), ("Solar", "FTS")],
+        "Peak": [("Peak", "FPP"), ("Peak", "FTP")],
+    },
+}
+
+
+def country_comparison_candidate_instruments(country_name: str, variable_label: str) -> list[tuple[str, str]]:
+    candidates_for_country = COUNTRY_INSTRUMENT_CANDIDATES.get(country_name, {})
+    if variable_label == "Baseload + Solar":
+        return (
+            candidates_for_country.get("Baseload", [("Baseload", "FTB")])
+            + candidates_for_country.get("Solar", [("Solar", "FTS")])
+        )
+    return candidates_for_country.get(variable_label, [(variable_label, INSTRUMENTS.get(f"{variable_label} - FTB", "FTB"))])
 
 
 def _cc_find_delivery_from_text(text: str) -> str | None:
@@ -1260,10 +1295,6 @@ def _cc_find_delivery_from_text(text: str) -> str | None:
     return None
 
 
-def _cc_pick_numeric_by_position(values: list, pos: int) -> float | None:
-    return parse_num(values[pos]) if pos < len(values) else None
-
-
 def parse_country_omip_tables_loose(
     tables: list[pd.DataFrame],
     asof: date,
@@ -1272,14 +1303,13 @@ def parse_country_omip_tables_loose(
     country_name: str,
     zone_code: str,
 ) -> pd.DataFrame:
-    """Fallback parser for non-ES zones where the visual OMIP table is the same
-    but the contract cell does not expose an FTB/FTS prefix in the same way.
+    """Fallback parser for non-ES zones.
 
-    It scans every row for a delivery token such as YR-27, Q3-26, M Jun-26 and
-    reconstructs a contract name as '<instrument> <delivery>'.
+    It scans rows for delivery tokens like YR-27 / Q3-26 / M Jun-26 and
+    reconstructs the contract as '<instrument> <delivery>' when the OMIP row
+    does not expose the instrument prefix in the exact same way as Spain.
     """
     rows: list[dict] = []
-
     for table_id, table in enumerate(tables, start=1):
         df = flatten_columns(table)
         if df.empty:
@@ -1289,13 +1319,11 @@ def parse_country_omip_tables_loose(
             values = list(row.values)
             texts = [normalize_str(v) for v in values]
             joined = " | ".join([t for t in texts if t])
-
             if not joined:
                 continue
 
-            # Skip rows that are obviously headers / no-data messages.
             low = joined.lower()
-            if "no data" in low or "contract" == low or "best bid" in low and "last price" in low:
+            if "no data" in low or ("contract name" in low and "best bid" in low):
                 continue
 
             delivery = None
@@ -1306,28 +1334,27 @@ def parse_country_omip_tables_loose(
             if not delivery:
                 continue
 
-            # Avoid treating metadata/header lines as contracts unless there is at least
-            # one numeric price-like value somewhere in the row.
             nums = [parse_num(v) for v in values]
             nums_clean = [x for x in nums if x is not None]
             if not nums_clean:
                 continue
 
-            # First try the standard OMIP positions used in the original parser.
-            best_bid = _cc_pick_numeric_by_position(values, 3)
-            best_ask = _cc_pick_numeric_by_position(values, 4)
-            session_volume = _cc_pick_numeric_by_position(values, 5)
-            last_price = _cc_pick_numeric_by_position(values, 7)
-            last_volume = _cc_pick_numeric_by_position(values, 9)
-            open_interest = _cc_pick_numeric_by_position(values, 11)
-            nr_contracts = _cc_pick_numeric_by_position(values, 12)
-            otc_volume = _cc_pick_numeric_by_position(values, 13)
-            d_price = _cc_pick_numeric_by_position(values, 15)
-            d_minus_1 = _cc_pick_numeric_by_position(values, 16)
+            def val_at(pos: int):
+                return values[pos] if pos < len(values) else None
 
-            # Fallback for layouts with fewer columns: use the most price-like numerics.
-            # For yearly/quarterly forward curves, prices are commonly in the 0-300 range.
-            price_like = [x for x in nums_clean if -500 <= float(x) <= 1000]
+            best_bid = parse_num(val_at(3))
+            best_ask = parse_num(val_at(4))
+            session_volume = parse_num(val_at(5))
+            last_price = parse_num(val_at(7))
+            last_volume = parse_num(val_at(9))
+            open_interest = parse_num(val_at(11))
+            nr_contracts = parse_num(val_at(12))
+            otc_volume = parse_num(val_at(13))
+            d_price = parse_num(val_at(15))
+            d_minus_1 = parse_num(val_at(16))
+
+            # Fallback if table positions are shifted.
+            price_like = [float(x) for x in nums_clean if -500 <= float(x) <= 1000]
             if d_price is None:
                 if len(price_like) >= 2:
                     d_price = price_like[-2]
@@ -1346,7 +1373,6 @@ def parse_country_omip_tables_loose(
             if curve_price is None:
                 continue
 
-            # If OMIP did expose the full contract with instrument, keep it; otherwise reconstruct.
             original_contract = None
             for txt in texts:
                 maybe = extract_contract_name(txt, instrument)
@@ -1386,7 +1412,6 @@ def parse_country_omip_tables_loose(
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-
     out["sort_key"] = out["contract"].map(contract_sort_key)
     out["delivery_label"] = out["contract"].map(delivery_label_from_contract)
     out = out.drop_duplicates(subset=["market_date", "country", "sheet", "instrument", "contract"], keep="last")
@@ -1401,89 +1426,110 @@ def country_comparison_pull_one(
     variable_label: str,
     maturity_code: str | None,
     include_maturity_param: bool,
+    try_all_candidates: bool,
 ) -> tuple[pd.DataFrame, list[dict], dict[str, pd.DataFrame]]:
     date_str = market_date.strftime("%Y-%m-%d")
-    instruments = country_comparison_variable_to_instruments(variable_label)
+    candidates = country_comparison_candidate_instruments(country_name, variable_label)
+
     parts: list[pd.DataFrame] = []
     debug_rows: list[dict] = []
     raw_by_label: dict[str, pd.DataFrame] = {}
 
-    for sheet_name, instrument in instruments.items():
-        try:
-            tables, url = fetch_tables(
-                date_str=date_str,
-                product=product_code,
-                zone=zone_code,
-                instrument=instrument,
-                include_maturity_param=include_maturity_param,
-                maturity=maturity_code,
-            )
+    # Group candidates by requested variable. For each variable, stop at the
+    # first candidate that parses unless the user asks to test all candidates.
+    candidates_df = pd.DataFrame(candidates, columns=["sheet_name", "instrument"])
+    for sheet_name, group in candidates_df.groupby("sheet_name", sort=False):
+        found_for_sheet = False
 
-            raw_concat = concat_tables(tables)
-            raw_by_label[f"{country_name}_{sheet_name}_{instrument}"] = raw_concat
+        for _, cand in group.iterrows():
+            instrument = str(cand["instrument"])
+            parsed = pd.DataFrame()
+            strict = pd.DataFrame()
+            parser_used = "none"
+            rows_after_filter = 0
 
-            # First use the original parser.
-            parsed_original = parse_raw_tables_to_contracts(tables, market_date, sheet_name, instrument)
-            parsed = parsed_original.copy()
-            parser_used = "strict_original"
-
-            # If the page has rows but strict parsing finds none, use the loose fallback.
-            if parsed.empty and tables:
-                parsed = parse_country_omip_tables_loose(
-                    tables=tables,
-                    asof=market_date,
-                    sheet_name=sheet_name,
+            try:
+                tables, url = fetch_tables(
+                    date_str=date_str,
+                    product=product_code,
+                    zone=zone_code,
                     instrument=instrument,
-                    country_name=country_name,
-                    zone_code=zone_code,
+                    include_maturity_param=include_maturity_param,
+                    maturity=maturity_code,
                 )
-                parser_used = "loose_country_fallback" if not parsed.empty else "none"
 
-            if not parsed.empty:
-                parsed = parsed.copy()
-                parsed["country"] = country_name
-                parsed["zone"] = zone_code
-                parsed["variable"] = sheet_name
-                parsed["parser"] = parsed.get("parser", parser_used)
-                if "delivery_label" not in parsed.columns:
-                    parsed["delivery_label"] = parsed["contract"].map(delivery_label_from_contract)
-                if maturity_code:
-                    parsed = parsed[parsed["maturity"] == maturity_code].copy()
-                parts.append(parsed)
+                raw_concat = concat_tables(tables)
+                raw_by_label[f"{country_name}_{sheet_name}_{instrument}"] = raw_concat
 
-            debug_rows.append(
-                {
-                    "date": date_str,
-                    "country": country_name,
-                    "zone": zone_code,
-                    "variable": sheet_name,
-                    "instrument": instrument,
-                    "parser": parser_used,
-                    "url": url,
-                    "tables_found": len(tables),
-                    "raw_rows": int(sum(len(t) for t in tables)) if tables else 0,
-                    "rows_parsed": int(len(parsed)) if parsed is not None else 0,
-                    "strict_rows_parsed": int(len(parsed_original)) if parsed_original is not None else 0,
-                    "error": "",
-                }
-            )
-        except Exception as exc:
-            debug_rows.append(
-                {
-                    "date": date_str,
-                    "country": country_name,
-                    "zone": zone_code,
-                    "variable": sheet_name,
-                    "instrument": instrument,
-                    "parser": "error",
-                    "url": omip_url(date_str, product_code, zone_code, instrument, include_maturity_param, maturity_code),
-                    "tables_found": 0,
-                    "raw_rows": 0,
-                    "rows_parsed": 0,
-                    "strict_rows_parsed": 0,
-                    "error": str(exc)[:500],
-                }
-            )
+                strict = parse_raw_tables_to_contracts(tables, market_date, sheet_name, instrument)
+                parsed = strict.copy()
+                parser_used = "strict_original" if not parsed.empty else "none"
+
+                if parsed.empty and tables:
+                    parsed = parse_country_omip_tables_loose(
+                        tables=tables,
+                        asof=market_date,
+                        sheet_name=sheet_name,
+                        instrument=instrument,
+                        country_name=country_name,
+                        zone_code=zone_code,
+                    )
+                    parser_used = "loose_country_fallback" if not parsed.empty else "none"
+
+                if not parsed.empty:
+                    parsed = parsed.copy()
+                    parsed["country"] = country_name
+                    parsed["zone"] = zone_code
+                    parsed["variable"] = sheet_name
+                    parsed["parser"] = parsed.get("parser", parser_used)
+                    if "delivery_label" not in parsed.columns:
+                        parsed["delivery_label"] = parsed["contract"].map(delivery_label_from_contract)
+                    if maturity_code:
+                        parsed = parsed[parsed["maturity"] == maturity_code].copy()
+                    rows_after_filter = int(len(parsed))
+                    if not parsed.empty:
+                        parts.append(parsed)
+                        found_for_sheet = True
+
+                debug_rows.append(
+                    {
+                        "date": date_str,
+                        "country": country_name,
+                        "zone": zone_code,
+                        "variable": sheet_name,
+                        "instrument_tested": instrument,
+                        "parser": parser_used,
+                        "url": url,
+                        "tables_found": len(tables),
+                        "raw_rows": int(sum(len(t) for t in tables)) if tables else 0,
+                        "strict_rows_parsed": int(len(strict)) if strict is not None else 0,
+                        "rows_after_filter": rows_after_filter,
+                        "used": bool(found_for_sheet and rows_after_filter > 0),
+                        "error": "",
+                    }
+                )
+
+                if found_for_sheet and not try_all_candidates:
+                    break
+
+            except Exception as exc:
+                debug_rows.append(
+                    {
+                        "date": date_str,
+                        "country": country_name,
+                        "zone": zone_code,
+                        "variable": sheet_name,
+                        "instrument_tested": instrument,
+                        "parser": "error",
+                        "url": omip_url(date_str, product_code, zone_code, instrument, include_maturity_param, maturity_code),
+                        "tables_found": 0,
+                        "raw_rows": 0,
+                        "strict_rows_parsed": 0,
+                        "rows_after_filter": 0,
+                        "used": False,
+                        "error": str(exc)[:500],
+                    }
+                )
 
     data = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     return data, debug_rows, raw_by_label
@@ -1515,6 +1561,7 @@ def country_comparison_chart(df: pd.DataFrame, chart_type: str):
         tooltip=[
             alt.Tooltip("country:N", title="Country"),
             alt.Tooltip("variable:N", title="Variable"),
+            alt.Tooltip("instrument:N", title="Instrument"),
             alt.Tooltip("parser:N", title="Parser"),
             alt.Tooltip("delivery_label:N", title="Delivery"),
             alt.Tooltip("contract:N", title="Contract"),
@@ -1539,8 +1586,8 @@ country_comparison_section_header("🌍 Country forward comparison")
 
 st.caption(
     "On-demand comparison block. It does not call OMIP until you press the button. "
-    "Use it mainly for Baseload across countries; Solar may not be available for every OMIP zone. "
-    "If strict parsing fails for non-ES zones, the block tries a loose fallback parser."
+    "For Germany Baseload the URL uses instrument FDB, not FTB. "
+    "The block now tries country-specific instrument codes first, then fallbacks."
 )
 
 with st.expander("Configure country comparison", expanded=False):
@@ -1604,6 +1651,12 @@ with st.expander("Configure country comparison", expanded=False):
         key="cc_include_maturity",
         help="Usually keep off. The parser filters maturity after reading the OMIP table.",
     )
+    cc_try_all_candidates = st.checkbox(
+        "Diagnostic mode: try all candidate instruments",
+        value=False,
+        key="cc_try_all_candidates",
+        help="Off = stop at the first instrument that parses for each country/variable. On = test all candidates and show diagnostics.",
+    )
 
     cc_run = st.button(
         "Compare selected countries",
@@ -1634,6 +1687,7 @@ if cc_run:
                     variable_label=cc_variable,
                     maturity_code=cc_maturity,
                     include_maturity_param=cc_include_maturity,
+                    try_all_candidates=cc_try_all_candidates,
                 )
                 if not country_data.empty:
                     all_data.append(country_data)
@@ -1677,7 +1731,7 @@ if cc_run:
                 st.altair_chart(cc_chart, use_container_width=True)
 
             cc_display_cols = [
-                "market_date", "country", "zone", "variable", "parser", "delivery_label", "contract", "maturity",
+                "market_date", "country", "zone", "variable", "instrument", "parser", "delivery_label", "contract", "maturity",
                 "curve_price", "d_price", "d_minus_1", "best_bid", "best_ask", "last_price",
                 "open_interest", "nr_contracts", "session_volume_mwh",
             ]
@@ -1688,6 +1742,7 @@ if cc_run:
                     "country": "Country",
                     "zone": "Zone",
                     "variable": "Variable",
+                    "instrument": "Instrument",
                     "parser": "Parser",
                     "delivery_label": "Delivery",
                     "contract": "Contract",
