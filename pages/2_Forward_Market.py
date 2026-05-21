@@ -2,23 +2,45 @@
 # =========================================================
 # COUNTRY BASELOAD COMPARISON — ON-DEMAND BLOCK
 # =========================================================
-# Paste this block at the end of pages/2_Forward_Market.py.
-# It only calls OMIP when the user presses the button.
+# Paste this block at the VERY END of pages/2_Forward_Market.py,
+# after all original functions and page code. It does not call OMIP until the button is pressed.
+
+def _cc_section_header(title: str) -> None:
+    dark = globals().get("CORP_GREEN_DARK", "#0F766E")
+    green = globals().get("CORP_GREEN", "#10B981")
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(90deg, {dark} 0%, {green} 55%, #C7F0DD 100%);
+            color: white;
+            padding: 12px 18px;
+            border-radius: 12px;
+            font-weight: 800;
+            font-size: 1.25rem;
+            margin-top: 24px;
+            margin-bottom: 14px;
+            box-shadow: 0 2px 8px rgba(15,118,110,0.14);
+        ">{title}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 def _country_comparison_contract_label(contract: str) -> str:
-    """Compact delivery label used to align the same contract across zones."""
-    return delivery_label_from_contract(contract)
+    try:
+        return delivery_label_from_contract(contract)
+    except Exception:
+        c = str(contract).strip()
+        return c.replace("FTB ", "").replace("FTS ", "").replace("FTP ", "")
 
 
 def _country_comparison_allowed_instruments(variable_label: str) -> list[tuple[str, str]]:
-    """Return (sheet_name, instrument) pairs."""
     if variable_label == "Baseload":
         return [("Baseload", "FTB")]
     if variable_label == "Peak":
         return [("Peak", "FTP")]
     if variable_label == "Solar":
         return [("Solar", "FTS")]
-    # Baseload + Solar keeps optionality, but country comparison defaults to Baseload.
     return [("Baseload", "FTB"), ("Solar", "FTS")]
 
 
@@ -31,12 +53,14 @@ def _country_comparison_pull_one(
     maturity_filter_code: str | None,
     include_maturity_param: bool,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Pull one date / one country / selected variable from OMIP."""
     date_str = market_date.strftime("%Y-%m-%d")
     frames: list[pd.DataFrame] = []
     diagnostics: list[dict] = []
 
     for sheet_name, instrument in _country_comparison_allowed_instruments(variable_label):
+        parsed = pd.DataFrame()
+        url = ""
+        tables = []
         try:
             tables, url = fetch_tables(
                 date_str=date_str,
@@ -84,10 +108,10 @@ def _country_comparison_pull_one(
                     "zone": zone_code,
                     "variable": sheet_name,
                     "instrument": instrument,
-                    "url": "",
-                    "tables_found": 0,
-                    "raw_rows": 0,
-                    "rows_parsed": 0,
+                    "url": url,
+                    "tables_found": len(tables) if tables else 0,
+                    "raw_rows": int(sum(len(t) for t in tables)) if tables else 0,
+                    "rows_parsed": int(len(parsed)) if parsed is not None else 0,
                     "error": str(exc)[:500],
                 }
             )
@@ -120,15 +144,14 @@ def _country_comparison_chart(df: pd.DataFrame, chart_kind: str):
         ],
     )
 
-    if chart_kind == "Lines":
-        chart = base.mark_line(point=True, strokeWidth=3)
-    else:
-        chart = base.mark_bar(opacity=0.82)
+    chart = base.mark_line(point=True, strokeWidth=3) if chart_kind == "Lines" else base.mark_bar(opacity=0.82)
+    try:
+        return apply_common_chart_style(chart, height=430)
+    except Exception:
+        return chart.properties(height=430)
 
-    return apply_common_chart_style(chart, height=430)
 
-
-section_header("🌍 Baseload country comparison")
+_cc_section_header("🌍 Baseload country comparison")
 
 st.caption(
     "On-demand block: OMIP is only called when you press the button. "
@@ -202,7 +225,7 @@ with st.expander("Configure country comparison", expanded=False):
         key="run_country_comparison",
     )
 
-if "run_country_comparison" in locals() and run_country_comparison:
+if run_country_comparison:
     if not selected_countries:
         st.warning("Choose at least one country.")
     else:
@@ -235,8 +258,6 @@ if "run_country_comparison" in locals() and run_country_comparison:
         else:
             country_df = pd.concat(all_frames, ignore_index=True)
             country_df = country_df.dropna(subset=["curve_price"]).copy()
-
-            # Keep the closest / first N contracts per country and variable to avoid a crowded chart.
             country_df = (
                 country_df.sort_values(["country", "variable", "sort_key", "contract"])
                 .groupby(["country", "variable"], group_keys=False)
@@ -286,7 +307,10 @@ if "run_country_comparison" in locals() and run_country_comparison:
                     "open_interest": "Open interest",
                 }
             )
-            st.dataframe(styled_df(table), use_container_width=True)
+            try:
+                st.dataframe(styled_df(table), use_container_width=True)
+            except Exception:
+                st.dataframe(table, use_container_width=True)
 
             with st.expander("Country comparison diagnostics", expanded=False):
                 st.dataframe(diagnostics_df, use_container_width=True)
