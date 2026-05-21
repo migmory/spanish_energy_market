@@ -51,21 +51,30 @@ def get_secret_or_env(*names: str) -> str:
 
 
 def build_headers(token: str, auth_style: str) -> dict[str, str]:
-    if auth_style == 'Token token="..."':
-        authorization = f'Token token="{token}"'
-    elif auth_style == "Token token=...":
-        authorization = f"Token token={token}"
-    elif auth_style == "Bearer ...":
-        authorization = f"Bearer {token}"
-    else:
-        authorization = token
-
-    return {
-        "Accept": "application/json; application/vnd.esios-api-v2+json",
+    """
+    HTTP 403 normally means the token exists but was sent in the wrong auth header,
+    or the token does not have access. ESIOS often expects x-api-key, while some
+    old examples use Authorization. This test can try both.
+    """
+    accept_v2 = "application/json; application/vnd.esios-api-v2+json"
+    accept_v1 = "application/json; application/vnd.esios-api-v1+json"
+    base = {
         "Content-Type": "application/json",
-        "Authorization": authorization,
         "User-Agent": "NexwellPower-Streamlit-ESIOS-Diagnostic/1.0",
     }
+    if auth_style == "x-api-key | v2":
+        return {**base, "Accept": accept_v2, "x-api-key": token}
+    if auth_style == "x-api-key | v1":
+        return {**base, "Accept": accept_v1, "x-api-key": token}
+    if auth_style == "api_key | v2":
+        return {**base, "Accept": accept_v2, "api_key": token}
+    if auth_style == "Authorization: Token token=... | v2":
+        return {**base, "Accept": accept_v2, "Authorization": f"Token token={token}"}
+    if auth_style == 'Authorization: Token token="..." | v2':
+        return {**base, "Accept": accept_v2, "Authorization": f'Token token="{token}"'}
+    if auth_style == "Authorization: Bearer ... | v2":
+        return {**base, "Accept": accept_v2, "Authorization": f"Bearer {token}"}
+    return {**base, "Accept": accept_v2, "x-api-key": token}
 
 
 def _safe_extract_values(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -203,7 +212,14 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     auth_style = st.selectbox(
         "Authorization header style",
-        ['Token token="..."', "Token token=...", "Bearer ..."],
+        [
+            "x-api-key | v2",
+            "x-api-key | v1",
+            "api_key | v2",
+            "Authorization: Token token=... | v2",
+            'Authorization: Token token="..." | v2',
+            "Authorization: Bearer ... | v2",
+        ],
         index=0,
     )
 with c2:
@@ -244,64 +260,81 @@ if run:
     end_dt = datetime.combine(end_day, time(23, 55, 0))
 
     variants = ["geo_ids[]", "geo_ids", "geo_id", "no geo"]
+    auth_variants = [
+        auth_style,
+        "x-api-key | v2",
+        "x-api-key | v1",
+        "api_key | v2",
+        "Authorization: Token token=... | v2",
+        'Authorization: Token token="..." | v2',
+        "Authorization: Bearer ... | v2",
+    ]
+    auth_variants = list(dict.fromkeys(auth_variants))
+
     diag_rows = []
     payloads: dict[str, dict[str, Any]] = {}
     frames: dict[str, pd.DataFrame] = {}
 
-    with st.spinner("Calling ESIOS API variants..."):
-        for geo_mode in variants:
-            try:
-                payload, df, info = request_variant(
-                    token=token,
-                    auth_style=auth_style,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    geo_mode=geo_mode,
-                    geo_text=geo_text,
-                    time_trunc=time_trunc,
-                    time_agg=time_agg,
-                    geo_agg=geo_agg,
-                    include_locale=include_locale,
-                )
-                payloads[geo_mode] = payload
-                frames[geo_mode] = df
-                geo_names = []
-                if not df.empty and "geo_name" in df.columns:
-                    geo_names = sorted({str(x) for x in df["geo_name"].dropna().unique().tolist()})
-                diag_rows.append(
-                    {
-                        "Variant": geo_mode,
-                        "HTTP": info["status_code"],
-                        "Rows": len(df),
-                        "Geo names": ", ".join(geo_names[:5]),
-                        "Response chars": info["response_chars"],
-                        "URL": info["url"],
-                    }
-                )
-            except Exception as exc:
-                payloads[geo_mode] = {"exception": str(exc)}
-                frames[geo_mode] = pd.DataFrame()
-                diag_rows.append(
-                    {
-                        "Variant": geo_mode,
-                        "HTTP": "ERROR",
-                        "Rows": 0,
-                        "Geo names": "",
-                        "Response chars": 0,
-                        "URL": str(exc),
-                    }
-                )
+    with st.spinner("Calling ESIOS API auth + geo variants..."):
+        for tested_auth_style in auth_variants:
+            for geo_mode in variants:
+                variant_key = f"{tested_auth_style} | {geo_mode}"
+                try:
+                    payload, df, info = request_variant(
+                        token=token,
+                        auth_style=tested_auth_style,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        geo_mode=geo_mode,
+                        geo_text=geo_text,
+                        time_trunc=time_trunc,
+                        time_agg=time_agg,
+                        geo_agg=geo_agg,
+                        include_locale=include_locale,
+                    )
+                    payloads[variant_key] = payload
+                    frames[variant_key] = df
+                    geo_names = []
+                    if not df.empty and "geo_name" in df.columns:
+                        geo_names = sorted({str(x) for x in df["geo_name"].dropna().unique().tolist()})
+                    diag_rows.append(
+                        {
+                            "Auth": tested_auth_style,
+                            "Geo variant": geo_mode,
+                            "HTTP": info["status_code"],
+                            "Rows": len(df),
+                            "Geo names": ", ".join(geo_names[:5]),
+                            "Response chars": info["response_chars"],
+                            "URL": info["url"],
+                        }
+                    )
+                except Exception as exc:
+                    payloads[variant_key] = {"exception": str(exc)}
+                    frames[variant_key] = pd.DataFrame()
+                    diag_rows.append(
+                        {
+                            "Auth": tested_auth_style,
+                            "Geo variant": geo_mode,
+                            "HTTP": "ERROR",
+                            "Rows": 0,
+                            "Geo names": "",
+                            "Response chars": 0,
+                            "URL": str(exc),
+                        }
+                    )
 
     diag = pd.DataFrame(diag_rows)
     st.markdown("### 1) Request diagnostics")
     st.dataframe(style_diag(diag), use_container_width=True)
 
-    # Pick best variant: first successful with rows, preferring a geo-filtered request.
+    # Pick best variant: first successful with rows, preferring geo-filtered requests.
     chosen_variant = None
-    for candidate in ["geo_ids[]", "geo_ids", "geo_id", "no geo"]:
-        df = frames.get(candidate, pd.DataFrame())
-        if df is not None and not df.empty:
-            chosen_variant = candidate
+    for suffix in ["geo_ids[]", "geo_ids", "geo_id", "no geo"]:
+        for key, df in frames.items():
+            if key.endswith(f"| {suffix}") and df is not None and not df.empty:
+                chosen_variant = key
+                break
+        if chosen_variant is not None:
             break
 
     if chosen_variant is None:
@@ -332,9 +365,9 @@ if run:
                     )
 
     st.markdown("### 4) Raw payload preview")
-    for variant in variants:
-        with st.expander(f"Payload preview — {variant}", expanded=False):
-            preview = json.dumps(payloads.get(variant, {}), ensure_ascii=False, indent=2)
+    for variant_key in list(payloads.keys())[:24]:
+        with st.expander(f"Payload preview — {variant_key}", expanded=False):
+            preview = json.dumps(payloads.get(variant_key, {}), ensure_ascii=False, indent=2)
             st.code(preview[:12000], language="json")
 
 st.markdown("---")
