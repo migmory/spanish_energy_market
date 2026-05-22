@@ -426,19 +426,40 @@ def build_demand_with_peak(start_day: date, end_day: date, token: str) -> tuple[
         return pd.DataFrame(), diagnostics, raw
 
     out = monthly.copy()
+
+    # Ensure all optional columns exist even if the hourly/ESIOS requests return no rows.
+    optional_defaults = {
+        "peak_hour": pd.NaT,
+        "hourly_avg_mw": pd.NA,
+        "hourly_avg_gw": pd.NA,
+        "esios_1293_max_mw": pd.NA,
+        "esios_1293_max_gw": pd.NA,
+    }
+
     if not hourly_peak.empty:
         out = out.merge(hourly_peak[["period", "peak_hour", "hourly_avg_mw", "hourly_avg_gw"]], on="period", how="outer")
     if not esios_peak.empty:
         out = out.merge(esios_peak[["period", "esios_1293_max_mw", "esios_1293_max_gw"]], on="period", how="outer")
 
+    for col, default in optional_defaults.items():
+        if col not in out.columns:
+            out[col] = default
+
+    # Ensure required monthly columns also exist if only hourly/ESIOS data came back.
+    for col in ["demand_gwh", "avg_demand_mw", "raw_mwh"]:
+        if col not in out.columns:
+            out[col] = pd.NA
+    if "source" not in out.columns:
+        out["source"] = "REE demanda/evolucion"
+
     out = out.sort_values("period").reset_index(drop=True)
-    out["prev_demand_gwh"] = out["demand_gwh"].shift(1)
-    out["prev_avg_demand_mw"] = out["avg_demand_mw"].shift(1)
-    out["prev_peak_hourly_gw"] = out["hourly_avg_gw"].shift(1)
-    out["demand_delta_pct"] = out["demand_gwh"] / out["prev_demand_gwh"] - 1
-    out["avg_mw_delta_pct"] = out["avg_demand_mw"] / out["prev_avg_demand_mw"] - 1
-    out["peak_hourly_delta_pct"] = out["hourly_avg_gw"] / out["prev_peak_hourly_gw"] - 1
-    out["period_label"] = out["period"].dt.strftime("%b-%Y")
+    out["prev_demand_gwh"] = pd.to_numeric(out["demand_gwh"], errors="coerce").shift(1)
+    out["prev_avg_demand_mw"] = pd.to_numeric(out["avg_demand_mw"], errors="coerce").shift(1)
+    out["prev_peak_hourly_gw"] = pd.to_numeric(out["hourly_avg_gw"], errors="coerce").shift(1)
+    out["demand_delta_pct"] = pd.to_numeric(out["demand_gwh"], errors="coerce") / out["prev_demand_gwh"] - 1
+    out["avg_mw_delta_pct"] = pd.to_numeric(out["avg_demand_mw"], errors="coerce") / out["prev_avg_demand_mw"] - 1
+    out["peak_hourly_delta_pct"] = pd.to_numeric(out["hourly_avg_gw"], errors="coerce") / out["prev_peak_hourly_gw"] - 1
+    out["period_label"] = pd.to_datetime(out["period"], errors="coerce").dt.strftime("%b-%Y")
     return out, diagnostics, raw
 
 
@@ -533,6 +554,8 @@ if run:
         )
     )
 
+    plot["avg_demand_mw_gw"] = pd.to_numeric(plot["avg_demand_mw"], errors="coerce") / 1000.0
+
     avg_line = (
         alt.Chart(plot)
         .mark_line(color=ORANGE, point=True, strokeDash=[6, 4], strokeWidth=2.5)
@@ -545,7 +568,6 @@ if run:
             ],
         )
     )
-    plot["avg_demand_mw_gw"] = plot["avg_demand_mw"] / 1000.0
 
     st.altair_chart(
         alt.layer(bars, peak_line, avg_line).resolve_scale(y="independent").properties(height=440),
@@ -553,21 +575,23 @@ if run:
     )
 
     section("Monthly table")
-    table = demand[
-        [
-            "period_label",
-            "source",
-            "raw_mwh",
-            "demand_gwh",
-            "avg_demand_mw",
-            "hourly_avg_gw",
-            "peak_hour",
-            "esios_1293_max_gw",
-            "demand_delta_pct",
-            "avg_mw_delta_pct",
-            "peak_hourly_delta_pct",
-        ]
-    ].copy()
+    table_cols = [
+        "period_label",
+        "source",
+        "raw_mwh",
+        "demand_gwh",
+        "avg_demand_mw",
+        "hourly_avg_gw",
+        "peak_hour",
+        "esios_1293_max_gw",
+        "demand_delta_pct",
+        "avg_mw_delta_pct",
+        "peak_hourly_delta_pct",
+    ]
+    for col in table_cols:
+        if col not in demand.columns:
+            demand[col] = pd.NA
+    table = demand[table_cols].copy()
     table = table.rename(
         columns={
             "period_label": "Month",
