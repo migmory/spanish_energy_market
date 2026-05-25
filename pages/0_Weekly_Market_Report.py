@@ -2840,6 +2840,56 @@ def forward_snapshot_chart(snapshot: pd.DataFrame):
     ).properties(title="Latest forward snapshot | Baseload vs Solar")
     return apply_chart_style(chart, height=330)
 
+def _forward_chart_prepare_plot(plot: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Prepare forward-evolution style fields.
+
+    Baseload is blue family; Solar is yellow family. Year contracts are solid;
+    Quarter contracts are dotted. The legend label includes curve + delivery so
+    it is clear what each line refers to.
+    """
+    out = plot.copy()
+    out["delivery_name"] = out["period"].astype(str) + " = " + out["contract"].map(_forward_contract_short)
+    out["legend_label"] = out["curve_family"].astype(str) + " | " + out["delivery_name"].astype(str)
+    out["series"] = out["legend_label"]
+    out["contract_type"] = np.where(
+        out["period"].astype(str).str.startswith("Q"),
+        "Quarter contracts — dotted",
+        "Year contracts — solid",
+    )
+
+    color_specs = [
+        ("Baseload", "Y+1", "#1D4ED8"),  # strong blue
+        ("Baseload", "Y+2", "#93C5FD"),  # light blue
+        ("Baseload", "Q+1", "#2563EB"),  # blue, dotted
+        ("Baseload", "Q+3", "#BFDBFE"),  # pale blue, dotted
+        ("Solar", "Y+1", "#D97706"),     # strong yellow/orange
+        ("Solar", "Y+2", "#FBBF24"),     # light yellow
+        ("Solar", "Q+1", "#F59E0B"),     # amber, dotted
+        ("Solar", "Q+3", "#FDE68A"),     # pale yellow, dotted
+    ]
+
+    color_domain: list[str] = []
+    color_range: list[str] = []
+    for curve, period, color in color_specs:
+        labels = (
+            out.loc[(out["curve_family"] == curve) & (out["period"] == period), "legend_label"]
+            .dropna()
+            .drop_duplicates()
+            .tolist()
+        )
+        if labels:
+            color_domain.append(labels[0])
+            color_range.append(color)
+
+    # Safety fallback for any unexpected curve/period not covered above.
+    for label in out["legend_label"].dropna().drop_duplicates().tolist():
+        if label not in color_domain:
+            color_domain.append(label)
+            color_range.append("#64748B")
+
+    return out, color_domain, color_range
+
+
 def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
     """Historical forward quote lines for latest selected Y+1/Y+2/Q+1/Q+3 delivery contracts."""
     if history.empty or snapshot.empty:
@@ -2853,45 +2903,21 @@ def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
     if plot.empty:
         return None
 
-    plot["delivery_name"] = (
-        plot["period"].astype(str)
-        + " = "
-        + plot["contract"].astype(str).str.replace(r"^(?:FTB|FTS)\s+", "", regex=True)
-    )
-    plot["series"] = plot["curve_family"].astype(str) + " | " + plot["delivery_name"].astype(str)
-
-    period_order = ["Y+1", "Y+2", "Q+1", "Q+3"]
-    delivery_domain = []
-    for period in period_order:
-        vals = plot.loc[plot["period"] == period, "delivery_name"].dropna().drop_duplicates().tolist()
-        if vals:
-            delivery_domain.append(vals[0])
-
-    palette_map = {
-        "Y+1": "#047857",
-        "Y+2": "#34D399",
-        "Q+1": "#6D28D9",
-        "Q+3": "#C4B5FD",
-    }
-    color_range = [
-        palette_map[period]
-        for period in period_order
-        if not plot.loc[plot["period"] == period, "delivery_name"].dropna().empty
-    ]
+    plot, color_domain, color_range = _forward_chart_prepare_plot(plot)
 
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2.8).encode(
         x=alt.X("as_of_date:T", title="Quote date", axis=alt.Axis(format="%b-%y", labelAngle=-35)),
         y=alt.Y("price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
         color=alt.Color(
-            "delivery_name:N",
-            title="Delivery tracked",
-            scale=alt.Scale(domain=delivery_domain, range=color_range),
-            legend=alt.Legend(labelLimit=260, symbolLimit=260),
+            "legend_label:N",
+            title="Curve / delivery tracked",
+            scale=alt.Scale(domain=color_domain, range=color_range),
+            legend=alt.Legend(labelLimit=360, symbolLimit=360),
         ),
         strokeDash=alt.StrokeDash(
-            "curve_family:N",
-            title="Curve type",
-            scale=alt.Scale(domain=["Baseload", "Solar"], range=[[1, 0], [7, 3]]),
+            "contract_type:N",
+            title="Line style",
+            scale=alt.Scale(domain=["Year contracts — solid", "Quarter contracts — dotted"], range=[[1, 0], [5, 4]]),
         ),
         detail="series:N",
         tooltip=[
@@ -2903,7 +2929,6 @@ def forward_history_line_chart(history: pd.DataFrame, snapshot: pd.DataFrame):
         ],
     ).properties(title="Forward quote history | Y+1 / Y+2 / Q+1 / Q+3 same-contract view")
     return apply_chart_style(chart, height=380)
-
 
 def _forward_visible_periods() -> list[str]:
     return ["Y+1", "Y+2", "Q+1", "Q+3"]
@@ -3113,28 +3138,14 @@ def forward_monthly_closing_evolution_chart(evolution: pd.DataFrame):
     if evolution.empty:
         return None
     plot = evolution.copy()
-    plot["delivery_name"] = plot["period"].astype(str) + " = " + plot["contract"].map(_forward_contract_short)
-    plot["series"] = plot["curve_family"].astype(str) + " | " + plot["delivery_name"].astype(str)
     quote_order = (
         plot[["quote_month", "quote_month_label"]]
         .drop_duplicates()
         .sort_values("quote_month")["quote_month_label"]
         .tolist()
     )
-    period_order = _forward_visible_periods()
-    delivery_domain = []
-    color_range = []
-    palette_map = {
-        "Y+1": "#047857",
-        "Y+2": "#34D399",
-        "Q+1": "#6D28D9",
-        "Q+3": "#C4B5FD",
-    }
-    for period in period_order:
-        vals = plot.loc[plot["period"] == period, "delivery_name"].dropna().drop_duplicates().tolist()
-        if vals:
-            delivery_domain.append(vals[0])
-            color_range.append(palette_map[period])
+
+    plot, color_domain, color_range = _forward_chart_prepare_plot(plot)
 
     chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X(
@@ -3145,15 +3156,15 @@ def forward_monthly_closing_evolution_chart(evolution: pd.DataFrame):
         ),
         y=alt.Y("price:Q", title="€/MWh", scale=alt.Scale(zero=False)),
         color=alt.Color(
-            "delivery_name:N",
-            title="Delivery tracked",
-            scale=alt.Scale(domain=delivery_domain, range=color_range),
-            legend=alt.Legend(labelLimit=260, symbolLimit=260),
+            "legend_label:N",
+            title="Curve / delivery tracked",
+            scale=alt.Scale(domain=color_domain, range=color_range),
+            legend=alt.Legend(labelLimit=360, symbolLimit=360),
         ),
         strokeDash=alt.StrokeDash(
-            "curve_family:N",
-            title="Curve",
-            scale=alt.Scale(domain=["Baseload", "Solar"], range=[[1, 0], [7, 3]]),
+            "contract_type:N",
+            title="Line style",
+            scale=alt.Scale(domain=["Year contracts — solid", "Quarter contracts — dotted"], range=[[1, 0], [5, 4]]),
         ),
         detail="series:N",
         tooltip=[
@@ -3167,7 +3178,6 @@ def forward_monthly_closing_evolution_chart(evolution: pd.DataFrame):
         ],
     ).properties(title="Forward monthly closing evolution | Last 10 monthly closes")
     return apply_chart_style(chart, height=420)
-
 
 
 # =========================================================
@@ -3929,6 +3939,37 @@ def bess_ytd_cards_summary_from_daily_model(
         },
     ]
     return pd.DataFrame(rows, columns=cols)
+
+
+def align_bess_summary_with_ytd_cards(bess_summary: pd.DataFrame, bess_ytd_cards_summary: pd.DataFrame) -> pd.DataFrame:
+    """Use the daily-model YTD card values in the BESS overview table too.
+
+    This keeps the BESS overview table and the YTD cards identical for YTD / Annualized
+    values in both Monthly and Weekly reports. Selected period values remain untouched.
+    """
+    if bess_summary is None or bess_summary.empty or bess_ytd_cards_summary is None or bess_ytd_cards_summary.empty:
+        return bess_summary
+    out = bess_summary.copy()
+    source = bess_ytd_cards_summary.copy()
+    if "Metric" not in out.columns or "Metric" not in source.columns:
+        return out
+    for metric in [
+        "Revenue w/o demand 1.0c",
+        "Revenue w. demand 1.0c",
+        "Revenue standalone | no cycle cap",
+        "Standalone cycles/day avg | no cycle cap",
+    ]:
+        src = source[source["Metric"] == metric]
+        if src.empty:
+            continue
+        idx = out.index[out["Metric"] == metric]
+        if len(idx) == 0:
+            continue
+        for col in ["YTD", "Annualized"]:
+            if col in out.columns and col in src.columns:
+                out.loc[idx, col] = src[col].iloc[0]
+    return out
+
 
 def render_bess_ytd_annualized_cards(
     bess_summary: pd.DataFrame,
@@ -5591,14 +5632,15 @@ bess_summary = bess_summary_table_weekly(bess_weekly, selected_week, report_end)
 if bess_summary.empty:
     st.info("No BESS metrics are available.")
 else:
-    st.dataframe(format_bess_summary(bess_summary), use_container_width=True)
     bess_ytd_cards_summary = bess_ytd_cards_summary_from_daily_model(
         price_hourly,
         report_year=selected_week.year,
         report_end=report_end,
     )
+    bess_summary_display = align_bess_summary_with_ytd_cards(bess_summary, bess_ytd_cards_summary)
+    st.dataframe(format_bess_summary(bess_summary_display), use_container_width=True)
     render_bess_ytd_annualized_cards(
-        bess_ytd_cards_summary if not bess_ytd_cards_summary.empty else bess_summary,
+        bess_ytd_cards_summary if not bess_ytd_cards_summary.empty else bess_summary_display,
         report_year=selected_week.year,
         report_end=report_end,
     )
