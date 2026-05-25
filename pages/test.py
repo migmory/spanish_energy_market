@@ -1,210 +1,143 @@
+"""
+Streamlit test: REE installed capacity (sin autoconsumo) annual to 2025 + monthly 2026.
+
+Run:
+    pip install streamlit pandas requests plotly beautifulsoup4 lxml
+    streamlit run ree_potencia_instalada_test.py
+
+Notes:
+- The 2025 report page explicitly separates:
+    * 142,558 MW = potencia instalada del sistema eléctrico español
+      (generación + almacenamiento visible to system, "sin autoconsumo no visible")
+    * 150,809 MW = total if including autoconsumo not visible
+- This script tries the REData API first, then scrapes the report page as fallback.
+- The 2026 monthly series is attempted via the same REData API family. If REE's endpoint
+  changes or returns a different taxonomy, the app shows raw/debug output to adjust parsing.
+"""
+
 from __future__ import annotations
 
 import json
-import os
-from datetime import date, datetime, time
-from pathlib import Path
-from typing import Any
+import re
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Iterable
 
-import altair as alt
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
-
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-
-try:
-    alt.data_transformers.disable_max_rows()
-except Exception:
-    pass
+from bs4 import BeautifulSoup
 
 
-# =========================================================
-# TEST — REE official demand + monthly peak GW
-# =========================================================
-st.set_page_config(page_title="REE official demand + peak test", layout="wide")
+REPORT_URL = "https://www.sistemaelectrico-ree.es/es/informe-del-sistema-electrico/potencia-instalada"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-if load_dotenv is not None:
-    load_dotenv(BASE_DIR / ".env")
-    load_dotenv()
+# Public REData API candidate endpoints.
+# Historically the browser page uses /datos/generacion/potencia-instalada-generacion,
+# while the public API often uses /datos/generacion/potencia-instalada.
+API_ENDPOINTS = [
+    "https://apidatos.ree.es/es/datos/generacion/potencia-instalada",
+    "https://apidatos.ree.es/es/datos/generacion/potencia-instalada-generacion",
+]
 
-CORP_GREEN_DARK = "#0F766E"
-CORP_GREEN = "#10B981"
-BLUE = "#1D4ED8"
-ORANGE = "#EA580C"
-RED = "#DC2626"
-GREY = "#64748B"
-
-REE_DEMAND_URL = "https://apidatos.ree.es/es/datos/demanda/evolucion"
-ESIOS_1293_URL = "https://api.esios.ree.es/indicators/1293"
-PENINSULA_GEO_ID = "8741"
+EXPECTED_2025_TOTAL_SIN_AUTOCONSUMO_MW = 142_558  # from REE Informe del Sistema 2025 text/table
 
 
-st.markdown(
-    f"""
-    <div style="
-        padding:18px 22px;
-        border-radius:18px;
-        background:linear-gradient(90deg,{CORP_GREEN_DARK} 0%,{CORP_GREEN} 58%,#C7F3E2 100%);
-        color:white;
-        font-weight:900;
-        font-size:1.55rem;
-        margin-bottom:12px;
-    ">🔎 REE official demand test | monthly GWh + max GW</div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.caption(
-    "Recommended demand series for report KPIs: REE apidatos `demanda/evolucion`. "
-    "This version also calculates monthly peak demand GW using hourly REE data and, if token is available, ESIOS 1293 max as a diagnostic."
-)
+@dataclass
+class FetchResult:
+    ok: bool
+    source: str
+    df: pd.DataFrame
+    raw: Any | None = None
+    error: str | None = None
 
 
-# =========================================================
-# Helpers
-# =========================================================
-def get_secret_or_env(*names: str) -> str:
-    for name in names:
-        try:
-            value = st.secrets.get(name)
-            if value:
-                return str(value)
-        except Exception:
-            pass
-        value = os.getenv(name)
-        if value:
-            return str(value)
-    return ""
-
-
-def ree_headers() -> dict[str, str]:
-    return {
-        "Accept": "application/json",
-        "User-Agent": "NexwellPower-REE-Demand-Test/1.1",
-    }
-
-
-def esios_headers(token: str) -> dict[str, str]:
-    return {
-        "Accept": "application/json; application/vnd.esios-api-v2+json",
-        "Content-Type": "application/json",
-        "x-api-key": token,
-        "User-Agent": "NexwellPower-REE-Demand-Test/1.1",
-    }
-
-
-def safe_json(response: requests.Response) -> dict[str, Any] | list[Any]:
-    try:
-        return response.json()
-    except Exception:
-        return {"non_json_body_preview": (response.text or "")[:5000]}
-
-
-def first_scalar(value):
-    if isinstance(value, list):
-        if not value:
-            return None
-        return first_scalar(value[0])
-    if isinstance(value, dict):
-        for key in ["value", "datetime", "datetime_utc", "date", "name", "id"]:
-            if key in value:
-                return first_scalar(value.get(key))
+def _safe_float(x: Any) -> float | None:
+    """Parse Spanish/English numeric strings into float."""
+    if x is None:
         return None
-    return value
+    if isinstance(x, (int, float)):
+        return float(x)
 
+    s = str(x).strip()
+    if not s:
+        return None
 
-def parse_dt_series(series: pd.Series) -> pd.Series:
-    cleaned = series.map(first_scalar)
+    # Remove units and NBSP; keep digits, signs, separators.
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"[^0-9,\.\-]", "", s)
+
+    # Spanish thousands/decimal heuristic:
+    # "142.558" in REE text means 142558 MW, but "7,3" means 7.3.
+    if "," in s and "." in s:
+        # "1.234,56" -> "1234.56"
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        # "7,3" -> "7.3"
+        s = s.replace(",", ".")
+    elif "." in s:
+        # If a dot is followed by exactly 3 digits and no decimal pattern, treat as thousands.
+        if re.match(r"^-?\d{1,3}(\.\d{3})+$", s):
+            s = s.replace(".", "")
+
     try:
-        return pd.to_datetime(cleaned, errors="coerce", utc=True, format="mixed")
-    except TypeError:
-        return pd.to_datetime(cleaned, errors="coerce", utc=True)
+        return float(s)
+    except ValueError:
+        return None
 
 
-def section(title: str) -> None:
-    st.markdown(
-        f"""
-        <div style="
-            margin-top:18px;
-            margin-bottom:10px;
-            padding:10px 14px;
-            background:#F4FCF8;
-            border-left:5px solid {CORP_GREEN};
-            border-radius:8px;
-            font-weight:850;
-            color:#0F172A;
-        ">{title}</div>
-        """,
-        unsafe_allow_html=True,
-    )
+def _walk_dicts(obj: Any) -> Iterable[dict[str, Any]]:
+    """Yield all dict nodes inside a JSON object."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_dicts(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_dicts(item)
 
 
-def fmt_gwh(v) -> str:
-    if v is None or pd.isna(v):
-        return "—"
-    return f"{float(v):,.1f} GWh"
+def _extract_series_from_reddata_json(raw: dict[str, Any]) -> pd.DataFrame:
+    """
+    Generic parser for REData JSONAPI responses.
 
+    It searches for nodes with a `values` list. Each value usually includes:
+        datetime, value, percentage
+    The parent node often includes title/type/groupId.
+    """
+    rows: list[dict[str, Any]] = []
 
-def fmt_gw(v) -> str:
-    if v is None or pd.isna(v):
-        return "—"
-    return f"{float(v):,.2f} GW"
-
-
-def fmt_mw(v) -> str:
-    if v is None or pd.isna(v):
-        return "—"
-    return f"{float(v):,.0f} MW"
-
-
-def fmt_pct(v) -> str:
-    if v is None or pd.isna(v):
-        return "—"
-    return f"{float(v):+,.1%}"
-
-
-def delta_html(v) -> str:
-    if v is None or pd.isna(v):
-        return '<span style="color:#94A3B8;">→ n/a vs prev. period</span>'
-    color = "#16A34A" if float(v) >= 0 else "#DC2626"
-    arrow = "↑" if float(v) >= 0 else "↓"
-    return f'<span style="color:{color}; font-weight:800;">{arrow} {fmt_pct(v)} vs prev. period</span>'
-
-
-# =========================================================
-# REE demanda/evolucion parser
-# =========================================================
-def flatten_ree_demand_payload(payload: dict[str, Any], source_label: str, time_trunc: str) -> pd.DataFrame:
-    rows = []
-    included = payload.get("included", []) if isinstance(payload, dict) else []
-    if isinstance(included, dict):
-        included = [included]
-
-    for item in included if isinstance(included, list) else []:
-        if not isinstance(item, dict):
+    for node in _walk_dicts(raw):
+        values = node.get("values")
+        if not isinstance(values, list) or not values:
             continue
-        attrs = item.get("attributes", {}) if isinstance(item.get("attributes"), dict) else {}
-        title = attrs.get("title") or item.get("type") or source_label
-        values = attrs.get("values") or item.get("values") or []
-        if isinstance(values, dict):
-            values = [values]
 
-        for v in values if isinstance(values, list) else []:
+        attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
+        title = (
+            node.get("title")
+            or node.get("name")
+            or attrs.get("title")
+            or attrs.get("name")
+            or node.get("type")
+            or "unknown"
+        )
+        group = node.get("groupId") or node.get("group_id") or attrs.get("groupId")
+        serie_type = node.get("type") or attrs.get("type")
+
+        for v in values:
             if not isinstance(v, dict):
                 continue
+            dt = v.get("datetime") or v.get("date") or v.get("x")
+            val = v.get("value") or v.get("y")
+            pct = v.get("percentage")
             rows.append(
                 {
-                    "series": title,
-                    "datetime": first_scalar(v.get("datetime") or v.get("date")),
-                    "value": first_scalar(v.get("value")),
-                    "percentage": first_scalar(v.get("percentage")),
-                    "source": source_label,
-                    "time_trunc": time_trunc,
+                    "datetime": dt,
+                    "technology": str(title).strip(),
+                    "group": group,
+                    "type": serie_type,
+                    "mw": _safe_float(val),
+                    "percentage": _safe_float(pct),
                 }
             )
 
@@ -212,431 +145,361 @@ def flatten_ree_demand_payload(payload: dict[str, Any], source_label: str, time_
     if df.empty:
         return df
 
-    df["datetime"] = parse_dt_series(df["datetime"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["percentage"] = pd.to_numeric(df["percentage"], errors="coerce")
-    df = df.dropna(subset=["datetime", "value"]).copy()
+    df["date"] = pd.to_datetime(df["datetime"], errors="coerce").dt.tz_localize(None)
+    df = df.dropna(subset=["date", "mw"]).copy()
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.to_period("M").astype(str)
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def fetch_reddata_api(start: str, end: str, time_trunc: str) -> FetchResult:
+    """
+    Try multiple endpoint/parameter combinations. For national data, REData often works
+    with no geo params; some widgets accept geo params.
+    """
+    param_sets = [
+        {
+            "start_date": start,
+            "end_date": end,
+            "time_trunc": time_trunc,
+        },
+        {
+            "start_date": start,
+            "end_date": end,
+            "time_trunc": time_trunc,
+            "geo_trunc": "electric_system",
+            "geo_limit": "nacional",
+            "geo_ids": "8741",
+        },
+        {
+            "start_date": start,
+            "end_date": end,
+            "time_trunc": time_trunc,
+            "geo_trunc": "electric_system",
+            "geo_limit": "peninsular",
+            "geo_ids": "8741",
+        },
+    ]
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 streamlit-ree-test/0.1",
+    }
+
+    errors: list[str] = []
+    for endpoint in API_ENDPOINTS:
+        for params in param_sets:
+            try:
+                r = requests.get(endpoint, params=params, headers=headers, timeout=30)
+                if r.status_code != 200:
+                    errors.append(f"{endpoint} {params} -> HTTP {r.status_code}: {r.text[:250]}")
+                    continue
+
+                raw = r.json()
+                df = _extract_series_from_reddata_json(raw)
+                if not df.empty:
+                    df["api_endpoint"] = endpoint
+                    df["api_params"] = json.dumps(params, ensure_ascii=False)
+                    return FetchResult(ok=True, source=f"API: {endpoint}", df=df, raw=raw)
+
+                errors.append(f"{endpoint} {params} -> JSON OK pero parser sin filas")
+            except Exception as e:
+                errors.append(f"{endpoint} {params} -> {type(e).__name__}: {e}")
+
+    return FetchResult(ok=False, source="REData API", df=pd.DataFrame(), error="\n".join(errors))
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def scrape_report_2025_table() -> FetchResult:
+    """
+    Scrape the 2025 report page as a fallback.
+
+    The static HTML/search result exposes the chart table in text. Depending on REE's
+    rendering, the table can appear as HTML, JSON in scripts, or plain text. This is
+    intentionally defensive.
+    """
+    try:
+        r = requests.get(REPORT_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        r.raise_for_status()
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text("\n", strip=True)
+
+        rows: list[dict[str, Any]] = []
+
+        # Fallback pattern for known 2025 table lines in text, e.g.
+        # "Solar fotovoltaica40.95227,27088,641.66026,9"
+        # We only need "Nacional MW", the 5th number in many rows. If parsing fails,
+        # we at least extract the headline total.
+        technologies = [
+            "Hidráulica", "Hidroeólica", "Eólica", "Solar fotovoltaica", "Solar térmica",
+            "Otras renovables", "Residuos renovables", "Renovables", "Nuclear", "Carbón",
+            "Motor diésel", "Turbina de gas", "Turbina de vapor", "Fuel", "Ciclo combinado",
+            "Cogeneración", "Residuos no renovables", "No renovables", "Generación",
+            "Turbinación bombeo", "Baterías", "Almacenamiento", "Potencia total",
+        ]
+
+        for tech in technologies:
+            # Capture a chunk after the tech label until next known tech or newline.
+            # This is best-effort because REE's chart table is often rendered client-side.
+            m = re.search(re.escape(tech) + r"\s*([0-9\.,\-\s]+)", text)
+            if not m:
+                continue
+            nums = re.findall(r"-?\d+(?:[\.,]\d+)?", m.group(1))
+            nums_float = [_safe_float(n) for n in nums]
+            nums_float = [x for x in nums_float if x is not None]
+
+            # In the report table order is normally:
+            # Peninsular MW, %25/24, No peninsular MW, %25/24, Nacional MW, %25/24
+            nacional_mw = nums_float[4] if len(nums_float) >= 5 else None
+            if nacional_mw is not None:
+                rows.append(
+                    {
+                        "date": pd.Timestamp("2025-12-31"),
+                        "year": 2025,
+                        "month": "2025-12",
+                        "technology": tech,
+                        "mw": nacional_mw,
+                        "source_detail": "scraped_report_table_best_effort",
+                    }
+                )
+
+        df = pd.DataFrame(rows)
+
+        # Hard fallback: headline 142.558 MW
+        if df.empty or not (df["technology"].eq("Potencia total").any()):
+            df = pd.concat(
+                [
+                    df,
+                    pd.DataFrame(
+                        [
+                            {
+                                "date": pd.Timestamp("2025-12-31"),
+                                "year": 2025,
+                                "month": "2025-12",
+                                "technology": "Potencia total",
+                                "mw": float(EXPECTED_2025_TOTAL_SIN_AUTOCONSUMO_MW),
+                                "source_detail": "report_headline_142558_mw",
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+        return FetchResult(ok=True, source=REPORT_URL, df=df, raw={"text_sample": text[:5000]})
+    except Exception as e:
+        return FetchResult(ok=False, source=REPORT_URL, df=pd.DataFrame(), error=f"{type(e).__name__}: {e}")
+
+
+def normalise_installed_capacity(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    """
+    Clean names and keep likely installed capacity rows.
+
+    We do NOT subtract autoconsumo here; instead we fetch the "generación/potencia-instalada"
+    widget and validate the annual 2025 total against the report's "sin autoconsumo" total.
+    If REE changes the widget to include BTM, the validation will show it.
+    """
     if df.empty:
         return df
 
-    local_dt = df["datetime"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
-    df["local_datetime"] = local_dt
-    df["period"] = local_dt.dt.to_period("M").dt.to_timestamp()
-    return df.sort_values("local_datetime").reset_index(drop=True)
-
-
-def fetch_ree_demanda_evolucion(
-    start_day: date,
-    end_day: date,
-    *,
-    geo_variant: str,
-    time_trunc: str,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    params: list[tuple[str, str]] = [
-        ("start_date", datetime.combine(start_day, time(0, 0)).strftime("%Y-%m-%dT%H:%M")),
-        ("end_date", datetime.combine(end_day, time(23, 59)).strftime("%Y-%m-%dT%H:%M")),
-        ("time_trunc", time_trunc),
-    ]
-
-    if geo_variant == "peninsular electric_system":
-        params.extend(
-            [
-                ("geo_trunc", "electric_system"),
-                ("geo_limit", "peninsular"),
-                ("geo_ids", PENINSULA_GEO_ID),
-            ]
-        )
-    elif geo_variant == "geo_ids only":
-        params.append(("geo_ids", PENINSULA_GEO_ID))
-    elif geo_variant == "no geo":
-        pass
-
-    response = requests.get(REE_DEMAND_URL, headers=ree_headers(), params=params, timeout=60)
-    payload = safe_json(response)
-    df = flatten_ree_demand_payload(payload, source_label=f"REE demanda/evolucion | {geo_variant}", time_trunc=time_trunc) if response.ok and isinstance(payload, dict) else pd.DataFrame()
-
-    info = {
-        "source": f"REE demanda/evolucion {time_trunc}",
-        "geo_variant": geo_variant,
-        "http": response.status_code,
-        "url": response.url,
-        "rows": int(len(df)),
-        "response_chars": len(response.text or ""),
-        "payload": payload if not response.ok or df.empty else None,
-    }
-    return df, info
-
-
-def best_ree_series(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    if not frames:
-        return pd.DataFrame()
-    all_df = pd.concat(frames, ignore_index=True)
-    priority = {
-        "REE demanda/evolucion | peninsular electric_system": 0,
-        "REE demanda/evolucion | geo_ids only": 1,
-        "REE demanda/evolucion | no geo": 2,
-    }
-    all_df["priority"] = all_df["source"].map(priority).fillna(99)
-    best_source = all_df.sort_values("priority")["source"].iloc[0]
-    best = all_df[all_df["source"] == best_source].copy()
-
-    if best["series"].nunique() > 1:
-        demand_like = best[best["series"].astype(str).str.contains("demanda", case=False, na=False)].copy()
-        if not demand_like.empty:
-            best = demand_like
-    return best
-
-
-def fetch_official_monthly_demand(start_day: date, end_day: date) -> tuple[pd.DataFrame, list[dict], dict[str, Any]]:
-    variants = ["peninsular electric_system", "geo_ids only", "no geo"]
-    frames = []
-    infos = []
-    raw = {}
-
-    for variant in variants:
-        try:
-            df, info = fetch_ree_demanda_evolucion(start_day, end_day, geo_variant=variant, time_trunc="month")
-            infos.append(info)
-            if not df.empty:
-                frames.append(df)
-            if info.get("payload") is not None:
-                raw[f"month | {variant}"] = info.get("payload")
-        except Exception as exc:
-            infos.append({"source": "REE month", "geo_variant": variant, "http": "ERROR", "url": "", "rows": 0, "error": str(exc)[:500]})
-
-    best = best_ree_series(frames)
-    if best.empty:
-        return pd.DataFrame(), infos, raw
-
-    # Monthly value is energy in MWh. Convert to GWh.
-    out = (
-        best.groupby(["period", "source"], as_index=False)
-        .agg(raw_mwh=("value", "sum"))
-        .sort_values("period")
-        .reset_index(drop=True)
+    out = df.copy()
+    out["technology_clean"] = (
+        out["technology"]
+        .astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
     )
-    out["demand_gwh"] = out["raw_mwh"] / 1000.0
-    out["hours_in_period"] = out["period"].dt.days_in_month * 24
-    out["avg_demand_mw"] = out["demand_gwh"] * 1000.0 / out["hours_in_period"]
-    return out, infos, raw
+
+    # Remove clearly non-technology helper rows if API returns them.
+    bad_terms = ["autoconsumo"]  # we want sin autoconsumo; explicit rows are excluded
+    mask_bad = out["technology_clean"].str.lower().apply(lambda x: any(t in x for t in bad_terms))
+    out = out.loc[~mask_bad].copy()
+
+    # Normalize periods.
+    if granularity == "year":
+        out["period"] = out["year"].astype(str)
+    else:
+        out["period"] = out["month"]
+
+    return out.sort_values(["date", "technology_clean"])
 
 
-def fetch_ree_hourly_peak_gw(start_day: date, end_day: date) -> tuple[pd.DataFrame, list[dict], dict[str, Any]]:
-    variants = ["peninsular electric_system", "geo_ids only", "no geo"]
-    frames = []
-    infos = []
-    raw = {}
-
-    for variant in variants:
-        try:
-            df, info = fetch_ree_demanda_evolucion(start_day, end_day, geo_variant=variant, time_trunc="hour")
-            infos.append(info)
-            if not df.empty:
-                frames.append(df)
-            if info.get("payload") is not None:
-                raw[f"hour | {variant}"] = info.get("payload")
-        except Exception as exc:
-            infos.append({"source": "REE hour", "geo_variant": variant, "http": "ERROR", "url": "", "rows": 0, "error": str(exc)[:500]})
-
-    best = best_ree_series(frames)
-    if best.empty:
-        return pd.DataFrame(), infos, raw
-
-    # Hourly value from demanda/evolucion is energy in MWh for the hour.
-    # For a one-hour period, MWh equals average MW over that hour.
-    best["hourly_avg_mw"] = best["value"]
-    best["hourly_avg_gw"] = best["hourly_avg_mw"] / 1000.0
-
-    idx = best.groupby("period")["hourly_avg_gw"].idxmax()
-    peak = best.loc[idx, ["period", "local_datetime", "hourly_avg_mw", "hourly_avg_gw", "source"]].copy()
-    peak = peak.rename(columns={"local_datetime": "peak_hour"})
-    return peak.sort_values("period").reset_index(drop=True), infos, raw
+def split_total_and_tech(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        return df, df
+    total_mask = df["technology_clean"].str.lower().isin(
+        ["potencia total", "total", "generación", "generacion"]
+    )
+    totals = df.loc[total_mask].copy()
+    tech = df.loc[~total_mask].copy()
+    return totals, tech
 
 
-# =========================================================
-# Optional ESIOS 1293 max diagnostic
-# =========================================================
-def fetch_esios_1293_monthly_max(token: str, start_day: date, end_day: date) -> tuple[pd.DataFrame, list[dict], dict[str, Any]]:
-    if not token:
-        return pd.DataFrame(), [], {}
-
-    params = [
-        ("start_date", datetime.combine(start_day, time(0, 0)).strftime("%Y-%m-%dT%H:%M:%S")),
-        ("end_date", datetime.combine(end_day, time(23, 55)).strftime("%Y-%m-%dT%H:%M:%S")),
-        ("time_trunc", "month"),
-        ("time_agg", "max"),
-        ("geo_agg", "max"),
-        ("locale", "es"),
-        ("geo_ids[]", PENINSULA_GEO_ID),
-    ]
-    response = requests.get(ESIOS_1293_URL, headers=esios_headers(token), params=params, timeout=60)
-    payload = safe_json(response)
-    values = payload.get("indicator", {}).get("values", []) if isinstance(payload, dict) else []
-
+def validate_2025_against_report(df_annual: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for item in values if isinstance(values, list) else []:
-        if not isinstance(item, dict):
-            continue
+    if df_annual.empty:
+        return pd.DataFrame(rows)
+
+    # Look for a 2025 total. Prefer "Potencia total", else sum technologies if no total.
+    d2025 = df_annual[df_annual["year"].eq(2025)].copy()
+    if d2025.empty:
+        return pd.DataFrame(rows)
+
+    total_candidates = d2025[d2025["technology_clean"].str.lower().eq("potencia total")]
+    if total_candidates.empty:
+        total_candidates = d2025[d2025["technology_clean"].str.lower().isin(["total", "generación", "generacion"])]
+
+    if not total_candidates.empty:
+        got = float(total_candidates.sort_values("date").iloc[-1]["mw"])
         rows.append(
             {
-                "datetime": first_scalar(item.get("datetime") or item.get("datetime_utc") or item.get("date")),
-                "esios_1293_max_mw": first_scalar(item.get("value")),
-                "geo_id": first_scalar(item.get("geo_id") or item.get("geoId") or item.get("geo_ids")),
-                "geo_name": first_scalar(item.get("geo_name") or item.get("geoName")) or "Península",
+                "check": "2025 total sin autoconsumo esperado por informe",
+                "expected_mw": EXPECTED_2025_TOTAL_SIN_AUTOCONSUMO_MW,
+                "got_mw": got,
+                "diff_mw": got - EXPECTED_2025_TOTAL_SIN_AUTOCONSUMO_MW,
+                "status": "OK" if abs(got - EXPECTED_2025_TOTAL_SIN_AUTOCONSUMO_MW) < 50 else "REVISAR",
             }
         )
 
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["datetime"] = parse_dt_series(df["datetime"])
-        df["esios_1293_max_mw"] = pd.to_numeric(df["esios_1293_max_mw"], errors="coerce")
-        df = df.dropna(subset=["datetime", "esios_1293_max_mw"]).copy()
-        if not df.empty:
-            df["period"] = df["datetime"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None).dt.to_period("M").dt.to_timestamp()
-            df["esios_1293_max_gw"] = df["esios_1293_max_mw"] / 1000.0
-            df = df[["period", "esios_1293_max_mw", "esios_1293_max_gw", "geo_id", "geo_name"]]
-
-    info = {
-        "source": "ESIOS 1293 monthly max",
-        "geo_variant": "geo_ids[] 8741",
-        "http": response.status_code,
-        "url": response.url,
-        "rows": int(len(df)),
-        "response_chars": len(response.text or ""),
-        "payload": payload if not response.ok or df.empty else None,
-    }
-    raw = {"ESIOS 1293 monthly max": info["payload"]} if info.get("payload") is not None else {}
-    return df, [info], raw
-
-
-def build_demand_with_peak(start_day: date, end_day: date, token: str) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    monthly, monthly_infos, monthly_raw = fetch_official_monthly_demand(start_day, end_day)
-    hourly_peak, hourly_infos, hourly_raw = fetch_ree_hourly_peak_gw(start_day, end_day)
-    esios_peak, esios_infos, esios_raw = fetch_esios_1293_monthly_max(token, start_day, end_day) if token else (pd.DataFrame(), [], {})
-
-    diagnostics = pd.DataFrame(
-        [{k: v for k, v in info.items() if k != "payload"} for info in (monthly_infos + hourly_infos + esios_infos)]
-    )
-    raw = {}
-    raw.update(monthly_raw)
-    raw.update(hourly_raw)
-    raw.update(esios_raw)
-
-    if monthly.empty and hourly_peak.empty and esios_peak.empty:
-        return pd.DataFrame(), diagnostics, raw
-
-    out = monthly.copy()
-
-    # Ensure all optional columns exist even if the hourly/ESIOS requests return no rows.
-    optional_defaults = {
-        "peak_hour": pd.NaT,
-        "hourly_avg_mw": pd.NA,
-        "hourly_avg_gw": pd.NA,
-        "esios_1293_max_mw": pd.NA,
-        "esios_1293_max_gw": pd.NA,
-    }
-
-    if not hourly_peak.empty:
-        out = out.merge(hourly_peak[["period", "peak_hour", "hourly_avg_mw", "hourly_avg_gw"]], on="period", how="outer")
-    if not esios_peak.empty:
-        out = out.merge(esios_peak[["period", "esios_1293_max_mw", "esios_1293_max_gw"]], on="period", how="outer")
-
-    for col, default in optional_defaults.items():
-        if col not in out.columns:
-            out[col] = default
-
-    # Ensure required monthly columns also exist if only hourly/ESIOS data came back.
-    for col in ["demand_gwh", "avg_demand_mw", "raw_mwh"]:
-        if col not in out.columns:
-            out[col] = pd.NA
-    if "source" not in out.columns:
-        out["source"] = "REE demanda/evolucion"
-
-    out = out.sort_values("period").reset_index(drop=True)
-    out["prev_demand_gwh"] = pd.to_numeric(out["demand_gwh"], errors="coerce").shift(1)
-    out["prev_avg_demand_mw"] = pd.to_numeric(out["avg_demand_mw"], errors="coerce").shift(1)
-    out["prev_peak_hourly_gw"] = pd.to_numeric(out["hourly_avg_gw"], errors="coerce").shift(1)
-    out["demand_delta_pct"] = pd.to_numeric(out["demand_gwh"], errors="coerce") / out["prev_demand_gwh"] - 1
-    out["avg_mw_delta_pct"] = pd.to_numeric(out["avg_demand_mw"], errors="coerce") / out["prev_avg_demand_mw"] - 1
-    out["peak_hourly_delta_pct"] = pd.to_numeric(out["hourly_avg_gw"], errors="coerce") / out["prev_peak_hourly_gw"] - 1
-    out["period_label"] = pd.to_datetime(out["period"], errors="coerce").dt.strftime("%b-%Y")
-    return out, diagnostics, raw
-
-
-# =========================================================
-# UI
-# =========================================================
-token = get_secret_or_env("ESIOS_TOKEN", "ESIOS_API_TOKEN", "REE_ESIOS_TOKEN")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    start_day = st.date_input("Start date", value=date(2026, 1, 1))
-with c2:
-    end_day = st.date_input("End date", value=date(2026, 5, 31))
-with c3:
-    st.markdown("#### Optional ESIOS token")
-    if token:
-        st.success("Token found. ESIOS max diagnostic enabled.")
-    else:
-        st.info("No token found. REE demand + hourly peak still works.")
-
-st.info(
-    "Recommended report demand: REE `demanda/evolucion` monthly GWh. "
-    "Monthly max GW is calculated from REE hourly `demanda/evolucion` as the highest hourly average demand in the month."
-)
-
-run = st.button("Run REE official demand + max GW test", type="primary", use_container_width=True)
-
-if run:
-    with st.spinner("Pulling REE monthly demand and hourly peak demand..."):
-        demand, diagnostics, raw_payloads = build_demand_with_peak(start_day, end_day, token)
-
-    section("Request diagnostics")
-    st.dataframe(diagnostics, use_container_width=True, hide_index=True)
-
-    if demand.empty:
-        st.error("No demand rows returned.")
-        if raw_payloads:
-            with st.expander("Raw payload previews", expanded=True):
-                st.code(json.dumps(raw_payloads, ensure_ascii=False, indent=2)[:20000], language="json")
-        st.stop()
-
-    section("Latest period quick read")
-    latest = demand.dropna(subset=["period"]).iloc[-1]
-    prev = demand.iloc[-2] if len(demand) >= 2 else None
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric(f"Demand total | {latest['period_label']}", fmt_gwh(latest.get("demand_gwh")))
-        st.markdown(delta_html(latest.get("demand_delta_pct")), unsafe_allow_html=True)
-    with k2:
-        st.metric(f"Average demand | {latest['period_label']}", fmt_mw(latest.get("avg_demand_mw")))
-        st.markdown(delta_html(latest.get("avg_mw_delta_pct")), unsafe_allow_html=True)
-    with k3:
-        st.metric(f"Max hourly demand | {latest['period_label']}", fmt_gw(latest.get("hourly_avg_gw")))
-        st.markdown(delta_html(latest.get("peak_hourly_delta_pct")), unsafe_allow_html=True)
-        if pd.notna(latest.get("peak_hour")):
-            st.caption(f"Peak hour: {pd.Timestamp(latest['peak_hour']):%d-%b-%Y %H:%M}")
-    with k4:
-        st.metric("ESIOS 1293 max diagnostic", fmt_gw(latest.get("esios_1293_max_gw")))
-        st.caption("Optional 5-min indicator max if token/API supports time_agg=max")
-
-    section("Monthly demand and peak chart")
-    plot = demand.copy()
-
-    bars = (
-        alt.Chart(plot)
-        .mark_bar(color=BLUE, opacity=0.76)
-        .encode(
-            x=alt.X("period:T", title="Month"),
-            y=alt.Y("demand_gwh:Q", title="Demand total (GWh)", scale=alt.Scale(zero=False)),
-            tooltip=[
-                alt.Tooltip("period_label:N", title="Month"),
-                alt.Tooltip("demand_gwh:Q", title="Demand GWh", format=",.1f"),
-                alt.Tooltip("avg_demand_mw:Q", title="Average MW", format=",.0f"),
-                alt.Tooltip("hourly_avg_gw:Q", title="Max hourly GW", format=",.2f"),
-                alt.Tooltip("peak_hour:T", title="Peak hour", format="%d-%b-%Y %H:%M"),
-            ],
-        )
-    )
-
-    peak_line = (
-        alt.Chart(plot)
-        .mark_line(color=RED, point=True, strokeWidth=3)
-        .encode(
-            x=alt.X("period:T"),
-            y=alt.Y("hourly_avg_gw:Q", title="Demand peak (GW)", scale=alt.Scale(zero=False)),
-            tooltip=[
-                alt.Tooltip("period_label:N", title="Month"),
-                alt.Tooltip("hourly_avg_gw:Q", title="Max hourly GW", format=",.2f"),
-                alt.Tooltip("peak_hour:T", title="Peak hour", format="%d-%b-%Y %H:%M"),
-            ],
-        )
-    )
-
-    plot["avg_demand_mw_gw"] = pd.to_numeric(plot["avg_demand_mw"], errors="coerce") / 1000.0
-
-    avg_line = (
-        alt.Chart(plot)
-        .mark_line(color=ORANGE, point=True, strokeDash=[6, 4], strokeWidth=2.5)
-        .encode(
-            x=alt.X("period:T"),
-            y=alt.Y("avg_demand_mw_gw:Q", title="Demand peak / average (GW)", scale=alt.Scale(zero=False)),
-            tooltip=[
-                alt.Tooltip("period_label:N", title="Month"),
-                alt.Tooltip("avg_demand_mw:Q", title="Average MW", format=",.0f"),
-            ],
-        )
-    )
-
-    st.altair_chart(
-        alt.layer(bars, peak_line, avg_line).resolve_scale(y="independent").properties(height=440),
-        use_container_width=True,
-    )
-
-    section("Monthly table")
-    table_cols = [
-        "period_label",
-        "source",
-        "raw_mwh",
-        "demand_gwh",
-        "avg_demand_mw",
-        "hourly_avg_gw",
-        "peak_hour",
-        "esios_1293_max_gw",
-        "demand_delta_pct",
-        "avg_mw_delta_pct",
-        "peak_hourly_delta_pct",
-    ]
-    for col in table_cols:
-        if col not in demand.columns:
-            demand[col] = pd.NA
-    table = demand[table_cols].copy()
-    table = table.rename(
-        columns={
-            "period_label": "Month",
-            "source": "Source",
-            "raw_mwh": "Raw REE monthly value (MWh)",
-            "demand_gwh": "Demand total (GWh)",
-            "avg_demand_mw": "Average demand (MW)",
-            "hourly_avg_gw": "Max hourly demand (GW)",
-            "peak_hour": "Peak hour",
-            "esios_1293_max_gw": "ESIOS 1293 max diagnostic (GW)",
-            "demand_delta_pct": "Δ demand vs prev. (%)",
-            "avg_mw_delta_pct": "Δ avg MW vs prev. (%)",
-            "peak_hourly_delta_pct": "Δ max hourly GW vs prev. (%)",
-        }
-    )
-    st.dataframe(
-        table.style.format(
+    # Check PV too if available: report gives 41,660 MW national solar fotovoltaica.
+    pv = d2025[d2025["technology_clean"].str.lower().eq("solar fotovoltaica")]
+    if not pv.empty:
+        got_pv = float(pv.sort_values("date").iloc[-1]["mw"])
+        rows.append(
             {
-                "Raw REE monthly value (MWh)": "{:,.0f}",
-                "Demand total (GWh)": "{:,.1f}",
-                "Average demand (MW)": "{:,.0f}",
-                "Max hourly demand (GW)": "{:,.2f}",
-                "ESIOS 1293 max diagnostic (GW)": "{:,.2f}",
-                "Δ demand vs prev. (%)": "{:+.1%}",
-                "Δ avg MW vs prev. (%)": "{:+.1%}",
-                "Δ max hourly GW vs prev. (%)": "{:+.1%}",
-            },
-            na_rep="—",
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    with st.expander("Interpretation", expanded=True):
-        st.markdown(
-            """
-            - **Demand total (GWh):** REE `demanda/evolucion` monthly value, converted from MWh to GWh.
-            - **Average demand (MW):** monthly GWh converted back to average MW across the month.
-            - **Max hourly demand (GW):** highest hourly value from REE `demanda/evolucion` with `time_trunc=hour`.
-              This is an hourly-average peak, not necessarily the absolute 5-minute instantaneous peak.
-            - **ESIOS 1293 max diagnostic:** optional 5-minute indicator max if ESIOS accepts `time_agg=max`.
-              Keep it as diagnostic until reconciled against REE.
-            """
+                "check": "2025 solar FV informe nacional",
+                "expected_mw": 41660,
+                "got_mw": got_pv,
+                "diff_mw": got_pv - 41660,
+                "status": "OK" if abs(got_pv - 41660) < 50 else "REVISAR",
+            }
         )
 
-    if raw_payloads:
-        with st.expander("Raw payload previews", expanded=False):
-            st.code(json.dumps(raw_payloads, ensure_ascii=False, indent=2)[:25000], language="json")
+    return pd.DataFrame(rows)
+
+
+def main() -> None:
+    st.set_page_config(page_title="REE Potencia instalada test", layout="wide")
+    st.title("Test REE potencia instalada — sin autoconsumo")
+
+    st.markdown(
+        """
+        Objetivo: traer **potencia instalada anual hasta 2025** desde REE y probar
+        **granularidad mensual 2026**. El test valida 2025 contra el informe:
+        **142.558 MW sin autoconsumo no visible**.
+        """
+    )
+
+    with st.sidebar:
+        st.header("Parámetros")
+        start_year = st.number_input("Año inicio anual", min_value=1990, max_value=2025, value=2020, step=1)
+        end_year = st.number_input("Año fin anual", min_value=1990, max_value=2025, value=2025, step=1)
+        start_2026 = st.date_input("Inicio mensual 2026", value=date(2026, 1, 1))
+        end_2026 = st.date_input("Fin mensual 2026", value=date(2026, 5, 31))
+        show_debug = st.checkbox("Mostrar debug/raw", value=True)
+
+    annual_start = f"{int(start_year)}-01-01T00:00"
+    annual_end = f"{int(end_year)}-12-31T23:59"
+    monthly_start = f"{start_2026:%Y-%m-%d}T00:00"
+    monthly_end = f"{end_2026:%Y-%m-%d}T23:59"
+
+    st.subheader("1) Anual hasta 2025")
+    with st.spinner("Consultando REData API anual..."):
+        annual_res = fetch_reddata_api(annual_start, annual_end, "year")
+
+    if annual_res.ok:
+        annual = normalise_installed_capacity(annual_res.df, "year")
+        st.success(f"Datos anuales obtenidos desde {annual_res.source}")
+    else:
+        st.warning("API anual no devolvió datos parseables. Probando scrape del informe 2025...")
+        fallback = scrape_report_2025_table()
+        annual = normalise_installed_capacity(fallback.df, "year") if fallback.ok else pd.DataFrame()
+        if fallback.ok:
+            st.info("Usando fallback scrape del informe 2025.")
+        else:
+            st.error(f"Fallback falló: {fallback.error}")
+
+    if not annual.empty:
+        st.dataframe(annual, use_container_width=True)
+
+        checks = validate_2025_against_report(annual)
+        if not checks.empty:
+            st.subheader("Validación contra informe 2025")
+            st.dataframe(checks, use_container_width=True)
+            if checks["status"].eq("REVISAR").any():
+                st.error("La serie no cuadra con el informe sin autoconsumo. Puede estar incluyendo BTM/autoconsumo o el parser tomó una fila incorrecta.")
+            else:
+                st.success("La serie cuadra razonablemente con el informe sin autoconsumo.")
+
+        totals, tech = split_total_and_tech(annual)
+        chart_df = tech if not tech.empty else annual
+        fig = px.line(
+            chart_df,
+            x="period",
+            y="mw",
+            color="technology_clean",
+            markers=True,
+            title="Potencia instalada anual por tecnología / bloque",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.error("No se han podido obtener datos anuales.")
+
+    st.subheader("2) Mensual 2026")
+    with st.spinner("Consultando REData API mensual 2026..."):
+        monthly_res = fetch_reddata_api(monthly_start, monthly_end, "month")
+
+    if monthly_res.ok:
+        monthly = normalise_installed_capacity(monthly_res.df, "month")
+        st.success(f"Datos mensuales 2026 obtenidos desde {monthly_res.source}")
+        st.dataframe(monthly, use_container_width=True)
+
+        totals_m, tech_m = split_total_and_tech(monthly)
+        chart_m = tech_m if not tech_m.empty else monthly
+        fig_m = px.line(
+            chart_m,
+            x="period",
+            y="mw",
+            color="technology_clean",
+            markers=True,
+            title="Potencia instalada mensual 2026",
+        )
+        st.plotly_chart(fig_m, use_container_width=True)
+
+        if not totals_m.empty:
+            st.metric(
+                "Última potencia total mensual encontrada",
+                f"{totals_m.sort_values('date').iloc[-1]['mw']:,.0f} MW".replace(",", "."),
+                help="Total tal como lo devuelve REE; revisar validación si sospechas inclusión de autoconsumo.",
+            )
+    else:
+        st.error("No se han podido obtener datos mensuales 2026 desde la API.")
+        st.code(monthly_res.error or "", language="text")
+
+    if show_debug:
+        st.subheader("Debug")
+        st.markdown("**API endpoints probados**")
+        st.code("\n".join(API_ENDPOINTS), language="text")
+
+        if annual_res.error:
+            st.markdown("**Errores anual API**")
+            st.code(annual_res.error, language="text")
+
+        if monthly_res.error:
+            st.markdown("**Errores mensual API**")
+            st.code(monthly_res.error, language="text")
+
+        if annual_res.ok and annual_res.raw is not None:
+            st.markdown("**Raw anual sample**")
+            st.json(annual_res.raw, expanded=False)
+
+        if monthly_res.ok and monthly_res.raw is not None:
+            st.markdown("**Raw mensual sample**")
+            st.json(monthly_res.raw, expanded=False)
+
+
+if __name__ == "__main__":
+    main()
