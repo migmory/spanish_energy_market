@@ -1,26 +1,29 @@
-
 """
-Streamlit test REE: potencia instalada SIN autoconsumo.
+Streamlit test REE: potencia instalada SIN autoconsumo — v4.
 
 Run:
     pip install streamlit pandas requests plotly
-    streamlit run ree_potencia_instalada_test_v3.py
+    streamlit run ree_potencia_instalada_test_v4.py
 
-Por qué esta v3:
-- El endpoint público `apidatos.ree.es/es/datos/generacion/potencia-instalada`
-  está devolviendo HTTP 500 para este widget.
-- El endpoint `potencia-instalada-generacion` devuelve HTTP 400 porque no parece
-  ser un widget API válido.
-- Por tanto, la parte anual se obtiene de las páginas del Informe del Sistema
-  de sistemaelectrico-ree.es.
-- La parte mensual 2026 se deja como "probe" de API: si REE lo expone, carga;
-  si no, lo enseña claramente como no disponible.
+Qué corrige esta v4:
+- La v3 intentaba parsear la tabla de tecnologías del HTML del informe, pero esos
+  valores NO vienen en el HTML estático; la web los renderiza/inyecta por JS o por
+  una fuente no expuesta en el HTML que recibe requests.
+- Por eso salían filas absurdas como Solar FV = 230 MW o Potencia total = 0.
+- Esta versión NO intenta parsear tablas ocultas. Solo extrae magnitudes que están
+  explícitamente escritas en el texto del informe:
+    * total nacional instalado a 31/12/año
+    * total incluyendo autoconsumo, cuando aparece
+    * renovables nacionales, cuando aparece
+    * almacenamiento nacional, cuando aparece
+    * solar FV peninsular, cuando aparece
+    * eólica peninsular, cuando aparece
+- Para 2026 mensual mantiene un "probe" de API. Si REE devuelve 500/400, se ve claro.
 """
 
 from __future__ import annotations
 
 import html
-import json
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -33,10 +36,6 @@ import requests
 import streamlit as st
 
 
-REPORT_TOTAL_2025_MW = 142_558
-REPORT_SOLAR_FV_2025_MW = 41_660
-
-# En la web de informe, 2025 está en la URL sin año.
 REPORT_URLS = {
     2025: "https://www.sistemaelectrico-ree.es/es/informe-del-sistema-electrico/potencia-instalada",
     2024: "https://www.sistemaelectrico-ree.es/es/2024/informe-del-sistema-electrico/potencia-instalada",
@@ -51,46 +50,6 @@ API_CANDIDATES = [
     "https://apidatos.ree.es/es/datos/generacion/potencia-instalada-generacion",
 ]
 
-TECH_ORDER = [
-    "Hidráulica",
-    "Hidroeólica",
-    "Eólica",
-    "Solar fotovoltaica",
-    "Solar Fotovoltaica",
-    "Solar térmica",
-    "Solar Térmica",
-    "Otras renovables",
-    "Otras Renovables",
-    "Residuos renovables",
-    "Residuos Renovables",
-    "Renovables",
-    "Nuclear",
-    "Carbón",
-    "Motor diésel",
-    "Motor Diésel",
-    "Turbina de gas",
-    "Turbina de Gas",
-    "Turbina de vapor",
-    "Turbina de Vapor",
-    "Fuel + Gas",
-    "Fuel+Gas",
-    "Fuel",
-    "Ciclo combinado",
-    "Ciclo Combinado",
-    "Cogeneración",
-    "Residuos no renovables",
-    "Residuos no Renovables",
-    "No renovables",
-    "No Renovables",
-    "Generación",
-    "Turbinación bombeo",
-    "Turbinación Bombeo",
-    "Baterías",
-    "Almacenamiento",
-    "Potencia total",
-    "Total",
-]
-
 
 @dataclass
 class FetchResult:
@@ -102,8 +61,6 @@ class FetchResult:
 
 
 class TextExtractor(HTMLParser):
-    """Extrae texto de HTML con separadores para no juntar celdas."""
-
     def __init__(self) -> None:
         super().__init__()
         self.parts: list[str] = []
@@ -120,265 +77,225 @@ class TextExtractor(HTMLParser):
 def html_to_text(raw_html: str) -> str:
     parser = TextExtractor()
     parser.feed(raw_html)
-    text = parser.get_text()
-    text = html.unescape(text)
+    text = html.unescape(parser.get_text())
     text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
     return text
 
 
-def parse_spanish_number(value: str | int | float | None) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
+def parse_es_number_to_mw(token: str | int | float | None, unit: str = "MW") -> float | None:
+    """
+    Convierte números españoles a MW.
 
-    txt = str(value).strip()
-    if not txt:
-        return None
-
-    txt = txt.replace("\xa0", "").replace(" ", "")
-
-    # 142.558 => 142558
-    # 7,3 => 7.3
-    # 1.234,56 => 1234.56
-    if "." in txt and "," in txt:
-        txt = txt.replace(".", "").replace(",", ".")
-    elif "," in txt:
-        txt = txt.replace(",", ".")
-    elif re.match(r"^-?\d{1,3}(\.\d{3})+$", txt):
-        txt = txt.replace(".", "")
-
-    try:
-        return float(txt)
-    except ValueError:
+    Ejemplos:
+    - "142.558" + MW => 142558
+    - "95,6" + GW => 95600
+    - "10" + GW => 10000
+    """
+    if token is None:
         return None
 
+    if isinstance(token, (int, float)):
+        val = float(token)
+    else:
+        s = str(token).strip()
+        s = s.replace("\xa0", "").replace(" ", "")
 
-def normalise_technology(name: str) -> str:
-    name = re.sub(r"\s+", " ", name).strip()
-    fixes = {
-        "Solar Fotovoltaica": "Solar fotovoltaica",
-        "Solar Térmica": "Solar térmica",
-        "Otras Renovables": "Otras renovables",
-        "Residuos Renovables": "Residuos renovables",
-        "Motor Diésel": "Motor diésel",
-        "Turbina de Gas": "Turbina de gas",
-        "Turbina de Vapor": "Turbina de vapor",
-        "Ciclo Combinado": "Ciclo combinado",
-        "Residuos no Renovables": "Residuos no renovables",
-        "No Renovables": "No renovables",
-        "Turbinación Bombeo": "Turbinación bombeo",
-        "Fuel+Gas": "Fuel + Gas",
-        "Total": "Potencia total",
-    }
-    return fixes.get(name, name)
+        if "." in s and "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            s = s.replace(",", ".")
+        elif re.match(r"^-?\d{1,3}(\.\d{3})+$", s):
+            s = s.replace(".", "")
+
+        try:
+            val = float(s)
+        except ValueError:
+            return None
+
+    if unit.upper() == "GW":
+        val *= 1000.0
+
+    return val
 
 
-def extract_report_headline_total(text: str, year: int) -> float | None:
-    # Ejemplo 2025:
-    # "... potencia instalada de 142.558 MW ..."
-    # Ejemplo 2024:
-    # "... potencia instalada de 132.343 MW."
-    patterns = [
-        r"potencia instalada de\s+([0-9\.\,]+)\s*MW",
-        r"ha alcanzado.*?([0-9\.\,]+)\s*MW",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
+def first_match_mw(text: str, patterns: list[tuple[str, str]]) -> tuple[float | None, str | None]:
+    """
+    patterns = [(regex, unit), ...]
+    El regex debe tener un grupo con el número.
+    """
+    for pattern, unit in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
         if m:
-            return parse_spanish_number(m.group(1))
-
-    return None
-
-
-def find_row_segment(text: str, tech: str) -> str | None:
-    """
-    Busca el segmento de texto correspondiente a una tecnología.
-    Funciona tanto si el HTMLParser separa celdas con saltos como si el chart
-    aparece como texto compacto.
-    """
-    candidates = [tech]
-    if tech == "Solar fotovoltaica":
-        candidates.append("Solar Fotovoltaica")
-    if tech == "Potencia total":
-        candidates.append("Total")
-
-    all_names = sorted(set(TECH_ORDER), key=len, reverse=True)
-
-    for c in candidates:
-        pos = text.find(c)
-        if pos == -1:
-            continue
-
-        start = pos + len(c)
-        end_positions = []
-        for nxt in all_names:
-            if nxt == c:
-                continue
-            p = text.find(nxt, start)
-            if p != -1:
-                end_positions.append(p)
-
-        end = min(end_positions) if end_positions else min(len(text), start + 250)
-        return text[start:end]
-
-    return None
+            val = parse_es_number_to_mw(m.group(1), unit)
+            if val is not None:
+                return val, m.group(0)[:300]
+    return None, None
 
 
-def extract_numbers_from_segment(segment: str) -> list[float]:
-    """
-    Extrae números españoles de un segmento.
-    Si vienen con saltos/separadores, va bien.
-    Si vienen compactados sin separador, se intenta una segunda estrategia simple.
-    """
-    # Caso normal: hay separadores entre celdas.
-    tokens = re.findall(r"-?\d{1,3}(?:\.\d{3})*(?:,\d+)?|-?\d+(?:,\d+)?", segment)
-    nums = [parse_spanish_number(t) for t in tokens]
-    nums = [n for n in nums if n is not None]
-
-    # Si sale un solo token enorme, probablemente el chart juntó celdas.
-    # En ese caso no intentamos adivinar cada columna; es mejor no contaminar.
-    if len(nums) <= 1:
-        return []
-
-    return nums
-
-
-def parse_report_capacity_table(text: str, year: int) -> pd.DataFrame:
-    """
-    Extrae filas de la tabla "Potencia instalada a 31.12.YYYY".
-
-    La tabla tiene normalmente:
-    Sistema peninsular: MW, %
-    Sistema no peninsular: MW, %
-    Nacional: MW, %
-
-    Por eso tomamos:
-    - nums[0] = peninsular MW
-    - nums[2] = no peninsular MW
-    - nums[4] = nacional MW
-    """
-    # Acotamos al bloque de tabla para evitar coger mapas por CCAA.
-    start_marker = f"Potencia instalada a 31.12.{year}"
-    start = text.find(start_marker)
-    block = text[start:] if start != -1 else text
-
-    # Cortamos antes de variaciones/evolución para no mezclar con otros gráficos.
-    cut_markers = [
-        "Variaciones de potencia",
-        "Evolución de la estructura",
-        "Mapa de potencia",
-        "Desglose de potencia",
-    ]
-    cuts = [block.find(m) for m in cut_markers if block.find(m) != -1]
-    if cuts:
-        block = block[: min(cuts)]
-
+def parse_report_metrics(text: str, year: int, url: str) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
-    seen = set()
-    for tech in TECH_ORDER:
-        tech_norm = normalise_technology(tech)
-        if tech_norm in seen:
-            continue
-        seen.add(tech_norm)
+    def add(metric: str, value_mw: float | None, source_text: str | None, confidence: str = "high") -> None:
+        if value_mw is None:
+            return
+        rows.append(
+            {
+                "year": year,
+                "date": pd.Timestamp(f"{year}-12-31"),
+                "period": str(year),
+                "metric": metric,
+                "mw": round(float(value_mw), 3),
+                "source_url": url,
+                "source_text": source_text or "",
+                "confidence": confidence,
+            }
+        )
 
-        segment = find_row_segment(block, tech)
-        if not segment:
-            continue
+    # Total nacional sin autoconsumo. Esta frase aparece clara en los informes.
+    total, total_src = first_match_mw(
+        text,
+        [
+            (
+                rf"A 31 de diciembre de {year}.*?potencia instalada de\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+            (
+                r"ha alcanzado.*?potencia instalada de\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+        ],
+    )
+    add("Total nacional sin autoconsumo visible", total, total_src)
 
-        nums = extract_numbers_from_segment(segment)
-        if len(nums) >= 5:
-            rows.append(
-                {
-                    "year": year,
-                    "date": pd.Timestamp(f"{year}-12-31"),
-                    "technology": tech_norm,
-                    "peninsular_mw": nums[0],
-                    "non_peninsular_mw": nums[2],
-                    "national_mw": nums[4],
-                    "period": str(year),
-                    "source": "report_table",
-                }
+    # Total nacional incluyendo autoconsumo: aparece explícito en 2025.
+    total_auto, total_auto_src = first_match_mw(
+        text,
+        [
+            (
+                r"tenemos en cuenta las instalaciones de autoconsumo.*?asciende a\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+            (
+                r"incluyendo autoconsumo.*?([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+        ],
+    )
+    add("Total nacional incluyendo autoconsumo", total_auto, total_auto_src)
+
+    # Renovables nacionales: aparece como X GW.
+    renov, renov_src = first_match_mw(
+        text,
+        [
+            (
+                r"alcanzar una potencia instalada de fuentes de generación renovables de\s+([0-9\.\,]+)\s*GW",
+                "GW",
+            ),
+            (
+                r"potencia instalada de generación renovable.*?alcanz.*?([0-9\.\,]+)\s*GW",
+                "GW",
+            ),
+        ],
+    )
+    add("Renovables nacional", renov, renov_src)
+
+    # Almacenamiento nacional.
+    storage, storage_src = first_match_mw(
+        text,
+        [
+            (
+                rf"potencia instalada de almacenamiento del sistema eléctrico español en {year} se sitúa en\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+            (
+                r"almacenamiento del sistema eléctrico español.*?se sitúa en\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+        ],
+    )
+    add("Almacenamiento nacional", storage, storage_src)
+
+    # Turbinación bombeo y baterías, si están en el texto.
+    pumped, pumped_src = first_match_mw(
+        text,
+        [
+            (
+                r"de los cuales\s+([0-9\.\,]+)\s+corresponden a turbinación bombeo",
+                "MW",
             )
+        ],
+    )
+    add("Turbinación bombeo nacional", pumped, pumped_src)
 
-    df = pd.DataFrame(rows)
-
-    # Fallback seguro para total anual desde el párrafo.
-    headline_total = extract_report_headline_total(text, year)
-    if headline_total is not None:
-        if df.empty or not df["technology"].eq("Potencia total").any():
-            df = pd.concat(
-                [
-                    df,
-                    pd.DataFrame(
-                        [
-                            {
-                                "year": year,
-                                "date": pd.Timestamp(f"{year}-12-31"),
-                                "technology": "Potencia total",
-                                "peninsular_mw": None,
-                                "non_peninsular_mw": None,
-                                "national_mw": headline_total,
-                                "period": str(year),
-                                "source": "report_headline",
-                            }
-                        ]
-                    ),
-                ],
-                ignore_index=True,
+    batteries, batteries_src = first_match_mw(
+        text,
+        [
+            (
+                r"turbinación bombeo y\s+([0-9\.\,]+)\s*MW a baterías",
+                "MW",
             )
+        ],
+    )
+    add("Baterías nacional", batteries, batteries_src)
 
-    return df
+    # Solar FV peninsular. No es nacional; lo marco claramente.
+    pv_pen, pv_pen_src = first_match_mw(
+        text,
+        [
+            (
+                r"solar fotovoltaica.*?potencia instalada peninsular con\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            ),
+            (
+                r"solar fotovoltaica.*?con\s+([0-9\.\,]+)\s*MW.*?potencia instalada peninsular",
+                "MW",
+            ),
+        ],
+    )
+    add("Solar fotovoltaica peninsular", pv_pen, pv_pen_src)
+
+    # Eólica peninsular.
+    wind_pen, wind_pen_src = first_match_mw(
+        text,
+        [
+            (
+                r"potencia instalada eólica.*?con un total de\s+([0-9\.\,]+)\s*MW",
+                "MW",
+            )
+        ],
+    )
+    add("Eólica peninsular", wind_pen, wind_pen_src)
+
+    return pd.DataFrame(rows)
 
 
 def fetch_report_year(year: int) -> FetchResult:
     url = REPORT_URLS.get(year)
     if not url:
-        return FetchResult(
-            ok=False,
-            source=f"report {year}",
-            df=pd.DataFrame(),
-            error=f"No tengo URL configurada para {year}. Añádela en REPORT_URLS.",
-        )
+        return FetchResult(False, f"report {year}", pd.DataFrame(), error=f"No hay URL configurada para {year}")
 
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         if r.status_code != 200:
-            return FetchResult(
-                ok=False,
-                source=url,
-                df=pd.DataFrame(),
-                error=f"HTTP {r.status_code}: {r.text[:300]}",
-            )
+            return FetchResult(False, url, pd.DataFrame(), error=f"HTTP {r.status_code}: {r.text[:300]}")
 
         text = html_to_text(r.text)
-        df = parse_report_capacity_table(text, year)
-        if df.empty:
-            return FetchResult(
-                ok=False,
-                source=url,
-                df=pd.DataFrame(),
-                raw=text[:4000],
-                error="Página descargada, pero no pude parsear la tabla.",
-            )
+        df = parse_report_metrics(text, year, url)
 
-        df["url"] = url
-        return FetchResult(ok=True, source=url, df=df, raw=text[:4000])
+        if df.empty:
+            return FetchResult(False, url, pd.DataFrame(), raw=text[:5000], error="Página descargada, pero sin métricas parseables.")
+
+        return FetchResult(True, url, df, raw=text[:5000])
 
     except Exception as exc:
-        return FetchResult(
-            ok=False,
-            source=url,
-            df=pd.DataFrame(),
-            error=f"{type(exc).__name__}: {exc}",
-        )
+        return FetchResult(False, url, pd.DataFrame(), error=f"{type(exc).__name__}: {exc}")
 
 
-def fetch_annual_reports(start_year: int, end_year: int) -> FetchResult:
-    dfs = []
-    errors = []
+def fetch_reports(start_year: int, end_year: int) -> FetchResult:
+    dfs: list[pd.DataFrame] = []
+    errors: list[str] = []
 
     for year in range(start_year, end_year + 1):
         res = fetch_report_year(year)
@@ -390,35 +307,31 @@ def fetch_annual_reports(start_year: int, end_year: int) -> FetchResult:
     if dfs:
         return FetchResult(
             ok=True,
-            source="sistemaelectrico-ree.es report pages",
+            source="Informes del sistema eléctrico REE",
             df=pd.concat(dfs, ignore_index=True),
             error="\n".join(errors) if errors else None,
         )
 
-    return FetchResult(
-        ok=False,
-        source="sistemaelectrico-ree.es report pages",
-        df=pd.DataFrame(),
-        error="\n".join(errors) or "Sin datos",
-    )
+    return FetchResult(False, "Informes del sistema eléctrico REE", pd.DataFrame(), error="\n".join(errors))
 
 
 def walk_dicts(obj: Any) -> Iterable[dict[str, Any]]:
     if isinstance(obj, dict):
         yield obj
-        for v in obj.values():
-            yield from walk_dicts(v)
+        for value in obj.values():
+            yield from walk_dicts(value)
     elif isinstance(obj, list):
         for item in obj:
             yield from walk_dicts(item)
 
 
 def parse_api_json(raw: dict[str, Any]) -> pd.DataFrame:
-    rows = []
+    rows: list[dict[str, Any]] = []
 
     for node in walk_dicts(raw):
         attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
         values = node.get("values") or attrs.get("values")
+
         if not isinstance(values, list):
             continue
 
@@ -435,11 +348,14 @@ def parse_api_json(raw: dict[str, Any]) -> pd.DataFrame:
         for point in values:
             if not isinstance(point, dict):
                 continue
+
             dt = point.get("datetime") or point.get("date")
-            val = parse_spanish_number(point.get("value"))
+            val = parse_es_number_to_mw(point.get("value"), "MW")
+
             if dt is None or val is None:
                 continue
-            rows.append({"datetime": dt, "technology": title, "national_mw": val})
+
+            rows.append({"datetime": dt, "metric": str(title), "mw": val})
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -452,11 +368,10 @@ def parse_api_json(raw: dict[str, Any]) -> pd.DataFrame:
     return df
 
 
-def probe_monthly_2026_api(start: str, end: str) -> FetchResult:
+def probe_monthly_api(start: str, end: str) -> FetchResult:
     headers = {
         "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 streamlit-ree-test/0.3",
+        "User-Agent": "Mozilla/5.0 streamlit-ree-test/0.4",
     }
 
     param_sets = [
@@ -465,81 +380,70 @@ def probe_monthly_2026_api(start: str, end: str) -> FetchResult:
             "start_date": start,
             "end_date": end,
             "time_trunc": "month",
+            "systemElectric": "nacional",
+        },
+        {
+            "start_date": start,
+            "end_date": end,
+            "time_trunc": "month",
             "geo_trunc": "electric_system",
-            "geo_limit": "peninsular",
+            "geo_limit": "nacional",
             "geo_ids": "8741",
         },
     ]
 
-    errors = []
+    errors: list[str] = []
 
     for endpoint in API_CANDIDATES:
         for params in param_sets:
             try:
                 r = requests.get(endpoint, params=params, headers=headers, timeout=30)
+
                 if r.status_code != 200:
-                    errors.append(
-                        f"{endpoint} | {params} | HTTP {r.status_code}: {r.text[:300]}"
-                    )
+                    errors.append(f"{endpoint} | {params} | HTTP {r.status_code}: {r.text[:250]}")
                     continue
 
                 raw = r.json()
                 df = parse_api_json(raw)
-                if not df.empty:
-                    return FetchResult(
-                        ok=True,
-                        source=f"{endpoint} | params={params}",
-                        df=df,
-                        raw=raw,
-                    )
 
-                errors.append(
-                    f"{endpoint} | {params} | HTTP 200 pero sin series parseables."
-                )
+                if not df.empty:
+                    return FetchResult(True, f"{endpoint} | params={params}", df, raw=raw)
+
+                errors.append(f"{endpoint} | {params} | HTTP 200 pero sin series parseables")
 
             except Exception as exc:
                 errors.append(f"{endpoint} | {params} | {type(exc).__name__}: {exc}")
 
-    return FetchResult(
-        ok=False,
-        source="REData API monthly probe",
-        df=pd.DataFrame(),
-        error="\n".join(errors),
-    )
+    return FetchResult(False, "REData API monthly probe", pd.DataFrame(), error="\n".join(errors))
 
 
 def validate_2025(df: pd.DataFrame) -> pd.DataFrame:
-    checks = []
     if df.empty:
-        return pd.DataFrame(checks)
+        return pd.DataFrame()
 
-    d2025 = df[df["year"] == 2025].copy()
-    if d2025.empty:
-        return pd.DataFrame(checks)
+    checks: list[dict[str, Any]] = []
+    d2025 = df[df["year"].eq(2025)]
 
-    total = d2025[d2025["technology"] == "Potencia total"]
-    if not total.empty:
-        got = float(total.iloc[-1]["national_mw"])
+    expected = {
+        "Total nacional sin autoconsumo visible": 142_558,
+        "Total nacional incluyendo autoconsumo": 150_809,
+        "Almacenamiento nacional": 3_427,
+        "Solar fotovoltaica peninsular": 40_952,
+        "Eólica peninsular": 32_593,
+    }
+
+    for metric, exp in expected.items():
+        row = d2025[d2025["metric"].eq(metric)]
+        if row.empty:
+            continue
+        got = float(row.iloc[-1]["mw"])
         checks.append(
             {
-                "check": "Total 2025 sin autoconsumo",
-                "expected_mw": REPORT_TOTAL_2025_MW,
+                "metric": metric,
+                "expected_mw": exp,
                 "got_mw": got,
-                "diff_mw": got - REPORT_TOTAL_2025_MW,
-                "status": "OK" if abs(got - REPORT_TOTAL_2025_MW) < 1 else "REVISAR",
-            }
-        )
-
-    fv = d2025[d2025["technology"] == "Solar fotovoltaica"]
-    if not fv.empty:
-        got = float(fv.iloc[-1]["national_mw"])
-        checks.append(
-            {
-                "check": "Solar FV 2025 sin autoconsumo",
-                "expected_mw": REPORT_SOLAR_FV_2025_MW,
-                "got_mw": got,
-                "diff_mw": got - REPORT_SOLAR_FV_2025_MW,
-                "status": "OK" if abs(got - REPORT_SOLAR_FV_2025_MW) < 1 else "REVISAR",
+                "diff_mw": got - exp,
+                "status": "OK" if abs(got - exp) < 1 else "REVISAR",
             }
         )
 
@@ -547,12 +451,13 @@ def validate_2025(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
-    st.set_page_config(page_title="REE potencia instalada v3", layout="wide")
-    st.title("REE potencia instalada — test sin autoconsumo")
+    st.set_page_config(page_title="REE potencia instalada v4", layout="wide")
+    st.title("REE potencia instalada — test sin autoconsumo v4")
 
-    st.info(
-        "Esta v3 no depende del endpoint de API que está devolviendo 500. "
-        "Para la serie anual usa las páginas del Informe del Sistema."
+    st.warning(
+        "Importante: la tabla de tecnologías del informe no viene en el HTML estático. "
+        "Esta versión evita parsear esa tabla y solo extrae datos explícitos del texto, "
+        "para no generar números falsos."
     )
 
     with st.sidebar:
@@ -561,87 +466,90 @@ def main() -> None:
         end_year = st.number_input("Año fin anual", min_value=2020, max_value=2025, value=2025)
         start_2026 = st.date_input("Inicio mensual 2026", value=date(2026, 1, 1))
         end_2026 = st.date_input("Fin mensual 2026", value=date(2026, 12, 31))
-        show_debug = st.checkbox("Mostrar debug", value=True)
+        show_sources = st.checkbox("Mostrar texto fuente de cada métrica", value=False)
+        show_debug = st.checkbox("Mostrar debug API", value=True)
 
-    st.header("1) Anual desde informes REE")
+    if start_year > end_year:
+        st.error("El año inicial no puede ser mayor que el año final.")
+        return
 
-    annual_res = fetch_annual_reports(int(start_year), int(end_year))
+    st.header("1) Anual desde texto de informes REE")
+
+    annual_res = fetch_reports(int(start_year), int(end_year))
 
     if annual_res.ok:
-        annual_df = annual_res.df.copy()
-        st.success(f"Datos anuales cargados desde: {annual_res.source}")
-        st.dataframe(annual_df, use_container_width=True)
+        df = annual_res.df.copy()
+        st.success(f"Datos extraídos desde: {annual_res.source}")
 
-        checks = validate_2025(annual_df)
+        display_cols = ["year", "metric", "mw", "confidence", "source_url"]
+        if show_sources:
+            display_cols.append("source_text")
+
+        st.dataframe(df[display_cols], use_container_width=True)
+
+        checks = validate_2025(df)
         if not checks.empty:
             st.subheader("Validación 2025")
             st.dataframe(checks, use_container_width=True)
 
-        # Gráfico: solo nacional.
-        chart_df = annual_df.copy()
-        totals = chart_df[chart_df["technology"] == "Potencia total"]
-        if len(totals) < len(chart_df):
-            chart_df = chart_df[chart_df["technology"] != "Potencia total"]
+        pivot = df.pivot_table(index="year", columns="metric", values="mw", aggfunc="last").reset_index()
+        st.subheader("Vista pivote")
+        st.dataframe(pivot, use_container_width=True)
 
         fig = px.line(
-            chart_df,
-            x="period",
-            y="national_mw",
-            color="technology",
+            df,
+            x="year",
+            y="mw",
+            color="metric",
             markers=True,
-            title="Potencia instalada nacional por tecnología",
+            title="Métricas extraídas del texto del informe",
         )
         fig.update_layout(yaxis_title="MW", xaxis_title="Año")
         st.plotly_chart(fig, use_container_width=True)
 
-        csv = annual_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Descargar anual CSV",
-            data=csv,
-            file_name="ree_potencia_instalada_anual_sin_autoconsumo.csv",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="ree_potencia_instalada_informe_texto_v4.csv",
             mime="text/csv",
         )
     else:
-        st.error("No se pudo cargar la parte anual.")
+        st.error("No se pudo extraer la parte anual.")
         st.code(annual_res.error or "Sin detalle", language="text")
 
     st.header("2) Mensual 2026 — probe API")
 
     monthly_start = f"{start_2026:%Y-%m-%d}T00:00"
     monthly_end = f"{end_2026:%Y-%m-%d}T23:59"
-
-    monthly_res = probe_monthly_2026_api(monthly_start, monthly_end)
+    monthly_res = probe_monthly_api(monthly_start, monthly_end)
 
     if monthly_res.ok:
         st.success(f"Mensual 2026 cargado desde API: {monthly_res.source}")
         st.dataframe(monthly_res.df, use_container_width=True)
-
         fig_m = px.line(
             monthly_res.df,
             x="period",
-            y="national_mw",
-            color="technology",
+            y="mw",
+            color="metric",
             markers=True,
-            title="Potencia instalada mensual 2026",
+            title="Potencia instalada mensual 2026 desde API",
         )
         st.plotly_chart(fig_m, use_container_width=True)
     else:
-        st.warning(
-            "No he encontrado mensual 2026 en la API pública de REE para este widget. "
-            "Esto es consistente con el HTTP 500/400 que estabas viendo."
+        st.info(
+            "No se ha encontrado mensual 2026 por API pública para este widget. "
+            "En tu prueba ya se veía HTTP 500/400, así que esto probablemente no está expuesto."
         )
-        st.code(monthly_res.error or "Sin detalle", language="text")
+        if show_debug:
+            st.code(monthly_res.error or "Sin detalle", language="text")
 
     if show_debug:
         st.header("Debug")
-        st.subheader("Errores anual")
-        st.code(annual_res.error or "Sin errores anuales", language="text")
+        st.subheader("Errores de informes")
+        st.code(annual_res.error or "Sin errores de informes", language="text")
 
-        st.subheader("Endpoints API probados para mensual")
+        st.subheader("Endpoints API probados")
         st.code("\n".join(API_CANDIDATES), language="text")
-
-        st.subheader("Errores mensual")
-        st.code(monthly_res.error or "Sin errores mensuales", language="text")
 
 
 if __name__ == "__main__":
