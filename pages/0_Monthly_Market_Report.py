@@ -1090,6 +1090,60 @@ def parse_ree_included_series_for_report(payload: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_ree_official_demand_monthly_for_report(start_day: date, end_day: date) -> pd.DataFrame:
+    """Official REE demand series for report KPIs.
+
+    Source: apidatos demanda/evolucion with peninsular filter. Values are
+    monthly energy in MWh; we expose GWh plus average GW for the month.
+    """
+    cols = ["datetime", "demand_gwh", "avg_demand_gw", "source"]
+    if start_day > end_day:
+        return pd.DataFrame(columns=cols)
+    try:
+        payload = fetch_ree_widget_for_report("demanda", "evolucion", start_day, end_day, time_trunc="month")
+        df = parse_ree_included_series_for_report(payload)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    if df["title"].nunique() > 1:
+        demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
+        if not demand_like.empty:
+            df = demand_like
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["demand_mwh"] = pd.to_numeric(df["value"], errors="coerce")
+    out = df.dropna(subset=["datetime", "demand_mwh"]).groupby("datetime", as_index=False)["demand_mwh"].sum()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    out["demand_gwh"] = out["demand_mwh"] / 1000.0
+    out["hours_in_month"] = out["datetime"].dt.days_in_month * 24
+    out["avg_demand_gw"] = out["demand_gwh"] / out["hours_in_month"]
+    out["source"] = "REE demanda/evolucion"
+    return out[["datetime", "demand_gwh", "avg_demand_gw", "source"]].sort_values("datetime").reset_index(drop=True)
+
+
+def demand_month_metrics(demand_monthly: pd.DataFrame, target_month: pd.Timestamp) -> dict[str, float | None]:
+    if demand_monthly is None or demand_monthly.empty:
+        return {"demand_gwh": None, "avg_demand_gw": None}
+    tmp = demand_monthly.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    mask = (tmp["datetime"].dt.year == target_month.year) & (tmp["datetime"].dt.month == target_month.month)
+    row = tmp.loc[mask].sort_values("datetime").tail(1)
+    if row.empty:
+        return {"demand_gwh": None, "avg_demand_gw": None}
+    return {
+        "demand_gwh": float(row["demand_gwh"].iloc[0]) if pd.notna(row["demand_gwh"].iloc[0]) else None,
+        "avg_demand_gw": float(row["avg_demand_gw"].iloc[0]) if pd.notna(row["avg_demand_gw"].iloc[0]) else None,
+    }
+
+
+def fmt_gw(value: float | int | None, decimals: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.{decimals}f} GW"
+
+
 def _normalize_ree_energy_to_mwh(series: pd.Series) -> pd.Series:
     vals = pd.to_numeric(series, errors="coerce")
     max_abs = vals.abs().max(skipna=True) if not vals.empty else None
@@ -1198,10 +1252,10 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
             mask = (mix["datetime"].dt.year == target_month.year) & (mix["datetime"].dt.month == target_month.month)
             mix = mix.loc[mask].copy()
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     mix = mix[mix["technology"].isin(DETAILED_MIX_TECHS)].copy()
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     grouped = mix.groupby("technology", as_index=False)["energy_mwh"].sum()
     energy_map = dict(zip(grouped["technology"], grouped["energy_mwh"]))
     total = float(grouped["energy_mwh"].sum()) if not grouped.empty else np.nan
@@ -1209,6 +1263,7 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
     solar_mwh = float(energy_map.get("Solar PV", 0.0) + energy_map.get("Solar thermal", 0.0))
     return {
         "re_share": None if not total or pd.isna(total) else renewables / total,
+        "total_generation_gwh": None if pd.isna(total) else total / 1000.0,
         "solar_gwh": solar_mwh / 1000.0,
         "wind_gwh": float(energy_map.get("Wind", 0.0)) / 1000.0,
         "hydro_gwh": float(energy_map.get("Hydro", 0.0)) / 1000.0,
@@ -1216,13 +1271,20 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
     }
 
 
-def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str) -> pd.DataFrame:
+def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str, demand_current: dict[str, float | None] | None = None, demand_previous: dict[str, float | None] | None = None) -> pd.DataFrame:
+    if demand_current:
+        current = {**current, **demand_current}
+    if demand_previous:
+        previous = {**previous, **demand_previous}
     specs = [
         ("🌱 Renewable generation share", "re_share", "share"),
+        ("⚡ Total generation", "total_generation_gwh", "gwh"),
         ("☀️ Solar injected", "solar_gwh", "gwh"),
         ("💨 Wind injected", "wind_gwh", "gwh"),
         ("💧 Hydro injected", "hydro_gwh", "gwh"),
         ("⚛️ Nuclear injected", "nuclear_gwh", "gwh"),
+        ("📈 Demand total", "demand_gwh", "gwh"),
+        ("📊 Average demand", "avg_demand_gw", "gw"),
     ]
     rows = []
     for label, key, kind in specs:
@@ -1232,6 +1294,10 @@ def build_generation_month_comparison_table(current: dict[str, float | None], pr
             curr_display, prev_display = fmt_pct(curr), fmt_pct(prev)
             share_diff = None if curr is None or prev is None else curr - prev
             diff_display = arrow_pp_text(share_diff)
+        elif kind == "gw":
+            curr_display, prev_display = fmt_gw(curr), fmt_gw(prev)
+            diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
+            diff_display = arrow_change_pct_text(diff)
         else:
             curr_display, prev_display = fmt_gwh(curr), fmt_gwh(prev)
             diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
@@ -4763,6 +4829,7 @@ mibgas_actuals = load_mibgas_actuals_for_report()
 historical_mix_daily = load_historical_generation_mix_daily_for_report()
 live_mix_monthly = load_live_2026_mix_monthly_for_report(date(2026, 1, 1), today)
 live_mix_daily = load_live_2026_mix_daily_for_report(date(2026, 1, 1), today)
+official_demand_monthly = load_ree_official_demand_monthly_for_report(date(2026, 1, 1), today)
 
 # =========================================================
 # SECTION 1 — DAY AHEAD
@@ -4851,8 +4918,10 @@ kpi_generation_prev = build_generation_month_metrics(
     live_mix_daily if not live_mix_daily.empty else live_mix_monthly,
     prev_month,
 )
+kpi_demand_current = demand_month_metrics(official_demand_monthly, selected_month)
+kpi_demand_prev = demand_month_metrics(official_demand_monthly, prev_month)
 
-k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5)
+k2_1, k2_2, k2_3, k2_4, k2_5, k2_6 = st.columns(6)
 with k2_1:
     st.metric(
         f"Market spread TB4 | {month_label(selected_month, is_current_mtd)}",
@@ -4894,6 +4963,16 @@ with k2_4:
         unsafe_allow_html=True,
     )
 with k2_5:
+    st.metric(
+        f"Demand total | {month_label(selected_month, is_current_mtd)}",
+        fmt_gwh(kpi_demand_current.get("demand_gwh")),
+        help="Official REE demanda/evolucion monthly demand, converted to GWh.",
+    )
+    st.markdown(
+        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. month")}<br>Prev. month: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b></div>',
+        unsafe_allow_html=True,
+    )
+with k2_6:
     st.markdown(
         f"""
         <div style="font-size:0.88rem; color:#0F172A; margin-top:0.15rem;">
@@ -5034,9 +5113,11 @@ generation_comparison = build_generation_month_comparison_table(
     previous_generation_metrics,
     month_label(selected_month, is_current_mtd),
     month_label(prev_month, False),
+    demand_month_metrics(official_demand_monthly, selected_month),
+    demand_month_metrics(official_demand_monthly, prev_month),
 )
 st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
-st.caption("Solar = Solar PV + Solar thermal. For 2026, the renewable-share metric now uses the REE daily generation-mix pull aggregated to the selected month, with a monthly-widget fallback only if the daily pull is unavailable.")
+st.caption("Solar = Solar PV + Solar thermal. Demand = REE demanda/evolucion official monthly GWh; average GW is GWh divided by month hours.  For 2026, the renewable-share metric now uses the REE daily generation-mix pull aggregated to the selected month, with a monthly-widget fallback only if the daily pull is unavailable.")
 
 
 # =========================================================
