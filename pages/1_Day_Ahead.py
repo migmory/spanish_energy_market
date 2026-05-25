@@ -607,29 +607,54 @@ def load_live_2026_mix_monthly_from_ree(start_day: date, end_day: date) -> pd.Da
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_live_2026_demand_monthly_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    """Official REE monthly demand from demanda/evolucion.
+
+    Values are returned in MWh for the month, converted to GWh and average GW.
+    """
+    cols = ["datetime", "demand_mwh", "demand_gwh", "avg_demand_gw"]
     start_day = max(start_day, LIVE_START_DATE)
     if start_day > end_day:
-        return pd.DataFrame(columns=["datetime", "demand_mwh"])
+        return pd.DataFrame(columns=cols)
     try:
-        payload = fetch_ree_widget("demanda", "ire-general", start_day, end_day, time_trunc="month")
+        payload = fetch_ree_widget("demanda", "evolucion", start_day, end_day, time_trunc="month")
         df = parse_ree_included_series(payload, value_field="value")
     except Exception:
-        return pd.DataFrame(columns=["datetime", "demand_mwh"])
+        return pd.DataFrame(columns=cols)
     if df.empty:
-        return pd.DataFrame(columns=["datetime", "demand_mwh"])
-    df["title_norm"] = df["title"].astype(str).str.strip().str.lower()
-    preferred = df[df["title_norm"].str.contains("real", na=False)].copy()
-    if preferred.empty:
-        preferred = df.copy()
-    preferred["datetime"] = pd.to_datetime(preferred["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        return pd.DataFrame(columns=cols)
+    if df["title"].nunique() > 1:
+        demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
+        if not demand_like.empty:
+            df = demand_like
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["demand_mwh"] = pd.to_numeric(df["value"], errors="coerce")
+    out = df.dropna(subset=["datetime", "demand_mwh"]).groupby("datetime", as_index=False)["demand_mwh"].sum()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    out["demand_gwh"] = out["demand_mwh"] / 1000.0
+    out["avg_demand_gw"] = out["demand_gwh"] / (out["datetime"].dt.days_in_month * 24)
+    return out[cols].sort_values("datetime").reset_index(drop=True)
 
-    # In the REE monthly demand widget, values are reported in GWh for the monthly view.
-    # Convert them explicitly to MWh so the chart, which later divides by 1000 to display GWh,
-    # lands in the correct 20k-24k GWh range.
-    preferred["demand_mwh"] = pd.to_numeric(preferred["value"], errors="coerce") * 1000.0
 
-    preferred = preferred.dropna(subset=["datetime", "demand_mwh"]).copy()
-    return preferred.groupby("datetime", as_index=False)["demand_mwh"].sum().sort_values("datetime").reset_index(drop=True)
+def build_monthly_demand_evolution_table(demand_monthly: pd.DataFrame, year_sel: int | None = None) -> pd.DataFrame:
+    cols = ["Month", "Demand (GWh)", "Average demand (GW)", "Δ demand vs prev. (%)", "Δ avg demand vs prev. (%)"]
+    if demand_monthly is None or demand_monthly.empty:
+        return pd.DataFrame(columns=cols)
+    tmp = demand_monthly.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    if year_sel is not None:
+        tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
+    tmp = tmp.sort_values("datetime").reset_index(drop=True)
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+    tmp["demand_delta_pct"] = tmp["demand_gwh"] / tmp["demand_gwh"].shift(1) - 1
+    tmp["avg_delta_pct"] = tmp["avg_demand_gw"] / tmp["avg_demand_gw"].shift(1) - 1
+    tmp["Month"] = tmp["datetime"].dt.strftime("%b - %Y")
+    tmp["Demand (GWh)"] = tmp["demand_gwh"]
+    tmp["Average demand (GW)"] = tmp["avg_demand_gw"]
+    tmp["Δ demand vs prev. (%)"] = tmp["demand_delta_pct"]
+    tmp["Δ avg demand vs prev. (%)"] = tmp["avg_delta_pct"]
+    return tmp[cols]
 
 
 def load_live_2026_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
@@ -1771,17 +1796,30 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
     return apply_common_chart_style(chart, height=430)
 
 def build_monthly_renewables_table(mix_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "Month", "Solar injected (GWh)", "Δ solar vs prev. (%)",
+        "Total generation (GWh)", "Δ total vs prev. (%)",
+        "Renewables (GWh)", "% Renewables"
+    ]
     if mix_df.empty:
-        return pd.DataFrame(columns=["Month", "Renewables (MWh)", "Total generation (MWh)", "% Renewables"])
+        return pd.DataFrame(columns=cols)
     tmp = mix_df.copy()
     tmp["month"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
-    total = tmp.groupby("month", as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "Total generation (MWh)"})
-    renew = tmp[tmp["technology"].isin(RENEWABLE_TECHS)].groupby("month", as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "Renewables (MWh)"})
-    out = total.merge(renew, on="month", how="left")
-    out["Renewables (MWh)"] = out["Renewables (MWh)"].fillna(0.0)
-    out["% Renewables"] = out["Renewables (MWh)"] / out["Total generation (MWh)"]
+    grouped = tmp.groupby(["month", "technology"], as_index=False)["energy_mwh"].sum()
+    total = grouped.groupby("month", as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "total_mwh"})
+    renew = grouped[grouped["technology"].isin(RENEWABLE_TECHS)].groupby("month", as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "renewable_mwh"})
+    solar = grouped[grouped["technology"].isin(["Solar PV", "Solar thermal"])].groupby("month", as_index=False)["energy_mwh"].sum().rename(columns={"energy_mwh": "solar_mwh"})
+    out = total.merge(renew, on="month", how="left").merge(solar, on="month", how="left")
+    out[["renewable_mwh", "solar_mwh"]] = out[["renewable_mwh", "solar_mwh"]].fillna(0.0)
+    out = out.sort_values("month").reset_index(drop=True)
+    out["% Renewables"] = out["renewable_mwh"] / out["total_mwh"]
+    out["Solar injected (GWh)"] = out["solar_mwh"] / 1000.0
+    out["Total generation (GWh)"] = out["total_mwh"] / 1000.0
+    out["Renewables (GWh)"] = out["renewable_mwh"] / 1000.0
+    out["Δ solar vs prev. (%)"] = out["Solar injected (GWh)"] / out["Solar injected (GWh)"].shift(1) - 1
+    out["Δ total vs prev. (%)"] = out["Total generation (GWh)"] / out["Total generation (GWh)"].shift(1) - 1
     out["Month"] = out["month"].dt.strftime("%b - %Y")
-    return out[["Month", "Renewables (MWh)", "Total generation (MWh)", "% Renewables"]]
+    return out[cols]
 
 
 def build_selected_day_chart(day_price: pd.DataFrame, day_solar: pd.DataFrame, metrics: dict):
@@ -3849,9 +3887,25 @@ try:
             mt = monthly_renewables_table.copy()
             mt["_year"] = pd.to_datetime(mt["Month"], format="%b - %Y").dt.year
             mt = mt[mt["_year"] == sel_year].drop(columns=["_year"])
-            st.dataframe(styled_df(mt, pct_cols=["% Renewables"]), use_container_width=True)
+            st.dataframe(
+                styled_df(mt, pct_cols=["% Renewables", "Δ solar vs prev. (%)", "Δ total vs prev. (%)"]),
+                use_container_width=True,
+            )
         else:
             st.info("No monthly renewables table available.")
+
+        subtle_subsection("Monthly demand evolution")
+        demand_evolution = build_monthly_demand_evolution_table(
+            load_live_2026_demand_monthly_from_ree(date(max(year_sel, 2026), 1, 1), max_refresh_day()) if year_sel >= 2026 else pd.DataFrame(),
+            year_sel if year_sel >= 2026 else None,
+        )
+        if not demand_evolution.empty:
+            st.dataframe(
+                styled_df(demand_evolution, pct_cols=["Δ demand vs prev. (%)", "Δ avg demand vs prev. (%)"]),
+                use_container_width=True,
+            )
+        else:
+            st.info("No REE demanda/evolucion monthly demand data available for this year.")
 
     # Installed capacity
     section_header("Installed capacity")
