@@ -3828,6 +3828,108 @@ def _bess_summary_numeric_value(df: pd.DataFrame, metric: str, column: str) -> f
     return None if pd.isna(value) else float(value)
 
 
+
+
+def bess_ytd_cards_summary_from_daily_model(
+    price_hourly: pd.DataFrame,
+    *,
+    report_year: int,
+    report_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """
+    Build the YTD/annualized BESS rows directly from the daily dispatch model.
+
+    This avoids small differences between Monthly and Weekly reports caused by
+    summing already-periodized monthly vs weekly BESS aggregates. The card values
+    are now period-independent: same cut-off date + same model = same YTD cards.
+    """
+    cols = ["Metric", "Selected month", "Selected week", "YTD", "Annualized", "Previous year"]
+    if price_hourly is None or price_hourly.empty:
+        return pd.DataFrame(columns=cols)
+
+    report_end = pd.Timestamp(report_end).normalize()
+    report_start = pd.Timestamp(report_year, 1, 1)
+    days_elapsed = max((report_end - report_start).days + 1, 1)
+
+    def _dispatch_ytd(mode: str, cycle_limit_factor: float) -> pd.DataFrame:
+        dispatch = _bess_dispatch_from_model(price_hourly, mode, cycle_limit_factor)
+        if dispatch is None or dispatch.empty:
+            return pd.DataFrame()
+        d = dispatch.copy()
+        d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+        d = d.dropna(subset=["datetime"]).copy()
+        d["day"] = d["datetime"].dt.normalize()
+        d = d[(d["day"] >= report_start) & (d["day"] <= report_end)].copy()
+        return d
+
+    def _revenue_per_mw(dispatch: pd.DataFrame) -> float | None:
+        if dispatch is None or dispatch.empty or BESS_REPORT_POWER_MW <= 0:
+            return None
+        revenue = pd.to_numeric(dispatch.get("bess_revenue_eur"), errors="coerce").sum()
+        return float(revenue) / BESS_REPORT_POWER_MW
+
+    without_dispatch = _dispatch_ytd("without_demand", BESS_REPORT_CYCLE_LIMIT)
+    with_dispatch = _dispatch_ytd("with_demand", BESS_REPORT_CYCLE_LIMIT)
+    standalone_dispatch = _dispatch_ytd("standalone", BESS_REPORT_UNRESTRICTED_CYCLE_FACTOR)
+
+    rev_wo_ytd = _revenue_per_mw(without_dispatch)
+    rev_w_ytd = _revenue_per_mw(with_dispatch)
+    rev_st_ytd = _revenue_per_mw(standalone_dispatch)
+
+    if standalone_dispatch is not None and not standalone_dispatch.empty:
+        standalone_days = max(pd.to_datetime(standalone_dispatch["day"]).nunique(), 1)
+        standalone_discharge = pd.to_numeric(
+            standalone_dispatch.get("discharge_total_mwh"),
+            errors="coerce",
+        ).fillna(0.0).sum()
+        standalone_cycles_day_ytd = (
+            standalone_discharge
+            / max(BESS_REPORT_ETA_DIS, 1e-9)
+            / max(BESS_REPORT_CAPACITY_MWH, 1e-9)
+            / standalone_days
+        )
+    else:
+        standalone_cycles_day_ytd = np.nan
+
+    def _annualize(v):
+        return np.nan if v is None or pd.isna(v) else float(v) * 365.0 / days_elapsed
+
+    rows = [
+        {
+            "Metric": "Revenue w/o demand 1.0c",
+            "Selected month": np.nan,
+            "Selected week": np.nan,
+            "YTD": rev_wo_ytd,
+            "Annualized": _annualize(rev_wo_ytd),
+            "Previous year": np.nan,
+        },
+        {
+            "Metric": "Revenue w. demand 1.0c",
+            "Selected month": np.nan,
+            "Selected week": np.nan,
+            "YTD": rev_w_ytd,
+            "Annualized": _annualize(rev_w_ytd),
+            "Previous year": np.nan,
+        },
+        {
+            "Metric": "Revenue standalone | no cycle cap",
+            "Selected month": np.nan,
+            "Selected week": np.nan,
+            "YTD": rev_st_ytd,
+            "Annualized": _annualize(rev_st_ytd),
+            "Previous year": np.nan,
+        },
+        {
+            "Metric": "Standalone cycles/day avg | no cycle cap",
+            "Selected month": np.nan,
+            "Selected week": np.nan,
+            "YTD": standalone_cycles_day_ytd,
+            "Annualized": standalone_cycles_day_ytd,
+            "Previous year": np.nan,
+        },
+    ]
+    return pd.DataFrame(rows, columns=cols)
+
 def render_bess_ytd_annualized_cards(
     bess_summary: pd.DataFrame,
     *,
@@ -5490,8 +5592,13 @@ if bess_summary.empty:
     st.info("No BESS metrics are available.")
 else:
     st.dataframe(format_bess_summary(bess_summary), use_container_width=True)
+    bess_ytd_cards_summary = bess_ytd_cards_summary_from_daily_model(
+        price_hourly,
+        report_year=selected_week.year,
+        report_end=report_end,
+    )
     render_bess_ytd_annualized_cards(
-        bess_summary,
+        bess_ytd_cards_summary if not bess_ytd_cards_summary.empty else bess_summary,
         report_year=selected_week.year,
         report_end=report_end,
     )
