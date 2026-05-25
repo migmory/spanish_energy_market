@@ -11,3 +11,4 @@ paramiko
 lxml
 reportlab
 scipy
+beautifulsoup4
