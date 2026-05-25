@@ -258,6 +258,48 @@ def delta_pp_arrow_html(current: float | int | None, previous: float | int | Non
         color = "#64748B"
     return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_pp(diff)} vs {reference_label}</span>'
 
+
+def adverse_delta_arrow_html(current: float | int | None, previous: float | int | None, reference_label: str) -> str:
+    """
+    For adverse metrics such as zero/negative hours:
+      - increase = red
+      - decrease = green
+    """
+    delta = pct_change_vs(current, previous)
+    if delta is None or pd.isna(delta):
+        return f'<span style="color:#94A3B8;">→ n/a vs {reference_label}</span>'
+    if delta > 0:
+        arrow = "↑"
+        color = "#DC2626"
+    elif delta < 0:
+        arrow = "↓"
+        color = "#16A34A"
+    else:
+        arrow = "→"
+        color = "#64748B"
+    return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_change_pct(delta)} vs {reference_label}</span>'
+
+
+def adverse_delta_pp_arrow_html(current: float | int | None, previous: float | int | None, reference_label: str) -> str:
+    """
+    For adverse percentage-point metrics such as economic curtailment:
+      - increase = red
+      - decrease = green
+    """
+    if current is None or previous is None or pd.isna(current) or pd.isna(previous):
+        return f'<span style="color:#94A3B8;">→ n/a vs {reference_label}</span>'
+    diff = float(current) - float(previous)
+    if diff > 0:
+        arrow = "↑"
+        color = "#DC2626"
+    elif diff < 0:
+        arrow = "↓"
+        color = "#16A34A"
+    else:
+        arrow = "→"
+        color = "#64748B"
+    return f'<span style="color:{color}; font-weight:700;">{arrow} {fmt_pp(diff)} vs {reference_label}</span>'
+
 def fmt_change_pct(value: float | int | None, decimals: int = 1) -> str:
     if value is None or pd.isna(value):
         return "—"
@@ -1205,6 +1247,61 @@ def _normalize_ree_energy_to_mwh(series: pd.Series) -> pd.Series:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def load_ree_official_demand_weekly_for_report(start_day: date, end_day: date) -> pd.DataFrame:
+    """Official REE demand for weekly report KPIs.
+
+    Source: apidatos demanda/evolucion with peninsular filter. The daily pull
+    is summed to selected weeks. Values are MWh, converted to GWh; average GW
+    uses only the actual selected/WTD days included in the period.
+    """
+    cols = ["datetime", "demand_gwh", "avg_demand_gw", "source"]
+    if start_day > end_day:
+        return pd.DataFrame(columns=cols)
+    try:
+        payload = fetch_ree_widget_for_report("demanda", "evolucion", start_day, end_day, time_trunc="day")
+        df = parse_ree_included_series_for_report(payload)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    if df["title"].nunique() > 1:
+        demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
+        if not demand_like.empty:
+            df = demand_like
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.normalize()
+    df["demand_mwh"] = pd.to_numeric(df["value"], errors="coerce")
+    out = df.dropna(subset=["datetime", "demand_mwh"]).groupby("datetime", as_index=False)["demand_mwh"].sum()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    out["demand_gwh"] = out["demand_mwh"] / 1000.0
+    out["avg_demand_gw"] = out["demand_gwh"] / 24.0
+    out["source"] = "REE demanda/evolucion"
+    return out[cols].sort_values("datetime").reset_index(drop=True)
+
+
+def demand_week_metrics(demand_daily: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> dict[str, float | None]:
+    if demand_daily is None or demand_daily.empty:
+        return {"demand_gwh": None, "avg_demand_gw": None}
+    tmp = demand_daily.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce").dt.normalize()
+    start_ts = pd.Timestamp(start_ts).normalize()
+    end_ts = pd.Timestamp(end_ts).normalize()
+    mask = (tmp["datetime"] >= start_ts) & (tmp["datetime"] <= end_ts)
+    sel = tmp.loc[mask].copy()
+    if sel.empty:
+        return {"demand_gwh": None, "avg_demand_gw": None}
+    demand_gwh = float(pd.to_numeric(sel["demand_gwh"], errors="coerce").sum())
+    days = max(1, int((end_ts - start_ts).days) + 1)
+    return {"demand_gwh": demand_gwh, "avg_demand_gw": demand_gwh / (days * 24.0)}
+
+
+def fmt_gw(value: float | int | None, decimals: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.{decimals}f} GW"
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_live_2026_mix_monthly_for_report(start_day: date, end_day: date) -> pd.DataFrame:
     cols = ["datetime", "technology", "energy_mwh", "data_source"]
     start_day = max(start_day, LIVE_START_DATE)
@@ -1306,10 +1403,10 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
             mask = (mix["datetime"].dt.year == target_month.year) & (mix["datetime"].dt.month == target_month.month)
             mix = mix.loc[mask].copy()
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     mix = mix[mix["technology"].isin(DETAILED_MIX_TECHS)].copy()
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     grouped = mix.groupby("technology", as_index=False)["energy_mwh"].sum()
     energy_map = dict(zip(grouped["technology"], grouped["energy_mwh"]))
     total = float(grouped["energy_mwh"].sum()) if not grouped.empty else np.nan
@@ -1317,6 +1414,7 @@ def build_generation_month_metrics(mix_daily_hist: pd.DataFrame, mix_monthly_liv
     solar_mwh = float(energy_map.get("Solar PV", 0.0) + energy_map.get("Solar thermal", 0.0))
     return {
         "re_share": None if not total or pd.isna(total) else renewables / total,
+        "total_generation_gwh": None if pd.isna(total) else total / 1000.0,
         "solar_gwh": solar_mwh / 1000.0,
         "wind_gwh": float(energy_map.get("Wind", 0.0)) / 1000.0,
         "hydro_gwh": float(energy_map.get("Hydro", 0.0)) / 1000.0,
@@ -1334,16 +1432,16 @@ def build_generation_week_metrics(
     live = mix_daily_live.copy() if mix_daily_live is not None else pd.DataFrame()
     mix = pd.concat([hist, live], ignore_index=True)
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     mix["datetime"] = pd.to_datetime(mix["datetime"], errors="coerce")
     mix = mix.dropna(subset=["datetime"]).copy()
     mask = (mix["datetime"] >= target_week_start) & (mix["datetime"] < target_week_end + pd.Timedelta(days=1))
     mix = mix.loc[mask].copy()
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     mix = mix[mix["technology"].isin(DETAILED_MIX_TECHS)].copy()
     if mix.empty:
-        return {"re_share": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
+        return {"re_share": None, "total_generation_gwh": None, "solar_gwh": None, "wind_gwh": None, "hydro_gwh": None, "nuclear_gwh": None}
     grouped = mix.groupby("technology", as_index=False)["energy_mwh"].sum()
     energy_map = dict(zip(grouped["technology"], grouped["energy_mwh"]))
     total = float(grouped["energy_mwh"].sum()) if not grouped.empty else np.nan
@@ -1351,6 +1449,7 @@ def build_generation_week_metrics(
     solar_mwh = float(energy_map.get("Solar PV", 0.0) + energy_map.get("Solar thermal", 0.0))
     return {
         "re_share": None if not total or pd.isna(total) else renewables / total,
+        "total_generation_gwh": None if pd.isna(total) else total / 1000.0,
         "solar_gwh": solar_mwh / 1000.0,
         "wind_gwh": float(energy_map.get("Wind", 0.0)) / 1000.0,
         "hydro_gwh": float(energy_map.get("Hydro", 0.0)) / 1000.0,
@@ -1358,13 +1457,20 @@ def build_generation_week_metrics(
     }
 
 
-def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str) -> pd.DataFrame:
+def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str, demand_current: dict[str, float | None] | None = None, demand_previous: dict[str, float | None] | None = None) -> pd.DataFrame:
+    if demand_current:
+        current = {**current, **demand_current}
+    if demand_previous:
+        previous = {**previous, **demand_previous}
     specs = [
-        ("🌱 Renewable generation share", "re_share", "share"),
+        ("🌱 Renewable share of total generation", "re_share", "share"),
+        ("⚡ Total generation", "total_generation_gwh", "gwh"),
         ("☀️ Solar injected", "solar_gwh", "gwh"),
         ("💨 Wind injected", "wind_gwh", "gwh"),
         ("💧 Hydro injected", "hydro_gwh", "gwh"),
         ("⚛️ Nuclear injected", "nuclear_gwh", "gwh"),
+        ("📈 Demand total", "demand_gwh", "gwh"),
+        ("📊 Average demand", "avg_demand_gw", "gw"),
     ]
     rows = []
     for label, key, kind in specs:
@@ -1374,6 +1480,10 @@ def build_generation_month_comparison_table(current: dict[str, float | None], pr
             curr_display, prev_display = fmt_pct(curr), fmt_pct(prev)
             share_diff = None if curr is None or prev is None else curr - prev
             diff_display = arrow_pp_text(share_diff)
+        elif kind == "gw":
+            curr_display, prev_display = fmt_gw(curr), fmt_gw(prev)
+            diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
+            diff_display = arrow_change_pct_text(diff)
         else:
             curr_display, prev_display = fmt_gwh(curr), fmt_gwh(prev)
             diff = None if curr is None or prev in [None, 0] or pd.isna(prev) else (curr / prev) - 1
@@ -3706,6 +3816,125 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         ])
     )
 
+
+
+def _bess_summary_numeric_value(df: pd.DataFrame, metric: str, column: str) -> float | None:
+    if df is None or df.empty or column not in df.columns:
+        return None
+    hit = df[df["Metric"] == metric]
+    if hit.empty:
+        return None
+    value = pd.to_numeric(hit.iloc[0][column], errors="coerce")
+    return None if pd.isna(value) else float(value)
+
+
+def render_bess_ytd_annualized_cards(
+    bess_summary: pd.DataFrame,
+    *,
+    report_year: int,
+    report_end: pd.Timestamp,
+) -> None:
+    """
+    Show annualized BESS revenue run-rates only when the report year is still YTD,
+    plus a clear standalone annualized cycles/year metric.
+    """
+    if bess_summary is None or bess_summary.empty:
+        return
+
+    report_end = pd.Timestamp(report_end)
+    year_end = pd.Timestamp(report_year, 12, 31)
+    if report_end >= year_end:
+        return
+
+    rev_wo_ytd = _bess_summary_numeric_value(bess_summary, "Revenue w/o demand 1.0c", "YTD")
+    rev_wo_ann = _bess_summary_numeric_value(bess_summary, "Revenue w/o demand 1.0c", "Annualized")
+    rev_w_ytd = _bess_summary_numeric_value(bess_summary, "Revenue w. demand 1.0c", "YTD")
+    rev_w_ann = _bess_summary_numeric_value(bess_summary, "Revenue w. demand 1.0c", "Annualized")
+    rev_st_ytd = _bess_summary_numeric_value(bess_summary, "Revenue standalone | no cycle cap", "YTD")
+    rev_st_ann = _bess_summary_numeric_value(bess_summary, "Revenue standalone | no cycle cap", "Annualized")
+
+    standalone_cycles_day_ytd = _bess_summary_numeric_value(
+        bess_summary,
+        "Standalone cycles/day avg | no cycle cap",
+        "YTD",
+    )
+    standalone_cycles_year_ann = (
+        standalone_cycles_day_ytd * 365.0
+        if standalone_cycles_day_ytd is not None
+        else None
+    )
+
+    def _rev_card(title: str, annualized: float | None, ytd: float | None, accent: str) -> str:
+        return f"""
+        <div style="
+            border:1px solid #D9E7F3;
+            border-radius:14px;
+            padding:12px 14px;
+            background:linear-gradient(180deg, #FFFFFF 0%, #F8FBFF 100%);
+            box-shadow:0 3px 10px rgba(15, 23, 42, 0.04);
+            min-height:112px;
+        ">
+            <div style="border-left:4px solid {accent}; padding-left:10px;">
+                <div style="font-size:0.78rem; color:#64748B; font-weight:700;">{title}</div>
+                <div style="font-size:1.22rem; font-weight:850; color:#0F172A;">{fmt_mw_revenue(annualized)}</div>
+                <div style="font-size:0.77rem; color:#475569; margin-top:4px;">YTD actual: <b>{fmt_mw_revenue(ytd)}</b></div>
+            </div>
+        </div>
+        """
+
+    def _cycles_card(cycles_year: float | None, cycles_day: float | None) -> str:
+        big = "—" if cycles_year is None or pd.isna(cycles_year) else f"{float(cycles_year):,.0f} cycles/year"
+        small = "—" if cycles_day is None or pd.isna(cycles_day) else f"{float(cycles_day):,.2f} c/day"
+        return f"""
+        <div style="
+            border:1px solid #D9E7F3;
+            border-radius:14px;
+            padding:12px 14px;
+            background:linear-gradient(180deg, #FFFFFF 0%, #F8FAFC 100%);
+            box-shadow:0 3px 10px rgba(15, 23, 42, 0.04);
+            min-height:112px;
+        ">
+            <div style="border-left:4px solid #64748B; padding-left:10px;">
+                <div style="font-size:0.78rem; color:#64748B; font-weight:700;">Standalone no-cycle-cap annualized cycling</div>
+                <div style="font-size:1.22rem; font-weight:850; color:#0F172A;">{big}</div>
+                <div style="font-size:0.77rem; color:#475569; margin-top:4px;">YTD avg: <b>{small}</b></div>
+            </div>
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        <div style="
+            margin-top:10px;
+            margin-bottom:8px;
+            padding:8px 12px;
+            color:#0F172A;
+            background:#F4FCF8;
+            border-left:5px solid #10B981;
+            font-size:1.0rem;
+            font-weight:800;
+            border-radius:8px;
+        ">YTD BESS annualized revenue run-rate and standalone cycling | {report_year}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(_rev_card("Annualized revenue w/o demand 1.0c", rev_wo_ann, rev_wo_ytd, "#F59E0B"), unsafe_allow_html=True)
+    with c2:
+        st.markdown(_rev_card("Annualized revenue w. demand 1.0c", rev_w_ann, rev_w_ytd, "#10B981"), unsafe_allow_html=True)
+    with c3:
+        st.markdown(_rev_card("Annualized revenue standalone | no cycle cap", rev_st_ann, rev_st_ytd, "#1D4ED8"), unsafe_allow_html=True)
+    with c4:
+        st.markdown(_cycles_card(standalone_cycles_year_ann, standalone_cycles_day_ytd), unsafe_allow_html=True)
+
+    st.caption(
+        "Annualized revenues are scaled from YTD revenue using elapsed calendar days. "
+        "Standalone cycles/year is the YTD average cycles/day multiplied by 365."
+    )
+
+
 def _load_hybrid_monthly_file() -> pd.DataFrame:
     """Optional dedicated monthly hybrid capture file."""
     raw = _load_optional_table(HYBRID_MONTHLY_CANDIDATES)
@@ -4875,6 +5104,7 @@ mibgas_actuals = load_mibgas_actuals_for_report()
 historical_mix_daily = load_historical_generation_mix_daily_for_report()
 live_mix_monthly = load_live_2026_mix_monthly_for_report(date(2026, 1, 1), today)
 live_mix_daily = load_live_2026_mix_daily_for_report(date(2026, 1, 1), today)
+official_demand_daily = load_ree_official_demand_weekly_for_report(date(2026, 1, 1), today)
 
 # =========================================================
 # SECTION 1 — DAY AHEAD
@@ -4970,8 +5200,10 @@ kpi_generation_prev = build_generation_week_metrics(
     prev_week,
     week_end(prev_week),
 )
+kpi_demand_current = demand_week_metrics(official_demand_daily, selected_week, report_end)
+kpi_demand_prev = demand_week_metrics(official_demand_daily, prev_week, week_end(prev_week))
 
-k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5)
+k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5, gap="small")
 with k2_1:
     st.metric(
         f"Market spread TB4 | {week_label(selected_week, is_current_wtd)}",
@@ -4989,7 +5221,7 @@ with k2_2:
         help="Number of selected-period day-ahead hours with price less than or equal to zero.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_arrow_html(zero_neg_selected, zero_neg_prev, "prev. week")}<br>Prev. week: <b>{fmt_hours(zero_neg_prev)}</b></div>',
+        f'<div class="metric-footnote">{adverse_delta_arrow_html(zero_neg_selected, zero_neg_prev, "prev. week")}<br>Prev. week: <b>{fmt_hours(zero_neg_prev)}</b></div>',
         unsafe_allow_html=True,
     )
 with k2_3:
@@ -4999,7 +5231,7 @@ with k2_3:
         help="Share of solar generation produced during zero or negative day-ahead price hours.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_pp_arrow_html(curt_selected, curt_prev, "prev. week")}<br>Prev. week: <b>{fmt_pct(curt_prev)}</b></div>',
+        f'<div class="metric-footnote">{adverse_delta_pp_arrow_html(curt_selected, curt_prev, "prev. week")}<br>Prev. week: <b>{fmt_pct(curt_prev)}</b></div>',
         unsafe_allow_html=True,
     )
 with k2_4:
@@ -5013,16 +5245,38 @@ with k2_4:
         unsafe_allow_html=True,
     )
 with k2_5:
+    st.metric(
+        f"Demand total | {week_label(selected_week, is_current_wtd)}",
+        fmt_gwh(kpi_demand_current.get("demand_gwh")),
+        help="Official REE demanda/evolucion demand summed for the selected week, converted to GWh.",
+    )
     st.markdown(
-        f"""
-        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.15rem;">
-            <div style="font-weight:700; margin-bottom:0.35rem;">Other injected generation</div>
-            <div style="margin-bottom:0.42rem;">💨 Wind: <b>{fmt_gwh(kpi_generation_current.get("wind_gwh"))}</b><br>
-                {delta_arrow_html(kpi_generation_current.get("wind_gwh"), kpi_generation_prev.get("wind_gwh"), "prev. week")}</div>
-            <div>💧 Hydro: <b>{fmt_gwh(kpi_generation_current.get("hydro_gwh"))}</b><br>
-                {delta_arrow_html(kpi_generation_current.get("hydro_gwh"), kpi_generation_prev.get("hydro_gwh"), "prev. week")}</div>
+        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. week")}<br>Prev. week: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b></div>',
+        unsafe_allow_html=True,
+    )
+
+st.markdown('<div style="height: 10px;"></div>', unsafe_allow_html=True)
+other_col1, other_col2, other_spacer = st.columns([1.0, 1.0, 3.0], gap="small")
+with other_col1:
+    st.markdown(
+        f'''
+        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.1rem;">
+            <div style="font-weight:800; margin-bottom:0.25rem;">💨 Wind injected</div>
+            <div><b>{fmt_gwh(kpi_generation_current.get("wind_gwh"))}</b></div>
+            <div>{delta_arrow_html(kpi_generation_current.get("wind_gwh"), kpi_generation_prev.get("wind_gwh"), "prev. week")}</div>
         </div>
-        """,
+        ''',
+        unsafe_allow_html=True,
+    )
+with other_col2:
+    st.markdown(
+        f'''
+        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.1rem;">
+            <div style="font-weight:800; margin-bottom:0.25rem;">💧 Hydro injected</div>
+            <div><b>{fmt_gwh(kpi_generation_current.get("hydro_gwh"))}</b></div>
+            <div>{delta_arrow_html(kpi_generation_current.get("hydro_gwh"), kpi_generation_prev.get("hydro_gwh"), "prev. week")}</div>
+        </div>
+        ''',
         unsafe_allow_html=True,
     )
 
@@ -5145,7 +5399,7 @@ if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
 
 
-subsection("Weekly generation injection and renewable share | selected week vs previous week")
+subsection("Weekly generation injection and renewable share of total generation | selected week vs previous week")
 selected_generation_metrics = build_generation_week_metrics(
     historical_mix_daily,
     live_mix_daily if not live_mix_daily.empty else live_mix_monthly,
@@ -5158,11 +5412,15 @@ previous_generation_metrics = build_generation_week_metrics(
     prev_week,
     week_end(prev_week),
 )
+selected_demand_metrics = demand_week_metrics(official_demand_daily, selected_week, report_end)
+previous_demand_metrics = demand_week_metrics(official_demand_daily, prev_week, week_end(prev_week))
 generation_comparison = build_generation_month_comparison_table(
     selected_generation_metrics,
     previous_generation_metrics,
     week_label(selected_week, is_current_wtd),
     week_label(prev_week, False),
+    selected_demand_metrics,
+    previous_demand_metrics,
 )
 st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
 st.caption("Solar = Solar PV + Solar thermal. For 2026, the renewable-share metric uses the REE daily generation-mix pull aggregated to the selected week, with the same detailed-technology filtering used in the Monthly Report.")
@@ -5232,6 +5490,11 @@ if bess_summary.empty:
     st.info("No BESS metrics are available.")
 else:
     st.dataframe(format_bess_summary(bess_summary), use_container_width=True)
+    render_bess_ytd_annualized_cards(
+        bess_summary,
+        report_year=selected_week.year,
+        report_end=report_end,
+    )
 
 subsection("Monthly BESS-model captured hybrid price vs monthly baseload")
 hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(price_hourly)
