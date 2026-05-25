@@ -1117,8 +1117,15 @@ def load_ree_official_demand_monthly_for_report(start_day: date, end_day: date) 
     if out.empty:
         return pd.DataFrame(columns=cols)
     out["demand_gwh"] = out["demand_mwh"] / 1000.0
-    out["hours_in_month"] = out["datetime"].dt.days_in_month * 24
-    out["avg_demand_gw"] = out["demand_gwh"] / out["hours_in_month"]
+    # Average demand for an open MTD month must use only the days actually
+    # included in the REE request, not the full calendar month.
+    start_ts = pd.Timestamp(start_day)
+    end_ts = pd.Timestamp(end_day)
+    out["period_start"] = out["datetime"].map(lambda m: max(pd.Timestamp(m), start_ts))
+    out["period_end"] = out["datetime"].map(lambda m: min(pd.Timestamp(m) + pd.offsets.MonthEnd(0), end_ts))
+    out["hours_in_period"] = ((out["period_end"] + pd.Timedelta(days=1)) - out["period_start"]).dt.total_seconds() / 3600.0
+    out["hours_in_period"] = out["hours_in_period"].clip(lower=1)
+    out["avg_demand_gw"] = out["demand_gwh"] / out["hours_in_period"]
     out["source"] = "REE demanda/evolucion"
     return out[["datetime", "demand_gwh", "avg_demand_gw", "source"]].sort_values("datetime").reset_index(drop=True)
 
@@ -4898,7 +4905,7 @@ with q5:
     )
 
 
-st.markdown('<div style="height: 14px;"></div>', unsafe_allow_html=True)
+st.markdown('<div style="height: 24px;"></div>', unsafe_allow_html=True)
 
 tb4_selected = top_bottom_summary(price_hourly, selected_month, report_end).get("TB4")
 tb4_prev = top_bottom_summary(price_hourly, prev_month, month_end(prev_month)).get("TB4")
@@ -4921,7 +4928,7 @@ kpi_generation_prev = build_generation_month_metrics(
 kpi_demand_current = demand_month_metrics(official_demand_monthly, selected_month)
 kpi_demand_prev = demand_month_metrics(official_demand_monthly, prev_month)
 
-k2_1, k2_2, k2_3, k2_4, k2_5, k2_6 = st.columns(6)
+k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5, gap="small")
 with k2_1:
     st.metric(
         f"Market spread TB4 | {month_label(selected_month, is_current_mtd)}",
@@ -4972,17 +4979,28 @@ with k2_5:
         f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. month")}<br>Prev. month: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b></div>',
         unsafe_allow_html=True,
     )
-with k2_6:
+st.markdown('<div style="height: 10px;"></div>', unsafe_allow_html=True)
+other_col1, other_col2, other_spacer = st.columns([1.0, 1.0, 3.0], gap="small")
+with other_col1:
     st.markdown(
-        f"""
-        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.15rem;">
-            <div style="font-weight:700; margin-bottom:0.35rem;">Other injected generation</div>
-            <div style="margin-bottom:0.42rem;">💨 Wind: <b>{fmt_gwh(kpi_generation_current.get("wind_gwh"))}</b><br>
-                {delta_arrow_html(kpi_generation_current.get("wind_gwh"), kpi_generation_prev.get("wind_gwh"), "prev. month")}</div>
-            <div>💧 Hydro: <b>{fmt_gwh(kpi_generation_current.get("hydro_gwh"))}</b><br>
-                {delta_arrow_html(kpi_generation_current.get("hydro_gwh"), kpi_generation_prev.get("hydro_gwh"), "prev. month")}</div>
+        f'''
+        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.1rem;">
+            <div style="font-weight:800; margin-bottom:0.25rem;">💨 Wind injected</div>
+            <div><b>{fmt_gwh(kpi_generation_current.get("wind_gwh"))}</b></div>
+            <div>{delta_arrow_html(kpi_generation_current.get("wind_gwh"), kpi_generation_prev.get("wind_gwh"), "prev. month")}</div>
         </div>
-        """,
+        ''',
+        unsafe_allow_html=True,
+    )
+with other_col2:
+    st.markdown(
+        f'''
+        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.1rem;">
+            <div style="font-weight:800; margin-bottom:0.25rem;">💧 Hydro injected</div>
+            <div><b>{fmt_gwh(kpi_generation_current.get("hydro_gwh"))}</b></div>
+            <div>{delta_arrow_html(kpi_generation_current.get("hydro_gwh"), kpi_generation_prev.get("hydro_gwh"), "prev. month")}</div>
+        </div>
+        ''',
         unsafe_allow_html=True,
     )
 
