@@ -1,34 +1,40 @@
 """
-Streamlit test REE: potencia instalada SIN autoconsumo — v4.
+Streamlit test REE: potencia instalada 2026 SIN autoconsumo — v5.
 
 Run:
-    pip install streamlit pandas requests plotly
-    streamlit run ree_potencia_instalada_test_v4.py
+    pip install streamlit pandas requests plotly openpyxl
+    streamlit run ree_potencia_instalada_2026_v5.py
 
-Qué corrige esta v4:
-- La v3 intentaba parsear la tabla de tecnologías del HTML del informe, pero esos
-  valores NO vienen en el HTML estático; la web los renderiza/inyecta por JS o por
-  una fuente no expuesta en el HTML que recibe requests.
-- Por eso salían filas absurdas como Solar FV = 230 MW o Potencia total = 0.
-- Esta versión NO intenta parsear tablas ocultas. Solo extrae magnitudes que están
-  explícitamente escritas en el texto del informe:
-    * total nacional instalado a 31/12/año
-    * total incluyendo autoconsumo, cuando aparece
-    * renovables nacionales, cuando aparece
-    * almacenamiento nacional, cuando aparece
-    * solar FV peninsular, cuando aparece
-    * eólica peninsular, cuando aparece
-- Para 2026 mensual mantiene un "probe" de API. Si REE devuelve 500/400, se ve claro.
+Idea:
+- La API pública del widget de potencia instalada devuelve 500/400.
+- Para 2026, REE sí publica los Excel mensuales de boletines.
+- Este script descarga:
+    02-produccion-{mes}-2026.xlsx
+    03-sistemas-no-peninsulares-{mes}-2026.xlsx
+- Extrae la hoja Data 6 / Dat_02:
+    bloque autoconsumo
+    bloque potencia total
+- Calcula:
+    sin_autoconsumo = total_publicado - autoconsumo
+- Devuelve:
+    Península
+    Baleares
+    Canarias
+    Nacional = Península + Baleares + Canarias
+
+Limitación:
+- Ceuta/Melilla aparecen en producción/energía, pero no en los bloques históricos de potencia
+  mensual Dat_02 usados para Baleares/Canarias. Su impacto es pequeño, pero si necesitas
+  "nacional estricto REE", habría que incorporar Ceuta/Melilla por otra fuente.
 """
 
 from __future__ import annotations
 
-import html
+import io
 import re
 from dataclasses import dataclass
 from datetime import date
-from html.parser import HTMLParser
-from typing import Any, Iterable
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
@@ -36,520 +42,480 @@ import requests
 import streamlit as st
 
 
-REPORT_URLS = {
-    2025: "https://www.sistemaelectrico-ree.es/es/informe-del-sistema-electrico/potencia-instalada",
-    2024: "https://www.sistemaelectrico-ree.es/es/2024/informe-del-sistema-electrico/potencia-instalada",
-    2023: "https://www.sistemaelectrico-ree.es/es/2023/informe-del-sistema-electrico/potencia-instalada",
-    2022: "https://www.sistemaelectrico-ree.es/es/2022/informe-del-sistema-electrico/potencia-instalada",
-    2021: "https://www.sistemaelectrico-ree.es/es/2021/informe-del-sistema-electrico/potencia-instalada",
-    2020: "https://www.sistemaelectrico-ree.es/es/2020/informe-del-sistema-electrico/potencia-instalada",
+BASE = "https://www.ree.es/sites/default/files/11_PUBLICACIONES/Documentos"
+
+MONTHS_ES = {
+    1: "enero",
+    2: "febrero",
+    3: "marzo",
+    4: "abril",
+    5: "mayo",
+    6: "junio",
+    7: "julio",
+    8: "agosto",
+    9: "septiembre",
+    10: "octubre",
+    11: "noviembre",
+    12: "diciembre",
 }
 
-API_CANDIDATES = [
-    "https://apidatos.ree.es/es/datos/generacion/potencia-instalada",
-    "https://apidatos.ree.es/es/datos/generacion/potencia-instalada-generacion",
-]
+MONTH_NAME_TO_NUM = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
+TECH_FIX = {
+    "Solar Fotovoltaica": "Solar fotovoltaica",
+    "Solar Térmica": "Solar térmica",
+    "Otras Renovables": "Otras renovables",
+    "Residuos Renovables": "Residuos renovables",
+    "Residuos no Renovables": "Residuos no renovables",
+    "Ciclo Combinado": "Ciclo combinado",
+    "Turbina de Gas": "Turbina de gas",
+    "Turbina de Vapor": "Turbina de vapor",
+    "Motor diésel": "Motor diésel",
+    "Motores diesel": "Motor diésel",
+    "Motores diésel": "Motor diésel",
+    "Total": "Total",
+}
+
+PROD_URL_TEMPLATE = BASE + "/02-produccion-{month}-{year}.xlsx"
+SNP_URL_TEMPLATE = BASE + "/03-sistemas-no-peninsulares-{month}-{year}.xlsx"
 
 
 @dataclass
-class FetchResult:
+class DownloadResult:
     ok: bool
-    source: str
-    df: pd.DataFrame
-    raw: Any | None = None
+    url: str
+    content: bytes | None = None
     error: str | None = None
 
 
-class TextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        data = data.strip()
-        if data:
-            self.parts.append(data)
-
-    def get_text(self) -> str:
-        return "\n".join(self.parts)
+def normalize_tech(x: Any) -> str:
+    s = str(x).strip()
+    s = re.sub(r"\s+", " ", s)
+    return TECH_FIX.get(s, s)
 
 
-def html_to_text(raw_html: str) -> str:
-    parser = TextExtractor()
-    parser.feed(raw_html)
-    text = html.unescape(parser.get_text())
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    return text
-
-
-def parse_es_number_to_mw(token: str | int | float | None, unit: str = "MW") -> float | None:
+def parse_month_label(label: Any) -> pd.Timestamp | None:
     """
-    Convierte números españoles a MW.
-
-    Ejemplos:
-    - "142.558" + MW => 142558
-    - "95,6" + GW => 95600
-    - "10" + GW => 10000
+    '2026 Febrero' -> Timestamp('2026-02-28') aprox month end.
     """
-    if token is None:
+    if not isinstance(label, str):
         return None
 
-    if isinstance(token, (int, float)):
-        val = float(token)
-    else:
-        s = str(token).strip()
-        s = s.replace("\xa0", "").replace(" ", "")
+    m = re.match(r"^\s*(\d{4})\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)\s*$", label)
+    if not m:
+        return None
 
-        if "." in s and "," in s:
-            s = s.replace(".", "").replace(",", ".")
-        elif "," in s:
-            s = s.replace(",", ".")
-        elif re.match(r"^-?\d{1,3}(\.\d{3})+$", s):
-            s = s.replace(".", "")
+    year = int(m.group(1))
+    month_name = m.group(2).strip().lower()
+    month_name = (
+        month_name.replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ü", "u")
+    )
+    month = MONTH_NAME_TO_NUM.get(month_name)
+    if not month:
+        return None
 
-        try:
-            val = float(s)
-        except ValueError:
-            return None
-
-    if unit.upper() == "GW":
-        val *= 1000.0
-
-    return val
+    return pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
 
 
-def first_match_mw(text: str, patterns: list[tuple[str, str]]) -> tuple[float | None, str | None]:
+def download_excel(url: str) -> DownloadResult:
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=45)
+        if r.status_code != 200:
+            return DownloadResult(False, url, error=f"HTTP {r.status_code}: {r.text[:250]}")
+        return DownloadResult(True, url, content=r.content)
+    except Exception as exc:
+        return DownloadResult(False, url, error=f"{type(exc).__name__}: {exc}")
+
+
+def read_xlsx(content: bytes, sheet_name: str) -> pd.DataFrame:
+    return pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None, engine="openpyxl")
+
+
+def extract_block(
+    df: pd.DataFrame,
+    header_row: int,
+    first_data_row: int,
+    last_data_row: int,
+    system: str,
+    block_type: str,
+    source_url: str,
+) -> pd.DataFrame:
     """
-    patterns = [(regex, unit), ...]
-    El regex debe tener un grupo con el número.
+    Extrae un bloque tipo:
+        fila header_row: Mes | 2025 Febrero | ... | 2026 Febrero
+        filas data: tecnología | MW...
+    Índices 0-based.
     """
-    for pattern, unit in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            val = parse_es_number_to_mw(m.group(1), unit)
-            if val is not None:
-                return val, m.group(0)[:300]
-    return None, None
+    month_cols: list[tuple[int, pd.Timestamp]] = []
 
+    for col in range(1, df.shape[1]):
+        dt = parse_month_label(df.iat[header_row, col])
+        if dt is not None:
+            month_cols.append((col, dt))
 
-def parse_report_metrics(text: str, year: int, url: str) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
-    def add(metric: str, value_mw: float | None, source_text: str | None, confidence: str = "high") -> None:
-        if value_mw is None:
-            return
-        rows.append(
-            {
-                "year": year,
-                "date": pd.Timestamp(f"{year}-12-31"),
-                "period": str(year),
-                "metric": metric,
-                "mw": round(float(value_mw), 3),
-                "source_url": url,
-                "source_text": source_text or "",
-                "confidence": confidence,
-            }
-        )
+    for r in range(first_data_row, last_data_row + 1):
+        tech_raw = df.iat[r, 0]
+        if pd.isna(tech_raw):
+            continue
 
-    # Total nacional sin autoconsumo. Esta frase aparece clara en los informes.
-    total, total_src = first_match_mw(
-        text,
-        [
-            (
-                rf"A 31 de diciembre de {year}.*?potencia instalada de\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-            (
-                r"ha alcanzado.*?potencia instalada de\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-        ],
-    )
-    add("Total nacional sin autoconsumo visible", total, total_src)
+        tech = normalize_tech(tech_raw)
 
-    # Total nacional incluyendo autoconsumo: aparece explícito en 2025.
-    total_auto, total_auto_src = first_match_mw(
-        text,
-        [
-            (
-                r"tenemos en cuenta las instalaciones de autoconsumo.*?asciende a\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-            (
-                r"incluyendo autoconsumo.*?([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-        ],
-    )
-    add("Total nacional incluyendo autoconsumo", total_auto, total_auto_src)
+        for col, dt in month_cols:
+            val = df.iat[r, col]
+            if pd.isna(val):
+                continue
 
-    # Renovables nacionales: aparece como X GW.
-    renov, renov_src = first_match_mw(
-        text,
-        [
-            (
-                r"alcanzar una potencia instalada de fuentes de generación renovables de\s+([0-9\.\,]+)\s*GW",
-                "GW",
-            ),
-            (
-                r"potencia instalada de generación renovable.*?alcanz.*?([0-9\.\,]+)\s*GW",
-                "GW",
-            ),
-        ],
-    )
-    add("Renovables nacional", renov, renov_src)
+            try:
+                mw = float(val)
+            except Exception:
+                continue
 
-    # Almacenamiento nacional.
-    storage, storage_src = first_match_mw(
-        text,
-        [
-            (
-                rf"potencia instalada de almacenamiento del sistema eléctrico español en {year} se sitúa en\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-            (
-                r"almacenamiento del sistema eléctrico español.*?se sitúa en\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-        ],
-    )
-    add("Almacenamiento nacional", storage, storage_src)
+            # Evita columnas auxiliares donde aparece un porcentaje junto al último mes.
+            # Para MW totales, valores absurdamente pequeños en Total pueden ser porcentajes.
+            if tech == "Total" and mw < 100:
+                continue
 
-    # Turbinación bombeo y baterías, si están en el texto.
-    pumped, pumped_src = first_match_mw(
-        text,
-        [
-            (
-                r"de los cuales\s+([0-9\.\,]+)\s+corresponden a turbinación bombeo",
-                "MW",
+            rows.append(
+                {
+                    "system": system,
+                    "date": dt,
+                    "period": dt.strftime("%Y-%m"),
+                    "technology": tech,
+                    "block": block_type,
+                    "mw": mw,
+                    "source_url": source_url,
+                }
             )
-        ],
-    )
-    add("Turbinación bombeo nacional", pumped, pumped_src)
-
-    batteries, batteries_src = first_match_mw(
-        text,
-        [
-            (
-                r"turbinación bombeo y\s+([0-9\.\,]+)\s*MW a baterías",
-                "MW",
-            )
-        ],
-    )
-    add("Baterías nacional", batteries, batteries_src)
-
-    # Solar FV peninsular. No es nacional; lo marco claramente.
-    pv_pen, pv_pen_src = first_match_mw(
-        text,
-        [
-            (
-                r"solar fotovoltaica.*?potencia instalada peninsular con\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            ),
-            (
-                r"solar fotovoltaica.*?con\s+([0-9\.\,]+)\s*MW.*?potencia instalada peninsular",
-                "MW",
-            ),
-        ],
-    )
-    add("Solar fotovoltaica peninsular", pv_pen, pv_pen_src)
-
-    # Eólica peninsular.
-    wind_pen, wind_pen_src = first_match_mw(
-        text,
-        [
-            (
-                r"potencia instalada eólica.*?con un total de\s+([0-9\.\,]+)\s*MW",
-                "MW",
-            )
-        ],
-    )
-    add("Eólica peninsular", wind_pen, wind_pen_src)
 
     return pd.DataFrame(rows)
 
 
-def fetch_report_year(year: int) -> FetchResult:
-    url = REPORT_URLS.get(year)
-    if not url:
-        return FetchResult(False, f"report {year}", pd.DataFrame(), error=f"No hay URL configurada para {year}")
+def parse_peninsula_production_excel(content: bytes, source_url: str) -> pd.DataFrame:
+    """
+    Hoja Data 6 del Excel de Producción:
+    - filas 6-17: autoconsumo Península
+    - filas 21-38: total Península incluyendo autoconsumo
+    Ojo: pandas 0-based => fila Excel 6 es índice 5.
+    """
+    df = read_xlsx(content, "Data 6")
 
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        if r.status_code != 200:
-            return FetchResult(False, url, pd.DataFrame(), error=f"HTTP {r.status_code}: {r.text[:300]}")
+    auto = extract_block(
+        df,
+        header_row=5,       # Excel row 6
+        first_data_row=7,   # Excel row 8
+        last_data_row=16,   # Excel row 17
+        system="Península",
+        block_type="autoconsumo",
+        source_url=source_url,
+    )
 
-        text = html_to_text(r.text)
-        df = parse_report_metrics(text, year, url)
+    total = extract_block(
+        df,
+        header_row=20,      # Excel row 21
+        first_data_row=22,  # Excel row 23
+        last_data_row=37,   # Excel row 38
+        system="Península",
+        block_type="total_incl_autoconsumo",
+        source_url=source_url,
+    )
 
-        if df.empty:
-            return FetchResult(False, url, pd.DataFrame(), raw=text[:5000], error="Página descargada, pero sin métricas parseables.")
-
-        return FetchResult(True, url, df, raw=text[:5000])
-
-    except Exception as exc:
-        return FetchResult(False, url, pd.DataFrame(), error=f"{type(exc).__name__}: {exc}")
-
-
-def fetch_reports(start_year: int, end_year: int) -> FetchResult:
-    dfs: list[pd.DataFrame] = []
-    errors: list[str] = []
-
-    for year in range(start_year, end_year + 1):
-        res = fetch_report_year(year)
-        if res.ok:
-            dfs.append(res.df)
-        else:
-            errors.append(f"{year}: {res.error}")
-
-    if dfs:
-        return FetchResult(
-            ok=True,
-            source="Informes del sistema eléctrico REE",
-            df=pd.concat(dfs, ignore_index=True),
-            error="\n".join(errors) if errors else None,
-        )
-
-    return FetchResult(False, "Informes del sistema eléctrico REE", pd.DataFrame(), error="\n".join(errors))
+    return pd.concat([auto, total], ignore_index=True)
 
 
-def walk_dicts(obj: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(obj, dict):
-        yield obj
-        for value in obj.values():
-            yield from walk_dicts(value)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from walk_dicts(item)
+def parse_snp_excel(content: bytes, source_url: str) -> pd.DataFrame:
+    """
+    Hoja Dat_02 del Excel SNP:
+    Baleares:
+      - filas 6-13 auto
+      - filas 17-31 total
+    Canarias:
+      - filas 39-46 auto
+      - filas 50-64 total
+    Todo en índices 0-based.
+    """
+    df = read_xlsx(content, "Dat_02")
 
-
-def parse_api_json(raw: dict[str, Any]) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-
-    for node in walk_dicts(raw):
-        attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else {}
-        values = node.get("values") or attrs.get("values")
-
-        if not isinstance(values, list):
-            continue
-
-        title = (
-            node.get("title")
-            or node.get("name")
-            or attrs.get("title")
-            or attrs.get("name")
-            or node.get("type")
-            or attrs.get("type")
-            or "unknown"
-        )
-
-        for point in values:
-            if not isinstance(point, dict):
-                continue
-
-            dt = point.get("datetime") or point.get("date")
-            val = parse_es_number_to_mw(point.get("value"), "MW")
-
-            if dt is None or val is None:
-                continue
-
-            rows.append({"datetime": dt, "metric": str(title), "mw": val})
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    df["date"] = pd.to_datetime(df["datetime"], errors="coerce").dt.tz_localize(None)
-    df = df.dropna(subset=["date"]).copy()
-    df["year"] = df["date"].dt.year
-    df["period"] = df["date"].dt.to_period("M").astype(str)
-    return df
-
-
-def probe_monthly_api(start: str, end: str) -> FetchResult:
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 streamlit-ree-test/0.4",
-    }
-
-    param_sets = [
-        {"start_date": start, "end_date": end, "time_trunc": "month"},
-        {
-            "start_date": start,
-            "end_date": end,
-            "time_trunc": "month",
-            "systemElectric": "nacional",
-        },
-        {
-            "start_date": start,
-            "end_date": end,
-            "time_trunc": "month",
-            "geo_trunc": "electric_system",
-            "geo_limit": "nacional",
-            "geo_ids": "8741",
-        },
+    blocks = [
+        # Baleares autoconsumo
+        dict(header_row=5, first_data_row=7, last_data_row=12, system="Baleares", block_type="autoconsumo"),
+        # Baleares total incluyendo autoconsumo
+        dict(header_row=16, first_data_row=18, last_data_row=30, system="Baleares", block_type="total_incl_autoconsumo"),
+        # Canarias autoconsumo
+        dict(header_row=38, first_data_row=40, last_data_row=45, system="Canarias", block_type="autoconsumo"),
+        # Canarias total incluyendo autoconsumo
+        dict(header_row=49, first_data_row=51, last_data_row=63, system="Canarias", block_type="total_incl_autoconsumo"),
     ]
 
+    out = []
+    for b in blocks:
+        out.append(extract_block(df, source_url=source_url, **b))
+
+    return pd.concat(out, ignore_index=True)
+
+
+def compute_without_autoconsumo(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    total_incl_autoconsumo - autoconsumo por sistema/mes/tecnología.
+    Si una tecnología no existe en autoconsumo, autoconsumo = 0.
+    """
+    if raw.empty:
+        return raw
+
+    total = raw[raw["block"].eq("total_incl_autoconsumo")].copy()
+    auto = raw[raw["block"].eq("autoconsumo")].copy()
+
+    keys = ["system", "date", "period", "technology"]
+
+    total = total.rename(columns={"mw": "mw_total_incl_autoconsumo"})
+    auto = auto.rename(columns={"mw": "mw_autoconsumo"})
+
+    merged = total[keys + ["mw_total_incl_autoconsumo", "source_url"]].merge(
+        auto[keys + ["mw_autoconsumo"]],
+        on=keys,
+        how="left",
+    )
+
+    merged["mw_autoconsumo"] = merged["mw_autoconsumo"].fillna(0.0)
+    merged["mw_sin_autoconsumo"] = (
+        merged["mw_total_incl_autoconsumo"] - merged["mw_autoconsumo"]
+    )
+
+    # Evita -0.000000 por redondeos.
+    merged.loc[merged["mw_sin_autoconsumo"].abs() < 1e-9, "mw_sin_autoconsumo"] = 0.0
+
+    return merged.sort_values(["date", "system", "technology"]).reset_index(drop=True)
+
+
+def aggregate_national(clean: pd.DataFrame) -> pd.DataFrame:
+    """
+    Suma Península + Baleares + Canarias.
+    """
+    if clean.empty:
+        return clean
+
+    value_cols = ["mw_total_incl_autoconsumo", "mw_autoconsumo", "mw_sin_autoconsumo"]
+    nat = (
+        clean.groupby(["date", "period", "technology"], as_index=False)[value_cols]
+        .sum()
+        .assign(system="Nacional parcial")
+    )
+    nat["source_url"] = "Suma Península + Baleares + Canarias desde boletines mensuales REE"
+
+    cols = ["system", "date", "period", "technology"] + value_cols + ["source_url"]
+    return nat[cols].sort_values(["date", "technology"]).reset_index(drop=True)
+
+
+def get_month_data(year: int, month: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """
+    Descarga producción y SNP para un mes/año y devuelve:
+    raw_blocks, clean_without_autoconsumo, errores
+    """
+    month_slug = MONTHS_ES[month]
+
+    prod_url = PROD_URL_TEMPLATE.format(month=month_slug, year=year)
+    snp_url = SNP_URL_TEMPLATE.format(month=month_slug, year=year)
+
     errors: list[str] = []
+    raw_parts: list[pd.DataFrame] = []
 
-    for endpoint in API_CANDIDATES:
-        for params in param_sets:
-            try:
-                r = requests.get(endpoint, params=params, headers=headers, timeout=30)
+    prod = download_excel(prod_url)
+    if prod.ok and prod.content:
+        try:
+            raw_parts.append(parse_peninsula_production_excel(prod.content, prod.url))
+        except Exception as exc:
+            errors.append(f"Producción {month_slug} {year}: parse error {type(exc).__name__}: {exc}")
+    else:
+        errors.append(f"Producción {month_slug} {year}: {prod.error}")
 
-                if r.status_code != 200:
-                    errors.append(f"{endpoint} | {params} | HTTP {r.status_code}: {r.text[:250]}")
-                    continue
+    snp = download_excel(snp_url)
+    if snp.ok and snp.content:
+        try:
+            raw_parts.append(parse_snp_excel(snp.content, snp.url))
+        except Exception as exc:
+            errors.append(f"SNP {month_slug} {year}: parse error {type(exc).__name__}: {exc}")
+    else:
+        errors.append(f"SNP {month_slug} {year}: {snp.error}")
 
-                raw = r.json()
-                df = parse_api_json(raw)
+    if not raw_parts:
+        return pd.DataFrame(), pd.DataFrame(), errors
 
-                if not df.empty:
-                    return FetchResult(True, f"{endpoint} | params={params}", df, raw=raw)
+    raw = pd.concat(raw_parts, ignore_index=True)
+    clean = compute_without_autoconsumo(raw)
+    nat = aggregate_national(clean)
+    clean_all = pd.concat([clean, nat], ignore_index=True)
 
-                errors.append(f"{endpoint} | {params} | HTTP 200 pero sin series parseables")
+    # Nos quedamos solo con meses del año solicitado.
+    clean_all = clean_all[clean_all["date"].dt.year.eq(year)].copy()
+    raw = raw[raw["date"].dt.year.eq(year)].copy()
 
-            except Exception as exc:
-                errors.append(f"{endpoint} | {params} | {type(exc).__name__}: {exc}")
-
-    return FetchResult(False, "REData API monthly probe", pd.DataFrame(), error="\n".join(errors))
+    return raw, clean_all, errors
 
 
-def validate_2025(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
+def get_2026_until(month_to_try: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    raw_all = []
+    clean_all = []
+    errors = []
 
-    checks: list[dict[str, Any]] = []
-    d2025 = df[df["year"].eq(2025)]
+    for m in range(1, month_to_try + 1):
+        raw, clean, err = get_month_data(2026, m)
+        if not raw.empty:
+            raw_all.append(raw)
+        if not clean.empty:
+            clean_all.append(clean)
+        errors.extend(err)
 
-    expected = {
-        "Total nacional sin autoconsumo visible": 142_558,
-        "Total nacional incluyendo autoconsumo": 150_809,
-        "Almacenamiento nacional": 3_427,
-        "Solar fotovoltaica peninsular": 40_952,
-        "Eólica peninsular": 32_593,
-    }
+    raw_df = pd.concat(raw_all, ignore_index=True) if raw_all else pd.DataFrame()
+    clean_df = pd.concat(clean_all, ignore_index=True) if clean_all else pd.DataFrame()
 
-    for metric, exp in expected.items():
-        row = d2025[d2025["metric"].eq(metric)]
-        if row.empty:
-            continue
-        got = float(row.iloc[-1]["mw"])
-        checks.append(
-            {
-                "metric": metric,
-                "expected_mw": exp,
-                "got_mw": got,
-                "diff_mw": got - exp,
-                "status": "OK" if abs(got - exp) < 1 else "REVISAR",
-            }
+    # Quitar duplicados: cada boletín trae histórico desde 2025; nos quedamos con el último fichero
+    # que contiene cada periodo/tecnología/sistema.
+    if not clean_df.empty:
+        clean_df = clean_df.sort_values(["date", "source_url"]).drop_duplicates(
+            subset=["system", "period", "technology"],
+            keep="last",
         )
+        clean_df = clean_df.sort_values(["date", "system", "technology"]).reset_index(drop=True)
 
-    return pd.DataFrame(checks)
+    return raw_df, clean_df, errors
 
 
 def main() -> None:
-    st.set_page_config(page_title="REE potencia instalada v4", layout="wide")
-    st.title("REE potencia instalada — test sin autoconsumo v4")
+    st.set_page_config(page_title="REE potencia instalada 2026 v5", layout="wide")
+    st.title("REE potencia instalada 2026 — sin autoconsumo v5")
 
-    st.warning(
-        "Importante: la tabla de tecnologías del informe no viene en el HTML estático. "
-        "Esta versión evita parsear esa tabla y solo extrae datos explícitos del texto, "
-        "para no generar números falsos."
+    st.markdown(
+        """
+        Esta versión usa los **Excel mensuales de boletines REE** en vez del endpoint API que devuelve 500/400.
+        Calcula **sin autoconsumo** como:
+
+        `potencia total publicada - potencia autoconsumo`
+
+        Fuente base:
+        - `02-produccion-{mes}-2026.xlsx` para Península.
+        - `03-sistemas-no-peninsulares-{mes}-2026.xlsx` para Baleares y Canarias.
+        """
     )
 
     with st.sidebar:
         st.header("Parámetros")
-        start_year = st.number_input("Año inicio anual", min_value=2020, max_value=2025, value=2020)
-        end_year = st.number_input("Año fin anual", min_value=2020, max_value=2025, value=2025)
-        start_2026 = st.date_input("Inicio mensual 2026", value=date(2026, 1, 1))
-        end_2026 = st.date_input("Fin mensual 2026", value=date(2026, 12, 31))
-        show_sources = st.checkbox("Mostrar texto fuente de cada métrica", value=False)
-        show_debug = st.checkbox("Mostrar debug API", value=True)
+        month_to_try = st.selectbox(
+            "Hasta qué mes de 2026 intentar descargar",
+            options=list(MONTHS_ES.keys()),
+            index=min(date.today().month, 12) - 1,
+            format_func=lambda m: MONTHS_ES[m].capitalize(),
+        )
+        system_filter = st.multiselect(
+            "Sistema",
+            ["Nacional parcial", "Península", "Baleares", "Canarias"],
+            default=["Nacional parcial", "Península"],
+        )
+        show_raw = st.checkbox("Mostrar bloques raw", value=False)
+        show_errors = st.checkbox("Mostrar errores/URLs no disponibles", value=True)
 
-    if start_year > end_year:
-        st.error("El año inicial no puede ser mayor que el año final.")
+    with st.spinner("Descargando y parseando boletines REE..."):
+        raw_df, clean_df, errors = get_2026_until(int(month_to_try))
+
+    if clean_df.empty:
+        st.error("No se ha podido extraer ningún dato mensual 2026 desde los Excel.")
+        if errors:
+            st.code("\n".join(errors), language="text")
         return
 
-    st.header("1) Anual desde texto de informes REE")
+    st.success("Datos 2026 extraídos desde boletines mensuales REE.")
 
-    annual_res = fetch_reports(int(start_year), int(end_year))
+    filtered = clean_df[clean_df["system"].isin(system_filter)].copy()
 
-    if annual_res.ok:
-        df = annual_res.df.copy()
-        st.success(f"Datos extraídos desde: {annual_res.source}")
+    st.subheader("Potencia instalada sin autoconsumo")
+    st.dataframe(filtered, use_container_width=True)
 
-        display_cols = ["year", "metric", "mw", "confidence", "source_url"]
-        if show_sources:
-            display_cols.append("source_text")
+    latest_period = filtered["period"].max()
+    latest = filtered[(filtered["period"].eq(latest_period)) & (filtered["technology"].eq("Total"))].copy()
 
-        st.dataframe(df[display_cols], use_container_width=True)
+    if not latest.empty:
+        st.subheader(f"Último total disponible: {latest_period}")
+        cols = st.columns(len(latest))
+        for col, (_, row) in zip(cols, latest.iterrows()):
+            col.metric(
+                row["system"],
+                f"{row['mw_sin_autoconsumo']:,.0f} MW".replace(",", "."),
+                help=(
+                    f"Total incl. autoconsumo: {row['mw_total_incl_autoconsumo']:,.0f} MW; "
+                    f"Autoconsumo: {row['mw_autoconsumo']:,.0f} MW"
+                ).replace(",", "."),
+            )
 
-        checks = validate_2025(df)
-        if not checks.empty:
-            st.subheader("Validación 2025")
-            st.dataframe(checks, use_container_width=True)
+    chart_df = filtered[filtered["technology"].ne("Total")].copy()
+    fig = px.line(
+        chart_df,
+        x="period",
+        y="mw_sin_autoconsumo",
+        color="technology",
+        facet_row="system" if len(system_filter) > 1 else None,
+        markers=True,
+        title="Potencia instalada 2026 sin autoconsumo por tecnología",
+    )
+    fig.update_layout(yaxis_title="MW sin autoconsumo", xaxis_title="Mes")
+    st.plotly_chart(fig, use_container_width=True)
 
-        pivot = df.pivot_table(index="year", columns="metric", values="mw", aggfunc="last").reset_index()
-        st.subheader("Vista pivote")
-        st.dataframe(pivot, use_container_width=True)
+    st.subheader("Comparativa total: incl. autoconsumo vs sin autoconsumo")
+    comp = filtered[filtered["technology"].eq("Total")].copy()
+    comp_long = comp.melt(
+        id_vars=["system", "period", "technology"],
+        value_vars=["mw_total_incl_autoconsumo", "mw_autoconsumo", "mw_sin_autoconsumo"],
+        var_name="serie",
+        value_name="mw",
+    )
+    fig2 = px.line(
+        comp_long,
+        x="period",
+        y="mw",
+        color="serie",
+        line_dash="system",
+        markers=True,
+        title="Total instalado: total publicado, autoconsumo y sin autoconsumo",
+    )
+    fig2.update_layout(yaxis_title="MW", xaxis_title="Mes")
+    st.plotly_chart(fig2, use_container_width=True)
 
-        fig = px.line(
-            df,
-            x="year",
-            y="mw",
-            color="metric",
-            markers=True,
-            title="Métricas extraídas del texto del informe",
-        )
-        fig.update_layout(yaxis_title="MW", xaxis_title="Año")
-        st.plotly_chart(fig, use_container_width=True)
+    st.download_button(
+        "Descargar CSV limpio",
+        data=clean_df.to_csv(index=False).encode("utf-8"),
+        file_name="ree_potencia_instalada_2026_sin_autoconsumo_v5.csv",
+        mime="text/csv",
+    )
 
-        st.download_button(
-            "Descargar anual CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="ree_potencia_instalada_informe_texto_v4.csv",
-            mime="text/csv",
-        )
-    else:
-        st.error("No se pudo extraer la parte anual.")
-        st.code(annual_res.error or "Sin detalle", language="text")
+    if show_raw:
+        st.subheader("Raw blocks")
+        st.dataframe(raw_df, use_container_width=True)
 
-    st.header("2) Mensual 2026 — probe API")
+    if show_errors and errors:
+        st.subheader("Errores / meses no publicados todavía")
+        st.code("\n".join(errors), language="text")
 
-    monthly_start = f"{start_2026:%Y-%m-%d}T00:00"
-    monthly_end = f"{end_2026:%Y-%m-%d}T23:59"
-    monthly_res = probe_monthly_api(monthly_start, monthly_end)
-
-    if monthly_res.ok:
-        st.success(f"Mensual 2026 cargado desde API: {monthly_res.source}")
-        st.dataframe(monthly_res.df, use_container_width=True)
-        fig_m = px.line(
-            monthly_res.df,
-            x="period",
-            y="mw",
-            color="metric",
-            markers=True,
-            title="Potencia instalada mensual 2026 desde API",
-        )
-        st.plotly_chart(fig_m, use_container_width=True)
-    else:
-        st.info(
-            "No se ha encontrado mensual 2026 por API pública para este widget. "
-            "En tu prueba ya se veía HTTP 500/400, así que esto probablemente no está expuesto."
-        )
-        if show_debug:
-            st.code(monthly_res.error or "Sin detalle", language="text")
-
-    if show_debug:
-        st.header("Debug")
-        st.subheader("Errores de informes")
-        st.code(annual_res.error or "Sin errores de informes", language="text")
-
-        st.subheader("Endpoints API probados")
-        st.code("\n".join(API_CANDIDATES), language="text")
+    st.caption(
+        "Nota: 'Nacional parcial' suma Península + Baleares + Canarias. "
+        "Ceuta/Melilla no están incorporadas en este cálculo desde estos bloques históricos."
+    )
 
 
 if __name__ == "__main__":
