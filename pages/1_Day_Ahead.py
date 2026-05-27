@@ -68,7 +68,19 @@ HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_SOLAR_FILE = DATA_DIR / "p48solar_since21.csv"
 HIST_WORKBOOK_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 HIST_MIX_FILE = DATA_DIR / "generation_mix_daily_2021_2025.xlsx"
-HIST_INSTALLED_CAP_FILE = DATA_DIR / "installed_capacity_monthly.xlsx"
+HIST_INSTALLED_CAP_FILE = DATA_DIR / "Potencia instalada anual sin autoconsumo (MW).xlsx"
+HIST_INSTALLED_CAP_FALLBACK_FILE = DATA_DIR / "installed_capacity_monthly.xlsx"
+
+# REE monthly production reports used for 2026 live installed capacity without autoconsumo.
+# The 2026 extraction mirrors the working test page: download monthly REE production
+# Excel files, read Data 6, and compute total_incl_autoconsumo - autoconsumo.
+REE_PUBLICATIONS_BASE = "https://www.ree.es/sites/default/files/11_PUBLICACIONES/Documentos"
+REE_PRODUCTION_URL_TEMPLATE = REE_PUBLICATIONS_BASE + "/02-produccion-{month}-{year}.xlsx"
+REE_MONTHS_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+    7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
+}
+REE_MONTH_NAME_TO_NUM = {v: k for k, v in REE_MONTHS_ES.items()}
 
 # Hourly forward-price files used for Aurora/Baringa scenario overlays.
 # In the app layout these live next to /pages in /forward_curves.
@@ -132,6 +144,16 @@ LOCAL_MIX_TECH_MAP = {
     "Residuos renovables": "Biomass",
     "Biogás": "Biogas",
     "Biomasa": "Biomass",
+    "Baterías": "Batteries",
+    "Fuel": "Fuel + Gas",
+    "Turbina de Gas": "Gas turbine",
+    "Turbina de Vapor": "Steam turbine",
+    "Ciclo Combinado": "CCGT",
+    "Solar Fotovoltaica": "Solar PV",
+    "Solar Térmica": "Solar thermal",
+    "Otras Renovables": "Other renewables",
+    "Residuos Renovables": "Biomass",
+    "Residuos no Renovables": "Other non-renewables",
 }
 
 RENEWABLE_TECHS = {
@@ -187,6 +209,7 @@ CAPACITY_COLOR_DOMAIN = [
     "Solar PV",
     "Wind",
     "Hydro",
+    "Batteries",
     "CCGT",
     "Nuclear",
     "Solar thermal",
@@ -198,6 +221,7 @@ CAPACITY_COLOR_DOMAIN = [
     "Coal",
     "Fuel + Gas",
     "Steam turbine",
+    "Gas turbine",
     "Other non-renewables",
 ]
 
@@ -205,6 +229,7 @@ CAPACITY_COLOR_RANGE = [
     "#FACC15",  # Solar PV - yellow
     "#2563EB",  # Wind - blue
     "#38BDF8",  # Hydro - light blue
+    "#22C55E",  # Batteries - green
     "#9CA3AF",  # CCGT - grey
     "#C084FC",
     "#FCA5A5",
@@ -216,6 +241,7 @@ CAPACITY_COLOR_RANGE = [
     "#374151",
     "#6B7280",
     "#4B5563",
+    "#D946EF",
     "#7C2D12",
 ]
 
@@ -657,71 +683,175 @@ def build_monthly_demand_evolution_table(demand_monthly: pd.DataFrame, year_sel:
     return tmp[cols]
 
 
-def load_live_2026_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
-    """Load live 2026 installed capacity from REE monthly API.
+def _normalise_ree_month_name(value: str) -> str:
+    return (
+        str(value).strip().lower()
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ü", "u")
+    )
 
-    Installed capacity is a stock and REE sometimes publishes the current year
-    with only the latest completed/available month. This function therefore tries
-    several month-end windows and keeps whatever 2026 months are available, so
-    the annual additions chart can show 2026 even when the year/month is not
-    complete yet.
+
+def _parse_ree_capacity_month_label(label) -> pd.Timestamp | None:
+    """Parse labels from REE monthly production Excel, e.g. '2026 Febrero'."""
+    if not isinstance(label, str):
+        return None
+    m = re.match(r"^\s*(\d{4})\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)\s*$", label)
+    if not m:
+        return None
+    year = int(m.group(1))
+    month = REE_MONTH_NAME_TO_NUM.get(_normalise_ree_month_name(m.group(2)))
+    if not month:
+        return None
+    return pd.Timestamp(year=year, month=month, day=1)
+
+
+def _download_ree_production_excel(year: int, month: int) -> tuple[bytes | None, str | None]:
+    month_slug = REE_MONTHS_ES.get(int(month))
+    if not month_slug:
+        return None, None
+    url = REE_PRODUCTION_URL_TEMPLATE.format(month=month_slug, year=year)
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=45)
+        if resp.status_code != 200:
+            return None, url
+        return resp.content, url
+    except Exception:
+        return None, url
+
+
+def _extract_ree_capacity_block(
+    raw_sheet: pd.DataFrame,
+    *,
+    header_row: int,
+    first_data_row: int,
+    last_data_row: int,
+    block_type: str,
+    source_url: str,
+) -> pd.DataFrame:
+    """Extract one Data 6 installed-capacity block from a REE monthly production workbook."""
+    month_cols: list[tuple[int, pd.Timestamp]] = []
+    for col in range(1, raw_sheet.shape[1]):
+        dt = _parse_ree_capacity_month_label(raw_sheet.iat[header_row, col])
+        if dt is not None:
+            month_cols.append((col, dt))
+
+    rows: list[dict] = []
+    for row_idx in range(first_data_row, last_data_row + 1):
+        tech_raw = raw_sheet.iat[row_idx, 0]
+        if pd.isna(tech_raw):
+            continue
+        tech_name = str(tech_raw).strip()
+        tech = LOCAL_MIX_TECH_MAP.get(tech_name, tech_name)
+        for col_idx, dt in month_cols:
+            value = pd.to_numeric(raw_sheet.iat[row_idx, col_idx], errors="coerce")
+            if pd.isna(value):
+                continue
+            # Skip percentage/helper columns if any are accidentally detected.
+            if tech_name.strip().lower() == "total" and float(value) < 100:
+                continue
+            rows.append(
+                {
+                    "datetime": pd.Timestamp(dt).to_period("M").to_timestamp(),
+                    "technology": tech,
+                    "block": block_type,
+                    "capacity_mw": float(value),
+                    "source_url": source_url,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _parse_ree_monthly_production_capacity_without_autoconsumo(content: bytes, source_url: str, year: int) -> pd.DataFrame:
+    """Parse all Peninsular technologies from REE Data 6 and remove autoconsumo where present."""
+    try:
+        raw_sheet = pd.read_excel(BytesIO(content), sheet_name="Data 6", header=None, engine="openpyxl")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw", "capacity_source"])
+
+    # Working test structure: Data 6, 0-based rows:
+    # autoconsumo block header=5 rows=7:16; total incl. autoconsumo header=20 rows=22:37.
+    auto = _extract_ree_capacity_block(
+        raw_sheet,
+        header_row=5,
+        first_data_row=7,
+        last_data_row=16,
+        block_type="autoconsumo",
+        source_url=source_url,
+    )
+    total = _extract_ree_capacity_block(
+        raw_sheet,
+        header_row=20,
+        first_data_row=22,
+        last_data_row=37,
+        block_type="total_incl_autoconsumo",
+        source_url=source_url,
+    )
+
+    if total.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw", "capacity_source"])
+
+    total = total[total["datetime"].dt.year.eq(year)].copy()
+    auto = auto[auto["datetime"].dt.year.eq(year)].copy() if not auto.empty else auto
+    if total.empty:
+        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw", "capacity_source"])
+
+    keys = ["datetime", "technology"]
+    total = total.rename(columns={"capacity_mw": "capacity_total_incl_autoconsumo_mw"})
+    auto = auto.rename(columns={"capacity_mw": "capacity_autoconsumo_mw"}) if not auto.empty else pd.DataFrame(columns=keys + ["capacity_autoconsumo_mw"])
+    merged = total[keys + ["capacity_total_incl_autoconsumo_mw", "source_url"]].merge(
+        auto[keys + ["capacity_autoconsumo_mw"]],
+        on=keys,
+        how="left",
+    )
+    merged["capacity_autoconsumo_mw"] = pd.to_numeric(merged["capacity_autoconsumo_mw"], errors="coerce").fillna(0.0)
+    merged["capacity_mw"] = merged["capacity_total_incl_autoconsumo_mw"] - merged["capacity_autoconsumo_mw"]
+    merged["capacity_source"] = "REE monthly production Excel — total minus autoconsumo"
+    return (
+        merged[["datetime", "technology", "capacity_mw", "capacity_source", "source_url"]]
+        .dropna(subset=["datetime", "technology", "capacity_mw"])
+        .sort_values(["datetime", "technology"])
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_installed_capacity_from_ree(start_day: date, end_day: date) -> pd.DataFrame:
+    """Load 2026 Peninsular installed capacity without autoconsumo from REE monthly production Excels.
+
+    This follows the working test page logic:
+    total published capacity including autoconsumo - autoconsumo block = capacity without autoconsumo.
+    It returns monthly 2026 data in MW for all technologies available in Data 6.
     """
-    cols = ["datetime", "technology", "capacity_mw"]
+    cols = ["datetime", "technology", "capacity_mw", "capacity_source", "source_url"]
     start_day = max(start_day, LIVE_START_DATE)
     if start_day > end_day:
         return pd.DataFrame(columns=cols)
 
-    def _month_end(d: date) -> date:
-        first_next = date(d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1, 1)
-        return first_next - timedelta(days=1)
-
-    candidate_windows: list[tuple[date, date]] = []
-    # Main request: from 1-Jan-2026 to the selected/live end day.
-    candidate_windows.append((start_day, end_day))
-    # If the current month is not yet published, try through the previous month-end.
-    first_this_month = date(end_day.year, end_day.month, 1)
-    prev_month_end = first_this_month - timedelta(days=1)
-    if prev_month_end >= start_day:
-        candidate_windows.append((start_day, prev_month_end))
-    # Robust fallback: query each 2026 month separately, including the partial current month.
-    m = date(start_day.year, start_day.month, 1)
-    while m <= end_day:
-        me = min(_month_end(m), end_day)
-        if me >= start_day:
-            candidate_windows.append((max(m, start_day), me))
-        if m.month == 12:
-            m = date(m.year + 1, 1, 1)
-        else:
-            m = date(m.year, m.month + 1, 1)
-
-    frames = []
-    for s_day, e_day in candidate_windows:
-        try:
-            payload = fetch_ree_widget("generacion", "potencia-instalada", s_day, e_day, time_trunc="month")
-            df = parse_ree_included_series(payload, value_field="value")
-        except Exception:
-            df = pd.DataFrame(columns=["datetime", "title", "value"])
-        if df.empty:
+    month_to_try = max(1, min(12, end_day.month))
+    frames: list[pd.DataFrame] = []
+    for month in range(1, month_to_try + 1):
+        content, url = _download_ree_production_excel(2026, month)
+        if not content or not url:
             continue
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-        df["technology"] = df["title"].map(lambda x: LOCAL_MIX_TECH_MAP.get(str(x).strip(), str(x).strip()))
-        df["capacity_mw"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna(subset=["datetime", "technology", "capacity_mw"]).copy()
-        if not df.empty:
-            frames.append(df[cols])
+        parsed = _parse_ree_monthly_production_capacity_without_autoconsumo(content, url, 2026)
+        if not parsed.empty:
+            frames.append(parsed)
 
     if not frames:
         return pd.DataFrame(columns=cols)
 
     out = pd.concat(frames, ignore_index=True)
+    # Each bulletin can include several months; keep the latest downloaded source for each month/technology.
     out = (
-        out.groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
-        .sum()
-        .sort_values(["datetime", "technology"])
+        out.sort_values(["datetime", "technology", "source_url"])
         .drop_duplicates(subset=["datetime", "technology"], keep="last")
         .reset_index(drop=True)
     )
-    return out
+    return out[cols]
 
 
 # =========================================================
@@ -844,34 +974,67 @@ def load_historical_generation_mix_daily() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_installed_capacity_monthly() -> pd.DataFrame:
-    if not HIST_INSTALLED_CAP_FILE.exists():
-        return pd.DataFrame(columns=["datetime", "technology", "capacity_mw"])
+    """Load historical 2021-2025 installed capacity without autoconsumo from annual REE Excel.
 
-    raw = pd.read_excel(HIST_INSTALLED_CAP_FILE, sheet_name="data", header=None)
-    dates = [parse_mixed_date(v) for v in raw.iloc[4, 1:].tolist()]
-    tech_rows = raw.iloc[5:19, :].copy()
+    The file is annual and already in MW / sin autoconsumo, so it is kept at annual
+    granularity. The timestamp is set to 31-Dec of each year so stock values behave
+    as year-end capacity when grouped annually.
+    """
+    cols = ["datetime", "technology", "capacity_mw", "capacity_source"]
+    file_path = HIST_INSTALLED_CAP_FILE if HIST_INSTALLED_CAP_FILE.exists() else HIST_INSTALLED_CAP_FALLBACK_FILE
+    if not file_path.exists():
+        return pd.DataFrame(columns=cols)
 
-    records = []
-    for _, row in tech_rows.iterrows():
-        tech_raw = str(row.iloc[0]).strip()
-        tech = LOCAL_MIX_TECH_MAP.get(tech_raw, tech_raw)
-        for col_idx, dt in enumerate(dates, start=1):
-            if pd.isna(dt):
+    try:
+        raw = pd.read_excel(file_path, sheet_name=0, header=None)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+    header_idx = None
+    for idx in range(len(raw)):
+        row_values = raw.iloc[idx].astype(str).str.strip().str.lower().tolist()
+        if "category" in row_values and any("solar" in x or "fotovoltaica" in x for x in row_values):
+            header_idx = idx
+            break
+    if header_idx is None:
+        return pd.DataFrame(columns=cols)
+
+    header = raw.iloc[header_idx].tolist()
+    records: list[dict] = []
+    for row_idx in range(header_idx + 1, len(raw)):
+        year_val = pd.to_numeric(raw.iat[row_idx, 0], errors="coerce")
+        if pd.isna(year_val):
+            continue
+        year_int = int(year_val)
+        if year_int < 2021 or year_int > 2025:
+            continue
+        for col_idx in range(1, len(header)):
+            tech_raw = header[col_idx]
+            if pd.isna(tech_raw):
                 continue
-            val = pd.to_numeric(row.iloc[col_idx], errors="coerce")
-            if pd.isna(val):
+            tech_name = str(tech_raw).strip()
+            if not tech_name or tech_name.lower() in {"nan", "potencia total"}:
                 continue
+            value = pd.to_numeric(raw.iat[row_idx, col_idx], errors="coerce")
+            if pd.isna(value):
+                continue
+            tech = LOCAL_MIX_TECH_MAP.get(tech_name, tech_name)
             records.append(
                 {
-                    "datetime": pd.Timestamp(dt).normalize(),
+                    "datetime": pd.Timestamp(year_int, 12, 31),
                     "technology": tech,
-                    "capacity_mw": float(val),
+                    "capacity_mw": float(value),
+                    "capacity_source": "Historical annual Excel — sin autoconsumo",
                 }
             )
-    out = pd.DataFrame(records)
-    if out.empty:
-        return out
-    return out.sort_values(["datetime", "technology"]).reset_index(drop=True)
+
+    if not records:
+        return pd.DataFrame(columns=cols)
+    return (
+        pd.DataFrame(records)
+        .sort_values(["datetime", "technology"])
+        .reset_index(drop=True)
+    )
 
 
 # =========================================================
@@ -1120,11 +1283,12 @@ def normalize_installed_capacity_df(cap_df: pd.DataFrame) -> pd.DataFrame:
     numeric MW values, and always returns the expected columns.
     """
     expected_cols = ["datetime", "technology", "capacity_mw"]
+    optional_cols = ["capacity_source", "source_url"]
     if cap_df is None or cap_df.empty:
-        return pd.DataFrame(columns=expected_cols)
+        return pd.DataFrame(columns=expected_cols + optional_cols)
 
     out = cap_df.copy()
-    for col in expected_cols:
+    for col in expected_cols + optional_cols:
         if col not in out.columns:
             out[col] = pd.NA
 
@@ -1145,10 +1309,9 @@ def normalize_installed_capacity_df(cap_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=expected_cols)
 
     return (
-        out[expected_cols]
-        .groupby(["datetime", "technology"], as_index=False)["capacity_mw"]
-        .sum()
+        out[expected_cols + optional_cols]
         .sort_values(["datetime", "technology"])
+        .drop_duplicates(subset=["datetime", "technology"], keep="last")
         .reset_index(drop=True)
     )
 
@@ -3163,6 +3326,14 @@ def capacity_period_start(dt: pd.Series, granularity: str) -> pd.Series:
     dt = pd.to_datetime(dt, errors="coerce")
     if granularity == "Annual":
         return dt.dt.to_period("Y").dt.to_timestamp()
+    if granularity == "Annual history + 2026 monthly":
+        return pd.Series(
+            pd.NaT,
+            index=dt.index,
+            dtype="datetime64[ns]",
+        ).mask(dt.dt.year < 2026, dt.dt.to_period("Y").dt.to_timestamp()).mask(
+            dt.dt.year >= 2026, dt.dt.to_period("M").dt.to_timestamp()
+        )
     if granularity == "Quarterly":
         return dt.dt.to_period("Q").dt.to_timestamp()
     return dt.dt.to_period("M").dt.to_timestamp()
@@ -3173,6 +3344,10 @@ def capacity_period_label(dt: pd.Series, granularity: str) -> pd.Series:
     dt = pd.to_datetime(dt, errors="coerce")
     if granularity == "Annual":
         return dt.dt.strftime("%Y")
+    if granularity == "Annual history + 2026 monthly":
+        annual_labels = dt.dt.strftime("%Y")
+        monthly_labels = dt.dt.strftime("%b-%y")
+        return annual_labels.mask(dt.dt.year >= 2026, monthly_labels)
     if granularity == "Quarterly":
         q = dt.dt.quarter.astype(str)
         y = dt.dt.year.astype(str)
@@ -3380,7 +3555,7 @@ def build_installed_capacity_chart(
             text=alt.Text("capacity_mw:Q", format=",.0f"),
         )
 
-        chart_title = f"{selected_tech} installed capacity additions: initial base + annual additions"
+        chart_title = f"{selected_tech} installed capacity additions without autoconsumo: initial base + annual additions"
         chart = alt.layer(bars, line, delta_labels, total_labels).properties(height=430, title=chart_title)
         return apply_common_chart_style(chart, height=430)
 
@@ -3406,7 +3581,7 @@ def build_installed_capacity_chart(
             alt.Tooltip("technology:N", title="Technology"),
             alt.Tooltip("capacity_mw:Q", title="Installed capacity MW", format=",.0f"),
         ],
-    ).properties(height=410, title=f"Installed capacity evolution by technology ({granularity.lower()})")
+    ).properties(height=410, title=f"Installed capacity evolution by technology ({granularity.lower()}, without autoconsumo)")
     return apply_common_chart_style(chart, height=410)
 
 def build_price_workbook(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, monthly_combo: pd.DataFrame, negative_price_df: pd.DataFrame, mix_monthly_table: pd.DataFrame, installed_capacity: pd.DataFrame, curtailment_table: pd.DataFrame | None = None, zero_negative_hour_table: pd.DataFrame | None = None, demand_hourly: pd.DataFrame | None = None, weekly_load_df: pd.DataFrame | None = None, aemet_anomalies_df: pd.DataFrame | None = None) -> bytes:
@@ -3908,10 +4083,10 @@ try:
             st.info("No REE demanda/evolucion monthly demand data available for this year.")
 
     # Installed capacity
-    section_header("Installed capacity")
+    section_header("Installed capacity — without autoconsumo")
     installed_capacity = normalize_installed_capacity_df(installed_capacity)
     if installed_capacity.empty:
-        st.info("No installed capacity file found in /data.")
+        st.info("No installed capacity file found in /data. Expected: Potencia instalada anual sin autoconsumo (MW).xlsx")
     else:
         cap_years = sorted(installed_capacity["datetime"].dt.year.unique().tolist())
         default_years = cap_years[-5:] if len(cap_years) >= 5 else cap_years
@@ -3927,12 +4102,15 @@ try:
                 "The additions bridge can show a partial 2026 year as soon as REE's monthly installed-capacity endpoint returns any 2026 month."
             )
 
+        st.caption(
+            "Installed-capacity values are shown without autoconsumo. Historical 2021-2025 data is annual from the uploaded REE Excel in /data; 2026 is monthly from REE production Excels using total minus autoconsumo."
+        )
         cap_view_mode = st.radio(
             "Installed capacity view",
             ["Additions from initial base", "Total installed evolution"],
             index=0,
             horizontal=True,
-            help="Additions is annual-only and single-technology. Total installed evolution can be monthly or annual.",
+            help="Additions is annual-only and single-technology. Total installed evolution shows annual history plus monthly 2026 when selected.",
         )
 
         available_cap_techs = sorted(cap_df_year["technology"].dropna().unique().tolist())
@@ -3947,7 +4125,7 @@ try:
                 help="Additions mode is restricted to one technology so the bottom-up bridge is easy to read.",
             )
             cap_granularity = "Annual"
-            st.caption("Additions mode uses annual granularity only: first bar = initial base; following bars = annual MW additions on top of the previous total. The latest year is shown even if it is partial, using the latest available monthly capacity value in that year.")
+            st.caption("Additions mode uses annual granularity only: first bar = initial base; following bars = annual MW additions on top of the previous total. Historical values are sin autoconsumo; 2026 is the latest available monthly REE value sin autoconsumo.")
             cap_chart = build_installed_capacity_chart(cap_df_year, [selected_add_tech], cap_view_mode, cap_granularity)
             if cap_chart is not None:
                 st.altair_chart(cap_chart, use_container_width=True)
@@ -3992,9 +4170,9 @@ try:
             )
             cap_granularity = st.selectbox(
                 "Installed capacity granularity",
-                ["Monthly", "Annual"],
+                ["Annual history + 2026 monthly", "Annual"],
                 index=0,
-                help="Capacity is a stock variable: annual view keeps the last available capacity value in each year.",
+                help="Historical 2021-2025 values are annual only. The hybrid view keeps those annual points and displays monthly 2026 REE values.",
             )
             cap_chart = build_installed_capacity_chart(cap_df_year, selected_techs, cap_view_mode, cap_granularity)
             if cap_chart is not None:
@@ -4011,7 +4189,7 @@ try:
                     }
                 )
 
-                subtle_subsection(f"Installed capacity {cap_granularity.lower()} evolution by technology")
+                subtle_subsection(f"Installed capacity {cap_granularity.lower()} evolution by technology — without autoconsumo")
                 st.dataframe(
                     styled_df(
                         cap_table[["Period", "Technology", "Installed capacity (MW)"]]
