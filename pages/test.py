@@ -23,7 +23,7 @@ try:
 except Exception:
     pass
 
-st.set_page_config(page_title="Embalses + demand profile test", layout="wide")
+st.set_page_config(page_title="Embalses + demand profile test v3", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if load_dotenv is not None:
@@ -56,13 +56,14 @@ st.markdown(
         font-weight:900;
         font-size:1.55rem;
         margin-bottom:12px;
-    ">🧪 Test | Embalses historical evolution + REE demand shape</div>
+    ">🧪 Test v3 | Embalses style + REE demand shape</div>
     """,
     unsafe_allow_html=True,
 )
 
 st.caption(
     "Embalses.net is scraped as a public webpage source, so this page includes diagnostics and fallbacks. "
+    "v3 adds an Embalses.net-style weekly chart: Med 10 + previous two years + current year. "
     "REE demand uses `demanda/evolucion` for Península."
 )
 
@@ -345,6 +346,136 @@ def build_embalses_chart_df(hist: pd.DataFrame, current: dict[str, Any], since: 
     return out.dropna(subset=["date", "series", "hm3"]).sort_values(["date", "series"]).drop_duplicates(subset=["date", "series"], keep="last").reset_index(drop=True)
 
 
+
+def build_embalses_net_style_df(hist: pd.DataFrame, current: dict[str, Any], current_year: int) -> pd.DataFrame:
+    """Return weekly series in the visual style of Embalses.net: Med 10, Y-2, Y-1 and Y."""
+    display_years = [current_year - 2, current_year - 1, current_year]
+    rows: list[dict[str, Any]] = []
+
+    def add_observation(dt_value: Any, stored_hm3: Any, stored_pct: Any, source: str) -> None:
+        dt = pd.to_datetime(dt_value, errors="coerce")
+        hm3 = pd.to_numeric(stored_hm3, errors="coerce")
+        if pd.isna(dt) or pd.isna(hm3):
+            return
+        year = int(dt.year)
+        if year not in display_years:
+            return
+        rows.append({
+            "date": dt,
+            "week": int(dt.isocalendar().week),
+            "series": str(year),
+            "hm3": float(hm3),
+            "pct": pd.to_numeric(stored_pct, errors="coerce"),
+            "source": source,
+            "sort_key": display_years.index(year) + 1,
+        })
+
+    def add_med10(dt_value: Any, med_hm3: Any, med_pct: Any, source: str) -> None:
+        dt = pd.to_datetime(dt_value, errors="coerce")
+        hm3 = pd.to_numeric(med_hm3, errors="coerce")
+        if pd.isna(dt) or pd.isna(hm3):
+            return
+        rows.append({
+            "date": dt,
+            "week": int(dt.isocalendar().week),
+            "series": "Med 10",
+            "hm3": float(hm3),
+            "pct": pd.to_numeric(med_pct, errors="coerce"),
+            "source": source,
+            "sort_key": 0,
+        })
+
+    if hist is not None and not hist.empty:
+        tmp = hist.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce")
+        tmp = tmp.dropna(subset=["date"])
+        for _, r in tmp.iterrows():
+            add_observation(r.get("date"), r.get("stored_hm3"), r.get("stored_pct"), "archive")
+            # Embalses.net archive pages usually include the same-week 10-year average on each bulletin.
+            add_med10(r.get("date"), r.get("same_week_10y_avg_hm3"), r.get("same_week_10y_avg_pct"), "archive_10y")
+
+    if current and current.get("date") is not None:
+        add_observation(current.get("date"), current.get("stored_hm3"), current.get("stored_pct"), "current")
+        add_med10(current.get("date"), current.get("same_week_10y_avg_hm3"), current.get("same_week_10y_avg_pct"), "current_10y")
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["week"] = pd.to_numeric(out["week"], errors="coerce").astype("Int64")
+    out["hm3"] = pd.to_numeric(out["hm3"], errors="coerce")
+    out["pct"] = pd.to_numeric(out["pct"], errors="coerce")
+    out = out.dropna(subset=["week", "series", "hm3"]).copy()
+    out["week"] = out["week"].astype(int)
+
+    # If the site does not expose enough Med 10 rows, build a fallback average by ISO week from the available archive.
+    med_weeks = set(out.loc[out["series"].eq("Med 10"), "week"].dropna().astype(int).tolist())
+    if hist is not None and not hist.empty:
+        tmp = hist.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce")
+        tmp["stored_hm3"] = pd.to_numeric(tmp.get("stored_hm3"), errors="coerce")
+        tmp["stored_pct"] = pd.to_numeric(tmp.get("stored_pct"), errors="coerce")
+        tmp = tmp.dropna(subset=["date", "stored_hm3"])
+        tmp["week"] = tmp["date"].dt.isocalendar().week.astype(int)
+        tmp["year"] = tmp["date"].dt.year.astype(int)
+        hist_avg = tmp[~tmp["year"].isin(display_years)].groupby("week", as_index=False).agg(hm3=("stored_hm3", "mean"), pct=("stored_pct", "mean"))
+        missing_avg = hist_avg[~hist_avg["week"].isin(med_weeks)].copy()
+        if not missing_avg.empty:
+            missing_avg["date"] = pd.NaT
+            missing_avg["series"] = "Med 10"
+            missing_avg["source"] = "fallback_avg"
+            missing_avg["sort_key"] = 0
+            out = pd.concat([out, missing_avg[["date", "week", "series", "hm3", "pct", "source", "sort_key"]]], ignore_index=True)
+
+    order = ["Med 10", str(current_year - 2), str(current_year - 1), str(current_year)]
+    out["series"] = pd.Categorical(out["series"], categories=order, ordered=True)
+    return out.sort_values(["sort_key", "series", "week", "date"]).drop_duplicates(subset=["series", "week"], keep="last").reset_index(drop=True)
+
+
+def make_embalses_net_style_chart(style_df: pd.DataFrame, y_field: str = "hm3") -> alt.Chart:
+    if style_df is None or style_df.empty:
+        return alt.Chart(pd.DataFrame())
+    y_title = "hm³" if y_field == "hm3" else "%"
+    y_vals = pd.to_numeric(style_df[y_field], errors="coerce").dropna()
+    y_min = max(0, int((y_vals.min() // 5000) * 5000)) if y_field == "hm3" and not y_vals.empty else None
+    y_max = int(((y_vals.max() // 5000) + 1) * 5000) if y_field == "hm3" and not y_vals.empty else None
+    if y_field != "hm3":
+        y_min = max(0, int((y_vals.min() // 5) * 5)) if not y_vals.empty else None
+        y_max = min(100, int(((y_vals.max() // 5) + 1) * 5)) if not y_vals.empty else None
+
+    order = [str(s) for s in style_df["series"].cat.categories] if hasattr(style_df["series"], "cat") else list(style_df["series"].dropna().astype(str).unique())
+    current_year = max([int(s) for s in order if str(s).isdigit()] or [datetime.now(MADRID_TZ).year])
+    color_domain = ["Med 10", str(current_year - 2), str(current_year - 1), str(current_year)]
+    color_range = ["#1E22FF", "#00E846", "#111111", "#FF2A1F"]
+    dash_range = [[2, 6], [1, 0], [1, 0], [1, 0]]
+
+    base = alt.Chart(style_df).encode(
+        x=alt.X("week:Q", title="52 Semanas", scale=alt.Scale(domain=[1, 52]), axis=alt.Axis(values=list(range(1, 53, 2)), labelAngle=0, grid=False)),
+        y=alt.Y(f"{y_field}:Q", title=y_title, scale=alt.Scale(domain=[y_min, y_max], zero=False), axis=alt.Axis(grid=True, tickCount=8)),
+        color=alt.Color("series:N", title=None, scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(orient="top", direction="horizontal", fillColor="#F7F7F7", strokeColor="#222", padding=8)),
+        strokeDash=alt.StrokeDash("series:N", scale=alt.Scale(domain=color_domain, range=dash_range), legend=None),
+        order=alt.Order("week:Q"),
+        tooltip=[alt.Tooltip("series:N", title="Serie"), alt.Tooltip("week:Q", title="Semana", format=".0f"), alt.Tooltip(f"{y_field}:Q", title=y_title, format=",.0f"), alt.Tooltip("pct:Q", title="%", format=",.2f")],
+    )
+
+    layers = []
+    if y_min is not None and y_max is not None and y_max > y_min:
+        step = 5000 if y_field == "hm3" else 5
+        bands = []
+        i = 0
+        y = y_min
+        while y < y_max:
+            if i % 2 == 0:
+                bands.append({"y0": y, "y1": min(y + step, y_max)})
+            y += step
+            i += 1
+        if bands:
+            layers.append(alt.Chart(pd.DataFrame(bands)).mark_rect(color="#EAF6FB", opacity=0.85).encode(y="y0:Q", y2="y1:Q"))
+
+    layers.append(base.mark_line(interpolate="monotone", strokeWidth=2.6))
+    return alt.layer(*layers).properties(title="Agua embalsada en España", height=430).configure_view(stroke="#222222").configure_axis(labelFontSize=12, titleFontSize=12).configure_title(anchor="middle", fontSize=20, color="#40779D")
+
+
 def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
     rows = []
     for item in payload.get("included", []) or []:
@@ -468,6 +599,7 @@ if run:
 
     jan_start = date(today.year, 1, 1)
     chart_df = build_embalses_chart_df(emb_hist, emb_current, since=jan_start)
+    embalses_style_df = build_embalses_net_style_df(emb_hist, emb_current, current_year=today.year)
 
     if emb_current:
         k1, k2, k3, k4 = st.columns(4)
@@ -490,10 +622,16 @@ if run:
                 diff = emb_current["stored_hm3"] - emb_current["same_week_10y_avg_hm3"]
                 st.markdown(delta_html(diff, suffix=" hm³ vs 10Y", decimals=0, good_when_up=True), unsafe_allow_html=True)
 
-    if chart_df.empty:
-        st.warning("Could not build Embalses historical series from archive. Check diagnostics below.")
+    if embalses_style_df.empty:
+        st.warning("Could not build the Embalses.net-style weekly series from archive. Check diagnostics below.")
     else:
-        tab_hm3, tab_pct, tab_available = st.tabs(["Stored hm³", "Stored %", "Available capacity"])
+        st.altair_chart(make_embalses_net_style_chart(embalses_style_df, y_field="hm3"), use_container_width=True)
+        st.caption("Style v3: dotted blue Med 10, green previous-2 year, black previous year and red current year, with ISO weeks on the x-axis.")
+
+    if chart_df.empty:
+        st.warning("Could not build the legacy Embalses historical series from archive. Check diagnostics below.")
+    else:
+        tab_hm3, tab_pct, tab_available, tab_style_data = st.tabs(["Legacy stored hm³", "Legacy stored %", "Available capacity", "Style data"])
         with tab_hm3:
             ch = alt.Chart(chart_df).mark_line(point=True, strokeWidth=3).encode(
                 x=alt.X("date:T", title="Week"),
@@ -525,8 +663,12 @@ if run:
                 st.altair_chart(ch_av, use_container_width=True)
             else:
                 st.info("Capacity could not be parsed, so available capacity cannot be calculated.")
-        display_df = chart_df.pivot_table(index="date", columns="series", values=["hm3", "pct"], aggfunc="last")
-        st.dataframe(display_df, use_container_width=True)
+        with tab_style_data:
+            style_pivot = embalses_style_df.pivot_table(index="week", columns="series", values="hm3", aggfunc="last") if not embalses_style_df.empty else pd.DataFrame()
+            st.dataframe(style_pivot, use_container_width=True)
+            display_df = chart_df.pivot_table(index="date", columns="series", values=["hm3", "pct"], aggfunc="last")
+            st.markdown("**Legacy table**")
+            st.dataframe(display_df, use_container_width=True)
 
     with st.expander("Embalses diagnostics", expanded=False):
         st.markdown("**Current bulletin attempts**")
