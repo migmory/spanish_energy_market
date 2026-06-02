@@ -232,7 +232,7 @@ def make_month_summary(gen15: pd.DataFrame) -> pd.DataFrame:
     return out[["site", "generation_mwh", "obs_15min"]]
 
 
-st.title("Solarpark / UNITY — May production test + 24h profile")
+st.title("Solarpark / UNITY — May production test + 24h average profile")
 st.caption(
     "Test using Cookie auth from the browser request. "
     "API source values appear at 10-min intervals; this page converts them to 15-min generation."
@@ -294,31 +294,14 @@ if run:
 
     st.subheader("Monthly production summary")
     st.dataframe(month_summary, use_container_width=True, hide_index=True)
-
-    st.subheader("Daily production")
-    daily_chart = (
-        alt.Chart(daily)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("date:T", title="Date"),
-            y=alt.Y("generation_mwh:Q", title="Generation MWh/day"),
-            color=alt.Color("site:N", title="Site"),
-            tooltip=[
-                alt.Tooltip("site:N", title="Site"),
-                alt.Tooltip("date:T", title="Date", format="%d-%b-%Y"),
-                alt.Tooltip("generation_mwh:Q", title="MWh", format=",.2f"),
-            ],
-        )
-        .properties(height=420)
-    )
-    st.altair_chart(daily_chart, use_container_width=True)
+    st.caption("Below: average 24h profile calculated from all selected May days.")
 
     st.subheader("Average 24h generation profile by site")
     profile24 = make_24h_average_profile(gen15)
 
     metric = st.radio(
         "Profile metric",
-        options=["Average generation per 15-min bucket (kWh)", "Equivalent average power (kW)"],
+        options=["Equivalent average power (kW)", "Average generation per 15-min bucket (kWh)"],
         horizontal=True,
         index=0,
     )
@@ -351,12 +334,30 @@ if run:
                 alt.Tooltip("obs:Q", title="Obs", format=","),
             ],
         )
-        .properties(height=420)
+        .properties(height=460)
     )
     st.altair_chart(profile_chart, use_container_width=True)
 
     with st.expander("Show 24h profile data", expanded=False):
         st.dataframe(profile24, use_container_width=True, hide_index=True)
+
+    st.subheader("Daily production")
+    daily_chart = (
+        alt.Chart(daily)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("generation_mwh:Q", title="Generation MWh/day"),
+            color=alt.Color("site:N", title="Site"),
+            tooltip=[
+                alt.Tooltip("site:N", title="Site"),
+                alt.Tooltip("date:T", title="Date", format="%d-%b-%Y"),
+                alt.Tooltip("generation_mwh:Q", title="MWh", format=",.2f"),
+            ],
+        )
+        .properties(height=360)
+    )
+    st.altair_chart(daily_chart, use_container_width=True)
 
     st.subheader("15-min generation sample")
     st.dataframe(gen15.head(500), use_container_width=True, hide_index=True)
