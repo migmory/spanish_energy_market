@@ -187,6 +187,36 @@ def make_daily_summary(gen15: pd.DataFrame) -> pd.DataFrame:
     return daily[["site", "date", "generation_mwh"]]
 
 
+def make_24h_average_profile(gen15: pd.DataFrame) -> pd.DataFrame:
+    """
+    Average 24h daily profile by site.
+
+    The source data is 15-min generation (kWh per 15-min bucket).
+    For each site and time-of-day bucket, calculate the average generation
+    across all selected days.
+    """
+    if gen15.empty:
+        return pd.DataFrame(columns=["site", "time_of_day", "hour_decimal", "avg_generation_kwh_15min", "avg_power_kw"])
+
+    tmp = gen15.copy()
+    tmp["time_of_day"] = tmp["datetime_madrid"].dt.strftime("%H:%M")
+    tmp["hour_decimal"] = tmp["datetime_madrid"].dt.hour + tmp["datetime_madrid"].dt.minute / 60.0
+
+    profile = (
+        tmp.groupby(["site", "time_of_day", "hour_decimal"], as_index=False)
+           .agg(
+               avg_generation_kwh_15min=("generation_kwh_15min", "mean"),
+               obs=("generation_kwh_15min", "count"),
+           )
+           .sort_values(["site", "hour_decimal"])
+    )
+
+    # Equivalent average power during each 15-min bucket:
+    # kW = kWh / 0.25h
+    profile["avg_power_kw"] = profile["avg_generation_kwh_15min"] / 0.25
+    return profile
+
+
 def make_month_summary(gen15: pd.DataFrame) -> pd.DataFrame:
     if gen15.empty:
         return pd.DataFrame(columns=["site", "generation_mwh", "obs_15min"])
@@ -202,7 +232,7 @@ def make_month_summary(gen15: pd.DataFrame) -> pd.DataFrame:
     return out[["site", "generation_mwh", "obs_15min"]]
 
 
-st.title("Solarpark / UNITY — May production test")
+st.title("Solarpark / UNITY — May production test + 24h profile")
 st.caption(
     "Test using Cookie auth from the browser request. "
     "API source values appear at 10-min intervals; this page converts them to 15-min generation."
@@ -282,6 +312,51 @@ if run:
         .properties(height=420)
     )
     st.altair_chart(daily_chart, use_container_width=True)
+
+    st.subheader("Average 24h generation profile by site")
+    profile24 = make_24h_average_profile(gen15)
+
+    metric = st.radio(
+        "Profile metric",
+        options=["Average generation per 15-min bucket (kWh)", "Equivalent average power (kW)"],
+        horizontal=True,
+        index=0,
+    )
+
+    if metric.startswith("Average generation"):
+        y_field = "avg_generation_kwh_15min"
+        y_title = "Avg generation per 15-min bucket (kWh)"
+        tooltip_value = alt.Tooltip("avg_generation_kwh_15min:Q", title="Avg kWh/15min", format=",.2f")
+    else:
+        y_field = "avg_power_kw"
+        y_title = "Equivalent average power (kW)"
+        tooltip_value = alt.Tooltip("avg_power_kw:Q", title="Avg kW", format=",.0f")
+
+    profile_chart = (
+        alt.Chart(profile24)
+        .mark_line(point=False, strokeWidth=3)
+        .encode(
+            x=alt.X(
+                "hour_decimal:Q",
+                title="Hour of day",
+                scale=alt.Scale(domain=[0, 24]),
+                axis=alt.Axis(values=list(range(0, 25, 2)), labelExpr="datum.value + ':00'"),
+            ),
+            y=alt.Y(f"{y_field}:Q", title=y_title),
+            color=alt.Color("site:N", title="Site"),
+            tooltip=[
+                alt.Tooltip("site:N", title="Site"),
+                alt.Tooltip("time_of_day:N", title="Time"),
+                tooltip_value,
+                alt.Tooltip("obs:Q", title="Obs", format=","),
+            ],
+        )
+        .properties(height=420)
+    )
+    st.altair_chart(profile_chart, use_container_width=True)
+
+    with st.expander("Show 24h profile data", expanded=False):
+        st.dataframe(profile24, use_container_width=True, hide_index=True)
 
     st.subheader("15-min generation sample")
     st.dataframe(gen15.head(500), use_container_width=True, hide_index=True)
