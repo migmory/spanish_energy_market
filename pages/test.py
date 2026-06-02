@@ -410,6 +410,103 @@ def build_monthly_summary(hourly: pd.DataFrame) -> dict[str, Any]:
     return summary
 
 
+
+def parse_ree_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
+            rows.append({
+                "datetime": dt,
+                "title": str(title).strip(),
+                value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
+            })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_ree_demand_evolution(start_day: date, end_day: date, time_trunc: str = "hour") -> tuple[pd.DataFrame, dict[str, Any]]:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": time_trunc,
+        **REE_PENINSULAR_PARAMS,
+    }
+    url = f"{REE_API_BASE}/demanda/evolucion"
+    try:
+        resp = requests.get(url, params=params, timeout=60)
+    except Exception as exc:
+        return pd.DataFrame(), {"http": "ERROR", "url": url, "rows": 0, "error": str(exc)[:500]}
+
+    payload = safe_json(resp)
+    if not resp.ok or not isinstance(payload, dict):
+        return pd.DataFrame(), {"http": resp.status_code, "url": resp.url, "rows": 0, "payload_preview": payload}
+
+    df = parse_ree_included_series(payload, value_field="value")
+    if df.empty:
+        return pd.DataFrame(), {"http": resp.status_code, "url": resp.url, "rows": 0, "payload_preview": payload}
+
+    if df["title"].nunique() > 1:
+        demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
+        if not demand_like.empty:
+            df = demand_like
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"]).copy()
+
+    if time_trunc == "hour":
+        df["hourly_avg_mw"] = df["value"]
+        df["hourly_avg_gw"] = df["hourly_avg_mw"] / 1000.0
+        df["month"] = df["datetime"].dt.to_period("M").dt.to_timestamp()
+        df["date"] = df["datetime"].dt.date
+        df["hour"] = df["datetime"].dt.hour
+        df["weekday"] = df["datetime"].dt.day_name()
+        df["is_weekend"] = df["datetime"].dt.weekday >= 5
+    elif time_trunc == "month":
+        df["month"] = df["datetime"].dt.to_period("M").dt.to_timestamp()
+        df["demand_mwh"] = df["value"]
+        df["demand_gwh"] = df["demand_mwh"] / 1000.0
+        df["avg_demand_gw"] = df["demand_gwh"] / (df["month"].dt.days_in_month * 24)
+
+    info = {
+        "http": resp.status_code,
+        "url": resp.url,
+        "rows": int(len(df)),
+        "title_values": ", ".join(sorted(df["title"].dropna().astype(str).unique().tolist())[:5]),
+        "payload_preview": None,
+    }
+    return df.sort_values("datetime").reset_index(drop=True), info
+
+
+def month_bounds(d: date) -> tuple[date, date]:
+    start = date(d.year, d.month, 1)
+    end = date(d.year, 12, 31) if d.month == 12 else date(d.year, d.month + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def previous_month_bounds(d: date) -> tuple[date, date]:
+    first = date(d.year, d.month, 1)
+    return month_bounds(first - timedelta(days=1))
+
+
+def build_hourly_profile(hourly: pd.DataFrame, label: str) -> pd.DataFrame:
+    if hourly is None or hourly.empty:
+        return pd.DataFrame(columns=["hour", "avg_gw", "min_gw", "max_gw", "label"])
+    out = hourly.groupby("hour", as_index=False).agg(
+        avg_gw=("hourly_avg_gw", "mean"),
+        min_gw=("hourly_avg_gw", "min"),
+        max_gw=("hourly_avg_gw", "max"),
+        obs=("hourly_avg_gw", "count"),
+    )
+    out["label"] = label
+    return out
+
 # Controls
 today = datetime.now(MADRID_TZ).date()
 default_month_date = date(today.year, today.month, 1)
