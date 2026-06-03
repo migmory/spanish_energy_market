@@ -72,14 +72,14 @@ DEFAULT_THERMAL_STACK = [
 def get_esios_token() -> str:
     token = ""
     try:
-        token = str(st.secrets.get("ESIOS_TOKEN", "") or "")
+        token = str(st.secrets.get("ESIOS_API_TOKEN", "") or "")
     except Exception:
         token = ""
     if not token:
-        token = os.getenv("ESIOS_TOKEN", "")
+        token = os.getenv("ESIOS_API_TOKEN", "")
     token = token.strip().strip('"').strip("'")
     if not token:
-        st.error("Missing ESIOS_TOKEN. Put it in .env locally or Streamlit Secrets.")
+        st.error("Missing ESIOS_API_TOKEN. Put it in .env locally or Streamlit Secrets.")
         st.stop()
     return token
 
@@ -237,7 +237,7 @@ non_thermal = st.multiselect(
 )
 
 show_stack_components = st.multiselect(
-    "Thermal stack components to show",
+    "Conventional technologies to stack in the main chart",
     options=list(P48_COMPONENTS.keys()),
     default=DEFAULT_THERMAL_STACK,
 )
@@ -266,41 +266,77 @@ if run:
     df = calculate_thermal_gap(wide, non_thermal)
     monthly = calculate_monthly_stats(df)
 
-    st.subheader("Hourly thermal gap — Madrid date and hour")
-    c_gap = (
-        alt.Chart(df)
-        .mark_line(strokeWidth=2.5)
-        .encode(
-            x=alt.X("datetime_madrid:T", title="Madrid date and hour", axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45)),
-            y=alt.Y("thermal_gap_mwh:Q", title="Thermal gap MWh/h"),
-            tooltip=[
-                alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                alt.Tooltip("thermal_gap_mwh:Q", title="Thermal gap", format=",.0f"),
-                alt.Tooltip("Total scheduled demand P48:Q", title="Demand P48", format=",.0f"),
-                alt.Tooltip("non_thermal_mwh:Q", title="Non-thermal", format=",.0f"),
-            ],
-        )
-        .properties(height=320)
+    st.subheader("Overlay — thermal gap stacked conventional mix + day-ahead price")
+    st.caption(
+        "Barras apiladas = tecnologías convencionales en MWh/h. "
+        "Línea azul = precio day-ahead en eje secundario. "
+        "Línea negra discontinua = hueco térmico calculado."
     )
-    st.altair_chart(c_gap, use_container_width=True)
 
-    if "Day-ahead price" in df.columns:
-        st.subheader("Day-ahead price — Madrid date and hour")
-        c_price = (
-            alt.Chart(df)
-            .mark_line(strokeWidth=2.5)
+    stack_cols = [c for c in show_stack_components if c in df.columns]
+    if stack_cols:
+        stack_df = df[["datetime_madrid", "thermal_gap_mwh"] + stack_cols].melt(
+            id_vars=["datetime_madrid", "thermal_gap_mwh"],
+            var_name="component",
+            value_name="mwh",
+        )
+        stack_df["mwh"] = pd.to_numeric(stack_df["mwh"], errors="coerce").fillna(0.0)
+
+        bars = (
+            alt.Chart(stack_df)
+            .mark_bar(opacity=0.82)
             .encode(
                 x=alt.X("datetime_madrid:T", title="Madrid date and hour", axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45)),
-                y=alt.Y("Day-ahead price:Q", title="Day-ahead price €/MWh"),
+                y=alt.Y("mwh:Q", title="Conventional stack / thermal gap (MWh/h)", stack="zero"),
+                color=alt.Color("component:N", title="Conventional technology"),
                 tooltip=[
                     alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                    alt.Tooltip("Day-ahead price:Q", title="€/MWh", format=",.2f"),
+                    alt.Tooltip("component:N", title="Technology"),
+                    alt.Tooltip("mwh:Q", title="MWh/h", format=",.0f"),
                 ],
             )
-            .properties(height=280)
         )
-        st.altair_chart(c_price, use_container_width=True)
 
+        gap_line = (
+            alt.Chart(df)
+            .mark_line(color="black", strokeDash=[6, 4], strokeWidth=2)
+            .encode(
+                x=alt.X("datetime_madrid:T", title="Madrid date and hour", axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45)),
+                y=alt.Y("thermal_gap_mwh:Q", title="Conventional stack / thermal gap (MWh/h)"),
+                tooltip=[
+                    alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
+                    alt.Tooltip("thermal_gap_mwh:Q", title="Thermal gap", format=",.0f"),
+                    alt.Tooltip("Total scheduled demand P48:Q", title="Demand P48", format=",.0f"),
+                    alt.Tooltip("non_thermal_mwh:Q", title="Non-thermal", format=",.0f"),
+                ],
+            )
+        )
+
+        layers = [bars, gap_line]
+
+        if "Day-ahead price" in df.columns:
+            price_line = (
+                alt.Chart(df)
+                .mark_line(color="#2563EB", strokeWidth=3)
+                .encode(
+                    x=alt.X("datetime_madrid:T", title="Madrid date and hour", axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45)),
+                    y=alt.Y(
+                        "Day-ahead price:Q",
+                        title="Day-ahead price (€/MWh)",
+                        axis=alt.Axis(titleColor="#2563EB", labelColor="#2563EB"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
+                        alt.Tooltip("Day-ahead price:Q", title="Price €/MWh", format=",.2f"),
+                    ],
+                )
+            )
+            layers.append(price_line)
+
+        combined = alt.layer(*layers).resolve_scale(y="independent").properties(height=430)
+        st.altair_chart(combined, use_container_width=True)
+
+    if "Day-ahead price" in df.columns:
         st.subheader("Scatter — price vs thermal gap")
         scatter = (
             alt.Chart(df)
