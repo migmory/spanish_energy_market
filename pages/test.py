@@ -72,14 +72,14 @@ DEFAULT_THERMAL_STACK = [
 def get_esios_token() -> str:
     token = ""
     try:
-        token = str(st.secrets.get("ESIOS_API_TOKEN", "") or "")
+        token = str(st.secrets.get("ESIOS_TOKEN", "") or "")
     except Exception:
         token = ""
     if not token:
-        token = os.getenv("ESIOS_API_TOKEN", "")
+        token = os.getenv("ESIOS_TOKEN", "")
     token = token.strip().strip('"').strip("'")
     if not token:
-        st.error("Missing ESIOS_API_TOKEN. Put it in .env locally or Streamlit Secrets.")
+        st.error("Missing ESIOS_TOKEN. Put it in .env locally or Streamlit Secrets.")
         st.stop()
     return token
 
