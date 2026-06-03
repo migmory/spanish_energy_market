@@ -268,9 +268,8 @@ if run:
 
     st.subheader("Overlay — conventional volumes + day-ahead price")
     st.caption(
-        "Eje izquierdo: volúmenes en MWh/h (barras apiladas por tecnología convencional). "
-        "Eje derecho: precio day-ahead en €/MWh (línea azul). "
-        "La línea negra discontinua muestra el hueco térmico calculado."
+        "Eje Y izquierdo: volúmenes en MWh/h (barras apiladas por tecnología convencional + línea negra de hueco térmico). "
+        "Eje Y derecho: precio day-ahead en €/MWh (línea azul)."
     )
 
     stack_cols = [c for c in show_stack_components if c in df.columns]
@@ -282,15 +281,17 @@ if run:
         )
         stack_df["mwh"] = pd.to_numeric(stack_df["mwh"], errors="coerce").fillna(0.0)
 
+        base_x = alt.X(
+            "datetime_madrid:T",
+            title="Madrid date and hour",
+            axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45),
+        )
+
         bars = (
             alt.Chart(stack_df)
             .mark_bar(opacity=0.85)
             .encode(
-                x=alt.X(
-                    "datetime_madrid:T",
-                    title="Madrid date and hour",
-                    axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45),
-                ),
+                x=base_x,
                 y=alt.Y(
                     "mwh:Q",
                     title="Conventional volumes (MWh/h)",
@@ -299,10 +300,9 @@ if run:
                 ),
                 color=alt.Color(
                     "component:N",
-                    title="Conventional volumes by technology",
+                    title="Conventional technologies",
                     legend=alt.Legend(orient="right"),
                 ),
-                order=alt.Order("component:N"),
                 tooltip=[
                     alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
                     alt.Tooltip("component:N", title="Technology"),
@@ -315,7 +315,7 @@ if run:
             alt.Chart(df)
             .mark_line(color="black", strokeDash=[6, 4], strokeWidth=2)
             .encode(
-                x=alt.X("datetime_madrid:T", title="Madrid date and hour"),
+                x=base_x,
                 y=alt.Y(
                     "thermal_gap_mwh:Q",
                     title="Conventional volumes (MWh/h)",
@@ -330,14 +330,15 @@ if run:
             )
         )
 
-        layers = [bars, gap_line]
+        # Left axis only: volumes + thermal gap share the same scale
+        left_layer = alt.layer(bars, gap_line)
 
         if "Day-ahead price" in df.columns:
             price_line = (
                 alt.Chart(df)
                 .mark_line(color="#2563EB", strokeWidth=3)
                 .encode(
-                    x=alt.X("datetime_madrid:T", title="Madrid date and hour"),
+                    x=base_x,
                     y=alt.Y(
                         "Day-ahead price:Q",
                         title="Day-ahead price (€/MWh)",
@@ -353,15 +354,16 @@ if run:
                     ],
                 )
             )
-            layers.append(price_line)
+            combined = alt.layer(left_layer, price_line).resolve_scale(y="independent").properties(height=450)
+        else:
+            combined = left_layer.properties(height=450)
 
-        combined = alt.layer(*layers).resolve_scale(y="independent").properties(height=450)
         st.altair_chart(combined, use_container_width=True)
 
         st.markdown(
-            "- **Barras apiladas**: volúmenes por tecnología convencional (eje izquierdo)\n"
-            "- **Línea negra discontinua**: hueco térmico total calculado (eje izquierdo)\n"
-            "- **Línea azul**: precio day-ahead (eje derecho)"
+            "- **Barras apiladas**: volúmenes por tecnología convencional (**eje Y izquierdo**)\n"
+            "- **Línea negra discontinua**: hueco térmico total calculado (**eje Y izquierdo**)\n"
+            "- **Línea azul**: precio day-ahead (**eje Y derecho**)"
         )
 
     if "Day-ahead price" in df.columns:
