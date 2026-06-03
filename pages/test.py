@@ -232,6 +232,126 @@ def make_month_summary(gen15: pd.DataFrame) -> pd.DataFrame:
     return out[["site", "generation_mwh", "obs_15min"]]
 
 
+
+# =========================================================
+# Day-ahead revenue helpers
+# =========================================================
+def _find_col(cols, candidates):
+    norm = {str(c).strip().lower().replace(" ", "_"): c for c in cols}
+    for cand in candidates:
+        key = cand.strip().lower().replace(" ", "_")
+        if key in norm:
+            return norm[key]
+    for c in cols:
+        lc = str(c).strip().lower()
+        for cand in candidates:
+            if cand.strip().lower() in lc:
+                return c
+    return None
+
+
+def load_day_ahead_prices(uploaded_file=None) -> pd.DataFrame:
+    """
+    Accepted formats:
+      datetime, price_eur_mwh
+      date, hour, price
+      Fecha, Hora, Precio
+    Datetimes are interpreted as Europe/Madrid if timezone-naive.
+    """
+    if uploaded_file is None:
+        local_candidates = [
+            Path("data/day_ahead_prices.csv"),
+            Path("data/omie_day_ahead_prices.csv"),
+            Path("day_ahead_prices.csv"),
+        ]
+        path = next((p for p in local_candidates if p.exists()), None)
+        if path is None:
+            return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh"])
+        raw = pd.read_csv(path)
+    else:
+        name = getattr(uploaded_file, "name", "").lower()
+        raw = pd.read_excel(uploaded_file) if name.endswith((".xlsx", ".xls")) else pd.read_csv(uploaded_file)
+
+    if raw.empty:
+        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh"])
+
+    dt_col = _find_col(raw.columns, ["datetime", "timestamp", "date_time", "datetime_madrid", "fecha_hora"])
+    date_col = _find_col(raw.columns, ["date", "fecha", "day", "delivery_date"])
+    hour_col = _find_col(raw.columns, ["hour", "hora", "he", "period", "periodo"])
+    price_col = _find_col(raw.columns, ["price_eur_mwh", "price", "precio", "day_ahead_price", "omie_price", "eur_mwh", "€/mwh"])
+
+    if price_col is None:
+        raise ValueError("No price column found. Use e.g. price_eur_mwh or Precio.")
+
+    out = pd.DataFrame()
+    if dt_col is not None:
+        out["datetime_madrid"] = pd.to_datetime(raw[dt_col], errors="coerce")
+    elif date_col is not None and hour_col is not None:
+        d = pd.to_datetime(raw[date_col], errors="coerce")
+        h = pd.to_numeric(raw[hour_col], errors="coerce")
+        h0 = (h - 1).where(h.between(1, 24), h).clip(lower=0, upper=23)
+        out["datetime_madrid"] = d + pd.to_timedelta(h0, unit="h")
+    else:
+        raise ValueError("No datetime columns found. Use datetime or date+hour.")
+
+    out["price_eur_mwh"] = pd.to_numeric(
+        raw[price_col].astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    out = out.dropna(subset=["datetime_madrid", "price_eur_mwh"]).copy()
+
+    if out["datetime_madrid"].dt.tz is None:
+        out["datetime_madrid"] = out["datetime_madrid"].dt.tz_localize(
+            "Europe/Madrid", ambiguous="infer", nonexistent="shift_forward"
+        )
+    else:
+        out["datetime_madrid"] = out["datetime_madrid"].dt.tz_convert("Europe/Madrid")
+
+    out["hour_madrid"] = out["datetime_madrid"].dt.floor("h")
+    return out[["hour_madrid", "price_eur_mwh"]].drop_duplicates("hour_madrid").sort_values("hour_madrid")
+
+
+def generation_15min_to_hourly_mwh(gen15: pd.DataFrame) -> pd.DataFrame:
+    if gen15.empty:
+        return pd.DataFrame(columns=["site", "hour_madrid", "generation_mwh"])
+    tmp = gen15.copy()
+    tmp["hour_madrid"] = tmp["datetime_madrid"].dt.floor("h")
+    tmp["generation_mwh_15min"] = tmp["generation_kwh_15min"] / 1000.0
+    return (
+        tmp.groupby(["site", "hour_madrid"], as_index=False)
+           .agg(generation_mwh=("generation_mwh_15min", "sum"))
+    )
+
+
+def calculate_revenues(gen15: pd.DataFrame, prices: pd.DataFrame):
+    hourly = generation_15min_to_hourly_mwh(gen15)
+    if hourly.empty or prices.empty:
+        return hourly, pd.DataFrame(), pd.DataFrame()
+
+    joined = hourly.merge(prices, on="hour_madrid", how="left")
+    joined["revenue_eur"] = joined["generation_mwh"] * joined["price_eur_mwh"]
+    joined["month"] = joined["hour_madrid"].dt.strftime("%Y-%m")
+    joined["year"] = joined["hour_madrid"].dt.year
+
+    def agg(g):
+        gen = g["generation_mwh"].sum()
+        rev = g["revenue_eur"].sum()
+        captured = rev / gen if gen else pd.NA
+        baseload = g["price_eur_mwh"].mean()
+        return pd.Series({
+            "generation_mwh": gen,
+            "revenue_eur": rev,
+            "captured_price_eur_mwh": captured,
+            "baseload_price_eur_mwh": baseload,
+            "capture_factor_pct": (captured / baseload * 100) if pd.notna(captured) and baseload else pd.NA,
+            "priced_hours": g["price_eur_mwh"].notna().sum(),
+            "missing_price_hours": g["price_eur_mwh"].isna().sum(),
+        })
+
+    monthly = joined.groupby(["site", "month"], dropna=False).apply(agg).reset_index()
+    annual = joined.groupby(["site", "year"], dropna=False).apply(agg).reset_index()
+    return joined, monthly, annual
+
 st.title("Solarpark / UNITY — May production test + 24h average profile")
 st.caption(
     "Test using Cookie auth from the browser request. "
@@ -340,6 +460,76 @@ if run:
 
     with st.expander("Show 24h profile data", expanded=False):
         st.dataframe(profile24, use_container_width=True, hide_index=True)
+
+    st.subheader("15-min generation profile — Madrid date and hour")
+    st.caption("The API request window is UTC, but the chart uses datetime_madrid converted to Europe/Madrid.")
+    gen15_plot = gen15.copy()
+    detail_chart = (
+        alt.Chart(gen15_plot)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("datetime_madrid:T", title="Madrid date and hour", axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45)),
+            y=alt.Y("generation_kwh_15min:Q", title="Generation kWh / 15-min"),
+            color=alt.Color("site:N", title="Site"),
+            tooltip=[
+                alt.Tooltip("site:N", title="Site"),
+                alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
+                alt.Tooltip("generation_kwh_15min:Q", title="kWh/15-min", format=",.2f"),
+            ],
+        )
+        .properties(height=360)
+    )
+    st.altair_chart(detail_chart, use_container_width=True)
+
+    st.subheader("Day-ahead revenues")
+    st.caption("Upload hourly day-ahead prices. Join is hourly in Europe/Madrid.")
+    price_file = st.file_uploader(
+        "Upload day-ahead price CSV/XLSX",
+        type=["csv", "xlsx", "xls"],
+        help="Accepted columns: datetime + price_eur_mwh, or date + hour + price.",
+    )
+
+    try:
+        prices = load_day_ahead_prices(price_file)
+        if prices.empty:
+            st.info("No day-ahead price file found/uploaded. Upload hourly prices to calculate revenues.")
+        else:
+            joined_rev, monthly_rev, annual_rev = calculate_revenues(gen15, prices)
+            st.write(f"Loaded {len(prices):,} hourly price rows.")
+            st.markdown("**Monthly revenue metrics**")
+            st.dataframe(monthly_rev, use_container_width=True, hide_index=True)
+            st.markdown("**Annual revenue metrics**")
+            st.dataframe(annual_rev, use_container_width=True, hide_index=True)
+
+            rev_chart = (
+                alt.Chart(monthly_rev)
+                .mark_bar()
+                .encode(
+                    x=alt.X("month:N", title="Month"),
+                    y=alt.Y("revenue_eur:Q", title="Revenue €"),
+                    color=alt.Color("site:N", title="Site"),
+                    tooltip=[
+                        alt.Tooltip("site:N", title="Site"),
+                        alt.Tooltip("month:N", title="Month"),
+                        alt.Tooltip("generation_mwh:Q", title="MWh", format=",.2f"),
+                        alt.Tooltip("revenue_eur:Q", title="Revenue €", format=",.0f"),
+                        alt.Tooltip("captured_price_eur_mwh:Q", title="Captured €/MWh", format=",.2f"),
+                        alt.Tooltip("capture_factor_pct:Q", title="Capture factor %", format=",.1f"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(rev_chart, use_container_width=True)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.download_button("Download hourly revenue join", joined_rev.to_csv(index=False).encode("utf-8"), f"solarpark_hourly_revenue_join_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
+            with c2:
+                st.download_button("Download monthly revenue metrics", monthly_rev.to_csv(index=False).encode("utf-8"), f"solarpark_monthly_revenue_metrics_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
+            with c3:
+                st.download_button("Download annual revenue metrics", annual_rev.to_csv(index=False).encode("utf-8"), f"solarpark_annual_revenue_metrics_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
+    except Exception as exc:
+        st.error(f"Could not calculate revenues: {exc}")
 
     st.subheader("Daily production")
     daily_chart = (
