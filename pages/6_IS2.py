@@ -1,866 +1,411 @@
+# is2_generation_revenues_dashboard.py
+# Streamlit dashboard for IS2 operational solar parks:
+# - 15-min generation profile by site
+# - solar sanity checks to prevent night generation / bad forward-fill issues
+# - hourly day-ahead revenue calculation
+# - professional revenue layout and diagnostics
+#
+# Run:
+#   streamlit run is2_generation_revenues_dashboard.py
+
 from __future__ import annotations
 
+import io
 import os
-from pathlib import Path
-from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from typing import Optional, Iterable
 
-import altair as alt
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
+MADRID_TZ = "Europe/Madrid"
+UTC_TZ = "UTC"
 
-# =========================================================
-# Solarpark / UNITY API test
-# Purpose: download 10-min power values and aggregate to 15-min production
-# for 4 parks during May.
-# =========================================================
+st.set_page_config(page_title="IS2 generation and revenues", page_icon="⚡", layout="wide")
 
-st.set_page_config(page_title="Solarpark production test", layout="wide")
-
-BASE = "https://portal.solarpark-online.com"
-MADRID_TZ = ZoneInfo("Europe/Madrid")
-
-if load_dotenv is not None:
-    load_dotenv(override=True)
-
-# Confirmed / inferred source IDs from /ifms/sources/values/v2 responses.
-# These look like plant-level Power kW signals.
-POWER_SOURCE_IDS = {
-    "Carmona Central 36": "d19246ea-065e-11f0-980e-42010afa015a",
-    "Carmona Central 36.1": "cc211458-0892-11f0-9eeb-42010afa015a",
-    "Palma del Condado Solar 555": "7113ab0e-2726-11f0-b9a2-42010afa015a",
-    # Guarroman: chosen because it has 10-min power-shaped values, max ~5,003 kW.
-    # Similar source c60814c2 also tracks it but has small negative night noise.
-    "Guarroman Solar 81": "e1e421b8-1382-11f0-85ad-42010afa015a",
-}
-
-ID_TO_SITE = {v: k for k, v in POWER_SOURCE_IDS.items()}
-
-
-def get_cookie() -> str:
+st.markdown(
     """
-    The portal request uses Cookie auth, not Authorization Bearer.
-
-    Local .env:
-        SOLARPARK_COOKIE='IFMSCK=...'
-
-    Streamlit Cloud Secrets:
-        SOLARPARK_COOKIE = "IFMSCK=..."
-    """
-    cookie = ""
-    try:
-        cookie = str(st.secrets.get("SOLARPARK_COOKIE", "") or "")
-    except Exception:
-        cookie = ""
-
-    if not cookie:
-        cookie = os.getenv("SOLARPARK_COOKIE", "")
-
-    if not cookie:
-        st.error(
-            "Missing SOLARPARK_COOKIE. Put it in local .env or Streamlit Secrets. "
-            "Example: SOLARPARK_COOKIE='IFMSCK=xxxxxxxx'"
-        )
-        st.stop()
-
-    return str(cookie).strip().strip('"').strip("'")
+    <style>
+        .main .block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1500px;}
+        div[data-testid="metric-container"] {
+            background: #ffffff; border: 1px solid #e6eaf0; padding: 14px 16px;
+            border-radius: 14px; box-shadow: 0 1px 2px rgba(15,23,42,.04);
+        }
+        .ok-box {background:#ecfdf5;color:#065f46;border:1px solid #bbf7d0;border-radius:12px;padding:12px 14px;margin:8px 0 16px 0;}
+        .warning-box {background:#fff8e6;color:#7a5200;border:1px solid #ffe1a6;border-radius:12px;padding:12px 14px;margin:8px 0 16px 0;}
+        .danger-box {background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:12px;padding:12px 14px;margin:8px 0 16px 0;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-def madrid_day_to_utc_str(d: date, end_of_day: bool = False) -> str:
-    """
-    The browser request sends UTC timestamps.
-    For Spain local day boundaries:
-      local 2026-05-01 00:00 Europe/Madrid -> UTC string
-      local 2026-06-01 00:00 Europe/Madrid -> UTC string
-    """
-    dt_local = datetime.combine(d, time(0, 0), tzinfo=MADRID_TZ)
-    if end_of_day:
-        dt_local = dt_local + timedelta(days=1)
-    dt_utc = dt_local.astimezone(ZoneInfo("UTC"))
-    return dt_utc.strftime("%Y%m%dT%H%M%SZ")
+def norm_col(c: str) -> str:
+    return str(c).strip().lower().replace(" ", "_").replace("-", "_").replace("/", "_").replace(".", "_")
 
 
-@st.cache_data(show_spinner=True, ttl=900)
-def fetch_power_values(start_utc: str, end_utc: str, cookie: str, source_ids: list[str]) -> dict | list:
-    url = f"{BASE}/ifms/sources/values/v2"
-    params = {
-        "start_date": start_utc,
-        "end_date": end_utc,
-        "millis": "false",
-        "lang": "en",
-    }
+def find_col(cols: Iterable[str], candidates: list[str]) -> Optional[str]:
+    mapping = {norm_col(c): c for c in cols}
+    for cand in candidates:
+        if norm_col(cand) in mapping:
+            return mapping[norm_col(cand)]
+    for c in cols:
+        nc = norm_col(c)
+        if any(norm_col(cand) in nc for cand in candidates):
+            return c
+    return None
+
+
+def read_uploaded_table(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(io.BytesIO(raw))
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(io.BytesIO(raw))
+        except UnicodeDecodeError:
+            return pd.read_csv(io.BytesIO(raw), sep=";", decimal=",", encoding="latin1")
+    if name.endswith(".parquet"):
+        return pd.read_parquet(io.BytesIO(raw))
+    raise ValueError("Unsupported file type. Use CSV, XLSX, XLS or Parquet.")
+
+
+def clean_numeric(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    txt = s.astype(str).str.strip()
+    # Handles European 1.234,56 and normal 1234.56 reasonably well.
+    euro_mask = txt.str.contains(",", regex=False) & txt.str.contains(".", regex=False)
+    txt = txt.where(~euro_mask, txt.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+    txt = txt.where(euro_mask, txt.str.replace(",", ".", regex=False))
+    return pd.to_numeric(txt.replace({"nan": np.nan, "None": np.nan, "": np.nan}), errors="coerce")
+
+
+def to_madrid_datetime(series: pd.Series, source_tz: str) -> pd.Series:
+    dt = pd.to_datetime(series, errors="coerce")
+    if getattr(dt.dt, "tz", None) is not None:
+        return dt.dt.tz_convert(MADRID_TZ)
+    if source_tz == "UTC":
+        return dt.dt.tz_localize(UTC_TZ, nonexistent="shift_forward", ambiguous="NaT").dt.tz_convert(MADRID_TZ)
+    return dt.dt.tz_localize(source_tz, nonexistent="shift_forward", ambiguous="NaT").dt.tz_convert(MADRID_TZ)
+
+
+def normalize_generation_units(values: pd.Series, unit: str) -> pd.Series:
+    v = clean_numeric(values)
+    if unit == "kWh per 15-min":
+        return v / 1000.0
+    if unit == "MWh per 15-min":
+        return v
+    if unit == "kW average in 15-min":
+        return v * 0.25 / 1000.0
+    if unit == "MW average in 15-min":
+        return v * 0.25
+    raise ValueError("Unknown generation unit.")
+
+
+def fmt_eur(x: float) -> str:
+    return "—" if pd.isna(x) else f"€{x:,.0f}"
+
+
+def fmt_mwh(x: float) -> str:
+    return "—" if pd.isna(x) else f"{x:,.1f} MWh"
+
+
+def fmt_price(x: float) -> str:
+    return "—" if pd.isna(x) else f"{x:,.1f} €/MWh"
+
+
+def plot_layout(title: str, subtitle: str = "", height: int = 480) -> dict:
+    text = f"<b>{title}</b><br><sup>{subtitle}</sup>" if subtitle else f"<b>{title}</b>"
+    return dict(
+        title=dict(text=text, x=0.01, xanchor="left"),
+        height=height,
+        margin=dict(l=55, r=40, t=78, b=50),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        font=dict(size=12),
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_esios_indicator_600(token: str, start_date_iso: str, end_date_iso: str, geo_id: int = 3) -> pd.DataFrame:
+    url = "https://api.esios.ree.es/indicators/600"
     headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Cookie": cookie,
-        "Origin": BASE,
-        "Referer": f"{BASE}/",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    r = requests.post(
-        url,
-        params=params,
-        json=source_ids,
-        headers=headers,
-        timeout=120,
-    )
-
-    if not r.ok:
-        raise RuntimeError(
-            f"Solarpark request failed: HTTP {r.status_code}. "
-            f"URL={r.url}. Body preview={r.text[:500]}"
-        )
-
-    return r.json()
-
-
-def events_payload_to_power_df(payload: dict | list) -> pd.DataFrame:
-    """
-    Expected response:
-      [{"events": [[timestamp_utc, value, source_id], ...]}]
-    """
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        events = payload[0].get("events", [])
-    elif isinstance(payload, dict):
-        events = payload.get("events", [])
-    else:
-        events = []
-
-    if not events:
-        return pd.DataFrame(columns=["datetime_utc", "datetime_madrid", "site", "source_id", "power_kw"])
-
-    df = pd.DataFrame(events, columns=["datetime_utc", "value", "source_id"])
-    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], format="%Y%m%dT%H%M%SZ", utc=True, errors="coerce")
-    df["datetime_madrid"] = df["datetime_utc"].dt.tz_convert("Europe/Madrid")
-    df["power_kw"] = pd.to_numeric(df["value"], errors="coerce")
-    df["site"] = df["source_id"].map(ID_TO_SITE)
-
-    df = df.dropna(subset=["datetime_utc", "site", "power_kw"]).copy()
-
-    # Remove tiny negative night noise from some power signals.
-    df["power_kw"] = df["power_kw"].clip(lower=0)
-
-    return df[["datetime_utc", "datetime_madrid", "site", "source_id", "power_kw"]].sort_values(["site", "datetime_madrid"])
-
-
-def power_10min_to_generation_15min(power_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert SCADA/API power points to 15-min energy using proportional interval overlap.
-
-    The API timestamps are parsed as UTC and converted to Europe/Madrid before this function.
-    Assumption:
-      each power_kw value is valid from timestamp t to t + interval,
-      where interval is inferred per site from the median timestamp difference
-      and defaults to 10 minutes.
-
-    For each source interval:
-      energy allocated to a 15-min bucket =
-          power_kw * overlap_minutes / 60
-
-    This is more accurate than simply assigning complete 10-min intervals into 15-min buckets,
-    because 10-min intervals do not align perfectly with 15-min buckets.
-    """
-    if power_df.empty:
-        return pd.DataFrame(columns=["site", "datetime_madrid", "generation_kwh_15min"])
-
-    rows = []
-
-    for site, g in power_df.sort_values("datetime_madrid").groupby("site"):
-        g = g.dropna(subset=["datetime_madrid", "power_kw"]).copy()
-        if g.empty:
-            continue
-
-        diffs = g["datetime_madrid"].diff().dt.total_seconds().dropna()
-        if diffs.empty:
-            interval_seconds = 10 * 60
-        else:
-            # Use median positive diff. Clamp to a sensible range to avoid outages/gaps becoming interval length.
-            positive = diffs[diffs > 0]
-            interval_seconds = float(positive.median()) if not positive.empty else 10 * 60
-            if interval_seconds < 30 or interval_seconds > 3600:
-                interval_seconds = 10 * 60
-
-        interval = pd.Timedelta(seconds=interval_seconds)
-
-        for _, r in g.iterrows():
-            start_ts = r["datetime_madrid"]
-            end_ts = start_ts + interval
-            power_kw = float(r["power_kw"])
-
-            # Iterate over all 15-min buckets overlapped by [start_ts, end_ts)
-            bucket_start = start_ts.floor("15min")
-            while bucket_start < end_ts:
-                bucket_end = bucket_start + pd.Timedelta(minutes=15)
-                overlap_start = max(start_ts, bucket_start)
-                overlap_end = min(end_ts, bucket_end)
-                overlap_minutes = (overlap_end - overlap_start).total_seconds() / 60.0
-
-                if overlap_minutes > 0:
-                    rows.append(
-                        {
-                            "site": site,
-                            "datetime_madrid": bucket_start,
-                            "generation_kwh_15min": power_kw * overlap_minutes / 60.0,
-                        }
-                    )
-
-                bucket_start = bucket_end
-
-    if not rows:
-        return pd.DataFrame(columns=["site", "datetime_madrid", "generation_kwh_15min"])
-
-    out = (
-        pd.DataFrame(rows)
-        .groupby(["site", "datetime_madrid"], as_index=False)["generation_kwh_15min"]
-        .sum()
-        .sort_values(["site", "datetime_madrid"])
-        .reset_index(drop=True)
-    )
-
-    return out
-
-
-def make_daily_summary(gen15: pd.DataFrame) -> pd.DataFrame:
-    if gen15.empty:
-        return pd.DataFrame(columns=["site", "date", "generation_mwh"])
-
-    tmp = gen15.copy()
-    tmp["date"] = tmp["datetime_madrid"].dt.date
-    daily = (
-        tmp.groupby(["site", "date"], as_index=False)
-           .agg(generation_kwh=("generation_kwh_15min", "sum"))
-    )
-    daily["generation_mwh"] = daily["generation_kwh"] / 1000.0
-    return daily[["site", "date", "generation_mwh"]]
-
-
-def make_24h_average_profile(gen15: pd.DataFrame) -> pd.DataFrame:
-    """
-    Average 24h daily profile by site.
-
-    The source data is 15-min generation (kWh per 15-min bucket).
-    For each site and time-of-day bucket, calculate the average generation
-    across all selected days.
-    """
-    if gen15.empty:
-        return pd.DataFrame(columns=["site", "time_of_day", "hour_decimal", "avg_generation_kwh_15min", "avg_power_kw"])
-
-    tmp = gen15.copy()
-    tmp["time_of_day"] = tmp["datetime_madrid"].dt.strftime("%H:%M")
-    tmp["hour_decimal"] = tmp["datetime_madrid"].dt.hour + tmp["datetime_madrid"].dt.minute / 60.0
-
-    profile = (
-        tmp.groupby(["site", "time_of_day", "hour_decimal"], as_index=False)
-           .agg(
-               avg_generation_kwh_15min=("generation_kwh_15min", "mean"),
-               obs=("generation_kwh_15min", "count"),
-           )
-           .sort_values(["site", "hour_decimal"])
-    )
-
-    # Equivalent average power during each 15-min bucket:
-    # kW = kWh / 0.25h
-    profile["avg_power_kw"] = profile["avg_generation_kwh_15min"] / 0.25
-    return profile
-
-
-def make_month_summary(gen15: pd.DataFrame) -> pd.DataFrame:
-    if gen15.empty:
-        return pd.DataFrame(columns=["site", "generation_mwh", "obs_15min"])
-
-    out = (
-        gen15.groupby("site", as_index=False)
-             .agg(
-                 generation_kwh=("generation_kwh_15min", "sum"),
-                 obs_15min=("generation_kwh_15min", "count"),
-             )
-    )
-    out["generation_mwh"] = out["generation_kwh"] / 1000.0
-    return out[["site", "generation_mwh", "obs_15min"]]
-
-
-
-# =========================================================
-# Day-ahead revenue helpers — reuse Day Ahead tab data
-# =========================================================
-PRICE_INDICATOR_ID = 600
-
-def get_esios_token_optional() -> str:
-    """
-    Reads the same token names used by the Day Ahead tab.
-    Local .env:
-        ESIOS_TOKEN=...
-        or ESIOS_API_TOKEN=...
-    Streamlit Secrets:
-        ESIOS_TOKEN = "..."
-        or ESIOS_API_TOKEN = "..."
-    """
-    token = ""
-    try:
-        token = str(st.secrets.get("ESIOS_TOKEN", "") or st.secrets.get("ESIOS_API_TOKEN", "") or "")
-    except Exception:
-        token = ""
-
-    if not token:
-        token = os.getenv("ESIOS_TOKEN", "") or os.getenv("ESIOS_API_TOKEN", "")
-
-    return str(token).strip().strip('"').strip("'")
-
-
-def esios_headers(token: str) -> dict:
-    return {
         "Accept": "application/json; application/vnd.esios-api-v1+json",
         "Content-Type": "application/json",
+        "Authorization": f"Token token={token}",
         "x-api-key": token,
-        "User-Agent": "Mozilla/5.0",
     }
-
-
-def fetch_esios_day_ahead_prices(start_day: date, end_day: date, token: str) -> pd.DataFrame:
-    """
-    Fetch hourly day-ahead prices from ESIOS indicator 600.
-
-    Important:
-      ESIOS can return several geography rows. For Spanish day-ahead price we keep
-      geo_id == 3 / España, exactly like the Day Ahead tab parser, and we average
-      duplicates. We never sum prices.
-    """
-    if not token:
-        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-
-    start_local = datetime.combine(start_day, time(0, 0), tzinfo=MADRID_TZ)
-    end_local = datetime.combine(end_day + timedelta(days=1), time(0, 0), tzinfo=MADRID_TZ)
-    start_utc = start_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_utc = end_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    url = f"https://api.esios.ree.es/indicators/{PRICE_INDICATOR_ID}"
     params = {
-        "start_date": start_utc,
-        "end_date": end_utc,
+        "start_date": start_date_iso,
+        "end_date": end_date_iso,
         "time_trunc": "hour",
+        "geo_ids[]": geo_id,
     }
-    r = requests.get(url, headers=esios_headers(token), params=params, timeout=90)
-    if not r.ok:
-        raise RuntimeError(f"ESIOS price request failed HTTP {r.status_code}: {r.text[:400]}")
-
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
     values = r.json().get("indicator", {}).get("values", [])
     if not values:
         return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-
     df = pd.DataFrame(values)
-
-    # Same geo filter as Day Ahead page parse_esios_indicator().
-    if "geo_id" in df.columns and (pd.to_numeric(df["geo_id"], errors="coerce") == 3).any():
-        df = df[pd.to_numeric(df["geo_id"], errors="coerce") == 3].copy()
-    elif "geo_name" in df.columns:
-        geo = df["geo_name"].astype(str).str.strip().str.lower()
-        if geo.isin(["españa", "espana"]).any():
-            df = df[geo.isin(["españa", "espana"])].copy()
-
     dt_col = "datetime_utc" if "datetime_utc" in df.columns else "datetime"
+    df["hour_madrid"] = pd.to_datetime(df[dt_col], errors="coerce", utc=True).dt.tz_convert(MADRID_TZ).dt.floor("h")
+    df["price_eur_mwh"] = pd.to_numeric(df["value"], errors="coerce")
+    if "geo_id" in df.columns:
+        df = df[df["geo_id"].astype(str).eq(str(geo_id)) | df["geo_id"].isna()]
+    df = df.dropna(subset=["hour_madrid", "price_eur_mwh"]).sort_values("hour_madrid").drop_duplicates("hour_madrid", keep="last")
+    df["price_source"] = "eSIOS indicator 600 — geo_id 3 España"
+    return df[["hour_madrid", "price_eur_mwh", "price_source"]]
 
-    out = pd.DataFrame()
-    out["hour_madrid"] = (
-        pd.to_datetime(df[dt_col], utc=True, errors="coerce")
-          .dt.tz_convert("Europe/Madrid")
-          .dt.floor("h")
+
+def prepare_price_file(price_raw: pd.DataFrame, datetime_col: str, price_col: str, source_tz: str) -> pd.DataFrame:
+    df = price_raw.copy()
+    df["hour_madrid"] = to_madrid_datetime(df[datetime_col], source_tz).dt.floor("h")
+    df["price_eur_mwh"] = clean_numeric(df[price_col])
+    out = df.dropna(subset=["hour_madrid", "price_eur_mwh"]).sort_values("hour_madrid").drop_duplicates("hour_madrid", keep="last")
+    out["price_source"] = "Uploaded price file"
+    return out[["hour_madrid", "price_eur_mwh", "price_source"]]
+
+
+def price_quality_message(price_df: pd.DataFrame) -> tuple[str, str]:
+    if price_df.empty:
+        return "danger", "No hourly prices loaded."
+    p = price_df["price_eur_mwh"].dropna()
+    if p.empty:
+        return "danger", "Price series is empty after parsing."
+    avg, pmin, pmax = p.mean(), p.min(), p.max()
+    if avg > 200 or pmax > 600 or pmin < -200:
+        return "warning", f"Average {avg:.1f} €/MWh, min {pmin:.1f}, max {pmax:.1f}. Check source/unit: this may not be the expected OMIE Spain hourly price."
+    return "ok", f"Average {avg:.1f} €/MWh, min {pmin:.1f}, max {pmax:.1f}."
+
+
+def prepare_generation(raw, dt_col, site_col, gen_col, source_tz, gen_unit, apply_night_clean, night_start_hour, night_end_hour):
+    df = raw.copy()
+    df["datetime_madrid"] = to_madrid_datetime(df[dt_col], source_tz)
+    df["site"] = df[site_col].astype(str).str.strip()
+    df["generation_mwh_15min_raw"] = normalize_generation_units(df[gen_col], gen_unit)
+    df = df.dropna(subset=["datetime_madrid", "site", "generation_mwh_15min_raw"]).sort_values(["site", "datetime_madrid"])
+    df["datetime_madrid"] = df["datetime_madrid"].dt.floor("15min")
+    # Important: never forward-fill generation. Sum duplicates only.
+    df = df.groupby(["site", "datetime_madrid"], as_index=False)["generation_mwh_15min_raw"].sum().sort_values(["site", "datetime_madrid"])
+    hour_decimal = df["datetime_madrid"].dt.hour + df["datetime_madrid"].dt.minute / 60.0
+    is_night = (hour_decimal >= night_start_hour) | (hour_decimal < night_end_hour)
+    df["is_night_sanity_window"] = is_night
+    df["night_generation_mwh_raw"] = np.where(is_night, df["generation_mwh_15min_raw"], 0.0)
+    df["generation_mwh_15min"] = np.where(is_night, 0.0, df["generation_mwh_15min_raw"]) if apply_night_clean else df["generation_mwh_15min_raw"]
+    df["generation_kwh_15min"] = df["generation_mwh_15min"] * 1000.0
+    df["hour_madrid"] = df["datetime_madrid"].dt.floor("h")
+    df["month"] = df["datetime_madrid"].dt.to_period("M").astype(str)
+    diag = df.groupby("site", as_index=False).agg(
+        rows=("generation_mwh_15min", "size"),
+        start=("datetime_madrid", "min"),
+        end=("datetime_madrid", "max"),
+        raw_generation_mwh=("generation_mwh_15min_raw", "sum"),
+        clean_generation_mwh=("generation_mwh_15min", "sum"),
+        night_generation_mwh_raw=("night_generation_mwh_raw", "sum"),
     )
-    out["price_eur_mwh"] = pd.to_numeric(df["value"], errors="coerce")
-    out["price_source"] = "ESIOS indicator 600 — geo_id 3 España"
-    out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
+    diag["night_generation_pct_raw"] = np.where(diag["raw_generation_mwh"] > 0, diag["night_generation_mwh_raw"] / diag["raw_generation_mwh"] * 100, 0.0)
+    return df, diag
 
-    # Never sum €/MWh. Average duplicate hourly rows only.
-    out = (
-        out.groupby("hour_madrid", as_index=False)
-           .agg(price_eur_mwh=("price_eur_mwh", "mean"), price_source=("price_source", "first"))
-           .sort_values("hour_madrid")
+
+def calculate_revenues(gen: pd.DataFrame, price: pd.DataFrame):
+    merged = gen.merge(price[["hour_madrid", "price_eur_mwh", "price_source"]], on="hour_madrid", how="left")
+    merged["revenue_eur"] = merged["generation_mwh_15min"] * merged["price_eur_mwh"]
+    merged["is_priced"] = merged["price_eur_mwh"].notna()
+    monthly = merged.groupby(["site", "month"], as_index=False).agg(
+        generation_mwh=("generation_mwh_15min", "sum"),
+        revenue_eur=("revenue_eur", "sum"),
+        priced_intervals=("is_priced", "sum"),
+        total_intervals=("is_priced", "size"),
     )
+    monthly["missing_price_intervals"] = monthly["total_intervals"] - monthly["priced_intervals"]
+    monthly["captured_price_eur_mwh"] = np.where(monthly["generation_mwh"] > 0, monthly["revenue_eur"] / monthly["generation_mwh"], np.nan)
+    price_month = price.copy()
+    price_month["month"] = price_month["hour_madrid"].dt.to_period("M").astype(str)
+    baseload = price_month.groupby("month", as_index=False)["price_eur_mwh"].mean().rename(columns={"price_eur_mwh": "baseload_price_eur_mwh"})
+    monthly = monthly.merge(baseload, on="month", how="left")
+    monthly["capture_factor_pct"] = monthly["captured_price_eur_mwh"] / monthly["baseload_price_eur_mwh"] * 100
+    annual = merged.assign(year=merged["datetime_madrid"].dt.year).groupby(["site", "year"], as_index=False).agg(
+        generation_mwh=("generation_mwh_15min", "sum"),
+        revenue_eur=("revenue_eur", "sum"),
+        priced_intervals=("is_priced", "sum"),
+        total_intervals=("is_priced", "size"),
+    )
+    annual["missing_price_intervals"] = annual["total_intervals"] - annual["priced_intervals"]
+    annual["captured_price_eur_mwh"] = np.where(annual["generation_mwh"] > 0, annual["revenue_eur"] / annual["generation_mwh"], np.nan)
+    price_year = price.copy()
+    price_year["year"] = price_year["hour_madrid"].dt.year
+    annual_base = price_year.groupby("year", as_index=False)["price_eur_mwh"].mean().rename(columns={"price_eur_mwh": "baseload_price_eur_mwh"})
+    annual = annual.merge(annual_base, on="year", how="left")
+    annual["capture_factor_pct"] = annual["captured_price_eur_mwh"] / annual["baseload_price_eur_mwh"] * 100
+    return merged, monthly, annual
 
-    return out
 
+# Sidebar
+st.sidebar.title("IS2 controls")
+gen_file = st.sidebar.file_uploader("Upload 15-min generation file", type=["csv", "xlsx", "xls", "parquet"])
+st.sidebar.markdown("---")
+st.sidebar.subheader("Generation parsing")
+source_tz_gen = st.sidebar.selectbox("Generation timestamp source timezone", ["UTC", "Europe/Madrid"], index=0)
+gen_unit = st.sidebar.selectbox("Generation column unit", ["kWh per 15-min", "MWh per 15-min", "kW average in 15-min", "MW average in 15-min"], index=0)
+apply_solar_night_clean = st.sidebar.checkbox("Set impossible night generation to zero", value=True)
+ca, cb = st.sidebar.columns(2)
+night_start_hour = ca.number_input("Night starts", min_value=18, max_value=24, value=22, step=1)
+night_end_hour = cb.number_input("Night ends", min_value=0, max_value=9, value=5, step=1)
+st.sidebar.markdown("---")
+st.sidebar.subheader("Price source")
+price_source = st.sidebar.radio("Hourly price source", ["Upload price file", "Fetch eSIOS indicator 600"], index=0)
+price_file = None
+source_tz_price = "Europe/Madrid"
+esios_token = None
+if price_source == "Upload price file":
+    price_file = st.sidebar.file_uploader("Upload hourly OMIE/price file", type=["csv", "xlsx", "xls", "parquet"], key="price_upload")
+    source_tz_price = st.sidebar.selectbox("Price timestamp source timezone", ["UTC", "Europe/Madrid"], index=1)
+else:
+    esios_token = st.sidebar.text_input("eSIOS token", value=os.getenv("ESIOS_TOKEN", ""), type="password")
+st.sidebar.markdown("---")
+chart_height = st.sidebar.slider("Chart height", 350, 800, 520, 20)
+show_diagnostics = st.sidebar.checkbox("Show diagnostics", value=True)
 
-def load_day_ahead_tab_historical_prices(start_day: date, end_day: date) -> pd.DataFrame:
-    """
-    Reuses the same historical workbook convention as the Day Ahead tab:
-        data/hourly_avg_price_since2021.xlsx
-    sheet:
-        prices_hourly_avg
-    expected columns:
-        datetime, price
+# Main
+st.title("IS2 generation and day-ahead revenues")
+st.caption("15-min solar profile, hourly price join, revenue analytics. Timestamps displayed in Europe/Madrid.")
 
-    Important DST fix:
-      filter the requested date range while timestamps are still naive, then localize.
-      This avoids failing on historical ambiguous DST hours such as 2021-10-31 02:00
-      when the selected range is not that DST transition.
-    """
-    base_dir = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
-    candidates = [
-        Path("data/hourly_avg_price_since2021.xlsx"),
-        Path("data/hourly_avg_price_since2021.xls"),
-        Path("data/hourly_avg_price_since2021.csv"),
-        base_dir / "data" / "hourly_avg_price_since2021.xlsx",
-        base_dir / "data" / "hourly_avg_price_since2021.xls",
-        base_dir / "data" / "hourly_avg_price_since2021.csv",
-        Path.cwd() / "data" / "hourly_avg_price_since2021.xlsx",
-        Path.cwd() / "data" / "hourly_avg_price_since2021.xls",
-        Path.cwd() / "data" / "hourly_avg_price_since2021.csv",
-    ]
-    file_path = next((p for p in candidates if p.exists()), None)
-    if file_path is None:
-        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
+if gen_file is None:
+    st.info("Upload the IS2 15-min generation file to start.")
+    st.stop()
 
-    if str(file_path).lower().endswith(".csv"):
-        raw = pd.read_csv(file_path)
-    else:
+try:
+    raw_gen = read_uploaded_table(gen_file)
+except Exception as exc:
+    st.error(f"Could not read generation file: {exc}")
+    st.stop()
+
+dt_guess = find_col(raw_gen.columns, ["datetime_madrid", "datetime_utc", "datetime", "timestamp", "date", "time"])
+site_guess = find_col(raw_gen.columns, ["site", "asset", "plant", "park", "name", "installation"])
+gen_guess = find_col(raw_gen.columns, ["generation_kwh", "generation", "energy", "kwh", "mwh", "value"])
+
+with st.expander("Column mapping", expanded=False):
+    c1, c2, c3 = st.columns(3)
+    dt_col = c1.selectbox("Generation datetime column", raw_gen.columns, index=list(raw_gen.columns).index(dt_guess) if dt_guess in raw_gen.columns else 0)
+    site_col = c2.selectbox("Site column", raw_gen.columns, index=list(raw_gen.columns).index(site_guess) if site_guess in raw_gen.columns else 0)
+    gen_col = c3.selectbox("Generation value column", raw_gen.columns, index=list(raw_gen.columns).index(gen_guess) if gen_guess in raw_gen.columns else 0)
+
+gen_df, gen_diag = prepare_generation(raw_gen, dt_col, site_col, gen_col, source_tz_gen, gen_unit, apply_solar_night_clean, int(night_start_hour), int(night_end_hour))
+
+price_df = pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
+if price_source == "Upload price file" and price_file is not None:
+    raw_price = read_uploaded_table(price_file)
+    price_dt_guess = find_col(raw_price.columns, ["datetime_madrid", "datetime_utc", "datetime", "timestamp", "date", "hour"])
+    price_val_guess = find_col(raw_price.columns, ["price_eur_mwh", "price", "value", "precio", "eur_mwh", "€/mwh"])
+    with st.expander("Price column mapping", expanded=False):
+        p1, p2 = st.columns(2)
+        price_dt_col = p1.selectbox("Price datetime column", raw_price.columns, index=list(raw_price.columns).index(price_dt_guess) if price_dt_guess in raw_price.columns else 0)
+        price_col = p2.selectbox("Price value column", raw_price.columns, index=list(raw_price.columns).index(price_val_guess) if price_val_guess in raw_price.columns else 0)
+    price_df = prepare_price_file(raw_price, price_dt_col, price_col, source_tz_price)
+elif price_source == "Fetch eSIOS indicator 600":
+    if esios_token:
+        start_utc = gen_df["datetime_madrid"].min().tz_convert(UTC_TZ).floor("D")
+        end_utc = gen_df["datetime_madrid"].max().tz_convert(UTC_TZ).ceil("D") + pd.Timedelta(days=1)
         try:
-            raw = pd.read_excel(file_path, sheet_name="prices_hourly_avg")
-        except Exception:
-            raw = pd.read_excel(file_path, sheet_name=0)
-
-    if "price" not in raw.columns and "value" in raw.columns:
-        raw = raw.rename(columns={"value": "price"})
-
-    if "datetime" not in raw.columns or "price" not in raw.columns:
-        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-
-    dt = pd.to_datetime(raw["datetime"], errors="coerce")
-    out = pd.DataFrame()
-    out["datetime_naive"] = dt
-    out["price_eur_mwh"] = pd.to_numeric(raw["price"], errors="coerce")
-    out["price_source"] = f"Day Ahead workbook: {file_path.name}"
-    out = out.dropna(subset=["datetime_naive", "price_eur_mwh"])
-
-    # Filter before timezone localization to avoid unrelated ambiguous DST rows.
-    start_naive = pd.Timestamp(start_day)
-    end_naive = pd.Timestamp(end_day + timedelta(days=1))
-    out = out[(out["datetime_naive"] >= start_naive) & (out["datetime_naive"] < end_naive)].copy()
-
-    if out.empty:
-        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-
-    # Day Ahead tab normally stores historical datetimes as Madrid-naive labels.
-    # ambiguous=False means standard-time side for fall-back duplicate hours if they appear.
-    # nonexistent='shift_forward' handles spring DST gap.
-    if out["datetime_naive"].dt.tz is None:
-        out["hour_madrid"] = out["datetime_naive"].dt.tz_localize(
-            "Europe/Madrid",
-            ambiguous=False,
-            nonexistent="shift_forward",
-        ).dt.floor("h")
+            with st.spinner("Fetching hourly prices from eSIOS indicator 600..."):
+                price_df = fetch_esios_indicator_600(esios_token, start_utc.isoformat(), end_utc.isoformat(), geo_id=3)
+        except Exception as exc:
+            st.error(f"Could not fetch eSIOS prices: {exc}")
     else:
-        out["hour_madrid"] = out["datetime_naive"].dt.tz_convert("Europe/Madrid").dt.floor("h")
+        st.warning("Add your eSIOS token in the sidebar or upload a price file.")
 
-    return (
-        out[["hour_madrid", "price_eur_mwh", "price_source"]]
-        .drop_duplicates("hour_madrid", keep="last")
-        .sort_values("hour_madrid")
-        .reset_index(drop=True)
-    )
+if not price_df.empty:
+    min_hour, max_hour = gen_df["hour_madrid"].min(), gen_df["hour_madrid"].max()
+    price_df = price_df[(price_df["hour_madrid"] >= min_hour) & (price_df["hour_madrid"] <= max_hour)]
 
+# KPI row
+total_gen = gen_df["generation_mwh_15min"].sum()
+raw_night = gen_diag["night_generation_mwh_raw"].sum()
+raw_total = gen_diag["raw_generation_mwh"].sum()
+night_pct = raw_night / raw_total * 100 if raw_total else 0
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Clean generation", fmt_mwh(total_gen))
+m2.metric("Raw night generation", fmt_mwh(raw_night), f"{night_pct:.2f}% raw")
+m3.metric("Sites", f"{gen_df['site'].nunique():,.0f}")
+m4.metric("15-min intervals", f"{len(gen_df):,.0f}")
 
-def load_day_ahead_prices_from_app_data(start_day: date, end_day: date) -> pd.DataFrame:
-    """
-    Combined price loader for operational parks:
-      1) historical prices from the Day Ahead tab workbook
-      2) missing/current 2026 prices from ESIOS indicator 600 using the same token names
-    """
-    hist = load_day_ahead_tab_historical_prices(start_day, end_day)
+if raw_night > max(0.005 * raw_total, 0.01):
+    st.markdown(f'<div class="warning-box"><b>Solar sanity warning:</b> raw data has {raw_night:,.2f} MWh during the night window ({night_pct:.2f}% of raw generation). This normally means timezone shift or forward-fill. Cleaning: <b>{"night values set to zero" if apply_solar_night_clean else "night values kept"}</b>.</div>', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="ok-box"><b>Solar sanity check passed:</b> raw night generation is negligible.</div>', unsafe_allow_html=True)
 
-    token = get_esios_token_optional()
-    live = pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-    try:
-        live = fetch_esios_day_ahead_prices(start_day, end_day, token) if token else live
-    except Exception as exc:
-        st.warning(f"Could not fetch live day-ahead prices from ESIOS: {exc}")
+# Generation profile
+st.subheader("15-min generation profile")
+site_options = sorted(gen_df["site"].unique())
+selected_sites = st.multiselect("Sites to plot", site_options, default=site_options[: min(len(site_options), 6)])
+plot_df = gen_df[gen_df["site"].isin(selected_sites)]
+fig = go.Figure()
+for site in selected_sites:
+    sub = plot_df[plot_df["site"] == site]
+    fig.add_trace(go.Scatter(x=sub["datetime_madrid"], y=sub["generation_kwh_15min"], mode="lines", name=site, line=dict(width=1.8), hovertemplate="%{x|%d-%b %H:%M}<br>%{y:,.1f} kWh/15-min<extra>" + site + "</extra>"))
+fig.update_layout(**plot_layout("15-min generation profile", "Cleaned generation; no forward-fill; Europe/Madrid", chart_height))
+fig.update_xaxes(title="Madrid date and hour", showgrid=False)
+fig.update_yaxes(title="Generation (kWh / 15-min)", gridcolor="#e8edf3", zeroline=True, zerolinecolor="#94a3b8")
+st.plotly_chart(fig, use_container_width=True)
 
-    prices = pd.concat([hist, live], ignore_index=True)
-    if prices.empty:
-        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-
-    # Prefer live ESIOS over workbook for overlapping hours.
-    prices["source_priority"] = prices["price_source"].str.contains("ESIOS", case=False, na=False).astype(int)
-    prices = (
-        prices.sort_values(["hour_madrid", "source_priority"])
-              .drop_duplicates("hour_madrid", keep="last")
-              .drop(columns=["source_priority"])
-              .sort_values("hour_madrid")
-              .reset_index(drop=True)
-    )
-    return prices
-
-
-def generation_15min_to_hourly_mwh(gen15: pd.DataFrame) -> pd.DataFrame:
-    if gen15.empty:
-        return pd.DataFrame(columns=["site", "hour_madrid", "generation_mwh"])
-
-    tmp = gen15.copy()
-    # Force timezone-aware Europe/Madrid dtype, not object.
-    tmp["datetime_madrid"] = pd.to_datetime(tmp["datetime_madrid"], utc=True, errors="coerce").dt.tz_convert("Europe/Madrid")
-    tmp = tmp.dropna(subset=["datetime_madrid"])
-
-    tmp["hour_madrid"] = tmp["datetime_madrid"].dt.floor("h")
-    tmp["generation_mwh_15min"] = pd.to_numeric(tmp["generation_kwh_15min"], errors="coerce") / 1000.0
-
-    out = (
-        tmp.groupby(["site", "hour_madrid"], as_index=False)
-           .agg(generation_mwh=("generation_mwh_15min", "sum"))
-    )
-    # Ensure merge key has exactly the same dtype as price loader.
-    out["hour_madrid"] = pd.to_datetime(out["hour_madrid"], utc=True, errors="coerce").dt.tz_convert("Europe/Madrid")
-    return out.dropna(subset=["hour_madrid"])
-
-
-def normalize_price_hours(prices: pd.DataFrame) -> pd.DataFrame:
-    if prices.empty:
-        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
-
-    out = prices.copy()
-
-    # Robust timezone normalization:
-    # - if values are tz-aware, convert to Europe/Madrid
-    # - if values are naive, interpret as Europe/Madrid
-    raw_dt = pd.to_datetime(out["hour_madrid"], errors="coerce")
-    if getattr(raw_dt.dt, "tz", None) is None:
-        out["hour_madrid"] = raw_dt.dt.tz_localize(
-            "Europe/Madrid",
-            ambiguous=False,
-            nonexistent="shift_forward",
-        ).dt.floor("h")
-    else:
-        out["hour_madrid"] = raw_dt.dt.tz_convert("Europe/Madrid").dt.floor("h")
-
-    out["price_eur_mwh"] = pd.to_numeric(out["price_eur_mwh"], errors="coerce")
-    if "price_source" not in out.columns:
-        out["price_source"] = "unknown"
-
-    out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
-
-    # Do not sum prices. Average duplicate hourly prices.
-    return (
-        out.groupby("hour_madrid", as_index=False)
-           .agg(price_eur_mwh=("price_eur_mwh", "mean"), price_source=("price_source", "first"))
-           .sort_values("hour_madrid")
-           .reset_index(drop=True)
-    )
-
-
-def calculate_revenues(gen15: pd.DataFrame, prices: pd.DataFrame):
-    hourly = generation_15min_to_hourly_mwh(gen15)
-
-    # Keep only selected local date window to avoid the next local midnight creating a zero-MWh next-month row.
-    try:
-        _start_local = pd.Timestamp(start_day, tz="Europe/Madrid")
-        _end_local = pd.Timestamp(end_day + timedelta(days=1), tz="Europe/Madrid")
-        hourly = hourly[(hourly["hour_madrid"] >= _start_local) & (hourly["hour_madrid"] < _end_local)].copy()
-    except Exception:
-        pass
-
-    prices = normalize_price_hours(prices)
-
-    if hourly.empty or prices.empty:
-        return hourly, pd.DataFrame(), pd.DataFrame()
-
-    # Both keys are now datetime64[ns, Europe/Madrid].
-    joined = hourly.merge(prices, on="hour_madrid", how="left")
-
-    joined["revenue_eur"] = joined["generation_mwh"] * joined["price_eur_mwh"]
-    joined["month"] = joined["hour_madrid"].dt.strftime("%Y-%m")
-    joined["year"] = joined["hour_madrid"].dt.year
-
-    def agg(g):
-        gen = g["generation_mwh"].sum()
-        rev = g["revenue_eur"].sum()
-        captured = rev / gen if gen else pd.NA
-        baseload = g["price_eur_mwh"].mean()
-        return pd.Series({
-            "generation_mwh": gen,
-            "revenue_eur": rev,
-            "captured_price_eur_mwh": captured,
-            "baseload_price_eur_mwh": baseload,
-            "capture_factor_pct": (captured / baseload * 100) if pd.notna(captured) and baseload else pd.NA,
-            "priced_hours": int(g["price_eur_mwh"].notna().sum()),
-            "missing_price_hours": int(g["price_eur_mwh"].isna().sum()),
-        })
-
-    monthly = joined.groupby(["site", "month"], dropna=False).apply(agg).reset_index()
-    annual = joined.groupby(["site", "year"], dropna=False).apply(agg).reset_index()
-    return joined, monthly, annual
-
-
-st.title("Solarpark / UNITY — May production test + 24h average profile")
-st.caption(
-    "Test using Cookie auth from the browser request. "
-    "API source values appear around 10-min intervals; this page converts them to 15-min generation using proportional overlap."
-)
-
-with st.expander("Configured power source IDs", expanded=False):
-    st.json(POWER_SOURCE_IDS)
-
-col1, col2 = st.columns(2)
-with col1:
-    start_day = st.date_input("Start day", value=date(2026, 5, 1))
-with col2:
-    end_day = st.date_input("End day inclusive", value=date(2026, 5, 31))
-
-selected_sites = st.multiselect(
-    "Sites",
-    options=list(POWER_SOURCE_IDS.keys()),
-    default=list(POWER_SOURCE_IDS.keys()),
-)
-
-if end_day < start_day:
-    st.error("End day must be >= start day.")
+# Revenues
+st.subheader("Day-ahead revenues — operational parks")
+if price_df.empty:
+    st.markdown('<div class="danger-box">No price series loaded. Upload a clean OMIE Spain hourly price file or fetch eSIOS indicator 600 with token.</div>', unsafe_allow_html=True)
     st.stop()
 
-if not selected_sites:
-    st.warning("Select at least one site.")
-    st.stop()
+status, msg = price_quality_message(price_df)
+box_class = {"ok": "ok-box", "warning": "warning-box", "danger": "danger-box"}[status]
+st.markdown(f'<div class="{box_class}"><b>Price diagnostics:</b> {msg}</div>', unsafe_allow_html=True)
+revenues_df, monthly, annual = calculate_revenues(gen_df, price_df)
+priced_ratio = revenues_df["is_priced"].mean() * 100 if len(revenues_df) else 0
+total_revenue = revenues_df["revenue_eur"].sum(skipna=True)
+captured_price = total_revenue / total_gen if total_gen > 0 else np.nan
+baseload_price = price_df["price_eur_mwh"].mean()
+capture_factor = captured_price / baseload_price * 100 if baseload_price and not pd.isna(captured_price) else np.nan
+r1, r2, r3, r4 = st.columns(4)
+r1.metric("Revenue", fmt_eur(total_revenue))
+r2.metric("Captured price", fmt_price(captured_price))
+r3.metric("Baseload price", fmt_price(baseload_price))
+r4.metric("Capture factor", f"{capture_factor:.1f}%" if not pd.isna(capture_factor) else "—", f"{priced_ratio:.1f}% priced intervals")
 
-selected_source_ids = [POWER_SOURCE_IDS[s] for s in selected_sites]
+hourly_gen = revenues_df.groupby("hour_madrid", as_index=False).agg(generation_mwh=("generation_mwh_15min", "sum"), revenue_eur=("revenue_eur", "sum"))
+hourly = hourly_gen.merge(price_df[["hour_madrid", "price_eur_mwh"]], on="hour_madrid", how="left")
+fig_rev = go.Figure()
+fig_rev.add_trace(go.Bar(x=hourly["hour_madrid"], y=hourly["generation_mwh"], name="Generation", yaxis="y", opacity=0.75, hovertemplate="%{x|%d-%b %H:%M}<br>Generation: %{y:,.2f} MWh<extra></extra>"))
+fig_rev.add_trace(go.Scatter(x=hourly["hour_madrid"], y=hourly["price_eur_mwh"], name="Day-ahead price", yaxis="y2", mode="lines", line=dict(width=2.4), hovertemplate="%{x|%d-%b %H:%M}<br>Price: %{y:,.2f} €/MWh<extra></extra>"))
+fig_rev.update_layout(**plot_layout("Hourly generation and day-ahead price", "Generation aggregated from 15-min; price joined by Madrid hour", 460))
+fig_rev.update_layout(yaxis=dict(title="Generation (MWh)", gridcolor="#e8edf3", zeroline=True, zerolinecolor="#94a3b8"), yaxis2=dict(title="Price (€/MWh)", overlaying="y", side="right", showgrid=False), bargap=0.05)
+fig_rev.update_xaxes(title="Madrid date and hour", showgrid=False)
+st.plotly_chart(fig_rev, use_container_width=True)
 
-start_utc = madrid_day_to_utc_str(start_day)
-# End is exclusive: next local midnight after selected end day.
-end_utc = madrid_day_to_utc_str(end_day, end_of_day=True)
+st.markdown("### Monthly revenue metrics")
+monthly_display = monthly[["site", "month", "generation_mwh", "revenue_eur", "captured_price_eur_mwh", "baseload_price_eur_mwh", "capture_factor_pct", "priced_intervals", "missing_price_intervals"]].sort_values(["site", "month"])
+st.dataframe(monthly_display.style.format({"generation_mwh": "{:,.2f}", "revenue_eur": "€{:,.0f}", "captured_price_eur_mwh": "{:,.2f}", "baseload_price_eur_mwh": "{:,.2f}", "capture_factor_pct": "{:,.1f}%", "priced_intervals": "{:,.0f}", "missing_price_intervals": "{:,.0f}"}), use_container_width=True, hide_index=True)
 
-st.write(f"UTC request window: `{start_utc}` → `{end_utc}`")
-st.info("For May 2026 in Europe/Madrid, local midnight is UTC 22:00 the previous day.")
+st.markdown("### Annual revenue metrics")
+annual_display = annual[["site", "year", "generation_mwh", "revenue_eur", "captured_price_eur_mwh", "baseload_price_eur_mwh", "capture_factor_pct", "priced_intervals", "missing_price_intervals"]].sort_values(["site", "year"])
+st.dataframe(annual_display.style.format({"generation_mwh": "{:,.2f}", "revenue_eur": "€{:,.0f}", "captured_price_eur_mwh": "{:,.2f}", "baseload_price_eur_mwh": "{:,.2f}", "capture_factor_pct": "{:,.1f}%", "priced_intervals": "{:,.0f}", "missing_price_intervals": "{:,.0f}"}), use_container_width=True, hide_index=True)
 
-run = st.button("Fetch production", type="primary", use_container_width=True)
+if show_diagnostics:
+    st.markdown("### Diagnostics")
+    with st.expander("Generation diagnostics", expanded=False):
+        st.dataframe(gen_diag.style.format({"raw_generation_mwh": "{:,.3f}", "clean_generation_mwh": "{:,.3f}", "night_generation_mwh_raw": "{:,.3f}", "night_generation_pct_raw": "{:,.2f}%"}), use_container_width=True, hide_index=True)
+    with st.expander("Price diagnostics", expanded=False):
+        st.dataframe(price_df["price_eur_mwh"].describe().to_frame("price_eur_mwh").T, use_container_width=True)
+        st.dataframe(price_df.head(50), use_container_width=True, hide_index=True)
+    with st.expander("Revenue datetime diagnostics", expanded=False):
+        diag = pd.DataFrame({"metric": ["Generation start", "Generation end", "Price start", "Price end", "Generation intervals", "Price hours", "Priced generation intervals", "Missing price intervals"], "value": [str(gen_df["datetime_madrid"].min()), str(gen_df["datetime_madrid"].max()), str(price_df["hour_madrid"].min()), str(price_df["hour_madrid"].max()), f"{len(gen_df):,}", f"{len(price_df):,}", f"{revenues_df['is_priced'].sum():,}", f"{(~revenues_df['is_priced']).sum():,}"]})
+        st.dataframe(diag, use_container_width=True, hide_index=True)
 
-if run:
-    cookie = get_cookie()
-
-    try:
-        payload = fetch_power_values(start_utc, end_utc, cookie, selected_source_ids)
-    except Exception as exc:
-        st.error(f"Could not fetch Solarpark values: {exc}")
-        st.stop()
-
-    power_df = events_payload_to_power_df(payload)
-    if power_df.empty:
-        st.warning("No power events returned for the configured source IDs.")
-        st.write("Raw payload preview:")
-        st.json(payload if isinstance(payload, dict) else payload[:1])
-        st.stop()
-
-    gen15 = power_10min_to_generation_15min(power_df)
-    daily = make_daily_summary(gen15)
-    month_summary = make_month_summary(gen15)
-
-    st.subheader("Monthly production summary")
-    st.dataframe(month_summary, use_container_width=True, hide_index=True)
-    st.caption("Below: average 24h profile calculated from all selected May days.")
-
-    st.subheader("Average 24h generation profile by site")
-    profile24 = make_24h_average_profile(gen15)
-
-    metric = st.radio(
-        "Profile metric",
-        options=["Equivalent average power (kW)", "Average generation per 15-min bucket (kWh)"],
-        horizontal=True,
-        index=0,
-    )
-
-    if metric.startswith("Average generation"):
-        y_field = "avg_generation_kwh_15min"
-        y_title = "Avg generation per 15-min bucket (kWh)"
-        tooltip_value = alt.Tooltip("avg_generation_kwh_15min:Q", title="Avg kWh/15min", format=",.2f")
-    else:
-        y_field = "avg_power_kw"
-        y_title = "Equivalent average power (kW)"
-        tooltip_value = alt.Tooltip("avg_power_kw:Q", title="Avg kW", format=",.0f")
-
-    profile_chart = (
-        alt.Chart(profile24)
-        .mark_line(point=False, strokeWidth=3)
-        .encode(
-            x=alt.X(
-                "hour_decimal:Q",
-                title="Hour of day",
-                scale=alt.Scale(domain=[0, 24]),
-                axis=alt.Axis(values=list(range(0, 25, 2)), labelExpr="datum.value + ':00'"),
-            ),
-            y=alt.Y(f"{y_field}:Q", title=y_title),
-            color=alt.Color("site:N", title="Site"),
-            tooltip=[
-                alt.Tooltip("site:N", title="Site"),
-                alt.Tooltip("time_of_day:N", title="Time"),
-                tooltip_value,
-                alt.Tooltip("obs:Q", title="Obs", format=","),
-            ],
-        )
-        .properties(height=460)
-    )
-    st.altair_chart(profile_chart, use_container_width=True)
-
-    with st.expander("Show 24h profile data", expanded=False):
-        st.dataframe(profile24, use_container_width=True, hide_index=True)
-
-    st.subheader("15-min generation profile — Madrid date and hour")
-    st.caption("The API request window is UTC, but the chart uses datetime_madrid converted to Europe/Madrid.")
-    gen15_plot = gen15.copy()
-    detail_chart = (
-        alt.Chart(gen15_plot)
-        .mark_line(point=False)
-        .encode(
-            x=alt.X("datetime_madrid:T", title="Madrid date and hour", axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45)),
-            y=alt.Y("generation_kwh_15min:Q", title="Generation kWh / 15-min"),
-            color=alt.Color("site:N", title="Site"),
-            tooltip=[
-                alt.Tooltip("site:N", title="Site"),
-                alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                alt.Tooltip("generation_kwh_15min:Q", title="kWh/15-min", format=",.2f"),
-            ],
-        )
-        .properties(height=360)
-    )
-    st.altair_chart(detail_chart, use_container_width=True)
-
-    st.subheader("Day-ahead revenues — operational parks")
-    st.caption(
-        "Uses the same price source as the Day Ahead tab: "
-        "`data/hourly_avg_price_since2021.xlsx` plus live ESIOS indicator 600 for missing/current hours. "
-        "Join is hourly in Europe/Madrid with normalized timezone-aware datetime keys."
-    )
-
-    try:
-        prices = load_day_ahead_prices_from_app_data(start_day, end_day)
-        if prices.empty:
-            st.info(
-                "No day-ahead prices found. Check that `data/hourly_avg_price_since2021.xlsx` exists "
-                "or add ESIOS_TOKEN / ESIOS_API_TOKEN to .env or Streamlit Secrets."
-            )
-        else:
-            joined_rev, monthly_rev, annual_rev = calculate_revenues(gen15, prices)
-            st.write(
-                f"Loaded {len(prices):,} hourly day-ahead price rows "
-                f"from: {', '.join(sorted(prices['price_source'].dropna().unique().tolist()))}"
-            )
-            _prices_check = normalize_price_hours(prices)
-            if not _prices_check.empty and _prices_check["price_eur_mwh"].mean() > 200:
-                st.warning(
-                    "Average day-ahead price is above 200 €/MWh. "
-                    "Check 'Revenue datetime diagnostics' below: this usually means the source price file/API values are not the expected OMIE Spain hourly price."
-                )
-
-            with st.expander("Revenue datetime diagnostics", expanded=False):
-                _hourly_diag = generation_15min_to_hourly_mwh(gen15)
-                _prices_diag = normalize_price_hours(prices)
-                st.write({
-                    "generation_hour_madrid_dtype": str(_hourly_diag["hour_madrid"].dtype) if not _hourly_diag.empty else "empty",
-                    "prices_hour_madrid_dtype": str(_prices_diag["hour_madrid"].dtype) if not _prices_diag.empty else "empty",
-                    "generation_first_hour": str(_hourly_diag["hour_madrid"].min()) if not _hourly_diag.empty else None,
-                    "price_first_hour": str(_prices_diag["hour_madrid"].min()) if not _prices_diag.empty else None,
-                    "generation_last_hour": str(_hourly_diag["hour_madrid"].max()) if not _hourly_diag.empty else None,
-                    "price_last_hour": str(_prices_diag["hour_madrid"].max()) if not _prices_diag.empty else None,
-                    "price_min": float(_prices_diag["price_eur_mwh"].min()) if not _prices_diag.empty else None,
-                    "price_avg": float(_prices_diag["price_eur_mwh"].mean()) if not _prices_diag.empty else None,
-                    "price_max": float(_prices_diag["price_eur_mwh"].max()) if not _prices_diag.empty else None,
-                    "price_sources": sorted(_prices_diag["price_source"].dropna().unique().tolist()) if not _prices_diag.empty else [],
-                })
-                st.dataframe(
-                    _prices_diag.sort_values("price_eur_mwh", ascending=False).head(20),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            st.markdown("**Monthly revenue metrics**")
-            st.dataframe(monthly_rev, use_container_width=True, hide_index=True)
-
-            st.markdown("**Annual revenue metrics**")
-            st.dataframe(annual_rev, use_container_width=True, hide_index=True)
-
-            rev_chart = (
-                alt.Chart(monthly_rev)
-                .mark_bar()
-                .encode(
-                    x=alt.X("month:N", title="Month"),
-                    y=alt.Y("revenue_eur:Q", title="Revenue €"),
-                    color=alt.Color("site:N", title="Site"),
-                    tooltip=[
-                        alt.Tooltip("site:N", title="Site"),
-                        alt.Tooltip("month:N", title="Month"),
-                        alt.Tooltip("generation_mwh:Q", title="MWh", format=",.2f"),
-                        alt.Tooltip("revenue_eur:Q", title="Revenue €", format=",.0f"),
-                        alt.Tooltip("captured_price_eur_mwh:Q", title="Captured €/MWh", format=",.2f"),
-                        alt.Tooltip("capture_factor_pct:Q", title="Capture factor %", format=",.1f"),
-                    ],
-                )
-                .properties(height=320)
-            )
-            st.altair_chart(rev_chart, use_container_width=True)
-
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.download_button("Download hourly revenue join", joined_rev.to_csv(index=False).encode("utf-8"), f"solarpark_hourly_revenue_join_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
-            with c2:
-                st.download_button("Download monthly revenue metrics", monthly_rev.to_csv(index=False).encode("utf-8"), f"solarpark_monthly_revenue_metrics_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
-            with c3:
-                st.download_button("Download annual revenue metrics", annual_rev.to_csv(index=False).encode("utf-8"), f"solarpark_annual_revenue_metrics_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
-            with c4:
-                st.download_button("Download prices used", prices.to_csv(index=False).encode("utf-8"), f"day_ahead_prices_used_{start_day}_{end_day}.csv", "text/csv", use_container_width=True)
-
-            missing_total = int(joined_rev["price_eur_mwh"].isna().sum())
-            if missing_total:
-                st.warning(f"There are {missing_total:,} generation hours without matching day-ahead price.")
-    except Exception as exc:
-        st.error(f"Could not calculate revenues: {exc}")
-
-    st.subheader("Daily production")
-    daily_chart = (
-        alt.Chart(daily)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("date:T", title="Date"),
-            y=alt.Y("generation_mwh:Q", title="Generation MWh/day"),
-            color=alt.Color("site:N", title="Site"),
-            tooltip=[
-                alt.Tooltip("site:N", title="Site"),
-                alt.Tooltip("date:T", title="Date", format="%d-%b-%Y"),
-                alt.Tooltip("generation_mwh:Q", title="MWh", format=",.2f"),
-            ],
-        )
-        .properties(height=360)
-    )
-    st.altair_chart(daily_chart, use_container_width=True)
-
-    st.subheader("15-min generation sample")
-    st.dataframe(gen15.head(500), use_container_width=True, hide_index=True)
-
-    csv = gen15.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download 15-min generation CSV",
-        data=csv,
-        file_name=f"solarpark_generation_15min_{start_day}_{end_day}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    with st.expander("Diagnostics", expanded=False):
-        st.write("Power events rows:", len(power_df))
-        st.write("15-min rows:", len(gen15))
-        st.write("Source IDs returned:")
-        st.write(sorted(power_df["source_id"].unique().tolist()))
-        st.write("Timezone check:")
-        st.write({
-            "datetime_utc_dtype": str(power_df["datetime_utc"].dtype),
-            "datetime_madrid_dtype": str(power_df["datetime_madrid"].dtype),
-            "first_utc": str(power_df["datetime_utc"].min()),
-            "first_madrid": str(power_df["datetime_madrid"].min()),
-            "last_utc": str(power_df["datetime_utc"].max()),
-            "last_madrid": str(power_df["datetime_madrid"].max()),
-        })
-        st.write("Max power by site:")
-        st.dataframe(power_df.groupby("site", as_index=False)["power_kw"].max(), use_container_width=True, hide_index=True)
-        st.write("Raw payload first object keys:")
-        if isinstance(payload, list) and payload:
-            st.write(list(payload[0].keys()))
-        elif isinstance(payload, dict):
-            st.write(list(payload.keys()))
+st.markdown("### Download processed outputs")
+d1, d2, d3 = st.columns(3)
+d1.download_button("Download cleaned generation", data=gen_df.to_csv(index=False).encode("utf-8"), file_name="is2_cleaned_generation_15min.csv", mime="text/csv")
+d2.download_button("Download revenue detail", data=revenues_df.to_csv(index=False).encode("utf-8"), file_name="is2_revenue_detail_15min.csv", mime="text/csv")
+d3.download_button("Download monthly metrics", data=monthly_display.to_csv(index=False).encode("utf-8"), file_name="is2_monthly_revenue_metrics.csv", mime="text/csv")
