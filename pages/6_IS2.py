@@ -64,6 +64,7 @@ if load_dotenv is not None:
     load_dotenv(override=True)
 
 DAY_AHEAD_PRICE_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
+PRICE_INDICATOR_ID = 600
 
 POWER_SOURCE_IDS = {
     "Carmona Central 36": "d19246ea-065e-11f0-980e-42010afa015a",
@@ -463,6 +464,130 @@ def make_24h_average_profile(gen15: pd.DataFrame) -> pd.DataFrame:
     return profile
 
 
+
+# =========================================================
+# Live Day Ahead prices from eSIOS, same logic as Day Ahead tab
+# =========================================================
+def require_esios_token_optional() -> str:
+    """
+    Same token structure used by the Day Ahead page:
+      local .env:
+          ESIOS_TOKEN=...
+          or ESIOS_API_TOKEN=...
+      Streamlit secrets:
+          ESIOS_TOKEN = "..."
+          or ESIOS_API_TOKEN = "..."
+    """
+    token = ""
+    try:
+        token = str(st.secrets.get("ESIOS_TOKEN", "") or st.secrets.get("ESIOS_API_TOKEN", "") or "")
+    except Exception:
+        token = ""
+
+    if not token:
+        token = os.getenv("ESIOS_TOKEN", "") or os.getenv("ESIOS_API_TOKEN", "")
+
+    return str(token).strip().strip('"').strip("'")
+
+
+def build_esios_headers(token: str) -> dict:
+    return {
+        "Accept": "application/json; application/vnd.esios-api-v1+json",
+        "Content-Type": "application/json",
+        "x-api-key": token,
+    }
+
+
+def parse_esios_datetime_to_madrid_naive(df: pd.DataFrame) -> pd.Series:
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+    elif "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    else:
+        raise ValueError("eSIOS response has no datetime/datetime_utc column")
+    return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_esios_day_ahead_qh(token: str, start_day_iso: str, end_day_iso: str) -> pd.DataFrame:
+    """
+    Fetch indicator 600 exactly for the selected generation window.
+
+    For post Oct-2025 periods we request quarter-hourly values, so revenues are
+    matched at QH resolution. If eSIOS returns hourly values, the later QH builder
+    expands them to QH.
+    """
+    start_day = pd.to_datetime(start_day_iso).date()
+    end_day = pd.to_datetime(end_day_iso).date()
+
+    url = f"https://api.esios.ree.es/indicators/{PRICE_INDICATOR_ID}"
+    frames = []
+    chunk_start = start_day
+    chunk_days = 14
+
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=chunk_days - 1))
+
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+
+        params = {
+            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_trunc": "quarter_hour",
+        }
+
+        last_error = None
+        for _ in range(3):
+            try:
+                r = requests.get(
+                    url,
+                    headers=build_esios_headers(token),
+                    params=params,
+                    timeout=(15, 90),
+                )
+                r.raise_for_status()
+                values = r.json().get("indicator", {}).get("values", [])
+                if values:
+                    df = pd.DataFrame(values)
+
+                    # Keep Spain if the API returns several geographies.
+                    if "geo_id" in df.columns and (df["geo_id"].astype(str) == "3").any():
+                        df = df[df["geo_id"].astype(str) == "3"].copy()
+                    elif "geo_name" in df.columns:
+                        geo = df["geo_name"].astype(str).str.strip().str.lower()
+                        if (geo == "españa").any():
+                            df = df[geo == "españa"].copy()
+                        elif (geo == "espana").any():
+                            df = df[geo == "espana"].copy()
+
+                    if not df.empty:
+                        out = pd.DataFrame()
+                        out["datetime_madrid"] = parse_esios_datetime_to_madrid_naive(df)
+                        out["price_eur_mwh"] = pd.to_numeric(df["value"], errors="coerce")
+                        out = out.dropna(subset=["datetime_madrid", "price_eur_mwh"])
+                        frames.append(out)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime_madrid", "price_eur_mwh", "price_source"])
+
+    prices = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values("datetime_madrid")
+        .drop_duplicates("datetime_madrid", keep="last")
+        .reset_index(drop=True)
+    )
+    prices["price_source"] = "eSIOS indicator 600 — Spain"
+    return prices[["datetime_madrid", "price_eur_mwh", "price_source"]]
+
+
+
 # =========================================================
 # Day Ahead prices: mixed hourly/QH without DST ambiguity
 # =========================================================
@@ -557,6 +682,123 @@ def load_day_ahead_prices_qh(path_str: str) -> tuple[pd.DataFrame, pd.DataFrame]
     qh["price_source"] = f"Day Ahead workbook — {path.name}"
 
     return qh[["qh_madrid", "hour_madrid", "price_eur_mwh", "price_granularity", "price_source", "month"]], prices
+
+
+
+def build_qh_price_series_from_rows(prices: pd.DataFrame, source_label: str) -> pd.DataFrame:
+    """
+    Build QH buckets from raw local-naive Madrid rows.
+    Hourly rows are expanded into four QH rows when there are no native QH rows
+    for that same hour.
+    """
+    if prices.empty:
+        return pd.DataFrame(columns=["qh_madrid", "hour_madrid", "price_eur_mwh", "price_granularity", "price_source", "month"])
+
+    prices = prices.copy()
+    prices["datetime_madrid"] = pd.to_datetime(prices["datetime_madrid"], errors="coerce")
+    if getattr(prices["datetime_madrid"].dt, "tz", None) is not None:
+        prices["datetime_madrid"] = prices["datetime_madrid"].dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    prices["datetime_madrid"] = prices["datetime_madrid"].dt.floor("15min")
+    prices["price_eur_mwh"] = clean_numeric(prices["price_eur_mwh"])
+    prices = (
+        prices.dropna(subset=["datetime_madrid", "price_eur_mwh"])
+              .sort_values("datetime_madrid")
+              .drop_duplicates("datetime_madrid", keep="last")
+              .reset_index(drop=True)
+    )
+
+    existing = set(prices["datetime_madrid"])
+    qh_rows = []
+
+    for _, row in prices.iterrows():
+        ts = row["datetime_madrid"]
+        price = row["price_eur_mwh"]
+        src = row.get("price_source", source_label)
+
+        if ts.minute in (15, 30, 45):
+            qh_rows.append({"qh_madrid": ts, "price_eur_mwh": price, "price_granularity": "QH", "price_source": src})
+            continue
+
+        qh_candidates = [ts + pd.Timedelta(minutes=m) for m in (15, 30, 45)]
+        has_native_qh = any(q in existing for q in qh_candidates)
+
+        if has_native_qh:
+            qh_rows.append({"qh_madrid": ts, "price_eur_mwh": price, "price_granularity": "QH", "price_source": src})
+        else:
+            for m in (0, 15, 30, 45):
+                qh_rows.append({
+                    "qh_madrid": ts + pd.Timedelta(minutes=m),
+                    "price_eur_mwh": price,
+                    "price_granularity": "Hourly expanded to QH",
+                    "price_source": src,
+                })
+
+    qh = (
+        pd.DataFrame(qh_rows)
+        .dropna(subset=["qh_madrid", "price_eur_mwh"])
+        .sort_values("qh_madrid")
+        .drop_duplicates("qh_madrid", keep="last")
+        .reset_index(drop=True)
+    )
+    qh["hour_madrid"] = qh["qh_madrid"].dt.floor("h")
+    qh["month"] = qh["qh_madrid"].dt.to_period("M").astype(str)
+    return qh[["qh_madrid", "hour_madrid", "price_eur_mwh", "price_granularity", "price_source", "month"]]
+
+
+def load_day_ahead_prices_combined_qh(workbook_path: Path | None, start_day: date, end_day: date) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Load prices as the Day Ahead tab does:
+      - historical workbook from /data
+      - live 2026 from eSIOS indicator 600 using ESIOS_TOKEN / ESIOS_API_TOKEN
+
+    Returns QH prices for the selected period.
+    """
+    raw_frames = []
+    source_notes = []
+
+    if workbook_path is not None and workbook_path.exists():
+        try:
+            qh_from_workbook, raw_workbook = load_day_ahead_prices_qh(str(workbook_path))
+            if not qh_from_workbook.empty:
+                raw_for_merge = qh_from_workbook.rename(columns={"qh_madrid": "datetime_madrid"})[
+                    ["datetime_madrid", "price_eur_mwh", "price_source"]
+                ].copy()
+                raw_frames.append(raw_for_merge)
+                source_notes.append(f"workbook {workbook_path.name}")
+        except Exception as exc:
+            source_notes.append(f"workbook failed: {exc}")
+
+    # Live extraction: if selected range touches 2026 or later, fetch live eSIOS.
+    # This mirrors the Day Ahead page structure where historical file is used until
+    # 2025 and live extraction is used from 2026.
+    if end_day >= date(2026, 1, 1):
+        token = require_esios_token_optional()
+        if token:
+            live_start = max(start_day, date(2026, 1, 1))
+            live_prices = fetch_esios_day_ahead_qh(token, live_start.isoformat(), end_day.isoformat())
+            if not live_prices.empty:
+                raw_frames.append(live_prices)
+                source_notes.append("live eSIOS indicator 600")
+        else:
+            source_notes.append("missing ESIOS_TOKEN / ESIOS_API_TOKEN for live 2026 prices")
+
+    if not raw_frames:
+        return (
+            pd.DataFrame(columns=["qh_madrid", "hour_madrid", "price_eur_mwh", "price_granularity", "price_source", "month"]),
+            pd.DataFrame(),
+            "; ".join(source_notes),
+        )
+
+    raw = (
+        pd.concat(raw_frames, ignore_index=True)
+        .sort_values("datetime_madrid")
+        .drop_duplicates("datetime_madrid", keep="last")  # live eSIOS overrides workbook if overlap
+        .reset_index(drop=True)
+    )
+
+    qh = build_qh_price_series_from_rows(raw, "combined Day Ahead price source")
+    qh = qh[(qh["qh_madrid"].dt.date >= start_day) & (qh["qh_madrid"].dt.date <= end_day)].copy()
+    return qh, raw, "; ".join(source_notes)
 
 
 def price_sanity(price_qh: pd.DataFrame) -> tuple[str, str]:
@@ -789,21 +1031,10 @@ gen15, gen_diag = clean_night_generation(
     apply_clean=clean_night,
 )
 
-# Load and filter prices
+# Load and filter prices.
+# This mirrors the Day Ahead tab: historical workbook + live eSIOS from 2026.
 workbook = find_day_ahead_workbook()
-if workbook is None:
-    box(
-        "danger",
-        "Could not find <code>data/hourly_avg_price_since2021.xlsx</code>. "
-        "This file is required to use the same price source as the Day Ahead tab.",
-    )
-    st.stop()
-
-try:
-    price_qh_all, price_raw = load_day_ahead_prices_qh(str(workbook))
-except Exception as exc:
-    box("danger", f"Could not load Day Ahead prices from workbook: {exc}")
-    st.stop()
+price_qh_all, price_raw, price_source_notes = load_day_ahead_prices_combined_qh(workbook, start_day, end_day)
 
 price_qh = price_qh_all[
     (price_qh_all["qh_madrid"] >= gen15["qh_madrid"].min()) &
@@ -814,7 +1045,7 @@ section_header("SCADA generation profile")
 
 pill(f"UTC request window: {start_utc} → {end_utc}")
 pill(f"SCADA conversion: 10-min kW → 2 × 5-min kWh → QH")
-pill(f"Day Ahead price file: {workbook.name}")
+pill(f"Price sources: {price_source_notes}")
 
 total_gen = gen15["generation_mwh_15min"].sum()
 raw_total = gen_diag["raw_generation_mwh"].sum()
@@ -895,7 +1126,8 @@ if price_qh.empty:
     box(
         "danger",
         "No Day Ahead prices found for the selected generation period. "
-        "Check that the workbook contains the selected date range.",
+        "For 2026 the app needs <code>ESIOS_TOKEN</code> or <code>ESIOS_API_TOKEN</code> because the workbook is historical. "
+        f"Price source notes: {price_source_notes}",
     )
     st.stop()
 
