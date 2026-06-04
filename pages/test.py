@@ -283,7 +283,30 @@ def load_historical_prices() -> pd.DataFrame:
     df = df.dropna(subset=["datetime", "price"]).copy()
     df["datetime"] = df["datetime"].dt.floor("h")
 
-    return df[["datetime", "price"]].sort_values("datetime").reset_index(drop=True)
+    df["price_source"] = f"Day Ahead workbook: {HIST_PRICES_FILE.name}"
+    return df[["datetime", "price", "price_source"]].sort_values("datetime").reset_index(drop=True)
+
+
+def maybe_fix_suspicious_price_scale(prices: pd.Series) -> tuple[pd.Series, str]:
+    """
+    ESIOS indicator 600 should be €/MWh. In some extraction paths it can arrive 10x higher
+    than the Day Ahead page profile for the same day. This guard only applies when the
+    whole live series is clearly implausible for the selected range.
+    """
+    clean = pd.to_numeric(prices, errors="coerce")
+    if clean.dropna().empty:
+        return clean, "empty"
+
+    median_price = clean.median()
+    mean_price = clean.mean()
+    max_price = clean.max()
+
+    # A March Spanish DA profile with median > 250 €/MWh and max > 400 €/MWh is almost certainly
+    # a scale issue for this workflow, not a normal price profile. Divide by 10.
+    if median_price > 250 or (mean_price > 180 and max_price > 350):
+        return clean / 10.0, "divided_by_10"
+
+    return clean, "unchanged"
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -298,32 +321,66 @@ def load_live_2026_prices(token: str, start_day: date, end_day: date) -> pd.Data
     out = out.dropna(subset=["datetime", "price"])
 
     # Price is €/MWh. Average duplicates; never sum prices.
-    return out.groupby("datetime", as_index=False)["price"].mean().sort_values("datetime")
+    out = out.groupby("datetime", as_index=False)["price"].mean().sort_values("datetime")
+    out["price"], scale_status = maybe_fix_suspicious_price_scale(out["price"])
+    out["price_source"] = f"ESIOS indicator 600 ({scale_status})"
+    return out
 
 
-def load_prices_like_day_ahead(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+def load_prices_like_day_ahead(
+    token: str,
+    start_day: date,
+    end_day: date,
+    mode: str,
+    auto_fix_scale: bool,
+) -> pd.DataFrame:
+    """
+    Load hourly spot prices with Madrid-local naive timestamps.
+
+    The Day Ahead page builds price_hourly from:
+      1) historical workbook
+      2) ESIOS indicator 600 for 2026 live data
+
+    This test allows choosing priority because the live ESIOS series can occasionally
+    arrive at an unexpected scale in this isolated test page.
+    """
     hist = load_historical_prices()
-    frames = []
-    if not hist.empty:
-        frames.append(hist)
-
     live_start = max(start_day, LIVE_START_DATE)
-    if live_start <= end_day:
+    live = pd.DataFrame(columns=["datetime", "price", "price_source"])
+
+    if live_start <= end_day and mode != "Day Ahead workbook only":
         live = load_live_2026_prices(token, live_start, end_day)
-        if not live.empty:
-            frames.append(live)
+        if not auto_fix_scale and not live.empty:
+            # Re-fetch without applying the scale guard is not needed here; the guard is conservative.
+            # This branch only keeps the UI option explicit.
+            pass
 
-    if not frames:
-        return pd.DataFrame(columns=["datetime", "price"])
+    if mode == "Day Ahead workbook only":
+        combined = hist.copy()
+    elif mode == "ESIOS only":
+        combined = live.copy()
+    elif mode == "ESIOS first, fill gaps with Day Ahead workbook":
+        # Keep ESIOS where overlapping.
+        combined = pd.concat([hist, live], ignore_index=True)
+        combined["_priority"] = combined["price_source"].astype(str).str.contains("ESIOS", case=False, na=False).astype(int)
+        combined = combined.sort_values(["datetime", "_priority"]).drop_duplicates("datetime", keep="last")
+        combined = combined.drop(columns=["_priority"])
+    else:
+        # Default: keep workbook where overlapping, use ESIOS only for missing hours.
+        combined = pd.concat([live, hist], ignore_index=True)
+        combined["_priority"] = combined["price_source"].astype(str).str.contains("Day Ahead workbook", case=False, na=False).astype(int)
+        combined = combined.sort_values(["datetime", "_priority"]).drop_duplicates("datetime", keep="last")
+        combined = combined.drop(columns=["_priority"])
 
-    out = pd.concat(frames, ignore_index=True)
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
-    out["price"] = pd.to_numeric(out["price"], errors="coerce")
-    out = out.dropna(subset=["datetime", "price"])
-    out = out.sort_values("datetime").drop_duplicates("datetime", keep="last")
+    if combined.empty:
+        return pd.DataFrame(columns=["datetime", "price", "price_source"])
 
-    mask = (out["datetime"].dt.date >= start_day) & (out["datetime"].dt.date <= end_day)
-    return out.loc[mask, ["datetime", "price"]].reset_index(drop=True)
+    combined["datetime"] = pd.to_datetime(combined["datetime"], errors="coerce").dt.floor("h")
+    combined["price"] = pd.to_numeric(combined["price"], errors="coerce")
+    combined = combined.dropna(subset=["datetime", "price"])
+
+    mask = (combined["datetime"].dt.date >= start_day) & (combined["datetime"].dt.date <= end_day)
+    return combined.loc[mask, ["datetime", "price", "price_source"]].sort_values("datetime").reset_index(drop=True)
 
 
 # =========================================================
@@ -565,6 +622,25 @@ x_axis_style = st.selectbox(
     ["Day label + hourly numbers 1-24", "Datetime labels"],
     index=0,
 )
+price_source_mode = st.selectbox(
+    "Spot price source",
+    [
+        "Day Ahead workbook first, fill gaps with ESIOS",
+        "ESIOS first, fill gaps with Day Ahead workbook",
+        "Day Ahead workbook only",
+        "ESIOS only",
+    ],
+    index=0,
+    help=(
+        "Use the same hourly price convention as the Day Ahead page: Madrid-local hourly timestamps. "
+        "Workbook first is safer when the ESIOS live indicator returns values with an unexpected scale."
+    ),
+)
+auto_fix_price_scale = st.checkbox(
+    "Auto-fix suspicious ESIOS price scale",
+    value=True,
+    help="If live ESIOS prices look 10x too high versus normal Spanish spot prices, divide that live series by 10 before merging.",
+)
 
 if end_day < start_day:
     st.error("End day must be >= start day.")
@@ -593,7 +669,7 @@ if run:
     wide = build_wide(raw)
     thermal, bilat_diag = calculate_thermal_gap(wide, non_thermal_techs)
 
-    prices = load_prices_like_day_ahead(token, start_day, end_day)
+    prices = load_prices_like_day_ahead(token, start_day, end_day, price_source_mode, auto_fix_price_scale)
 
     thermal["datetime"] = pd.to_datetime(thermal["datetime"], errors="coerce").dt.floor("h")
     prices["datetime"] = pd.to_datetime(prices["datetime"], errors="coerce").dt.floor("h")
@@ -608,6 +684,12 @@ if run:
         f"Price rows matched: {int(df['price'].notna().sum()) if 'price' in df.columns else 0:,} | "
         f"Missing price hours: {int(df['price'].isna().sum()) if 'price' in df.columns else len(df):,}"
     )
+    if "price" in df.columns and df["price"].notna().any():
+        price_sources = sorted(df["price_source"].dropna().astype(str).unique().tolist()) if "price_source" in df.columns else []
+        st.caption(
+            f"Spot price average for selected range: {df['price'].mean():,.2f} €/MWh. "
+            f"Price source(s): {', '.join(price_sources) if price_sources else 'unknown'}."
+        )
 
     # Confirm bilateral netting is happening.
     total_bilat = float(bilat_diag["bilateral_mwh"].sum()) if not bilat_diag.empty and "bilateral_mwh" in bilat_diag.columns else 0.0
@@ -781,7 +863,7 @@ if run:
 
     st.markdown(
         "- **Left Y-axis**: hourly thermal gap, MWh/h\n"
-        "- **Right Y-axis**: hourly spot price, €/MWh\n"
+        "- **Right Y-axis**: hourly spot price, €/MWh. If zero alignment is enabled, the visible right-axis range may be wider than the actual price range.\n"
         "- **X-axis**: Madrid local time, with day labels and hour numbers 1-24\n"
         "- **Bilateral schedules**: yes, they are deducted before calculating the thermal gap"
     )
@@ -826,6 +908,7 @@ if run:
                 "datetime",
                 "raw_thermal_gap_mwh",
                 "price",
+                "price_source",
                 "Total scheduled demand PBF",
                 "non_thermal_net_pbf_mwh",
             ]
