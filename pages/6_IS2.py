@@ -326,7 +326,11 @@ def esios_headers(token: str) -> dict:
 def fetch_esios_day_ahead_prices(start_day: date, end_day: date, token: str) -> pd.DataFrame:
     """
     Fetch hourly day-ahead prices from ESIOS indicator 600.
-    Returned datetime is Europe/Madrid local and hourly.
+
+    Important:
+      ESIOS can return several geography rows. For Spanish day-ahead price we keep
+      geo_id == 3 / España, exactly like the Day Ahead tab parser, and we average
+      duplicates. We never sum prices.
     """
     if not token:
         return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
@@ -351,7 +355,17 @@ def fetch_esios_day_ahead_prices(start_day: date, end_day: date, token: str) -> 
         return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
 
     df = pd.DataFrame(values)
+
+    # Same geo filter as Day Ahead page parse_esios_indicator().
+    if "geo_id" in df.columns and (pd.to_numeric(df["geo_id"], errors="coerce") == 3).any():
+        df = df[pd.to_numeric(df["geo_id"], errors="coerce") == 3].copy()
+    elif "geo_name" in df.columns:
+        geo = df["geo_name"].astype(str).str.strip().str.lower()
+        if geo.isin(["españa", "espana"]).any():
+            df = df[geo.isin(["españa", "espana"])].copy()
+
     dt_col = "datetime_utc" if "datetime_utc" in df.columns else "datetime"
+
     out = pd.DataFrame()
     out["hour_madrid"] = (
         pd.to_datetime(df[dt_col], utc=True, errors="coerce")
@@ -359,13 +373,17 @@ def fetch_esios_day_ahead_prices(start_day: date, end_day: date, token: str) -> 
           .dt.floor("h")
     )
     out["price_eur_mwh"] = pd.to_numeric(df["value"], errors="coerce")
-    out["price_source"] = "ESIOS indicator 600"
+    out["price_source"] = "ESIOS indicator 600 — geo_id 3 España"
     out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
-    return (
+
+    # Never sum €/MWh. Average duplicate hourly rows only.
+    out = (
         out.groupby("hour_madrid", as_index=False)
            .agg(price_eur_mwh=("price_eur_mwh", "mean"), price_source=("price_source", "first"))
            .sort_values("hour_madrid")
     )
+
+    return out
 
 
 def load_day_ahead_tab_historical_prices(start_day: date, end_day: date) -> pd.DataFrame:
@@ -504,22 +522,46 @@ def normalize_price_hours(prices: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
 
     out = prices.copy()
-    # Force timezone-aware Europe/Madrid dtype. This avoids merge errors:
-    # datetime64[us, Europe/Madrid] vs object.
-    out["hour_madrid"] = pd.to_datetime(out["hour_madrid"], utc=True, errors="coerce").dt.tz_convert("Europe/Madrid").dt.floor("h")
+
+    # Robust timezone normalization:
+    # - if values are tz-aware, convert to Europe/Madrid
+    # - if values are naive, interpret as Europe/Madrid
+    raw_dt = pd.to_datetime(out["hour_madrid"], errors="coerce")
+    if getattr(raw_dt.dt, "tz", None) is None:
+        out["hour_madrid"] = raw_dt.dt.tz_localize(
+            "Europe/Madrid",
+            ambiguous=False,
+            nonexistent="shift_forward",
+        ).dt.floor("h")
+    else:
+        out["hour_madrid"] = raw_dt.dt.tz_convert("Europe/Madrid").dt.floor("h")
+
     out["price_eur_mwh"] = pd.to_numeric(out["price_eur_mwh"], errors="coerce")
     if "price_source" not in out.columns:
         out["price_source"] = "unknown"
+
     out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
+
+    # Do not sum prices. Average duplicate hourly prices.
     return (
         out.groupby("hour_madrid", as_index=False)
            .agg(price_eur_mwh=("price_eur_mwh", "mean"), price_source=("price_source", "first"))
            .sort_values("hour_madrid")
+           .reset_index(drop=True)
     )
 
 
 def calculate_revenues(gen15: pd.DataFrame, prices: pd.DataFrame):
     hourly = generation_15min_to_hourly_mwh(gen15)
+
+    # Keep only selected local date window to avoid the next local midnight creating a zero-MWh next-month row.
+    try:
+        _start_local = pd.Timestamp(start_day, tz="Europe/Madrid")
+        _end_local = pd.Timestamp(end_day + timedelta(days=1), tz="Europe/Madrid")
+        hourly = hourly[(hourly["hour_madrid"] >= _start_local) & (hourly["hour_madrid"] < _end_local)].copy()
+    except Exception:
+        pass
+
     prices = normalize_price_hours(prices)
 
     if hourly.empty or prices.empty:
@@ -701,6 +743,13 @@ if run:
                 f"Loaded {len(prices):,} hourly day-ahead price rows "
                 f"from: {', '.join(sorted(prices['price_source'].dropna().unique().tolist()))}"
             )
+            _prices_check = normalize_price_hours(prices)
+            if not _prices_check.empty and _prices_check["price_eur_mwh"].mean() > 200:
+                st.warning(
+                    "Average day-ahead price is above 200 €/MWh. "
+                    "Check 'Revenue datetime diagnostics' below: this usually means the source price file/API values are not the expected OMIE Spain hourly price."
+                )
+
             with st.expander("Revenue datetime diagnostics", expanded=False):
                 _hourly_diag = generation_15min_to_hourly_mwh(gen15)
                 _prices_diag = normalize_price_hours(prices)
@@ -711,7 +760,16 @@ if run:
                     "price_first_hour": str(_prices_diag["hour_madrid"].min()) if not _prices_diag.empty else None,
                     "generation_last_hour": str(_hourly_diag["hour_madrid"].max()) if not _hourly_diag.empty else None,
                     "price_last_hour": str(_prices_diag["hour_madrid"].max()) if not _prices_diag.empty else None,
+                    "price_min": float(_prices_diag["price_eur_mwh"].min()) if not _prices_diag.empty else None,
+                    "price_avg": float(_prices_diag["price_eur_mwh"].mean()) if not _prices_diag.empty else None,
+                    "price_max": float(_prices_diag["price_eur_mwh"].max()) if not _prices_diag.empty else None,
+                    "price_sources": sorted(_prices_diag["price_source"].dropna().unique().tolist()) if not _prices_diag.empty else [],
                 })
+                st.dataframe(
+                    _prices_diag.sort_values("price_eur_mwh", ascending=False).head(20),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             st.markdown("**Monthly revenue metrics**")
             st.dataframe(monthly_rev, use_container_width=True, hide_index=True)
