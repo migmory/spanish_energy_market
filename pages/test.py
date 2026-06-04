@@ -196,6 +196,7 @@ def fetch_esios_range(
     end_day: date,
     token: str,
     time_trunc: str = "hour",
+    time_agg: str | None = None,
 ) -> pd.DataFrame:
     """
     Day Ahead style chunked fetch using Madrid local date boundaries converted to UTC.
@@ -226,6 +227,7 @@ def fetch_esios_range(
                         "start_date": start_utc,
                         "end_date": end_utc,
                         "time_trunc": time_trunc,
+                        **({"time_agg": time_agg} if time_agg else {}),
                     },
                     timeout=(15, 120),
                 )
@@ -341,7 +343,7 @@ def fetch_named_indicators(
 
     for i, (name, indicator_id) in enumerate(items, start=1):
         try:
-            raw = fetch_esios_range(indicator_id, start_day, end_day, token, time_trunc="hour")
+            raw = fetch_esios_range(indicator_id, start_day, end_day, token, time_trunc="hour", time_agg="sum")
             if raw.empty:
                 missing.append(f"{name} ({indicator_id})")
             else:
@@ -362,8 +364,8 @@ def fetch_named_indicators(
 
     progress.empty()
 
-    if warn_missing and missing:
-        with st.expander("Missing optional indicators", expanded=False):
+    if missing:
+        with st.expander("Missing indicators returned by ESIOS", expanded=False):
             st.write(missing)
 
     if not frames:
@@ -550,7 +552,7 @@ non_thermal_techs = st.multiselect(
     default=NON_THERMAL_TECHS_DEFAULT,
 )
 
-show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=False)
+show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=True)
 
 if end_day < start_day:
     st.error("End day must be >= start day.")
@@ -588,6 +590,31 @@ if run:
 
     monthly = calculate_monthly_stats(df)
 
+    # Always show minimal status so the page does not look like "nothing happens".
+    st.info(
+        f"Fetched {len(raw):,} raw rows | {len(df):,} hourly chart rows | "
+        f"Price rows matched: {int(df['price'].notna().sum()) if 'price' in df.columns else 0:,} | "
+        f"Missing price hours: {int(df['price'].isna().sum()) if 'price' in df.columns else len(df):,}"
+    )
+
+    # Confirm bilateral netting is happening.
+    total_bilat = float(bilat_diag["bilateral_mwh"].sum()) if not bilat_diag.empty and "bilateral_mwh" in bilat_diag.columns else 0.0
+    total_gross = float(bilat_diag["gross_mwh"].sum()) if not bilat_diag.empty and "gross_mwh" in bilat_diag.columns else 0.0
+    st.caption(
+        f"Bilateral discount applied: {total_bilat:,.0f} MWh deducted from {total_gross:,.0f} MWh gross PBF "
+        f"({(total_bilat / total_gross * 100) if total_gross else 0:,.1f}%)."
+    )
+
+    # If all thermal gap values are missing/zero, show the key input table.
+    if df.empty or "raw_thermal_gap_mwh" not in df.columns or df["raw_thermal_gap_mwh"].dropna().empty:
+        st.error("No thermal gap data available after merge/calculation.")
+        st.dataframe(wide.head(50), use_container_width=True, hide_index=True)
+        st.stop()
+
+    if df["raw_thermal_gap_mwh"].abs().sum() == 0:
+        st.warning("Thermal gap is all zero. Check demand/non-thermal indicator IDs or ESIOS returned empty series.")
+        st.dataframe(df.head(50), use_container_width=True, hide_index=True)
+
     # -----------------------------------------------------
     # Main chart like the reference image
     # -----------------------------------------------------
@@ -610,7 +637,7 @@ if run:
 
     bars = (
         alt.Chart(df)
-        .mark_bar(color="#F5B041", opacity=0.90)
+        .mark_bar(color="#F5B041", opacity=0.90, width=8)
         .encode(
             x=base_x,
             y=alt.Y(
@@ -646,9 +673,14 @@ if run:
         )
     )
 
+    if "price" in df.columns and df["price"].notna().any():
+        chart_base = alt.layer(bars, price_line).resolve_scale(y="independent")
+    else:
+        st.warning("No price data matched; plotting only thermal gap bars.")
+        chart_base = bars
+
     chart = (
-        alt.layer(bars, price_line)
-        .resolve_scale(y="independent")
+        chart_base
         .properties(height=540)
         .configure_view(stroke=None)
         .configure_axis(
