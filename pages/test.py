@@ -492,108 +492,112 @@ if run:
     monthly = calculate_monthly_stats(df)
 
     # -----------------------------------------------------
-    # Main overlay chart
+    # Main overlay chart: hourly thermal gap columns + hourly spot price
     # -----------------------------------------------------
-    st.subheader("Overlay — net PBF conventional stack vs day-ahead price")
+    st.subheader("Hueco térmico y precio — hourly")
     st.caption(
-        "Left axis: net PBF conventional generation in MWh/h. "
-        "Right axis: day-ahead spot price in €/MWh."
+        "Barras = hueco térmico horario en MWh/h, una columna por hora. "
+        "Línea negra = precio day-ahead horario en €/MWh en eje derecho. "
+        "Eje X en horario Europe/Madrid."
     )
 
-    stack_cols = [c for c in stack_components if c in df.columns]
+    chart_df = df.copy()
+    chart_df["datetime_madrid"] = pd.to_datetime(chart_df["datetime_madrid"], errors="coerce")
 
-    if not stack_cols:
-        st.warning("Select at least one conventional technology to stack.")
+    # Keep negative bars visible if demand - net non-thermal is negative.
+    raw_non_thermal_cols = []
+    for _tech in non_thermal:
+        _col = f"{_tech} net PBF"
+        if _col in chart_df.columns:
+            raw_non_thermal_cols.append(_col)
+
+    if "Total scheduled demand PBF" in chart_df.columns and raw_non_thermal_cols:
+        chart_df["raw_thermal_gap_mwh"] = (
+            chart_df["Total scheduled demand PBF"] - chart_df[raw_non_thermal_cols].sum(axis=1)
+        )
     else:
-        stack_df = df[["datetime_madrid"] + stack_cols].melt(
-            id_vars=["datetime_madrid"],
-            var_name="component",
-            value_name="mwh",
-        )
-        stack_df["mwh"] = pd.to_numeric(stack_df["mwh"], errors="coerce").fillna(0.0)
+        chart_df["raw_thermal_gap_mwh"] = chart_df["thermal_gap_mwh"]
 
-        base_x = alt.X(
-            "datetime_madrid:T",
-            title="Madrid date and hour",
-            axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45),
-        )
+    base_x = alt.X(
+        "datetime_madrid:T",
+        title="Madrid date and hour",
+        axis=alt.Axis(
+            format="%d-%b %H:%M",
+            labelAngle=-90,
+            labelOverlap=False,
+            tickCount={"interval": "hour", "step": 6},
+        ),
+    )
 
-        bars = (
-            alt.Chart(stack_df)
-            .mark_bar(opacity=0.88)
+    gap_bars = (
+        alt.Chart(chart_df)
+        .mark_bar(color="#F5B041", opacity=0.9)
+        .encode(
+            x=base_x,
+            y=alt.Y(
+                "raw_thermal_gap_mwh:Q",
+                title="Hueco térmico (MWh/h)",
+                axis=alt.Axis(titleColor="#111827", labelColor="#111827"),
+                scale=alt.Scale(zero=True),
+            ),
+            tooltip=[
+                alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("raw_thermal_gap_mwh:Q", title="Hueco térmico MWh/h", format=",.0f"),
+                alt.Tooltip("Total scheduled demand PBF:Q", title="Demanda PBF", format=",.0f"),
+                alt.Tooltip("non_thermal_mwh:Q", title="No térmica neta", format=",.0f"),
+            ],
+        )
+    )
+
+    layers = [gap_bars]
+
+    if "Day-ahead price" in chart_df.columns:
+        price_line = (
+            alt.Chart(chart_df)
+            .mark_line(color="black", strokeWidth=2.5)
             .encode(
                 x=base_x,
                 y=alt.Y(
-                    "mwh:Q",
-                    title="Net PBF conventional generation (MWh/h)",
-                    stack="zero",
-                    axis=alt.Axis(titleColor="#111827", labelColor="#111827"),
-                ),
-                color=alt.Color(
-                    "component:N",
-                    title="Net PBF conventional technologies",
-                    legend=alt.Legend(orient="right"),
+                    "Day-ahead price:Q",
+                    title="Precio (€/MWh)",
+                    axis=alt.Axis(
+                        orient="right",
+                        titleColor="black",
+                        labelColor="black",
+                    ),
+                    scale=alt.Scale(zero=False),
                 ),
                 tooltip=[
-                    alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                    alt.Tooltip("component:N", title="Technology"),
-                    alt.Tooltip("mwh:Q", title="MWh/h", format=",.0f"),
+                    alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%Y-%m-%d %H:%M"),
+                    alt.Tooltip("Day-ahead price:Q", title="Precio €/MWh", format=",.2f"),
                 ],
             )
         )
+        layers.append(price_line)
 
-        if "Day-ahead price" in df.columns:
-            price_line = (
-                alt.Chart(df)
-                .mark_line(color="#2563EB", strokeWidth=3)
-                .encode(
-                    x=base_x,
-                    y=alt.Y(
-                        "Day-ahead price:Q",
-                        title="Day-ahead price (€/MWh)",
-                        axis=alt.Axis(
-                            titleColor="#2563EB",
-                            labelColor="#2563EB",
-                            orient="right",
-                        ),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                        alt.Tooltip("Day-ahead price:Q", title="Price €/MWh", format=",.2f"),
-                    ],
-                )
-            )
-
-            combined = alt.layer(bars, price_line).resolve_scale(y="independent").properties(height=460)
-        else:
-            combined = bars.properties(height=460)
-
-        st.altair_chart(combined, use_container_width=True)
-
-    # -----------------------------------------------------
-    # Thermal gap chart
-    # -----------------------------------------------------
-    st.subheader("Calculated thermal gap — net PBF basis")
-    gap_chart = (
-        alt.Chart(df)
-        .mark_line(color="black", strokeWidth=2.5)
-        .encode(
-            x=alt.X(
-                "datetime_madrid:T",
-                title="Madrid date and hour",
-                axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45),
-            ),
-            y=alt.Y("thermal_gap_mwh:Q", title="Thermal gap (MWh/h)"),
-            tooltip=[
-                alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                alt.Tooltip("thermal_gap_mwh:Q", title="Thermal gap", format=",.0f"),
-                alt.Tooltip("Total scheduled demand PBF:Q", title="Demand PBF", format=",.0f"),
-                alt.Tooltip("non_thermal_mwh:Q", title="Net non-thermal PBF", format=",.0f"),
-            ],
-        )
-        .properties(height=300)
+    main_chart = (
+        alt.layer(*layers)
+        .resolve_scale(y="independent")
+        .properties(height=520)
     )
-    st.altair_chart(gap_chart, use_container_width=True)
+    st.altair_chart(main_chart, use_container_width=True)
+
+    st.markdown(
+        "- **Columnas naranjas**: hueco térmico horario (**eje Y izquierdo, MWh/h**)\\n"
+        "- **Línea negra**: precio day-ahead horario (**eje Y derecho, €/MWh**)\\n"
+        "- **X**: fecha y hora en horario Madrid"
+    )
+
+    with st.expander("Hourly thermal gap + price data", expanded=False):
+        cols_to_show = [
+            "datetime_madrid",
+            "raw_thermal_gap_mwh",
+            "Day-ahead price",
+            "Total scheduled demand PBF",
+            "non_thermal_mwh",
+        ]
+        cols_to_show = [c for c in cols_to_show if c in chart_df.columns]
+        st.dataframe(chart_df[cols_to_show], use_container_width=True, hide_index=True)
 
     # -----------------------------------------------------
     # Scatter
