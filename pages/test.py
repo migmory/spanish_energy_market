@@ -366,7 +366,7 @@ def fetch_named_indicators(
 
     progress.empty()
 
-    if missing:
+    if warn_missing and missing:
         with st.expander("Missing indicators returned by ESIOS", expanded=False):
             st.write(missing)
 
@@ -528,10 +528,10 @@ BILATERAL_TO_GROSS_TECH = {
 # =========================================================
 # UI
 # =========================================================
-st.title("Hueco Térmico y Precio")
+st.title("Thermal Gap and Price")
 st.caption(
-    "PBF menos bilaterales. Precios cargados con la misma lógica que Day Ahead. "
-    "Todo se muestra en horario local Madrid."
+    "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
+    "Everything is displayed in Madrid local time."
 )
 
 with st.expander("Indicator IDs", expanded=False):
@@ -554,7 +554,17 @@ non_thermal_techs = st.multiselect(
     default=NON_THERMAL_TECHS_DEFAULT,
 )
 
-show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=True)
+show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=False)
+align_zero_axes = st.checkbox(
+    "Align zero on both Y-axes",
+    value=True,
+    help="Forces the right price axis to place 0 €/MWh at the same vertical height as 0 MWh on the left thermal-gap axis.",
+)
+x_axis_style = st.selectbox(
+    "X-axis style",
+    ["Day label + hourly numbers 1-24", "Datetime labels"],
+    index=0,
+)
 
 if end_day < start_day:
     st.error("End day must be >= start day.")
@@ -603,15 +613,15 @@ if run:
     total_bilat = float(bilat_diag["bilateral_mwh"].sum()) if not bilat_diag.empty and "bilateral_mwh" in bilat_diag.columns else 0.0
     total_gross = float(bilat_diag["gross_mwh"].sum()) if not bilat_diag.empty and "gross_mwh" in bilat_diag.columns else 0.0
     st.caption(
-        f"Bilateral discount applied: {total_bilat:,.0f} MWh deducted from {total_gross:,.0f} MWh gross PBF "
+        f"Bilateral schedules deducted: {total_bilat:,.0f} MWh deducted from {total_gross:,.0f} MWh gross PBF "
         f"({(total_bilat / total_gross * 100) if total_gross else 0:,.1f}%)."
     )
     if "raw_thermal_gap_mwh" in df.columns:
         st.caption(
-            f"Hueco térmico range: {df['raw_thermal_gap_mwh'].min():,.0f} to {df['raw_thermal_gap_mwh'].max():,.0f} MWh/h. "
+            f"Thermal gap range: {df['raw_thermal_gap_mwh'].min():,.0f} to {df['raw_thermal_gap_mwh'].max():,.0f} MWh/h. "
             f"Price range: {df['price'].min():,.2f} to {df['price'].max():,.2f} €/MWh."
             if "price" in df.columns and df["price"].notna().any()
-            else f"Hueco térmico range: {df['raw_thermal_gap_mwh'].min():,.0f} to {df['raw_thermal_gap_mwh'].max():,.0f} MWh/h."
+            else f"Thermal gap range: {df['raw_thermal_gap_mwh'].min():,.0f} to {df['raw_thermal_gap_mwh'].max():,.0f} MWh/h."
         )
 
     # If all thermal gap values are missing/zero, show the key input table.
@@ -627,11 +637,12 @@ if run:
     # -----------------------------------------------------
     # Main chart like the reference image
     # -----------------------------------------------------
-    st.subheader("Hueco Térmico y Precio")
+    st.subheader("Thermal Gap and Price")
     st.caption(
-        "Columnas: hueco térmico horario. Línea: precio spot horario. "
-        "Eje X en horario local Europe/Madrid. Gráfico dibujado con matplotlib para evitar "
-        "conversiones de timezone del navegador/Altair."
+        "Columns: hourly thermal gap. Line: hourly spot price. "
+        "X-axis is Europe/Madrid local time. The chart is rendered with matplotlib to avoid "
+        "browser/Altair timezone conversions. Exact matching with the LinkedIn chart depends on using the same "
+        "thermal-gap definition and the same underlying PBF/bilateral indicator set."
     )
 
     plot_df = df.copy()
@@ -656,12 +667,12 @@ if run:
         width=0.82,
         color="#F5B041",
         alpha=0.90,
-        label="Hueco Térmico",
+        label="Thermal Gap",
         zorder=2,
     )
 
     ax_gap.axhline(0, color="black", linewidth=0.8, alpha=0.65, zorder=3)
-    ax_gap.set_ylabel("Hueco Térmico (MWh)", fontweight="bold")
+    ax_gap.set_ylabel("Thermal Gap (MWh)", fontweight="bold")
     ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if abs(v) >= 1000 else f"{v:.0f}"))
     ax_gap.grid(axis="y", alpha=0.25, zorder=1)
     ax_gap.set_xlim(-0.8, len(plot_df) - 0.2)
@@ -675,24 +686,83 @@ if run:
             price_df["price"],
             color="black",
             linewidth=2.2,
-            label="Precio",
+            label="Price",
             zorder=4,
         )
-        ax_price.set_ylabel("Precio (€/MWh)", fontweight="bold")
+        ax_price.set_ylabel("Price (€/MWh)", fontweight="bold")
         ax_price.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}"))
+
+        if align_zero_axes:
+            left_min, left_max = ax_gap.get_ylim()
+            if left_min < 0 < left_max:
+                zero_frac = (0 - left_min) / (left_max - left_min)
+                p_min = float(price_df["price"].min())
+                p_max = float(price_df["price"].max())
+
+                # Add light padding.
+                p_min = p_min * 1.10 if p_min < 0 else p_min * 0.90
+                p_max = p_max * 1.10 if p_max > 0 else p_max * 0.90
+
+                if 0 < zero_frac < 1:
+                    required_range = max(
+                        p_max / (1 - zero_frac) if p_max > 0 else 0,
+                        (-p_min) / zero_frac if p_min < 0 else 0,
+                        1.0,
+                    )
+                    ax_price.set_ylim(
+                        -zero_frac * required_range,
+                        (1 - zero_frac) * required_range,
+                    )
     else:
-        ax_price.set_ylabel("Precio (€/MWh)", fontweight="bold")
+        ax_price.set_ylabel("Price (€/MWh)", fontweight="bold")
         st.warning("No price data matched the hourly thermal-gap data. Showing only thermal-gap bars.")
 
-    # Tick every 4 hours, plus last point. Label as YYYY-MM-DD on first line and hour below.
-    step = 4 if len(plot_df) <= 120 else max(4, int(len(plot_df) / 32))
-    tick_positions = list(range(0, len(plot_df), step))
-    if (len(plot_df) - 1) not in tick_positions:
-        tick_positions.append(len(plot_df) - 1)
-    ax_gap.set_xticks(tick_positions)
-    ax_gap.set_xticklabels([labels[i] for i in tick_positions], rotation=90, ha="center", fontsize=8)
+    if x_axis_style == "Day label + hourly numbers 1-24":
+        # Match the reference chart style:
+        #   bottom row = hour numbers 1-24
+        #   second row = date label once per day
+        # For long ranges, avoid overloading the axis by showing every 3rd hour.
+        hour_step = 1 if len(plot_df) <= 14 * 24 else 3
+        tick_positions = list(range(0, len(plot_df), hour_step))
+        hour_labels = [
+            str(int(plot_df.loc[i, "datetime"].hour) + 1)
+            for i in tick_positions
+        ]
+        ax_gap.set_xticks(tick_positions)
+        ax_gap.set_xticklabels(hour_labels, rotation=90, ha="center", fontsize=8)
+        ax_gap.set_xlabel("")
 
-    ax_gap.set_title("Hueco Térmico y Precio", loc="left", fontweight="bold", fontsize=14, pad=18)
+        # Draw vertical separators and centered date labels under the hour row.
+        day_groups = plot_df.groupby(plot_df["datetime"].dt.date).indices
+        for day, idxs in day_groups.items():
+            idxs = sorted(list(idxs))
+            first_i = idxs[0]
+            last_i = idxs[-1]
+            center_i = (first_i + last_i) / 2
+
+            ax_gap.axvline(first_i - 0.5, color="#D1D5DB", linewidth=0.8, alpha=0.8, zorder=1)
+            ax_gap.text(
+                center_i,
+                -0.20,
+                pd.Timestamp(day).strftime("%Y-%m-%d"),
+                ha="center",
+                va="top",
+                fontsize=8,
+                transform=ax_gap.get_xaxis_transform(),
+            )
+
+        # last separator
+        ax_gap.axvline(len(plot_df) - 0.5, color="#D1D5DB", linewidth=0.8, alpha=0.8, zorder=1)
+    else:
+        # Fallback: compact datetime labels.
+        step = 4 if len(plot_df) <= 120 else max(4, int(len(plot_df) / 32))
+        tick_positions = list(range(0, len(plot_df), step))
+        if (len(plot_df) - 1) not in tick_positions:
+            tick_positions.append(len(plot_df) - 1)
+        ax_gap.set_xticks(tick_positions)
+        ax_gap.set_xticklabels([labels[i] for i in tick_positions], rotation=90, ha="center", fontsize=8)
+
+    ax_gap.set_title("Thermal Gap and Price", loc="left", fontweight="bold", fontsize=14, pad=18)
 
     handles1, labels1 = ax_gap.get_legend_handles_labels()
     handles2, labels2 = ax_price.get_legend_handles_labels()
@@ -705,15 +775,15 @@ if run:
         bbox_to_anchor=(0.5, -0.02),
     )
 
-    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    fig.tight_layout(rect=[0, 0.12, 1, 1])
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
     st.markdown(
-        "- **Eje Y izquierdo**: Hueco Térmico horario, MWh/h\n"
-        "- **Eje Y derecho**: Precio spot horario, €/MWh\n"
-        "- **Eje X**: hora local Madrid, no UTC\n"
-        "- **Bilaterales**: sí, se descuentan antes de calcular el hueco térmico"
+        "- **Left Y-axis**: hourly thermal gap, MWh/h\n"
+        "- **Right Y-axis**: hourly spot price, €/MWh\n"
+        "- **X-axis**: Madrid local time, with day labels and hour numbers 1-24\n"
+        "- **Bilateral schedules**: yes, they are deducted before calculating the thermal gap"
     )
 
     if show_diagnostics:
