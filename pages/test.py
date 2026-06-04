@@ -641,14 +641,6 @@ auto_fix_price_scale = st.checkbox(
     value=True,
     help="If live ESIOS prices look 10x too high versus normal Spanish spot prices, divide that live series by 10 before merging.",
 )
-show_thermal_mix_stack = st.checkbox(
-    "Decompose thermal gap bars by conventional technology",
-    value=True,
-    help=(
-        "If enabled, the columns are stacked using available net PBF conventional technologies. "
-        "If disabled, the columns show the calculated thermal gap as one orange bar."
-    ),
-)
 
 if end_day < start_day:
     st.error("End day must be >= start day.")
@@ -706,26 +698,6 @@ if run:
         f"Bilateral schedules deducted: {total_bilat:,.0f} MWh deducted from {total_gross:,.0f} MWh gross PBF "
         f"({(total_bilat / total_gross * 100) if total_gross else 0:,.1f}%)."
     )
-    available_thermal_cols = [
-        f"{tech} net PBF"
-        for tech in [
-            "Coal sub-bituminous",
-            "Coal anthracite",
-            "Combined cycle GT",
-            "Fuel",
-            "Natural gas",
-            "Cogeneration",
-            "Non-renewable waste",
-        ]
-        if f"{tech} net PBF" in df.columns
-    ]
-    if available_thermal_cols:
-        df["available_conventional_net_pbf_mwh"] = df[available_thermal_cols].sum(axis=1)
-        st.caption(
-            f"Available conventional net PBF average: {df['available_conventional_net_pbf_mwh'].mean():,.0f} MWh/h. "
-            f"Calculated thermal gap average: {df['raw_thermal_gap_mwh'].mean():,.0f} MWh/h. "
-            "If these two differ, the missing indicators / balancing items explain why the stack may not fully match the calculated gap."
-        )
     if "raw_thermal_gap_mwh" in df.columns:
         st.caption(
             f"Thermal gap range: {df['raw_thermal_gap_mwh'].min():,.0f} to {df['raw_thermal_gap_mwh'].max():,.0f} MWh/h. "
@@ -749,7 +721,7 @@ if run:
     # -----------------------------------------------------
     st.subheader("Thermal Gap and Price")
     st.caption(
-        "Columns: hourly thermal mix stack or calculated thermal gap. Line: hourly spot price. "
+        "Columns: hourly thermal gap. Line: hourly spot price. "
         "X-axis is Europe/Madrid local time. The chart is rendered with matplotlib to avoid "
         "browser/Altair timezone conversions. Exact matching with the LinkedIn chart depends on using the same "
         "thermal-gap definition and the same underlying PBF/bilateral indicator set."
@@ -771,72 +743,17 @@ if run:
 
     fig, ax_gap = plt.subplots(figsize=(18, 6.2))
 
-    # Bars:
-    #   - default: stacked available net PBF conventional technologies
-    #   - fallback: single calculated thermal-gap bar
-    conventional_techs = [
-        "Coal sub-bituminous",
-        "Coal anthracite",
-        "Combined cycle GT",
-        "Fuel",
-        "Natural gas",
-        "Cogeneration",
-        "Non-renewable waste",
-    ]
-    conventional_net_cols = {
-        tech: f"{tech} net PBF"
-        for tech in conventional_techs
-        if f"{tech} net PBF" in plot_df.columns
-        and pd.to_numeric(plot_df[f"{tech} net PBF"], errors="coerce").fillna(0).abs().sum() > 0
-    }
+    ax_gap.bar(
+        x,
+        plot_df["raw_thermal_gap_mwh"],
+        width=0.82,
+        color="#F5B041",
+        alpha=0.90,
+        label="Thermal Gap",
+        zorder=2,
+    )
 
-    if show_thermal_mix_stack and conventional_net_cols:
-        stack_colors = {
-            "Coal sub-bituminous": "#6B7280",
-            "Coal anthracite": "#374151",
-            "Combined cycle GT": "#F97316",
-            "Fuel": "#7C2D12",
-            "Natural gas": "#A16207",
-            "Cogeneration": "#60A5FA",
-            "Non-renewable waste": "#9CA3AF",
-        }
-        bottom = pd.Series(0.0, index=plot_df.index)
-        for tech, col in conventional_net_cols.items():
-            values = pd.to_numeric(plot_df[col], errors="coerce").fillna(0.0)
-            ax_gap.bar(
-                x,
-                values,
-                bottom=bottom,
-                width=0.82,
-                color=stack_colors.get(tech, "#F5B041"),
-                alpha=0.90,
-                label=tech,
-                zorder=2,
-            )
-            bottom = bottom + values
-
-        # Keep the calculated thermal-gap total visible as a thin dashed orange outline/line.
-        ax_gap.plot(
-            x,
-            plot_df["raw_thermal_gap_mwh"],
-            color="#B45309",
-            linewidth=1.4,
-            linestyle="--",
-            label="Calculated thermal gap",
-            zorder=3,
-        )
-    else:
-        ax_gap.bar(
-            x,
-            plot_df["raw_thermal_gap_mwh"],
-            width=0.82,
-            color="#F5B041",
-            alpha=0.90,
-            label="Thermal Gap",
-            zorder=2,
-        )
-
-    ax_gap.axhline(0, color="black", linewidth=0.8, alpha=0.65, zorder=4)
+    ax_gap.axhline(0, color="black", linewidth=0.8, alpha=0.65, zorder=3)
     ax_gap.set_ylabel("Thermal Gap (MWh)", fontweight="bold")
     ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if abs(v) >= 1000 else f"{v:.0f}"))
     ax_gap.grid(axis="y", alpha=0.25, zorder=1)
@@ -945,7 +862,7 @@ if run:
     plt.close(fig)
 
     st.markdown(
-        "- **Left Y-axis**: hourly thermal mix / calculated thermal gap, MWh/h\n"
+        "- **Left Y-axis**: hourly thermal gap, MWh/h\n"
         "- **Right Y-axis**: hourly spot price, €/MWh. If zero alignment is enabled, the visible right-axis range may be wider than the actual price range.\n"
         "- **X-axis**: Madrid local time, with day labels and hour numbers 1-24\n"
         "- **Bilateral schedules**: yes, they are deducted before calculating the thermal gap"
@@ -990,7 +907,6 @@ if run:
             cols = [
                 "datetime",
                 "raw_thermal_gap_mwh",
-                "available_conventional_net_pbf_mwh",
                 "price",
                 "price_source",
                 "Total scheduled demand PBF",
