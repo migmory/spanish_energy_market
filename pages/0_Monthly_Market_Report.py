@@ -5324,7 +5324,7 @@ report_end = min(report_end, pd.Timestamp(latest_data_ts.date()))
 comparison_2025_end = comparable_ytd_end(report_end, 2025)
 
 pills([
-    "Monthly Report v20 demand profile test-style fix active",
+    "Monthly Report v21 demand profile month-by-month active",
     f"Report month: {selected_label}",
     f"Data cut-off: {report_end:%d %b %Y}",
     "Current month = MTD" if is_current_mtd else "Closed month",
@@ -5665,11 +5665,23 @@ st.caption("Solar = Solar PV + Solar thermal. Demand = REE demanda/evolucion off
 
 st.markdown("**Average 24h demand profile | selected month vs previous month**")
 
-demand_profile_hourly = official_demand_hourly
-if demand_profile_hourly is None or demand_profile_hourly.empty:
-    demand_profile_start = pd.Timestamp(prev_month).date()
-    demand_profile_end = (pd.Timestamp(selected_month) + pd.offsets.MonthEnd(0)).date()
-    demand_profile_hourly = load_ree_official_demand_hourly_for_report(demand_profile_start, min(demand_profile_end, today))
+# Pull the selected and previous months separately, as in the working REE demand test page.
+# A single long/cross-month request can return no rows or time out on Streamlit Cloud.
+selected_profile_start = pd.Timestamp(selected_month).date()
+selected_profile_end = min(pd.Timestamp(report_end).date(), today)
+previous_profile_start = pd.Timestamp(prev_month).date()
+previous_profile_end = (pd.Timestamp(prev_month) + pd.offsets.MonthEnd(0)).date()
+
+selected_profile_hourly = load_ree_official_demand_hourly_for_report(selected_profile_start, selected_profile_end)
+previous_profile_hourly = load_ree_official_demand_hourly_for_report(previous_profile_start, previous_profile_end)
+
+profile_frames = [
+    f for f in [selected_profile_hourly, previous_profile_hourly]
+    if f is not None and not f.empty
+]
+demand_profile_hourly = pd.concat(profile_frames, ignore_index=True) if profile_frames else pd.DataFrame(
+    columns=["datetime", "demand_gw", "source"]
+)
 
 avg_demand_profile = monthly_average_demand_profile_chart(
     demand_profile_hourly,
@@ -5680,23 +5692,9 @@ avg_demand_profile = monthly_average_demand_profile_chart(
 )
 if avg_demand_profile is not None:
     st.altair_chart(avg_demand_profile, use_container_width=True)
-    st.caption("Average demand profile source: REE demanda/evolucion hourly pull, grouped by hour of day in Europe/Madrid.")
+    st.caption("Average demand profile source: REE demanda/evolucion hourly pull, fetched month-by-month and grouped by hour of day in Europe/Madrid.")
 else:
-    try:
-        avg_demand_profile_fallback = monthly_average_demand_profile_fallback_chart(
-            kpi_demand_current,
-            kpi_demand_prev,
-            month_label(selected_month, is_current_mtd),
-            month_label(prev_month, False),
-        )
-    except Exception:
-        avg_demand_profile_fallback = None
-
-    if avg_demand_profile_fallback is not None:
-        st.altair_chart(avg_demand_profile_fallback, use_container_width=True)
-        st.caption("Fallback shown: REE hourly demand was unavailable, so the chart uses official monthly average demand as a flat 24h profile.")
-    else:
-        st.info("Average 24h demand profile is unavailable because REE did not return hourly demand and monthly average demand is unavailable.")
+    st.info("Average 24h demand profile is unavailable because REE did not return hourly demand for the selected or previous month.")
 
 
 # =========================================================
