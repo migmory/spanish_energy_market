@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, time, timedelta
+from io import BytesIO
+from pathlib import Path
+from time import sleep
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -11,260 +15,361 @@ import streamlit as st
 from dotenv import load_dotenv
 
 # =========================================================
-# TEST — PBF net of bilateral PBF + thermal gap + spot prices
+# TEST — PBF - bilaterales: Hueco térmico + precio spot
 # =========================================================
-# Logic:
-#   1) Fetch gross PBF scheduled generation by technology from ESIOS.
-#   2) Fetch Programa bilateral PBF by technology from ESIOS.
-#   3) Calculate net PBF:
-#          PBF_net_tech,h = PBF_gross_tech,h - PBF_bilateral_tech,h
-#   4) Calculate thermal gap:
-#          thermal_gap_h = Demand_PBF_h - sum(PBF_net_non_thermal_tech,h)
-#   5) Overlay:
-#          left Y-axis: net conventional generation stack, MWh/h
-#          right Y-axis: day-ahead spot price, €/MWh
 #
-# Local .env:
-#   ESIOS_TOKEN=your_token
+# Objetivo:
+#   Replicar el gráfico "Hueco Térmico y Precio":
+#     - Barras naranjas: hueco térmico horario, una barra por hora
+#     - Línea negra: precio spot day-ahead horario
+#     - Eje Y izquierdo: Hueco Térmico (MWh)
+#     - Eje Y derecho: Precio (€/MWh)
+#     - Eje X: hora local Madrid
 #
-# Streamlit Cloud Secrets:
-#   ESIOS_TOKEN = "your_token"
+# Precio:
+#   Usa exactamente la lógica base del Day Ahead:
+#     - data/hourly_avg_price_since2021.xlsx, sheet prices_hourly_avg
+#     - ESIOS indicator 600 para live/current 2026
+#     - timestamps ESIOS: UTC -> Europe/Madrid -> timezone-naive
+#
+# .env / Streamlit secrets:
+#   ESIOS_TOKEN=...
 # =========================================================
-
-st.set_page_config(page_title="PBF net bilateral thermal gap", layout="wide")
 
 try:
-    load_dotenv(override=True)
+    alt.data_transformers.disable_max_rows()
 except Exception:
     pass
 
-BASE = "https://api.esios.ree.es"
+st.set_page_config(page_title="Hueco térmico PBF - bilaterales", layout="wide")
+
+# Same path convention as the main app pages.
+BASE_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
+ENV_PATH = BASE_DIR / ".env"
+DATA_DIR = BASE_DIR / "data"
+HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
+LIVE_START_DATE = date(2026, 1, 1)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+
+BASE = "https://api.esios.ree.es"
+
 # ---------------------------------------------------------
-# ESIOS IDs
+# IDs
 # ---------------------------------------------------------
-DAY_AHEAD_PRICE_ID = 600
+PRICE_INDICATOR_ID = 600
 DEMAND_PBF_ID = 10141
 
-# Gross PBF scheduled generation by technology.
-# These are the PBF technology indicators used in the previous test page.
+# PBF gross generation.
+# IMPORTANT:
+# Avoid non-working aggregated IDs such as 10167/10077/10086 where ESIOS returns no rows.
+# Use base PBF technology IDs and aggregate manually.
 PBF_GROSS_COMPONENTS = {
+    "Hydro UGH": 1,
+    "Hydro non-UGH": 2,
     "Nuclear": 4,
-    "Hydro UGH + non UGH": 10064,
-    "Wind": 10073,
+    "Coal sub-bituminous": 7,
+    "Coal anthracite": 8,
+    "Combined cycle GT": 9,
+    "Fuel": 10,
+    "Natural gas": 11,
+    "Wind onshore": 12,
+    "Wind offshore": 13,
     "Solar PV": 14,
     "Solar thermal": 15,
+    "Cogeneration": 17,
+    # These may or may not exist depending on ESIOS/range; handled as optional.
     "Other renewables": 10074,
-    "Coal": 10167,
-    "Fuel-Gas": 10077,
-    "Combined cycle GT": 9,
-    "Natural gas": 11,
-    "Cogeneration": 10086,
     "Non-renewable waste": 10095,
 }
 
-# Programa bilateral PBF by technology.
-# Split technologies are aggregated to the same gross technology bucket.
+# Bilateral PBF indicators from the info you provided.
 PBF_BILATERAL_COMPONENTS = {
-    "Hydro UGH + non UGH": {
-        "Programa bilateral PBF Hidráulica UGH": 421,
-        "Programa bilateral PBF Hidráulica no UGH": 422,
-    },
-    "Nuclear": {
-        "Programa bilateral PBF Nuclear": 424,
-    },
-    "Coal": {
-        "Programa bilateral PBF Hulla sub-bituminosa": 426,
-        "Programa bilateral PBF Hulla antracita": 427,
-    },
-    "Combined cycle GT": {
-        "Programa bilateral PBF Ciclo combinado": 429,
-    },
-    "Wind": {
-        "Programa bilateral PBF Eólica terrestre": 432,
-        "Programa bilateral PBF Eólica marina": 433,
-    },
-    "Other renewables": {
-        "Programa bilateral PBF Otras renovables": 10234,
-    },
+    "Hydro UGH": 421,
+    "Hydro non-UGH": 422,
+    "Nuclear": 424,
+    "Coal sub-bituminous": 426,
+    "Coal anthracite": 427,
+    "Combined cycle GT": 429,
+    "Wind onshore": 432,
+    "Wind offshore": 433,
+    "Other renewables": 10234,
 }
-
 PBF_BILATERAL_TOTAL_SALES_ID = 10235
 
-DEFAULT_NON_THERMAL = [
+# Aggregations for the thermal gap formula.
+NON_THERMAL_TECHS_DEFAULT = [
+    "Hydro UGH",
+    "Hydro non-UGH",
     "Nuclear",
-    "Hydro UGH + non UGH",
-    "Wind",
+    "Wind onshore",
+    "Wind offshore",
     "Solar PV",
     "Solar thermal",
     "Other renewables",
 ]
 
-DEFAULT_CONVENTIONAL_STACK = [
-    "Coal",
-    "Fuel-Gas",
+CONVENTIONAL_TECHS_DEFAULT = [
+    "Coal sub-bituminous",
+    "Coal anthracite",
     "Combined cycle GT",
+    "Fuel",
     "Natural gas",
     "Cogeneration",
     "Non-renewable waste",
 ]
 
 
-# ---------------------------------------------------------
-# Auth / time helpers
-# ---------------------------------------------------------
-def get_esios_token() -> str:
-    token = ""
-
+# =========================================================
+# Shared helpers copied/adapted from Day Ahead
+# =========================================================
+def require_esios_token() -> str:
+    token = (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip()
     try:
-        token = str(st.secrets.get("ESIOS_TOKEN", "") or "")
+        token = str(st.secrets.get("ESIOS_TOKEN", "") or st.secrets.get("ESIOS_API_TOKEN", "") or token).strip()
     except Exception:
-        token = ""
+        pass
 
+    token = token.strip('"').strip("'")
     if not token:
-        token = os.getenv("ESIOS_TOKEN", "")
-
-    token = str(token).strip().strip('"').strip("'")
-
-    if not token:
-        st.error(
-            "Missing ESIOS_TOKEN. Add it to local .env or Streamlit Secrets.\n\n"
-            "Local .env example:\n"
-            "ESIOS_TOKEN=xxxxxxxx"
-        )
-        st.stop()
-
+        raise ValueError(f"No token found in {ENV_PATH}. Expected ESIOS_TOKEN.")
     return token
 
 
-def esios_headers(token: str) -> dict[str, str]:
+def build_headers(token: str) -> dict:
     return {
         "Accept": "application/json; application/vnd.esios-api-v1+json",
         "Content-Type": "application/json",
         "x-api-key": token,
-        "User-Agent": "Mozilla/5.0",
     }
 
 
-def madrid_date_to_api_range(start_day: date, end_day: date) -> tuple[str, str]:
+def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
     """
-    Use Madrid local boundaries converted to UTC.
-    End is exclusive: next local midnight after end_day.
+    Day Ahead convention:
+      ESIOS UTC timestamp -> Europe/Madrid -> timezone-naive local timestamp.
+
+    This avoids the browser/Altair applying another timezone conversion.
     """
-    start_local = datetime.combine(start_day, time(0, 0), tzinfo=MADRID_TZ)
-    end_local = datetime.combine(end_day + timedelta(days=1), time(0, 0), tzinfo=MADRID_TZ)
-    start_utc = start_local.astimezone(ZoneInfo("UTC"))
-    end_utc = end_local.astimezone(ZoneInfo("UTC"))
-    return (
-        start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    raise ValueError("No datetime column found")
 
 
-# ---------------------------------------------------------
-# ESIOS fetch / parse
-# ---------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=1800)
-def fetch_esios_indicator(
+def parse_esios_indicator(raw_json: dict, source_name: str) -> pd.DataFrame:
+    values = raw_json.get("indicator", {}).get("values", [])
+    if not values:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    df = pd.DataFrame(values)
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+
+    # Spain / national scope, like Day Ahead.
+    if (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
+    else:
+        geo_series = df["geo_name"].astype(str).str.strip().str.lower()
+        if (geo_series == "españa").any():
+            df = df[geo_series == "españa"].copy()
+        elif (geo_series == "espana").any():
+            df = df[geo_series == "espana"].copy()
+
+    df["datetime"] = parse_datetime_label(df)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"]).copy()
+    df["source"] = source_name
+    return df[["datetime", "value", "source", "geo_name", "geo_id"]].sort_values("datetime")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_esios_range(
     indicator_id: int,
-    start_utc: str,
-    end_utc: str,
+    start_day: date,
+    end_day: date,
     token: str,
-    time_agg: str = "sum",
+    time_trunc: str = "hour",
 ) -> pd.DataFrame:
     """
-    Fetch one ESIOS indicator at hourly granularity.
-
-    Important:
-    - For price, never sum values; filter to España/geo_id=3 if available and average duplicates.
-    - For generation/demand, sum duplicate hourly rows after filtering geography.
+    Day Ahead style chunked fetch using Madrid local date boundaries converted to UTC.
     """
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
     url = f"{BASE}/indicators/{indicator_id}"
-    params = {
-        "start_date": start_utc,
-        "end_date": end_utc,
-        "time_trunc": "hour",
-    }
+    frames = []
+    chunk_start = start_day
+    chunk_days = 31
 
-    # Price is already €/MWh, do not request sum aggregation.
-    if indicator_id != DAY_AHEAD_PRICE_ID:
-        params["time_agg"] = time_agg
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=chunk_days - 1))
 
-    r = requests.get(url, headers=esios_headers(token), params=params, timeout=90)
-    if not r.ok:
-        raise RuntimeError(
-            f"ESIOS indicator {indicator_id} failed: HTTP {r.status_code}. "
-            f"URL={r.url}. Body preview={r.text[:500]}"
-        )
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    values = r.json().get("indicator", {}).get("values", [])
-    if not values:
-        return pd.DataFrame(columns=["datetime_madrid", "indicator_id", "value"])
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=build_headers(token),
+                    params={
+                        "start_date": start_utc,
+                        "end_date": end_utc,
+                        "time_trunc": time_trunc,
+                    },
+                    timeout=(15, 120),
+                )
+                resp.raise_for_status()
+                parsed = parse_esios_indicator(resp.json(), source_name=f"esios_{indicator_id}")
+                if not parsed.empty:
+                    frames.append(parsed)
+                last_error = None
+                break
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                sleep(1.5 * (attempt + 1))
 
-    raw = pd.DataFrame(values)
+        if last_error is not None:
+            # Warning only for core data; optional indicators are handled higher up.
+            pass
 
-    # Prefer national Spain series when ESIOS returns several geographies.
-    if "geo_id" in raw.columns and (raw["geo_id"] == 3).any():
-        raw = raw[raw["geo_id"] == 3].copy()
-    elif "geo_name" in raw.columns:
-        geo = raw["geo_name"].astype(str).str.strip().str.lower()
-        mask = geo.isin(["españa", "espana"])
-        if mask.any():
-            raw = raw[mask].copy()
+        chunk_start = chunk_end + timedelta(days=1)
 
-    dt_col = "datetime_utc" if "datetime_utc" in raw.columns else "datetime"
-    if dt_col not in raw.columns:
-        raise ValueError(f"Indicator {indicator_id}: no datetime column in response: {raw.columns.tolist()}")
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
 
-    out = pd.DataFrame()
-    out["datetime_utc"] = pd.to_datetime(raw[dt_col], utc=True, errors="coerce")
-    out["datetime_madrid"] = out["datetime_utc"].dt.tz_convert("Europe/Madrid")
-    out["indicator_id"] = indicator_id
-    out["value"] = pd.to_numeric(raw["value"], errors="coerce")
-    out = out.dropna(subset=["datetime_madrid", "value"])
-
-    agg_func = "mean" if indicator_id == DAY_AHEAD_PRICE_ID else "sum"
-
-    out = (
-        out.groupby(["datetime_madrid", "indicator_id"], as_index=False)
-           .agg(value=("value", agg_func))
-           .sort_values("datetime_madrid")
-           .reset_index(drop=True)
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["datetime", "geo_id", "source"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
     )
 
-    return out
+
+@st.cache_data(show_spinner=False)
+def load_historical_prices() -> pd.DataFrame:
+    """
+    Exactly the same source as Day Ahead for historical spot prices.
+    """
+    if not HIST_PRICES_FILE.exists():
+        return pd.DataFrame(columns=["datetime", "price"])
+
+    try:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name="prices_hourly_avg")
+    except Exception:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name=0)
+        if "price" not in df.columns and "value" in df.columns:
+            df = df.rename(columns={"value": "price"})
+
+    if "datetime" not in df.columns or "price" not in df.columns:
+        return pd.DataFrame(columns=["datetime", "price"])
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["datetime", "price"]).copy()
+    df["datetime"] = df["datetime"].dt.floor("h")
+
+    return df[["datetime", "price"]].sort_values("datetime").reset_index(drop=True)
 
 
-def fetch_many_indicators(indicators: dict[str, int], start_utc: str, end_utc: str, token: str) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_prices(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    raw = fetch_esios_range(PRICE_INDICATOR_ID, start_day, end_day, token, time_trunc="hour")
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "price"])
 
-    progress = st.progress(0, text="Fetching ESIOS indicators...")
+    out = raw[["datetime", "value"]].rename(columns={"value": "price"}).copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.dropna(subset=["datetime", "price"])
+
+    # Price is €/MWh. Average duplicates; never sum prices.
+    return out.groupby("datetime", as_index=False)["price"].mean().sort_values("datetime")
+
+
+def load_prices_like_day_ahead(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    hist = load_historical_prices()
+    frames = []
+    if not hist.empty:
+        frames.append(hist)
+
+    live_start = max(start_day, LIVE_START_DATE)
+    if live_start <= end_day:
+        live = load_live_2026_prices(token, live_start, end_day)
+        if not live.empty:
+            frames.append(live)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "price"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.dropna(subset=["datetime", "price"])
+    out = out.sort_values("datetime").drop_duplicates("datetime", keep="last")
+
+    mask = (out["datetime"].dt.date >= start_day) & (out["datetime"].dt.date <= end_day)
+    return out.loc[mask, ["datetime", "price"]].reset_index(drop=True)
+
+
+# =========================================================
+# PBF fetch/calculation
+# =========================================================
+def fetch_named_indicators(
+    indicators: dict[str, int],
+    start_day: date,
+    end_day: date,
+    token: str,
+    *,
+    warn_missing: bool = False,
+) -> tuple[pd.DataFrame, list[str]]:
+    frames = []
+    missing = []
+
+    progress = st.progress(0, text="Fetching ESIOS PBF indicators...")
     items = list(indicators.items())
 
-    for i, (name, ind_id) in enumerate(items, start=1):
+    for i, (name, indicator_id) in enumerate(items, start=1):
         try:
-            df = fetch_esios_indicator(
-                indicator_id=ind_id,
-                start_utc=start_utc,
-                end_utc=end_utc,
-                token=token,
-                time_agg="sum",
-            )
-            if not df.empty:
-                df["series"] = name
-                frames.append(df)
-        except Exception as exc:
-            st.warning(f"Could not fetch {name} ({ind_id}): {exc}")
+            raw = fetch_esios_range(indicator_id, start_day, end_day, token, time_trunc="hour")
+            if raw.empty:
+                missing.append(f"{name} ({indicator_id})")
+            else:
+                temp = raw[["datetime", "value"]].copy()
+                temp["datetime"] = pd.to_datetime(temp["datetime"], errors="coerce").dt.floor("h")
+                temp["value"] = pd.to_numeric(temp["value"], errors="coerce")
+                temp = temp.dropna(subset=["datetime", "value"])
 
-        progress.progress(i / len(items), text=f"Fetched {i}/{len(items)} ESIOS indicators")
+                # Generation/demand are hourly energy/program values. Sum duplicates.
+                temp = temp.groupby("datetime", as_index=False)["value"].sum()
+                temp["series"] = name
+                temp["indicator_id"] = indicator_id
+                frames.append(temp)
+        except Exception as exc:
+            missing.append(f"{name} ({indicator_id}) error: {exc}")
+
+        progress.progress(i / len(items), text=f"Fetched {i}/{len(items)} PBF indicators")
 
     progress.empty()
 
-    if not frames:
-        return pd.DataFrame(columns=["datetime_madrid", "indicator_id", "value", "series"])
+    if warn_missing and missing:
+        with st.expander("Missing optional indicators", expanded=False):
+            st.write(missing)
 
-    return pd.concat(frames, ignore_index=True)
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value", "series", "indicator_id"]), missing
+
+    return pd.concat(frames, ignore_index=True), missing
 
 
 def build_wide(raw: pd.DataFrame) -> pd.DataFrame:
@@ -272,108 +377,87 @@ def build_wide(raw: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     wide = (
-        raw.pivot_table(
-            index="datetime_madrid",
-            columns="series",
-            values="value",
-            aggfunc="sum",
-        )
+        raw.pivot_table(index="datetime", columns="series", values="value", aggfunc="sum")
         .reset_index()
-        .sort_values("datetime_madrid")
+        .sort_values("datetime")
     )
     wide.columns.name = None
     return wide
 
 
-# ---------------------------------------------------------
-# Bilateral netting and thermal gap
-# ---------------------------------------------------------
 def apply_bilateral_netting(wide: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Calculate net PBF by technology:
-        net PBF = gross PBF - bilateral PBF
+    net PBF tech = gross PBF tech - bilateral PBF tech
+
+    If a bilateral indicator returns no data, it is treated as zero.
     """
     out = wide.copy()
-    diagnostics = []
+    diag = []
 
-    for tech in PBF_GROSS_COMPONENTS:
-        gross_col = tech
-        if gross_col not in out.columns:
-            out[gross_col] = 0.0
+    for tech, gross_id in PBF_GROSS_COMPONENTS.items():
+        if tech not in out.columns:
+            out[tech] = 0.0
 
-        bilat_map = PBF_BILATERAL_COMPONENTS.get(tech, {})
-        bilat_cols = list(bilat_map.keys())
+        bilat_col_name = f"{tech} bilateral PBF"
+        net_col_name = f"{tech} net PBF"
 
-        for col in bilat_cols:
+        bilat_indicator_name = f"Programa bilateral PBF {tech}"
+        # Actual column names are nicer Spanish labels below; get them from mapping reverse.
+        matching_bilat_cols = []
+        for bilat_name, bilat_id in BILATERAL_FETCH_NAMES.items():
+            if BILATERAL_TO_GROSS_TECH.get(bilat_name) == tech:
+                matching_bilat_cols.append(bilat_name)
+
+        for col in matching_bilat_cols:
             if col not in out.columns:
                 out[col] = 0.0
 
-        bilat_col = f"{tech} bilateral PBF"
-        net_col = f"{tech} net PBF"
+        out[bilat_col_name] = out[matching_bilat_cols].sum(axis=1) if matching_bilat_cols else 0.0
+        out[net_col_name] = out[tech] - out[bilat_col_name]
 
-        if bilat_cols:
-            out[bilat_col] = out[bilat_cols].sum(axis=1)
-        else:
-            out[bilat_col] = 0.0
+        # For the "PBF - bilaterals" view we do not want tiny negative values due to mismatched revisions.
+        # Keep the main thermal gap itself unclipped later.
+        out[net_col_name] = out[net_col_name].clip(lower=0)
 
-        out[net_col] = out[gross_col] - out[bilat_col]
-
-        # Avoid negative noise if bilaterals slightly exceed gross because of revisions/rounding.
-        out[net_col] = out[net_col].clip(lower=0)
-
-        gross_sum = out[gross_col].sum()
-        bilat_sum = out[bilat_col].sum()
-        net_sum = out[net_col].sum()
-
-        diagnostics.append(
+        gross_sum = out[tech].sum()
+        bilat_sum = out[bilat_col_name].sum()
+        diag.append(
             {
                 "technology": tech,
-                "gross_indicator": gross_col,
-                "bilateral_indicators": ", ".join(bilat_cols) if bilat_cols else "No bilateral mapped; assumed 0",
+                "gross_id": gross_id,
                 "gross_mwh": gross_sum,
                 "bilateral_mwh": bilat_sum,
-                "net_mwh": net_sum,
+                "net_mwh": out[net_col_name].sum(),
                 "bilateral_share_pct": (bilat_sum / gross_sum * 100) if gross_sum else pd.NA,
+                "bilateral_columns": ", ".join(matching_bilat_cols) if matching_bilat_cols else "None / assumed 0",
             }
         )
 
-    return out, pd.DataFrame(diagnostics)
+    return out, pd.DataFrame(diag)
 
 
 def calculate_thermal_gap(
     wide: pd.DataFrame,
-    non_thermal_components: list[str],
+    non_thermal_techs: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Thermal gap based on net PBF:
-        thermal_gap = Total scheduled demand PBF - sum(net PBF non-thermal techs)
-    """
     netted, diag = apply_bilateral_netting(wide)
     out = netted.copy()
-
-    # For chart readability, overwrite technology columns with net values.
-    for tech in PBF_GROSS_COMPONENTS:
-        net_col = f"{tech} net PBF"
-        out[tech] = out[net_col] if net_col in out.columns else 0.0
 
     if "Total scheduled demand PBF" not in out.columns:
         out["Total scheduled demand PBF"] = 0.0
 
-    non_thermal_net_cols = []
-    for tech in non_thermal_components:
+    net_cols = []
+    for tech in non_thermal_techs:
         col = f"{tech} net PBF"
         if col not in out.columns:
             out[col] = 0.0
-        non_thermal_net_cols.append(col)
+        net_cols.append(col)
 
-    out["non_thermal_mwh"] = out[non_thermal_net_cols].sum(axis=1)
-    out["thermal_gap_mwh"] = out["Total scheduled demand PBF"] - out["non_thermal_mwh"]
-    out["thermal_gap_mwh"] = out["thermal_gap_mwh"].clip(lower=0)
+    out["non_thermal_net_pbf_mwh"] = out[net_cols].sum(axis=1)
+    out["raw_thermal_gap_mwh"] = out["Total scheduled demand PBF"] - out["non_thermal_net_pbf_mwh"]
 
-    out["date_madrid"] = out["datetime_madrid"].dt.date
-    out["hour_madrid"] = out["datetime_madrid"].dt.hour
-    out["datetime_label"] = out["datetime_madrid"].dt.strftime("%d-%b %H:%M")
-
+    out["date_madrid"] = out["datetime"].dt.date
+    out["hour_madrid"] = out["datetime"].dt.hour
     return out, diag
 
 
@@ -382,311 +466,278 @@ def calculate_monthly_stats(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     tmp = df.copy()
-    tmp["month"] = tmp["datetime_madrid"].dt.strftime("%Y-%m")
+    tmp["month"] = tmp["datetime"].dt.strftime("%Y-%m")
 
     rows = []
     for month, g in tmp.groupby("month"):
-        baseload = g["Day-ahead price"].mean() if "Day-ahead price" in g.columns else pd.NA
-
-        if "Day-ahead price" in g.columns and g["thermal_gap_mwh"].sum() != 0:
-            price_weighted_by_gap = (
-                g["Day-ahead price"] * g["thermal_gap_mwh"]
-            ).sum() / g["thermal_gap_mwh"].sum()
-        else:
-            price_weighted_by_gap = pd.NA
+        avg_price = g["price"].mean() if "price" in g.columns else pd.NA
+        gap_sum = g["raw_thermal_gap_mwh"].sum()
+        weighted_price = (
+            (g["price"] * g["raw_thermal_gap_mwh"]).sum() / gap_sum
+            if "price" in g.columns and gap_sum != 0
+            else pd.NA
+        )
 
         rows.append(
             {
                 "month": month,
-                "avg_spot_price_eur_mwh": baseload,
-                "avg_thermal_gap_mwh": g["thermal_gap_mwh"].mean(),
-                "max_thermal_gap_mwh": g["thermal_gap_mwh"].max(),
-                "min_thermal_gap_mwh": g["thermal_gap_mwh"].min(),
-                "price_weighted_by_thermal_gap_eur_mwh": price_weighted_by_gap,
-                "demand_pbf_mwh": g["Total scheduled demand PBF"].sum() if "Total scheduled demand PBF" in g.columns else pd.NA,
-                "non_thermal_net_pbf_mwh": g["non_thermal_mwh"].sum(),
-                "thermal_gap_mwh_sum": g["thermal_gap_mwh"].sum(),
+                "avg_spot_price_eur_mwh": avg_price,
+                "avg_thermal_gap_mwh": g["raw_thermal_gap_mwh"].mean(),
+                "max_thermal_gap_mwh": g["raw_thermal_gap_mwh"].max(),
+                "min_thermal_gap_mwh": g["raw_thermal_gap_mwh"].min(),
+                "thermal_gap_mwh_sum": gap_sum,
+                "price_weighted_by_gap_eur_mwh": weighted_price,
+                "demand_pbf_mwh": g["Total scheduled demand PBF"].sum(),
+                "non_thermal_net_pbf_mwh": g["non_thermal_net_pbf_mwh"].sum(),
+                "missing_price_hours": int(g["price"].isna().sum()) if "price" in g.columns else len(g),
             }
         )
 
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------
-st.title("PBF net of bilaterals — thermal gap vs day-ahead price")
+# Nice bilingual names for bilaterals. These columns are fetched and mapped back to gross techs.
+BILATERAL_FETCH_NAMES = {
+    "Programa bilateral PBF Hidráulica UGH": 421,
+    "Programa bilateral PBF Hidráulica no UGH": 422,
+    "Programa bilateral PBF Nuclear": 424,
+    "Programa bilateral PBF Hulla sub-bituminosa": 426,
+    "Programa bilateral PBF Hulla antracita": 427,
+    "Programa bilateral PBF Ciclo combinado": 429,
+    "Programa bilateral PBF Eólica terrestre": 432,
+    "Programa bilateral PBF Eólica marina": 433,
+    "Programa bilateral PBF Otras renovables": 10234,
+}
+BILATERAL_TO_GROSS_TECH = {
+    "Programa bilateral PBF Hidráulica UGH": "Hydro UGH",
+    "Programa bilateral PBF Hidráulica no UGH": "Hydro non-UGH",
+    "Programa bilateral PBF Nuclear": "Nuclear",
+    "Programa bilateral PBF Hulla sub-bituminosa": "Coal sub-bituminous",
+    "Programa bilateral PBF Hulla antracita": "Coal anthracite",
+    "Programa bilateral PBF Ciclo combinado": "Combined cycle GT",
+    "Programa bilateral PBF Eólica terrestre": "Wind onshore",
+    "Programa bilateral PBF Eólica marina": "Wind offshore",
+    "Programa bilateral PBF Otras renovables": "Other renewables",
+}
+
+
+# =========================================================
+# UI
+# =========================================================
+st.title("Hueco Térmico y Precio")
 st.caption(
-    "Gross PBF generation is reduced by Programa bilateral PBF indicators where mapped. "
-    "Timestamps are requested in UTC and displayed in Europe/Madrid."
+    "PBF menos bilaterales. Precios cargados con la misma lógica que Day Ahead. "
+    "Todo se muestra en horario local Madrid."
 )
 
-with st.expander("Indicator IDs used", expanded=False):
-    st.markdown("**Core indicators**")
-    st.write({"Day-ahead price": DAY_AHEAD_PRICE_ID, "Total scheduled demand PBF": DEMAND_PBF_ID})
-
-    st.markdown("**Gross PBF generation indicators**")
+with st.expander("Indicator IDs", expanded=False):
+    st.markdown("**Core**")
+    st.write({"Spot price": PRICE_INDICATOR_ID, "Demand PBF": DEMAND_PBF_ID})
+    st.markdown("**Gross PBF components**")
     st.json(PBF_GROSS_COMPONENTS)
-
-    st.markdown("**Bilateral PBF indicators**")
-    st.json(PBF_BILATERAL_COMPONENTS)
-
-    st.markdown("**Bilateral total sales diagnostic**")
-    st.write(PBF_BILATERAL_TOTAL_SALES_ID)
+    st.markdown("**Bilateral PBF components**")
+    st.json(BILATERAL_FETCH_NAMES)
 
 col1, col2 = st.columns(2)
 with col1:
     start_day = st.date_input("Start day", value=date(2026, 3, 1))
 with col2:
-    end_day = st.date_input("End day inclusive", value=date(2026, 3, 31))
+    end_day = st.date_input("End day inclusive", value=date(2026, 3, 13))
 
-non_thermal = st.multiselect(
+non_thermal_techs = st.multiselect(
     "Non-thermal net PBF components deducted from demand",
     options=list(PBF_GROSS_COMPONENTS.keys()),
-    default=DEFAULT_NON_THERMAL,
+    default=NON_THERMAL_TECHS_DEFAULT,
 )
 
-stack_components = st.multiselect(
-    "Conventional net PBF technologies to stack",
-    options=list(PBF_GROSS_COMPONENTS.keys()),
-    default=DEFAULT_CONVENTIONAL_STACK,
-)
+show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=False)
 
 if end_day < start_day:
     st.error("End day must be >= start day.")
     st.stop()
 
-start_utc, end_utc = madrid_date_to_api_range(start_day, end_day)
-
-st.write(f"API UTC request window: `{start_utc}` → `{end_utc}`")
-st.info("Charts use Europe/Madrid local time.")
-
-run = st.button("Fetch PBF net bilateral thermal gap", type="primary", use_container_width=True)
+run = st.button("Fetch and plot", type="primary", use_container_width=True)
 
 if run:
-    token = get_esios_token()
+    try:
+        token = require_esios_token()
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
 
-    indicators = {
-        "Day-ahead price": DAY_AHEAD_PRICE_ID,
-        "Total scheduled demand PBF": DEMAND_PBF_ID,
-    }
+    indicator_map = {"Total scheduled demand PBF": DEMAND_PBF_ID}
+    indicator_map.update(PBF_GROSS_COMPONENTS)
+    indicator_map.update(BILATERAL_FETCH_NAMES)
+    indicator_map["Programa bilateral PBF Total Ventas"] = PBF_BILATERAL_TOTAL_SALES_ID
 
-    # Gross PBF technologies.
-    indicators.update(PBF_GROSS_COMPONENTS)
-
-    # Bilateral PBF indicators.
-    for tech, bilat_map in PBF_BILATERAL_COMPONENTS.items():
-        indicators.update(bilat_map)
-
-    # Total bilateral sales diagnostic.
-    indicators["Programa bilateral PBF Total Ventas"] = PBF_BILATERAL_TOTAL_SALES_ID
-
-    raw = fetch_many_indicators(indicators, start_utc, end_utc, token)
+    raw, missing = fetch_named_indicators(indicator_map, start_day, end_day, token, warn_missing=show_diagnostics)
 
     if raw.empty:
-        st.warning("No ESIOS data returned.")
+        st.warning("No PBF data returned.")
         st.stop()
 
     wide = build_wide(raw)
-    df, bilateral_diag = calculate_thermal_gap(wide, non_thermal)
+    thermal, bilat_diag = calculate_thermal_gap(wide, non_thermal_techs)
+
+    prices = load_prices_like_day_ahead(token, start_day, end_day)
+
+    thermal["datetime"] = pd.to_datetime(thermal["datetime"], errors="coerce").dt.floor("h")
+    prices["datetime"] = pd.to_datetime(prices["datetime"], errors="coerce").dt.floor("h")
+
+    df = thermal.merge(prices, on="datetime", how="left").sort_values("datetime")
+
     monthly = calculate_monthly_stats(df)
 
     # -----------------------------------------------------
-    # Main overlay chart
+    # Main chart like the reference image
     # -----------------------------------------------------
-    st.subheader("Overlay — net PBF conventional stack vs day-ahead price")
+    st.subheader("Hueco Térmico y Precio")
     st.caption(
-        "Left axis: net PBF conventional generation in MWh/h. "
-        "Right axis: day-ahead spot price in €/MWh."
+        "Columnas: hueco térmico horario. Línea: precio spot horario. "
+        "Eje X en horario Europe/Madrid."
     )
 
-    stack_cols = [c for c in stack_components if c in df.columns]
+    base_x = alt.X(
+        "datetime:T",
+        title=None,
+        axis=alt.Axis(
+            format="%Y-%m-%d %H",
+            labelAngle=-90,
+            labelOverlap=False,
+            tickCount={"interval": "hour", "step": 4},
+        ),
+    )
 
-    if not stack_cols:
-        st.warning("Select at least one conventional technology to stack.")
-    else:
-        stack_df = df[["datetime_madrid"] + stack_cols].melt(
-            id_vars=["datetime_madrid"],
-            var_name="component",
-            value_name="mwh",
-        )
-        stack_df["mwh"] = pd.to_numeric(stack_df["mwh"], errors="coerce").fillna(0.0)
-
-        base_x = alt.X(
-            "datetime_madrid:T",
-            title="Madrid date and hour",
-            axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45),
-        )
-
-        bars = (
-            alt.Chart(stack_df)
-            .mark_bar(opacity=0.88)
-            .encode(
-                x=base_x,
-                y=alt.Y(
-                    "mwh:Q",
-                    title="Net PBF conventional generation (MWh/h)",
-                    stack="zero",
-                    axis=alt.Axis(titleColor="#111827", labelColor="#111827"),
-                ),
-                color=alt.Color(
-                    "component:N",
-                    title="Net PBF conventional technologies",
-                    legend=alt.Legend(orient="right"),
-                ),
-                tooltip=[
-                    alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                    alt.Tooltip("component:N", title="Technology"),
-                    alt.Tooltip("mwh:Q", title="MWh/h", format=",.0f"),
-                ],
-            )
-        )
-
-        if "Day-ahead price" in df.columns:
-            price_line = (
-                alt.Chart(df)
-                .mark_line(color="#2563EB", strokeWidth=3)
-                .encode(
-                    x=base_x,
-                    y=alt.Y(
-                        "Day-ahead price:Q",
-                        title="Day-ahead price (€/MWh)",
-                        axis=alt.Axis(
-                            titleColor="#2563EB",
-                            labelColor="#2563EB",
-                            orient="right",
-                        ),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                        alt.Tooltip("Day-ahead price:Q", title="Price €/MWh", format=",.2f"),
-                    ],
-                )
-            )
-
-            combined = alt.layer(bars, price_line).resolve_scale(y="independent").properties(height=460)
-        else:
-            combined = bars.properties(height=460)
-
-        st.altair_chart(combined, use_container_width=True)
-
-    # -----------------------------------------------------
-    # Thermal gap chart
-    # -----------------------------------------------------
-    st.subheader("Calculated thermal gap — net PBF basis")
-    gap_chart = (
+    bars = (
         alt.Chart(df)
-        .mark_line(color="black", strokeWidth=2.5)
+        .mark_bar(color="#F5B041", opacity=0.90)
         .encode(
-            x=alt.X(
-                "datetime_madrid:T",
-                title="Madrid date and hour",
-                axis=alt.Axis(format="%d-%b %H:%M", labelAngle=-45),
+            x=base_x,
+            y=alt.Y(
+                "raw_thermal_gap_mwh:Q",
+                title="Hueco Térmico (MWh)",
+                axis=alt.Axis(titleColor="black", labelColor="black"),
+                scale=alt.Scale(zero=True),
             ),
-            y=alt.Y("thermal_gap_mwh:Q", title="Thermal gap (MWh/h)"),
             tooltip=[
-                alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                alt.Tooltip("thermal_gap_mwh:Q", title="Thermal gap", format=",.0f"),
-                alt.Tooltip("Total scheduled demand PBF:Q", title="Demand PBF", format=",.0f"),
-                alt.Tooltip("non_thermal_mwh:Q", title="Net non-thermal PBF", format=",.0f"),
+                alt.Tooltip("datetime:T", title="Hora Madrid", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("raw_thermal_gap_mwh:Q", title="Hueco Térmico MWh", format=",.0f"),
+                alt.Tooltip("Total scheduled demand PBF:Q", title="Demanda PBF", format=",.0f"),
+                alt.Tooltip("non_thermal_net_pbf_mwh:Q", title="No térmica neta", format=",.0f"),
             ],
         )
-        .properties(height=300)
     )
-    st.altair_chart(gap_chart, use_container_width=True)
 
-    # -----------------------------------------------------
-    # Scatter
-    # -----------------------------------------------------
-    if "Day-ahead price" in df.columns:
-        st.subheader("Scatter — day-ahead price vs net PBF thermal gap")
-        scatter = (
-            alt.Chart(df)
-            .mark_circle(size=60, opacity=0.7)
-            .encode(
-                x=alt.X("thermal_gap_mwh:Q", title="Thermal gap (MWh/h)"),
-                y=alt.Y("Day-ahead price:Q", title="Day-ahead price (€/MWh)"),
-                color=alt.Color("hour_madrid:O", title="Madrid hour"),
-                tooltip=[
-                    alt.Tooltip("datetime_madrid:T", title="Madrid time", format="%d-%b-%Y %H:%M"),
-                    alt.Tooltip("thermal_gap_mwh:Q", title="Thermal gap", format=",.0f"),
-                    alt.Tooltip("Day-ahead price:Q", title="Price €/MWh", format=",.2f"),
-                    alt.Tooltip("hour_madrid:O", title="Hour"),
-                ],
-            )
-            .properties(height=420)
+    price_line = (
+        alt.Chart(df)
+        .mark_line(color="black", strokeWidth=2.4)
+        .encode(
+            x=base_x,
+            y=alt.Y(
+                "price:Q",
+                title="Precio (€/MWh)",
+                axis=alt.Axis(orient="right", titleColor="black", labelColor="black"),
+                scale=alt.Scale(zero=False),
+            ),
+            tooltip=[
+                alt.Tooltip("datetime:T", title="Hora Madrid", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("price:Q", title="Precio €/MWh", format=",.2f"),
+            ],
         )
-        st.altair_chart(scatter, use_container_width=True)
-
-    # -----------------------------------------------------
-    # Tables / diagnostics
-    # -----------------------------------------------------
-    st.subheader("Monthly stats")
-    st.dataframe(monthly, use_container_width=True, hide_index=True)
-
-    st.subheader("Bilateral netting diagnostics")
-    st.caption(
-        "Net PBF = gross PBF technology - Programa bilateral PBF technology. "
-        "Technologies without a mapped bilateral indicator are assumed to have bilateral 0."
     )
-    st.dataframe(bilateral_diag, use_container_width=True, hide_index=True)
 
-    with st.expander("Price diagnostics", expanded=False):
-        if "Day-ahead price" in df.columns:
-            st.write(
-                {
-                    "min": float(df["Day-ahead price"].min()),
-                    "avg": float(df["Day-ahead price"].mean()),
-                    "max": float(df["Day-ahead price"].max()),
-                }
-            )
-            st.dataframe(
-                df[["datetime_madrid", "Day-ahead price"]]
-                .sort_values("Day-ahead price", ascending=False)
-                .head(20),
+    chart = (
+        alt.layer(bars, price_line)
+        .resolve_scale(y="independent")
+        .properties(height=540)
+        .configure_view(stroke=None)
+        .configure_axis(
+            grid=True,
+            gridColor="#E5E7EB",
+            domainColor="#9CA3AF",
+            tickColor="#9CA3AF",
+            labelFontSize=11,
+            titleFontSize=14,
+        )
+        .configure_legend(orient="bottom")
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+    st.markdown(
+        "- **Eje Y izquierdo**: Hueco Térmico horario, MWh/h\n"
+        "- **Eje Y derecho**: Precio spot horario, €/MWh\n"
+        "- **Eje X**: hora local Madrid, no UTC"
+    )
+
+    if show_diagnostics:
+        st.subheader("Diagnostics")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("First hour", str(df["datetime"].min()))
+        with c2:
+            st.metric("Last hour", str(df["datetime"].max()))
+        with c3:
+            st.metric("Missing price hours", int(df["price"].isna().sum()))
+        with c4:
+            st.metric("Missing optional indicators", len(missing))
+
+        st.markdown("**Monthly stats**")
+        st.dataframe(monthly, use_container_width=True, hide_index=True)
+
+        with st.expander("Price diagnostics", expanded=False):
+            if df["price"].notna().any():
+                st.write({
+                    "min": float(df["price"].min()),
+                    "avg": float(df["price"].mean()),
+                    "max": float(df["price"].max()),
+                })
+                st.dataframe(
+                    df[["datetime", "price"]].dropna().sort_values("price", ascending=False).head(25),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with st.expander("Bilateral netting diagnostics", expanded=False):
+            st.dataframe(bilat_diag, use_container_width=True, hide_index=True)
+
+        with st.expander("Missing indicators", expanded=False):
+            st.write(missing)
+
+        with st.expander("Chart data", expanded=False):
+            cols = [
+                "datetime",
+                "raw_thermal_gap_mwh",
+                "price",
+                "Total scheduled demand PBF",
+                "non_thermal_net_pbf_mwh",
+            ]
+            cols = [c for c in cols if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button(
+                "Download chart data CSV",
+                df.to_csv(index=False).encode("utf-8"),
+                file_name=f"hueco_termico_precio_pbf_net_bilat_{start_day}_{end_day}.csv",
+                mime="text/csv",
                 use_container_width=True,
-                hide_index=True,
             )
-
-    with st.expander("Hourly data", expanded=False):
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-    with st.expander("Raw fetched indicators", expanded=False):
-        st.dataframe(raw, use_container_width=True, hide_index=True)
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.download_button(
-            "Download hourly CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=f"pbf_net_bilateral_thermal_gap_hourly_{start_day}_{end_day}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with c2:
-        st.download_button(
-            "Download monthly stats CSV",
-            monthly.to_csv(index=False).encode("utf-8"),
-            file_name=f"pbf_net_bilateral_monthly_stats_{start_day}_{end_day}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with c3:
-        st.download_button(
-            "Download bilateral diagnostics CSV",
-            bilateral_diag.to_csv(index=False).encode("utf-8"),
-            file_name=f"pbf_bilateral_netting_diagnostics_{start_day}_{end_day}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with c4:
-        st.download_button(
-            "Download raw indicators CSV",
-            raw.to_csv(index=False).encode("utf-8"),
-            file_name=f"esios_raw_pbf_bilaterals_{start_day}_{end_day}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        with c2:
+            st.download_button(
+                "Download bilateral diagnostics CSV",
+                bilat_diag.to_csv(index=False).encode("utf-8"),
+                file_name=f"bilateral_diagnostics_{start_day}_{end_day}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with c3:
+            st.download_button(
+                "Download raw indicators CSV",
+                raw.to_csv(index=False).encode("utf-8"),
+                file_name=f"raw_pbf_bilaterals_{start_day}_{end_day}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
