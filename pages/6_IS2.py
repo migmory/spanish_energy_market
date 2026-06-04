@@ -152,26 +152,79 @@ def events_payload_to_power_df(payload: dict | list) -> pd.DataFrame:
 
 def power_10min_to_generation_15min(power_df: pd.DataFrame) -> pd.DataFrame:
     """
-    The API events are 10-min. Convert average power kW to kWh per 10-min interval:
-       kWh = kW * 10/60
-    Then sum into 15-min buckets.
+    Convert SCADA/API power points to 15-min energy using proportional interval overlap.
+
+    The API timestamps are parsed as UTC and converted to Europe/Madrid before this function.
+    Assumption:
+      each power_kw value is valid from timestamp t to t + interval,
+      where interval is inferred per site from the median timestamp difference
+      and defaults to 10 minutes.
+
+    For each source interval:
+      energy allocated to a 15-min bucket =
+          power_kw * overlap_minutes / 60
+
+    This is more accurate than simply assigning complete 10-min intervals into 15-min buckets,
+    because 10-min intervals do not align perfectly with 15-min buckets.
     """
     if power_df.empty:
         return pd.DataFrame(columns=["site", "datetime_madrid", "generation_kwh_15min"])
 
-    tmp = power_df.copy()
-    tmp["generation_kwh_10min"] = tmp["power_kw"] * (10.0 / 60.0)
+    rows = []
+
+    for site, g in power_df.sort_values("datetime_madrid").groupby("site"):
+        g = g.dropna(subset=["datetime_madrid", "power_kw"]).copy()
+        if g.empty:
+            continue
+
+        diffs = g["datetime_madrid"].diff().dt.total_seconds().dropna()
+        if diffs.empty:
+            interval_seconds = 10 * 60
+        else:
+            # Use median positive diff. Clamp to a sensible range to avoid outages/gaps becoming interval length.
+            positive = diffs[diffs > 0]
+            interval_seconds = float(positive.median()) if not positive.empty else 10 * 60
+            if interval_seconds < 30 or interval_seconds > 3600:
+                interval_seconds = 10 * 60
+
+        interval = pd.Timedelta(seconds=interval_seconds)
+
+        for _, r in g.iterrows():
+            start_ts = r["datetime_madrid"]
+            end_ts = start_ts + interval
+            power_kw = float(r["power_kw"])
+
+            # Iterate over all 15-min buckets overlapped by [start_ts, end_ts)
+            bucket_start = start_ts.floor("15min")
+            while bucket_start < end_ts:
+                bucket_end = bucket_start + pd.Timedelta(minutes=15)
+                overlap_start = max(start_ts, bucket_start)
+                overlap_end = min(end_ts, bucket_end)
+                overlap_minutes = (overlap_end - overlap_start).total_seconds() / 60.0
+
+                if overlap_minutes > 0:
+                    rows.append(
+                        {
+                            "site": site,
+                            "datetime_madrid": bucket_start,
+                            "generation_kwh_15min": power_kw * overlap_minutes / 60.0,
+                        }
+                    )
+
+                bucket_start = bucket_end
+
+    if not rows:
+        return pd.DataFrame(columns=["site", "datetime_madrid", "generation_kwh_15min"])
 
     out = (
-        tmp.set_index("datetime_madrid")
-           .groupby("site")["generation_kwh_10min"]
-           .resample("15min")
-           .sum()
-           .reset_index()
-           .rename(columns={"generation_kwh_10min": "generation_kwh_15min"})
+        pd.DataFrame(rows)
+        .groupby(["site", "datetime_madrid"], as_index=False)["generation_kwh_15min"]
+        .sum()
+        .sort_values(["site", "datetime_madrid"])
+        .reset_index(drop=True)
     )
 
-    return out.sort_values(["site", "datetime_madrid"]).reset_index(drop=True)
+    return out
 
 
 def make_daily_summary(gen15: pd.DataFrame) -> pd.DataFrame:
@@ -323,6 +376,11 @@ def load_day_ahead_tab_historical_prices(start_day: date, end_day: date) -> pd.D
         prices_hourly_avg
     expected columns:
         datetime, price
+
+    Important DST fix:
+      filter the requested date range while timestamps are still naive, then localize.
+      This avoids failing on historical ambiguous DST hours such as 2021-10-31 02:00
+      when the selected range is not that DST transition.
     """
     base_dir = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
     candidates = [
@@ -354,23 +412,39 @@ def load_day_ahead_tab_historical_prices(start_day: date, end_day: date) -> pd.D
     if "datetime" not in raw.columns or "price" not in raw.columns:
         return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
 
-    out = pd.DataFrame()
     dt = pd.to_datetime(raw["datetime"], errors="coerce")
-    # Day Ahead tab normally stores historical datetimes as Madrid-naive labels.
-    # If the file ever contains tz-aware datetimes, convert them to Madrid instead.
-    if dt.dt.tz is None:
-        out["hour_madrid"] = dt.dt.tz_localize("Europe/Madrid", ambiguous="infer", nonexistent="shift_forward").dt.floor("h")
-    else:
-        out["hour_madrid"] = dt.dt.tz_convert("Europe/Madrid").dt.floor("h")
+    out = pd.DataFrame()
+    out["datetime_naive"] = dt
     out["price_eur_mwh"] = pd.to_numeric(raw["price"], errors="coerce")
     out["price_source"] = f"Day Ahead workbook: {file_path.name}"
-    out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
+    out = out.dropna(subset=["datetime_naive", "price_eur_mwh"])
 
-    start_local = datetime.combine(start_day, time(0, 0), tzinfo=MADRID_TZ)
-    end_local = datetime.combine(end_day + timedelta(days=1), time(0, 0), tzinfo=MADRID_TZ)
-    out = out[(out["hour_madrid"] >= start_local) & (out["hour_madrid"] < end_local)].copy()
+    # Filter before timezone localization to avoid unrelated ambiguous DST rows.
+    start_naive = pd.Timestamp(start_day)
+    end_naive = pd.Timestamp(end_day + timedelta(days=1))
+    out = out[(out["datetime_naive"] >= start_naive) & (out["datetime_naive"] < end_naive)].copy()
 
-    return out.sort_values("hour_madrid").drop_duplicates("hour_madrid", keep="last")
+    if out.empty:
+        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
+
+    # Day Ahead tab normally stores historical datetimes as Madrid-naive labels.
+    # ambiguous=False means standard-time side for fall-back duplicate hours if they appear.
+    # nonexistent='shift_forward' handles spring DST gap.
+    if out["datetime_naive"].dt.tz is None:
+        out["hour_madrid"] = out["datetime_naive"].dt.tz_localize(
+            "Europe/Madrid",
+            ambiguous=False,
+            nonexistent="shift_forward",
+        ).dt.floor("h")
+    else:
+        out["hour_madrid"] = out["datetime_naive"].dt.tz_convert("Europe/Madrid").dt.floor("h")
+
+    return (
+        out[["hour_madrid", "price_eur_mwh", "price_source"]]
+        .drop_duplicates("hour_madrid", keep="last")
+        .sort_values("hour_madrid")
+        .reset_index(drop=True)
+    )
 
 
 def load_day_ahead_prices_from_app_data(start_day: date, end_day: date) -> pd.DataFrame:
@@ -449,7 +523,7 @@ def calculate_revenues(gen15: pd.DataFrame, prices: pd.DataFrame):
 st.title("Solarpark / UNITY — May production test + 24h average profile")
 st.caption(
     "Test using Cookie auth from the browser request. "
-    "API source values appear at 10-min intervals; this page converts them to 15-min generation."
+    "API source values appear around 10-min intervals; this page converts them to 15-min generation using proportional overlap."
 )
 
 with st.expander("Configured power source IDs", expanded=False):
@@ -673,6 +747,15 @@ if run:
         st.write("15-min rows:", len(gen15))
         st.write("Source IDs returned:")
         st.write(sorted(power_df["source_id"].unique().tolist()))
+        st.write("Timezone check:")
+        st.write({
+            "datetime_utc_dtype": str(power_df["datetime_utc"].dtype),
+            "datetime_madrid_dtype": str(power_df["datetime_madrid"].dtype),
+            "first_utc": str(power_df["datetime_utc"].min()),
+            "first_madrid": str(power_df["datetime_madrid"].min()),
+            "last_utc": str(power_df["datetime_utc"].max()),
+            "last_madrid": str(power_df["datetime_madrid"].max()),
+        })
         st.write("Max power by site:")
         st.dataframe(power_df.groupby("site", as_index=False)["power_kw"].max(), use_container_width=True, hide_index=True)
         st.write("Raw payload first object keys:")
