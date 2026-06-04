@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -323,19 +324,29 @@ def load_day_ahead_tab_historical_prices(start_day: date, end_day: date) -> pd.D
     expected columns:
         datetime, price
     """
+    base_dir = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
     candidates = [
         Path("data/hourly_avg_price_since2021.xlsx"),
-        Path(__file__).resolve().parents[1] / "data" / "hourly_avg_price_since2021.xlsx",
-        Path(__file__).resolve().parent / "data" / "hourly_avg_price_since2021.xlsx",
+        Path("data/hourly_avg_price_since2021.xls"),
+        Path("data/hourly_avg_price_since2021.csv"),
+        base_dir / "data" / "hourly_avg_price_since2021.xlsx",
+        base_dir / "data" / "hourly_avg_price_since2021.xls",
+        base_dir / "data" / "hourly_avg_price_since2021.csv",
+        Path.cwd() / "data" / "hourly_avg_price_since2021.xlsx",
+        Path.cwd() / "data" / "hourly_avg_price_since2021.xls",
+        Path.cwd() / "data" / "hourly_avg_price_since2021.csv",
     ]
     file_path = next((p for p in candidates if p.exists()), None)
     if file_path is None:
         return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
 
-    try:
-        raw = pd.read_excel(file_path, sheet_name="prices_hourly_avg")
-    except Exception:
-        raw = pd.read_excel(file_path, sheet_name=0)
+    if str(file_path).lower().endswith(".csv"):
+        raw = pd.read_csv(file_path)
+    else:
+        try:
+            raw = pd.read_excel(file_path, sheet_name="prices_hourly_avg")
+        except Exception:
+            raw = pd.read_excel(file_path, sheet_name=0)
 
     if "price" not in raw.columns and "value" in raw.columns:
         raw = raw.rename(columns={"value": "price"})
@@ -345,8 +356,12 @@ def load_day_ahead_tab_historical_prices(start_day: date, end_day: date) -> pd.D
 
     out = pd.DataFrame()
     dt = pd.to_datetime(raw["datetime"], errors="coerce")
-    # Day Ahead tab stores historical datetimes as Madrid-naive labels.
-    out["hour_madrid"] = dt.dt.tz_localize("Europe/Madrid", ambiguous="infer", nonexistent="shift_forward").dt.floor("h")
+    # Day Ahead tab normally stores historical datetimes as Madrid-naive labels.
+    # If the file ever contains tz-aware datetimes, convert them to Madrid instead.
+    if dt.dt.tz is None:
+        out["hour_madrid"] = dt.dt.tz_localize("Europe/Madrid", ambiguous="infer", nonexistent="shift_forward").dt.floor("h")
+    else:
+        out["hour_madrid"] = dt.dt.tz_convert("Europe/Madrid").dt.floor("h")
     out["price_eur_mwh"] = pd.to_numeric(raw["price"], errors="coerce")
     out["price_source"] = f"Day Ahead workbook: {file_path.name}"
     out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
@@ -665,4 +680,3 @@ if run:
             st.write(list(payload[0].keys()))
         elif isinstance(payload, dict):
             st.write(list(payload.keys()))
-
