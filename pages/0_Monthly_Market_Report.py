@@ -1248,7 +1248,10 @@ def monthly_average_demand_profile_chart(
         _month_hourly_demand_profile(demand_hourly, selected_month, selected_label),
         _month_hourly_demand_profile(demand_hourly, previous_month, previous_label),
     ]
-    plot = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True)
+    valid_frames = [f for f in frames if f is not None and not f.empty]
+    if not valid_frames:
+        return None
+    plot = pd.concat(valid_frames, ignore_index=True)
     if plot.empty:
         return None
 
@@ -5312,7 +5315,7 @@ report_end = min(report_end, pd.Timestamp(latest_data_ts.date()))
 comparison_2025_end = comparable_ytd_end(report_end, 2025)
 
 pills([
-    "Monthly Report v18 final requested fixes active",
+    "Monthly Report v19 demand profile crash fix active",
     f"Report month: {selected_label}",
     f"Data cut-off: {report_end:%d %b %Y}",
     "Current month = MTD" if is_current_mtd else "Closed month",
