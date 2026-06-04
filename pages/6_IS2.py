@@ -481,21 +481,53 @@ def load_day_ahead_prices_from_app_data(start_day: date, end_day: date) -> pd.Da
 def generation_15min_to_hourly_mwh(gen15: pd.DataFrame) -> pd.DataFrame:
     if gen15.empty:
         return pd.DataFrame(columns=["site", "hour_madrid", "generation_mwh"])
+
     tmp = gen15.copy()
+    # Force timezone-aware Europe/Madrid dtype, not object.
+    tmp["datetime_madrid"] = pd.to_datetime(tmp["datetime_madrid"], utc=True, errors="coerce").dt.tz_convert("Europe/Madrid")
+    tmp = tmp.dropna(subset=["datetime_madrid"])
+
     tmp["hour_madrid"] = tmp["datetime_madrid"].dt.floor("h")
-    tmp["generation_mwh_15min"] = tmp["generation_kwh_15min"] / 1000.0
-    return (
+    tmp["generation_mwh_15min"] = pd.to_numeric(tmp["generation_kwh_15min"], errors="coerce") / 1000.0
+
+    out = (
         tmp.groupby(["site", "hour_madrid"], as_index=False)
            .agg(generation_mwh=("generation_mwh_15min", "sum"))
+    )
+    # Ensure merge key has exactly the same dtype as price loader.
+    out["hour_madrid"] = pd.to_datetime(out["hour_madrid"], utc=True, errors="coerce").dt.tz_convert("Europe/Madrid")
+    return out.dropna(subset=["hour_madrid"])
+
+
+def normalize_price_hours(prices: pd.DataFrame) -> pd.DataFrame:
+    if prices.empty:
+        return pd.DataFrame(columns=["hour_madrid", "price_eur_mwh", "price_source"])
+
+    out = prices.copy()
+    # Force timezone-aware Europe/Madrid dtype. This avoids merge errors:
+    # datetime64[us, Europe/Madrid] vs object.
+    out["hour_madrid"] = pd.to_datetime(out["hour_madrid"], utc=True, errors="coerce").dt.tz_convert("Europe/Madrid").dt.floor("h")
+    out["price_eur_mwh"] = pd.to_numeric(out["price_eur_mwh"], errors="coerce")
+    if "price_source" not in out.columns:
+        out["price_source"] = "unknown"
+    out = out.dropna(subset=["hour_madrid", "price_eur_mwh"])
+    return (
+        out.groupby("hour_madrid", as_index=False)
+           .agg(price_eur_mwh=("price_eur_mwh", "mean"), price_source=("price_source", "first"))
+           .sort_values("hour_madrid")
     )
 
 
 def calculate_revenues(gen15: pd.DataFrame, prices: pd.DataFrame):
     hourly = generation_15min_to_hourly_mwh(gen15)
+    prices = normalize_price_hours(prices)
+
     if hourly.empty or prices.empty:
         return hourly, pd.DataFrame(), pd.DataFrame()
 
+    # Both keys are now datetime64[ns, Europe/Madrid].
     joined = hourly.merge(prices, on="hour_madrid", how="left")
+
     joined["revenue_eur"] = joined["generation_mwh"] * joined["price_eur_mwh"]
     joined["month"] = joined["hour_madrid"].dt.strftime("%Y-%m")
     joined["year"] = joined["hour_madrid"].dt.year
@@ -653,7 +685,7 @@ if run:
     st.caption(
         "Uses the same price source as the Day Ahead tab: "
         "`data/hourly_avg_price_since2021.xlsx` plus live ESIOS indicator 600 for missing/current hours. "
-        "Join is hourly in Europe/Madrid."
+        "Join is hourly in Europe/Madrid with normalized timezone-aware datetime keys."
     )
 
     try:
@@ -669,6 +701,17 @@ if run:
                 f"Loaded {len(prices):,} hourly day-ahead price rows "
                 f"from: {', '.join(sorted(prices['price_source'].dropna().unique().tolist()))}"
             )
+            with st.expander("Revenue datetime diagnostics", expanded=False):
+                _hourly_diag = generation_15min_to_hourly_mwh(gen15)
+                _prices_diag = normalize_price_hours(prices)
+                st.write({
+                    "generation_hour_madrid_dtype": str(_hourly_diag["hour_madrid"].dtype) if not _hourly_diag.empty else "empty",
+                    "prices_hour_madrid_dtype": str(_prices_diag["hour_madrid"].dtype) if not _prices_diag.empty else "empty",
+                    "generation_first_hour": str(_hourly_diag["hour_madrid"].min()) if not _hourly_diag.empty else None,
+                    "price_first_hour": str(_prices_diag["hour_madrid"].min()) if not _prices_diag.empty else None,
+                    "generation_last_hour": str(_hourly_diag["hour_madrid"].max()) if not _hourly_diag.empty else None,
+                    "price_last_hour": str(_prices_diag["hour_madrid"].max()) if not _prices_diag.empty else None,
+                })
 
             st.markdown("**Monthly revenue metrics**")
             st.dataframe(monthly_rev, use_container_width=True, hide_index=True)
