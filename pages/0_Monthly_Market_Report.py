@@ -1302,29 +1302,38 @@ def monthly_average_demand_profile_fallback_chart(
         if avg is None or pd.isna(avg):
             continue
         for hour in range(24):
-            rows.append({"hour": hour, "avg_demand_gw": float(avg), "series": f"{label} monthly avg fallback"})
+            rows.append({"hour": hour, "avg_demand_gw": float(avg), "series": label})
     plot = pd.DataFrame(rows)
     if plot.empty:
         return None
-    order = plot["series"].drop_duplicates().tolist()
-    return apply_chart_style(
-        alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
-            x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("avg_demand_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
-            color=alt.Color(
-                "series:N",
-                title="Month",
-                scale=alt.Scale(domain=order, range=[BLUE, GREY_DARK][:len(order)]),
-                legend=alt.Legend(orient="top", direction="horizontal", labelLimit=420, titleLimit=420),
-            ),
-            tooltip=[
-                alt.Tooltip("series:N", title="Month"),
-                alt.Tooltip("hour:O", title="Hour"),
-                alt.Tooltip("avg_demand_gw:Q", title="Average demand", format=",.2f"),
-            ],
-        ).properties(title="Monthly average 24h demand profile | fallback from official monthly average"),
-        height=340,
-    )
+
+    order = [s for s in [selected_label, previous_label] if s in plot["series"].unique().tolist()]
+    colors = [BLUE, GREY][:len(order)]
+    dashes = [[1, 0], [5, 3]][:len(order)]
+
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("hour:O", title="Hour of day", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("avg_demand_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "series:N",
+            title="Month",
+            scale=alt.Scale(domain=order, range=colors),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=420, titleLimit=420),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N",
+            title="Month",
+            scale=alt.Scale(domain=order, range=dashes),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("series:N", title="Month"),
+            alt.Tooltip("hour:O", title="Hour"),
+            alt.Tooltip("avg_demand_gw:Q", title="Avg GW", format=",.2f"),
+        ],
+    ).properties(title="Average 24h demand profile | selected month vs previous month")
+
+    return apply_chart_style(chart, height=380)
 
 
 def _embalses_to_float(value):
@@ -5315,7 +5324,7 @@ report_end = min(report_end, pd.Timestamp(latest_data_ts.date()))
 comparison_2025_end = comparable_ytd_end(report_end, 2025)
 
 pills([
-    "Monthly Report v19 demand profile crash fix active",
+    "Monthly Report v20 demand profile test-style fix active",
     f"Report month: {selected_label}",
     f"Data cut-off: {report_end:%d %b %Y}",
     "Current month = MTD" if is_current_mtd else "Closed month",
@@ -5673,12 +5682,16 @@ if avg_demand_profile is not None:
     st.altair_chart(avg_demand_profile, use_container_width=True)
     st.caption("Average demand profile source: REE demanda/evolucion hourly pull, grouped by hour of day in Europe/Madrid.")
 else:
-    avg_demand_profile_fallback = monthly_average_demand_profile_fallback_chart(
-        kpi_demand_current,
-        kpi_demand_prev,
-        month_label(selected_month, is_current_mtd),
-        month_label(prev_month, False),
-    )
+    try:
+        avg_demand_profile_fallback = monthly_average_demand_profile_fallback_chart(
+            kpi_demand_current,
+            kpi_demand_prev,
+            month_label(selected_month, is_current_mtd),
+            month_label(prev_month, False),
+        )
+    except Exception:
+        avg_demand_profile_fallback = None
+
     if avg_demand_profile_fallback is not None:
         st.altair_chart(avg_demand_profile_fallback, use_container_width=True)
         st.caption("Fallback shown: REE hourly demand was unavailable, so the chart uses official monthly average demand as a flat 24h profile.")
