@@ -6,6 +6,7 @@ from datetime import date, datetime, time, timedelta
 from io import BytesIO
 from pathlib import Path
 from time import sleep
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -43,7 +44,7 @@ try:
 except Exception:
     pass
 
-st.set_page_config(page_title="Hueco térmico PBF - bilaterales", layout="wide")
+st.set_page_config(page_title="Hueco térmico PBF + REE demand profile", layout="wide")
 
 # Same path convention as the main app pages.
 BASE_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
@@ -56,6 +57,12 @@ MADRID_TZ = ZoneInfo("Europe/Madrid")
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 BASE = "https://api.esios.ree.es"
+REE_API_BASE = "https://apidatos.ree.es/es/datos"
+REE_PENINSULAR_PARAMS = {
+    "geo_trunc": "electric_system",
+    "geo_limit": "peninsular",
+    "geo_ids": "8741",
+}
 
 # ---------------------------------------------------------
 # IDs
@@ -582,10 +589,181 @@ BILATERAL_TO_GROSS_TECH = {
 }
 
 
+
+# =========================================================
+# REE public demand profile helpers
+# Adapted from the working Embalses + demand test.
+# =========================================================
+def safe_json_response(resp: requests.Response) -> dict | list | str:
+    try:
+        return resp.json()
+    except Exception:
+        return (resp.text or "")[:2000]
+
+
+def parse_ree_public_included_series(payload: dict, value_field: str = "value") -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = attrs.get("title") or item.get("id")
+        for val in attrs.get("values", []) or []:
+            dt = pd.to_datetime(val.get("datetime"), utc=True, errors="coerce")
+            if pd.isna(dt):
+                continue
+            dt = dt.tz_convert("Europe/Madrid").tz_localize(None)
+            rows.append({
+                "datetime": dt,
+                "title": str(title).strip(),
+                value_field: pd.to_numeric(val.get(value_field), errors="coerce"),
+            })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_ree_demand_evolution_public(
+    start_day: date,
+    end_day: date,
+    time_trunc: str = "hour",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": time_trunc,
+        **REE_PENINSULAR_PARAMS,
+    }
+    url = f"{REE_API_BASE}/demanda/evolucion"
+    try:
+        resp = requests.get(url, params=params, timeout=60)
+    except Exception as exc:
+        return pd.DataFrame(), {"http": "ERROR", "url": url, "rows": 0, "error": str(exc)[:500]}
+
+    payload = safe_json_response(resp)
+    if not resp.ok or not isinstance(payload, dict):
+        return pd.DataFrame(), {"http": resp.status_code, "url": resp.url, "rows": 0, "payload_preview": payload}
+
+    df = parse_ree_public_included_series(payload, value_field="value")
+    if df.empty:
+        return pd.DataFrame(), {"http": resp.status_code, "url": resp.url, "rows": 0, "payload_preview": payload}
+
+    if df["title"].nunique() > 1:
+        demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
+        if not demand_like.empty:
+            df = demand_like
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"]).copy()
+
+    if time_trunc == "hour":
+        df["hourly_avg_mw"] = df["value"]
+        df["hourly_avg_gw"] = df["hourly_avg_mw"] / 1000.0
+        df["month"] = df["datetime"].dt.to_period("M").dt.to_timestamp()
+        df["date"] = df["datetime"].dt.date
+        df["hour"] = df["datetime"].dt.hour
+        df["weekday"] = df["datetime"].dt.day_name()
+        df["is_weekend"] = df["datetime"].dt.weekday >= 5
+    elif time_trunc == "month":
+        df["month"] = df["datetime"].dt.to_period("M").dt.to_timestamp()
+        df["demand_mwh"] = df["value"]
+        df["demand_gwh"] = df["demand_mwh"] / 1000.0
+        df["avg_demand_gw"] = df["demand_gwh"] / (df["month"].dt.days_in_month * 24)
+
+    info = {
+        "http": resp.status_code,
+        "url": resp.url,
+        "rows": int(len(df)),
+        "title_values": ", ".join(sorted(df["title"].dropna().astype(str).unique().tolist())[:5]),
+        "payload_preview": None,
+    }
+    return df.sort_values("datetime").reset_index(drop=True), info
+
+
+def public_month_bounds(d: date) -> tuple[date, date]:
+    start = date(d.year, d.month, 1)
+    end = date(d.year, 12, 31) if d.month == 12 else date(d.year, d.month + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def public_previous_month_bounds(d: date) -> tuple[date, date]:
+    first = date(d.year, d.month, 1)
+    return public_month_bounds(first - timedelta(days=1))
+
+
+def build_demand_monthly_summary(hourly: pd.DataFrame) -> dict[str, Any]:
+    summary = {
+        "demand_gwh": None,
+        "avg_demand_gw": None,
+        "max_hourly_gw": None,
+        "min_hourly_gw": None,
+        "peak_hour": None,
+        "days": None,
+        "load_factor": None,
+    }
+    if hourly is not None and not hourly.empty:
+        summary["days"] = hourly["date"].nunique()
+        summary["avg_demand_gw"] = hourly["hourly_avg_gw"].mean()
+        summary["demand_gwh"] = hourly["hourly_avg_gw"].sum()
+        summary["max_hourly_gw"] = hourly["hourly_avg_gw"].max()
+        summary["min_hourly_gw"] = hourly["hourly_avg_gw"].min()
+        idx = hourly["hourly_avg_gw"].idxmax()
+        summary["peak_hour"] = hourly.loc[idx, "datetime"]
+        if summary["max_hourly_gw"] not in [None, 0]:
+            summary["load_factor"] = summary["avg_demand_gw"] / summary["max_hourly_gw"]
+    return summary
+
+
+def build_demand_hourly_profile(hourly: pd.DataFrame, label: str) -> pd.DataFrame:
+    if hourly is None or hourly.empty:
+        return pd.DataFrame(columns=["hour", "avg_gw", "min_gw", "max_gw", "obs", "label"])
+    out = hourly.groupby("hour", as_index=False).agg(
+        avg_gw=("hourly_avg_gw", "mean"),
+        min_gw=("hourly_avg_gw", "min"),
+        max_gw=("hourly_avg_gw", "max"),
+        obs=("hourly_avg_gw", "count"),
+    )
+    out["label"] = label
+    return out
+
+
+def build_demand_daily_avg_profile(hourly: pd.DataFrame) -> pd.DataFrame:
+    if hourly is None or hourly.empty:
+        return pd.DataFrame(columns=["date", "avg_gw", "max_gw", "min_gw"])
+    return hourly.groupby("date", as_index=False).agg(
+        avg_gw=("hourly_avg_gw", "mean"),
+        max_gw=("hourly_avg_gw", "max"),
+        min_gw=("hourly_avg_gw", "min"),
+    )
+
+
+def build_demand_weekday_hourly_profile(hourly: pd.DataFrame) -> pd.DataFrame:
+    if hourly is None or hourly.empty:
+        return pd.DataFrame(columns=["hour", "day_type", "avg_gw", "obs"])
+    tmp = hourly.copy()
+    tmp["day_type"] = tmp["is_weekend"].map({True: "Weekend", False: "Weekday"})
+    return tmp.groupby(["day_type", "hour"], as_index=False).agg(
+        avg_gw=("hourly_avg_gw", "mean"),
+        obs=("hourly_avg_gw", "count"),
+    )
+
+
+def pct_delta(cur: Any, prev: Any) -> float | None:
+    if cur is None or prev in [None, 0] or pd.isna(cur) or pd.isna(prev):
+        return None
+    return float(cur) / float(prev) - 1
+
+
+def delta_text(value: float | None, suffix: str = "", decimals: int = 1, good_when_up: bool = True) -> str:
+    if value is None or pd.isna(value):
+        return "→ n/a"
+    positive = value >= 0
+    arrow = "↑" if positive else "↓"
+    return f"{arrow} {value:+,.{decimals}f}{suffix}"
+
+
 # =========================================================
 # UI
 # =========================================================
-st.title("Thermal Gap and Price")
+st.title("Thermal Gap and Price + REE Demand Profile")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -867,6 +1045,137 @@ if run:
         "- **X-axis**: Madrid local time, with day labels and hour numbers 1-24\n"
         "- **Bilateral schedules**: yes, they are deducted before calculating the thermal gap"
     )
+
+
+    # -----------------------------------------------------
+    # REE demand average 24h profile — from the working demand test
+    # -----------------------------------------------------
+    st.subheader("REE Península demand — monthly average hourly shape")
+    st.caption(
+        "Public REE demanda/evolucion hourly pull. Values are converted to Europe/Madrid local time and averaged by hour of day."
+    )
+
+    selected_month_start, selected_month_natural_end = public_month_bounds(start_day)
+    selected_month_end = min(end_day, selected_month_natural_end)
+    if selected_month_end < selected_month_start:
+        selected_month_end = selected_month_natural_end
+
+    prev_month_start, prev_month_end = public_previous_month_bounds(selected_month_start)
+
+    with st.spinner("Pulling REE demanda/evolucion hourly demand data..."):
+        selected_hourly, sel_info = fetch_ree_demand_evolution_public(
+            selected_month_start,
+            selected_month_end,
+            time_trunc="hour",
+        )
+        prev_hourly, prev_info = fetch_ree_demand_evolution_public(
+            prev_month_start,
+            prev_month_end,
+            time_trunc="hour",
+        )
+
+    if selected_hourly.empty:
+        st.warning("No hourly demand rows returned from REE demanda/evolucion for the selected month.")
+        with st.expander("REE demand diagnostics", expanded=False):
+            st.json({"selected": sel_info, "previous": prev_info})
+    else:
+        sel_label = (
+            f"{selected_month_start:%b-%Y}"
+            if selected_month_end == selected_month_natural_end
+            else f"{selected_month_start:%b-%Y} MTD to {selected_month_end:%d-%b}"
+        )
+        prev_label = f"{prev_month_start:%b-%Y}"
+
+        sel_summary = build_demand_monthly_summary(selected_hourly)
+        prev_summary = build_demand_monthly_summary(prev_hourly) if not prev_hourly.empty else {}
+
+        demand_delta = pct_delta(sel_summary.get("demand_gwh"), prev_summary.get("demand_gwh"))
+        avg_delta = pct_delta(sel_summary.get("avg_demand_gw"), prev_summary.get("avg_demand_gw"))
+        peak_delta = pct_delta(sel_summary.get("max_hourly_gw"), prev_summary.get("max_hourly_gw"))
+        lf_delta = pct_delta(sel_summary.get("load_factor"), prev_summary.get("load_factor"))
+
+        d1, d2, d3, d4, d5 = st.columns(5)
+        with d1:
+            st.metric(f"Demand total | {sel_label}", f"{sel_summary.get('demand_gwh'):,.1f} GWh" if sel_summary.get("demand_gwh") is not None else "—")
+            st.caption(delta_text(None if demand_delta is None else demand_delta * 100, suffix="% vs prev.", decimals=1, good_when_up=False))
+        with d2:
+            st.metric("Average demand", f"{sel_summary.get('avg_demand_gw'):,.2f} GW" if sel_summary.get("avg_demand_gw") is not None else "—")
+            st.caption(delta_text(None if avg_delta is None else avg_delta * 100, suffix="% vs prev.", decimals=1, good_when_up=False))
+        with d3:
+            st.metric("Max hourly demand", f"{sel_summary.get('max_hourly_gw'):,.2f} GW" if sel_summary.get("max_hourly_gw") is not None else "—")
+            st.caption(delta_text(None if peak_delta is None else peak_delta * 100, suffix="% vs prev.", decimals=1, good_when_up=False))
+        with d4:
+            lf = sel_summary.get("load_factor")
+            st.metric("Load factor", f"{lf * 100:,.1f}%" if lf is not None else "—")
+            st.caption(delta_text(None if lf_delta is None else lf_delta * 100, suffix="% vs prev.", decimals=1, good_when_up=True))
+        with d5:
+            st.metric("Days included", f"{sel_summary.get('days'):,.0f} d" if sel_summary.get("days") is not None else "—")
+            if sel_summary.get("peak_hour") is not None:
+                st.caption(f"Peak hour: {pd.Timestamp(sel_summary['peak_hour']):%d-%b %H:%M}")
+
+        profiles = [build_demand_hourly_profile(selected_hourly, sel_label)]
+        if not prev_hourly.empty:
+            profiles.append(build_demand_hourly_profile(prev_hourly, prev_label))
+
+        profile_df = pd.concat([p for p in profiles if p is not None and not p.empty], ignore_index=True)
+        if not profile_df.empty:
+            profile_chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
+                x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
+                y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
+                color=alt.Color(
+                    "label:N",
+                    title="Month",
+                    legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
+                ),
+                strokeDash=alt.StrokeDash("label:N", legend=None),
+                tooltip=[
+                    alt.Tooltip("label:N", title="Month"),
+                    alt.Tooltip("hour:O", title="Hour"),
+                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+                    alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
+                    alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
+                    alt.Tooltip("obs:Q", title="Obs", format=",d"),
+                ],
+            ).properties(height=380)
+            st.altair_chart(profile_chart, use_container_width=True)
+
+        wd = build_demand_weekday_hourly_profile(selected_hourly)
+        if not wd.empty:
+            wd_chart = alt.Chart(wd).mark_line(point=True, strokeWidth=3).encode(
+                x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
+                y=alt.Y("avg_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
+                color=alt.Color(
+                    "day_type:N",
+                    title="Day type",
+                    legend=alt.Legend(orient="top", direction="horizontal"),
+                ),
+                tooltip=[
+                    alt.Tooltip("day_type:N", title="Day type"),
+                    alt.Tooltip("hour:O", title="Hour"),
+                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+                    alt.Tooltip("obs:Q", title="Obs", format=",d"),
+                ],
+            ).properties(height=330)
+            st.altair_chart(wd_chart, use_container_width=True)
+
+        daily = build_demand_daily_avg_profile(selected_hourly)
+        if not daily.empty:
+            daily_chart = alt.Chart(daily).mark_bar().encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("avg_gw:Q", title="Daily average demand (GW)", scale=alt.Scale(zero=False)),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date", format="%d-%b-%Y"),
+                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+                    alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
+                    alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
+                ],
+            ).properties(height=300)
+            st.altair_chart(daily_chart, use_container_width=True)
+
+        with st.expander("REE demand diagnostics", expanded=False):
+            st.json({"selected": sel_info, "previous": prev_info})
+            st.dataframe(selected_hourly.head(200), use_container_width=True, hide_index=True)
+
 
     if show_diagnostics:
         st.subheader("Diagnostics")
