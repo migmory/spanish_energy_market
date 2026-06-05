@@ -303,68 +303,30 @@ def get_secret_or_env(name: str) -> str:
     return str(value).strip().strip('"').strip("'")
 
 
-def get_solarpark_auth_config() -> dict:
-    cfg = {
-        "cookie": get_secret_or_env("SOLARPARK_COOKIE"),
-        "api_key": get_secret_or_env("SOLARPARK_API_KEY"),
-        "application_key": get_secret_or_env("SOLARPARK_APPLICATION_KEY"),
-        "authorization_token": get_secret_or_env("SOLARPARK_AUTHORIZATION_TOKEN"),
-        "private_key": get_secret_or_env("SOLARPARK_PRIVATE_KEY"),
-    }
-    if not any(cfg.values()):
+def get_solarpark_cookie() -> str:
+    cookie = get_secret_or_env("SOLARPARK_COOKIE")
+    if not cookie:
         box(
             "danger",
-            "Missing Solarpark auth. Add at least <code>SOLARPARK_COOKIE</code> in local "
-            "<code>.env</code> or Streamlit Secrets. The safest value is the full browser "
-            "<code>Cookie</code> header from a Network request returning HTTP 200.",
+            "Missing <code>SOLARPARK_COOKIE</code>. Add the full browser Cookie header in local "
+            "<code>.env</code> or Streamlit Secrets, for example: "
+            "<code>SOLARPARK_COOKIE='apt.uid=...; apt.sid=...; IFMSCK=...'</code>",
         )
         st.stop()
-    return cfg
+    return cookie
 
 
-def build_solarpark_auth_headers(auth_cfg: dict) -> list[tuple[str, dict]]:
-    base_headers = {
+def build_solarpark_headers(cookie: str, json_request: bool = True) -> dict:
+    headers = {
         "Accept": "application/json",
-        "Content-Type": "application/json",
+        "Cookie": cookie,
         "Origin": BASE,
         "Referer": f"{BASE}/",
         "User-Agent": "Mozilla/5.0",
     }
-    candidates: list[tuple[str, dict]] = []
-
-    cookie = (auth_cfg.get("cookie") or "").strip()
-    if cookie:
-        h = dict(base_headers)
-        h["Cookie"] = cookie
-        candidates.append(("browser Cookie header", h))
-
-    api_key = (auth_cfg.get("api_key") or "").strip()
-    if api_key:
-        for label, header_name, header_value in [
-            ("SOLARPARK_API_KEY as x-api-key", "x-api-key", api_key),
-            ("SOLARPARK_API_KEY as X-API-Key", "X-API-Key", api_key),
-            ("SOLARPARK_API_KEY as Authorization Bearer", "Authorization", f"Bearer {api_key}"),
-            ("SOLARPARK_API_KEY as ApiKey Authorization", "Authorization", f"ApiKey {api_key}"),
-        ]:
-            h = dict(base_headers)
-            h[header_name] = header_value
-            candidates.append((label, h))
-
-    application_key = (auth_cfg.get("application_key") or "").strip()
-    authorization_token = (auth_cfg.get("authorization_token") or "").strip()
-    private_key = (auth_cfg.get("private_key") or "").strip()
-    if application_key or authorization_token or private_key:
-        h = dict(base_headers)
-        if application_key:
-            h["Application-Key"] = application_key
-            h["x-application-key"] = application_key
-        if authorization_token:
-            h["Authorization"] = f"Bearer {authorization_token}"
-        if private_key:
-            h["Private-Key"] = private_key
-        candidates.append(("CMMS credential headers best-effort", h))
-
-    return candidates
+    if json_request:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 def madrid_day_to_utc_str(d: date, end_of_day: bool = False) -> str:
@@ -375,7 +337,7 @@ def madrid_day_to_utc_str(d: date, end_of_day: bool = False) -> str:
 
 
 @st.cache_data(show_spinner=True, ttl=900)
-def fetch_power_values(start_utc: str, end_utc: str, auth_cfg: dict, source_ids: list[str]) -> dict | list:
+def fetch_power_values(start_utc: str, end_utc: str, cookie: str, source_ids: list[str]) -> dict | list:
     url = f"{BASE}/ifms/sources/values/v2"
     params = {
         "start_date": start_utc,
@@ -383,25 +345,14 @@ def fetch_power_values(start_utc: str, end_utc: str, auth_cfg: dict, source_ids:
         "millis": "false",
         "lang": "en",
     }
+    headers = build_solarpark_headers(cookie, json_request=True)
 
-    attempts = []
-    for auth_label, headers in build_solarpark_auth_headers(auth_cfg):
-        r = requests.post(url, params=params, json=source_ids, headers=headers, timeout=120)
-        if r.ok:
-            return r.json()
-
-        attempts.append(
-            {
-                "auth": auth_label,
-                "http": r.status_code,
-                "body": (r.text or "")[:220],
-            }
+    r = requests.post(url, params=params, json=source_ids, headers=headers, timeout=120)
+    if not r.ok:
+        raise RuntimeError(
+            f"Solarpark request failed: HTTP {r.status_code}. URL={r.url}. Body preview={(r.text or '')[:500]}"
         )
-
-    summary = " | ".join(f"{a['auth']}: HTTP {a['http']} {a['body']}" for a in attempts)
-    raise RuntimeError(
-        f"Solarpark request failed for all auth methods. URL={url}. Attempts: {summary}"
-    )
+    return r.json()
 
 
 def events_payload_to_power_df(payload: dict | list) -> pd.DataFrame:
@@ -906,25 +857,21 @@ def parse_ifms_utc(value) -> pd.Timestamp:
     return ts
 
 
-def auth_get_json(url: str, auth_cfg: dict, timeout: int = 90) -> dict | list:
-    attempts = []
-    for auth_label, headers in build_solarpark_auth_headers(auth_cfg):
-        # GET endpoint: Content-Type is not required and can confuse some proxies.
-        h = dict(headers)
-        h.pop("Content-Type", None)
-        r = requests.get(url, headers=h, timeout=timeout)
-        if r.ok:
-            return r.json()
-        attempts.append({"auth": auth_label, "http": r.status_code, "body": (r.text or "")[:220]})
+def solarpark_get_json(url: str, cookie: str, timeout: int = 90) -> dict | list:
+    headers = build_solarpark_headers(cookie, json_request=False)
+    r = requests.get(url, headers=headers, timeout=timeout)
+    if not r.ok:
+        raise RuntimeError(
+            f"Solarpark GET failed: HTTP {r.status_code}. URL={url}. Body preview={(r.text or '')[:500]}"
+        )
+    return r.json()
 
-    summary = " | ".join(f"{a['auth']}: HTTP {a['http']} {a['body']}" for a in attempts)
-    raise RuntimeError(f"Solarpark GET failed for all auth methods. URL={url}. Attempts: {summary}")
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def fetch_svar_details(svar_id: str, auth_cfg: dict) -> dict:
+def fetch_svar_details(svar_id: str, cookie: str) -> dict:
     url = f"{BASE}/ifms/svars/{svar_id}?lang=en"
-    payload = auth_get_json(url, auth_cfg)
+    payload = solarpark_get_json(url, cookie)
     return payload if isinstance(payload, dict) else {"payload": payload}
 
 
@@ -999,14 +946,14 @@ def extract_event_rows(payload, svar_id: str, svar_meta: dict | None = None) -> 
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def fetch_svar_events(svar_id: str, auth_cfg: dict) -> tuple[pd.DataFrame, dict]:
-    meta = fetch_svar_details(svar_id, auth_cfg)
+def fetch_svar_events(svar_id: str, cookie: str) -> tuple[pd.DataFrame, dict]:
+    meta = fetch_svar_details(svar_id, cookie)
     events_uri = meta.get("eventsURI") if isinstance(meta, dict) else None
     if not events_uri:
         events_uri = f"{BASE}/ifms/svars/{svar_id}/events?lang=en"
 
     events_uri = str(events_uri).replace("http://", "https://")
-    payload = auth_get_json(events_uri, auth_cfg)
+    payload = solarpark_get_json(events_uri, cookie)
     rows = extract_event_rows(payload, svar_id=svar_id, svar_meta=meta if isinstance(meta, dict) else {})
     df = pd.DataFrame(rows)
 
@@ -1227,7 +1174,7 @@ show_diagnostics = st.sidebar.checkbox("Show diagnostics", value=True)
 # Main
 # =========================================================
 st.title("IS2 SCADA generation & day-ahead revenues")
-st.caption("Auth debug build active. Production threshold and curtailment/control events are shown as diagnostics only; generation/revenue calculations still use all SCADA production.")
+st.caption("Production threshold is shown only when breached; curtailment/control events are diagnostics only; generation/revenue calculations still use all SCADA production.")
 st.caption(
     "SCADA 10-min power is split into 5-min energy packets and aggregated to QH. "
     "Revenues use QH Day Ahead prices when available, otherwise hourly prices are expanded to QH."
@@ -1245,16 +1192,13 @@ selected_source_ids = [POWER_SOURCE_IDS[s] for s in selected_sites]
 start_utc = madrid_day_to_utc_str(start_day)
 end_utc = madrid_day_to_utc_str(end_day, end_of_day=True)
 
-with st.expander("Solarpark auth diagnostics — no secret values shown", expanded=False):
-    _auth_preview = get_solarpark_auth_config()
+with st.expander("Solarpark connection", expanded=False):
+    _cookie_loaded = bool(get_secret_or_env("SOLARPARK_COOKIE"))
+    _event_ids_loaded = bool(get_secret_or_env("SOLARPARK_CURTAILMENT_SVAR_IDS"))
     st.write({
-        "SOLARPARK_COOKIE_loaded": bool(_auth_preview.get("cookie")),
-        "SOLARPARK_API_KEY_loaded": bool(_auth_preview.get("api_key")),
-        "SOLARPARK_APPLICATION_KEY_loaded": bool(_auth_preview.get("application_key")),
-        "SOLARPARK_AUTHORIZATION_TOKEN_loaded": bool(_auth_preview.get("authorization_token")),
-        "SOLARPARK_PRIVATE_KEY_loaded": bool(_auth_preview.get("private_key")),
-        "auth_methods_to_try": [label for label, _headers in build_solarpark_auth_headers(_auth_preview)],
-        "SOLARPARK_CURTAILMENT_SVAR_IDS_loaded": bool(get_secret_or_env("SOLARPARK_CURTAILMENT_SVAR_IDS")),
+        "SOLARPARK_COOKIE_loaded": _cookie_loaded,
+        "SOLARPARK_CURTAILMENT_SVAR_IDS_loaded": _event_ids_loaded,
+        "auth_mode": "browser Cookie header only",
     })
 
 run = st.button("Fetch SCADA and calculate revenues", type="primary", use_container_width=True)
@@ -1267,11 +1211,11 @@ if not run:
     )
     st.stop()
 
-solarpark_auth = get_solarpark_auth_config()
+solarpark_cookie = get_solarpark_cookie()
 
 with st.spinner("Fetching Solarpark / UNITY SCADA power values..."):
     try:
-        payload = fetch_power_values(start_utc, end_utc, solarpark_auth, selected_source_ids)
+        payload = fetch_power_values(start_utc, end_utc, solarpark_cookie, selected_source_ids)
     except Exception as exc:
         box("danger", f"Could not fetch Solarpark values: {exc}")
         st.stop()
@@ -1416,6 +1360,20 @@ portfolio_qh = (
     .merge(price_qh[["qh_madrid", "price_eur_mwh", "price_granularity"]], on="qh_madrid", how="left")
 )
 portfolio_qh["price_limit_eur_mwh"] = portfolio_qh["qh_madrid"].apply(production_price_limit_eur_mwh)
+portfolio_qh["price_below_limit"] = (
+    portfolio_qh["price_eur_mwh"].notna()
+    & (portfolio_qh["price_eur_mwh"] < portfolio_qh["price_limit_eur_mwh"])
+)
+# Only draw the reference threshold when the spot price is below it.
+portfolio_qh["price_limit_visible_eur_mwh"] = np.where(
+    portfolio_qh["price_below_limit"],
+    portfolio_qh["price_limit_eur_mwh"],
+    np.nan,
+)
+portfolio_qh["month"] = portfolio_qh["qh_madrid"].dt.to_period("M").astype(str)
+portfolio_qh = portfolio_qh.sort_values("qh_madrid").reset_index(drop=True)
+portfolio_qh["monthly_cum_generation_mwh"] = portfolio_qh.groupby("month")["generation_mwh"].cumsum()
+portfolio_qh["monthly_cum_revenue_eur"] = portfolio_qh.groupby("month")["revenue_eur"].cumsum()
 
 fig_rev = go.Figure()
 fig_rev.add_trace(
@@ -1443,18 +1401,18 @@ fig_rev.add_trace(
 fig_rev.add_trace(
     go.Scatter(
         x=portfolio_qh["qh_madrid"],
-        y=portfolio_qh["price_limit_eur_mwh"],
-        name="Production threshold",
+        y=portfolio_qh["price_limit_visible_eur_mwh"],
+        name="Production threshold when breached",
         yaxis="y2",
         mode="lines",
         line=dict(color=CORP_RED, width=1.8, dash="dash"),
-        hovertemplate="%{x|%d-%b %H:%M}<br>Threshold: %{y:,.2f} €/MWh<extra></extra>",
+        hovertemplate="%{x|%d-%b %H:%M}<br>Breached threshold: %{y:,.2f} €/MWh<extra></extra>",
     )
 )
 fig_rev.update_layout(
     **chart_layout(
-        "QH SCADA generation, day-ahead price and production threshold",
-        "Production threshold is shown only as reference; no production data is filtered or removed",
+        "QH SCADA generation, day-ahead price and breached production threshold",
+        "Production threshold appears only when spot price is below the configured limit; no production data is filtered or removed",
         480,
     )
 )
@@ -1465,6 +1423,53 @@ fig_rev.update_layout(
 )
 fig_rev.update_xaxes(title="Madrid date and QH", showgrid=False)
 st.plotly_chart(fig_rev, use_container_width=True)
+
+breach_qh = int(portfolio_qh["price_below_limit"].sum()) if "price_below_limit" in portfolio_qh.columns else 0
+if breach_qh > 0:
+    breached_gen_mwh = portfolio_qh.loc[portfolio_qh["price_below_limit"], "generation_mwh"].sum()
+    box(
+        "warning",
+        f"<b>Production threshold breached in {breach_qh:,.0f} QH intervals.</b> "
+        f"Spot price was below the configured threshold; production is still included in all calculations "
+        f"({breached_gen_mwh:,.2f} MWh in those intervals)."
+    )
+
+section_header("Monthly cumulative production and revenue")
+st.caption("Cumulative monthly portfolio production and revenue. Values reset at the start of each month.")
+
+fig_cum = go.Figure()
+fig_cum.add_trace(
+    go.Scatter(
+        x=portfolio_qh["qh_madrid"],
+        y=portfolio_qh["monthly_cum_generation_mwh"],
+        name="Cumulative production",
+        yaxis="y",
+        mode="lines",
+        line=dict(color=CORP_GREEN, width=2.8),
+        hovertemplate="%{x|%d-%b %H:%M}<br>Cum. production: %{y:,.2f} MWh<extra></extra>",
+    )
+)
+fig_cum.add_trace(
+    go.Scatter(
+        x=portfolio_qh["qh_madrid"],
+        y=portfolio_qh["monthly_cum_revenue_eur"],
+        name="Cumulative revenue",
+        yaxis="y2",
+        mode="lines",
+        line=dict(color=CORP_BLUE, width=2.8),
+        hovertemplate="%{x|%d-%b %H:%M}<br>Cum. revenue: €%{y:,.0f}<extra></extra>",
+    )
+)
+fig_cum.update_layout(
+    **chart_layout(
+        "Monthly cumulative SCADA production and day-ahead revenue",
+        "Cumulative values reset at each month boundary",
+    ),
+    yaxis=dict(title="Cumulative production (MWh)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8"),
+    yaxis2=dict(title="Cumulative revenue (€)", overlaying="y", side="right", showgrid=False),
+)
+fig_cum.update_xaxes(title="Madrid date and QH", showgrid=False)
+st.plotly_chart(fig_cum, use_container_width=True)
 
 section_header("Curtailment / control events tracker")
 st.caption(
@@ -1481,7 +1486,7 @@ ev_infos = []
 with st.spinner("Fetching Solarpark / UNITY curtailment/control events..."):
     for svar_id in curtailment_svar_ids:
         try:
-            ev_df, ev_info = fetch_svar_events(svar_id, solarpark_auth)
+            ev_df, ev_info = fetch_svar_events(svar_id, solarpark_cookie)
             ev_frames.append(ev_df)
             ev_infos.append(ev_info)
         except Exception as exc:
