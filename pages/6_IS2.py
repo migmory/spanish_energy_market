@@ -1134,6 +1134,32 @@ def infer_site_from_agent(agent_name: str, site_names: list[str]) -> str | None:
     return best
 
 
+def get_curtailment_svar_ids_for_sites(selected_sites: list[str]) -> list[str]:
+    """
+    Return PV curtailment svar IDs for selected sites.
+
+    Defaults are embedded for the 4 IS2 plants. SOLARPARK_CURTAILMENT_SVAR_IDS
+    can optionally override them either as:
+      - simple list: id1,id2,id3
+      - mapping: Site A=id1; Site B=id2
+    """
+    raw = get_secret_or_env("SOLARPARK_CURTAILMENT_SVAR_IDS")
+
+    if raw and ("=" in raw or "|" in raw):
+        mapping = dict(DEFAULT_CURTAILMENT_SVAR_IDS)
+        mapping.update(parse_site_id_mapping(raw))
+        return [mapping[s] for s in selected_sites if s in mapping]
+
+    if raw:
+        return [x.strip() for x in re.split(r"[,;\n]+", raw) if x.strip()]
+
+    return [
+        DEFAULT_CURTAILMENT_SVAR_IDS[s]
+        for s in selected_sites
+        if s in DEFAULT_CURTAILMENT_SVAR_IDS
+    ]
+
+
 def is_curtailment_event_row(row: pd.Series) -> bool:
     text = " ".join(
         str(row.get(col, "") or "")
