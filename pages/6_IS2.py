@@ -24,12 +24,9 @@
 #       revenue_eur = generation_mwh_15min * qh_or_expanded_price_eur_mwh
 #
 # Required .env / Streamlit secret:
-#       SOLARPARK_COOKIE='IFMSCK=...; apt.sid=...; apt.uid=...'
-#   Optional if your UNITY tenant supports it:
-#       SOLARPARK_API_KEY='...'
-#       SOLARPARK_APPLICATION_KEY='...'
-#       SOLARPARK_AUTHORIZATION_TOKEN='...'
-#       SOLARPARK_PRIVATE_KEY='...'
+#       SOLARPARK_COOKIE='apt.uid=...; apt.sid=...; IFMSCK=...'
+#       ESIOS_TOKEN='...'
+#       SOLARPARK_CURTAILMENT_SVAR_IDS='b574d090-065e-11f0-980e-42010afa015a,b574a430-065e-11f0-980e-42010afa015a'
 #
 # Run:
 #       streamlit run is2_solarpark_scada_revenues_qh_corporate.py
@@ -307,13 +304,6 @@ def get_secret_or_env(name: str) -> str:
 
 
 def get_solarpark_auth_config() -> dict:
-    """
-    Auth options for Solarpark / UNITY.
-
-    Current working browser endpoint /ifms/sources/values/v2 usually authenticates with the
-    full browser Cookie header. Some UNITY tenants also expose API credentials, so this page
-    can try them too, but cookie auth remains the most reliable for this specific endpoint.
-    """
     cfg = {
         "cookie": get_secret_or_env("SOLARPARK_COOKIE"),
         "api_key": get_secret_or_env("SOLARPARK_API_KEY"),
@@ -321,29 +311,18 @@ def get_solarpark_auth_config() -> dict:
         "authorization_token": get_secret_or_env("SOLARPARK_AUTHORIZATION_TOKEN"),
         "private_key": get_secret_or_env("SOLARPARK_PRIVATE_KEY"),
     }
-
     if not any(cfg.values()):
         box(
             "danger",
-            "Missing Solarpark auth. Add at least <code>SOLARPARK_COOKIE</code> or <code>SOLARPARK_API_KEY</code> "
-            "in local <code>.env</code> or Streamlit Secrets. For this web endpoint, the safest value is the full "
-            "browser <code>Cookie</code> header from a Network request that returns HTTP 200.",
+            "Missing Solarpark auth. Add at least <code>SOLARPARK_COOKIE</code> in local "
+            "<code>.env</code> or Streamlit Secrets. The safest value is the full browser "
+            "<code>Cookie</code> header from a Network request returning HTTP 200.",
         )
         st.stop()
-
     return cfg
 
 
 def build_solarpark_auth_headers(auth_cfg: dict) -> list[tuple[str, dict]]:
-    """
-    Try several auth header styles without exposing secrets in the UI.
-
-    Notes:
-    - /ifms/sources/values/v2 is the browser endpoint, so Cookie auth is tried first.
-    - SOLARPARK_API_KEY is tried with common API-key header conventions.
-    - CMMS fields are included only as an optional last attempt because CMMS credentials
-      may belong to a different integration API, not to IFMS SCADA source-values.
-    """
     base_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -351,7 +330,6 @@ def build_solarpark_auth_headers(auth_cfg: dict) -> list[tuple[str, dict]]:
         "Referer": f"{BASE}/",
         "User-Agent": "Mozilla/5.0",
     }
-
     candidates: list[tuple[str, dict]] = []
 
     cookie = (auth_cfg.get("cookie") or "").strip()
@@ -383,8 +361,6 @@ def build_solarpark_auth_headers(auth_cfg: dict) -> list[tuple[str, dict]]:
         if authorization_token:
             h["Authorization"] = f"Bearer {authorization_token}"
         if private_key:
-            # This is only a best-effort guess. If the vendor requires signed requests,
-            # this will not work without their exact signing documentation.
             h["Private-Key"] = private_key
         candidates.append(("CMMS credential headers best-effort", h))
 
@@ -422,9 +398,7 @@ def fetch_power_values(start_utc: str, end_utc: str, auth_cfg: dict, source_ids:
             }
         )
 
-    summary = " | ".join(
-        f"{a['auth']}: HTTP {a['http']} {a['body']}" for a in attempts
-    )
+    summary = " | ".join(f"{a['auth']}: HTTP {a['http']} {a['body']}" for a in attempts)
     raise RuntimeError(
         f"Solarpark request failed for all auth methods. URL={url}. Attempts: {summary}"
     )
@@ -911,6 +885,191 @@ def price_sanity(price_qh: pd.DataFrame) -> tuple[str, str]:
     )
 
 
+
+
+# =========================================================
+# Solarpark / UNITY event tracking
+# =========================================================
+def csv_secret_list(name: str, default: str = "") -> list[str]:
+    raw = get_secret_or_env(name) or default
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def parse_ifms_utc(value) -> pd.Timestamp:
+    if value is None or value == "":
+        return pd.NaT
+    txt = str(value).strip()
+    # IFMS format usually looks like 20260605T080240.000Z or 20250321T145239Z.
+    ts = pd.to_datetime(txt, utc=True, errors="coerce")
+    if pd.isna(ts) and txt.endswith("Z"):
+        ts = pd.to_datetime(txt.replace("Z", "+00:00"), utc=True, errors="coerce")
+    return ts
+
+
+def auth_get_json(url: str, auth_cfg: dict, timeout: int = 90) -> dict | list:
+    attempts = []
+    for auth_label, headers in build_solarpark_auth_headers(auth_cfg):
+        # GET endpoint: Content-Type is not required and can confuse some proxies.
+        h = dict(headers)
+        h.pop("Content-Type", None)
+        r = requests.get(url, headers=h, timeout=timeout)
+        if r.ok:
+            return r.json()
+        attempts.append({"auth": auth_label, "http": r.status_code, "body": (r.text or "")[:220]})
+
+    summary = " | ".join(f"{a['auth']}: HTTP {a['http']} {a['body']}" for a in attempts)
+    raise RuntimeError(f"Solarpark GET failed for all auth methods. URL={url}. Attempts: {summary}")
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_svar_details(svar_id: str, auth_cfg: dict) -> dict:
+    url = f"{BASE}/ifms/svars/{svar_id}?lang=en"
+    payload = auth_get_json(url, auth_cfg)
+    return payload if isinstance(payload, dict) else {"payload": payload}
+
+
+def extract_event_rows(payload, svar_id: str, svar_meta: dict | None = None) -> list[dict]:
+    rows = []
+    meta = svar_meta or {}
+
+    # Endpoint shapes seen in IFMS can be: list[events], dict{"events": [...]},
+    # dict{"data": [...]}, dict{"lastEvent": {...}}, or a single event dict.
+    if isinstance(payload, list):
+        events = payload
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("events"), list):
+            events = payload.get("events")
+        elif isinstance(payload.get("data"), list):
+            events = payload.get("data")
+        elif isinstance(payload.get("items"), list):
+            events = payload.get("items")
+        elif isinstance(payload.get("content"), list):
+            events = payload.get("content")
+        elif isinstance(payload.get("lastEvent"), dict):
+            events = [payload.get("lastEvent")]
+        elif any(k in payload for k in ["date", "startDate", "endDate", "apcode", "severity", "duration"]):
+            events = [payload]
+        else:
+            events = []
+    else:
+        events = []
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+
+        start_raw = ev.get("date") or ev.get("startDate") or ev.get("timestamp") or ev.get("lastEvent")
+        end_raw = ev.get("endDate") or ev.get("end_date")
+        start_ts_utc = parse_ifms_utc(start_raw)
+        end_ts_utc = parse_ifms_utc(end_raw)
+
+        if pd.isna(start_ts_utc):
+            continue
+
+        duration_seconds = pd.to_numeric(ev.get("duration"), errors="coerce")
+        if pd.isna(duration_seconds):
+            if not pd.isna(end_ts_utc):
+                duration_seconds = max((end_ts_utc - start_ts_utc).total_seconds(), 0)
+            else:
+                duration_seconds = np.nan
+
+        rows.append(
+            {
+                "svar_id": svar_id,
+                "svar_name": meta.get("name") or meta.get("apcode") or svar_id,
+                "svar_apcode": meta.get("apcode"),
+                "agent_id": ((meta.get("agent") or {}).get("id") if isinstance(meta.get("agent"), dict) else None),
+                "agent_name": ((meta.get("agent") or {}).get("name") if isinstance(meta.get("agent"), dict) else None),
+                "event_id": ev.get("id") or ev.get("eventId"),
+                "event_name": ev.get("name") or ev.get("type") or ev.get("apcode"),
+                "event_apcode": ev.get("apcode"),
+                "severity": ev.get("severity"),
+                "quality": ev.get("quality"),
+                "ack": ev.get("ack"),
+                "start_utc": start_ts_utc,
+                "end_utc": end_ts_utc,
+                "start_madrid": start_ts_utc.tz_convert(MADRID_TZ).tz_localize(None),
+                "end_madrid": (end_ts_utc.tz_convert(MADRID_TZ).tz_localize(None) if not pd.isna(end_ts_utc) else pd.NaT),
+                "duration_h": (float(duration_seconds) / 3600.0 if not pd.isna(duration_seconds) else np.nan),
+                "uri": ev.get("uri"),
+            }
+        )
+
+    return rows
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_svar_events(svar_id: str, auth_cfg: dict) -> tuple[pd.DataFrame, dict]:
+    meta = fetch_svar_details(svar_id, auth_cfg)
+    events_uri = meta.get("eventsURI") if isinstance(meta, dict) else None
+    if not events_uri:
+        events_uri = f"{BASE}/ifms/svars/{svar_id}/events?lang=en"
+
+    events_uri = str(events_uri).replace("http://", "https://")
+    payload = auth_get_json(events_uri, auth_cfg)
+    rows = extract_event_rows(payload, svar_id=svar_id, svar_meta=meta if isinstance(meta, dict) else {})
+    df = pd.DataFrame(rows)
+
+    info = {
+        "svar_id": svar_id,
+        "svar_name": meta.get("name") if isinstance(meta, dict) else None,
+        "svar_apcode": meta.get("apcode") if isinstance(meta, dict) else None,
+        "agent_name": ((meta.get("agent") or {}).get("name") if isinstance(meta, dict) and isinstance(meta.get("agent"), dict) else None),
+        "events_uri": events_uri,
+        "rows": int(len(df)),
+    }
+    return df, info
+
+
+def filter_events_by_madrid_range(events_df: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    if events_df.empty:
+        return events_df
+    out = events_df.copy()
+    out["start_madrid"] = pd.to_datetime(out["start_madrid"], errors="coerce")
+    start_dt = pd.Timestamp(start_day)
+    end_dt = pd.Timestamp(end_day) + pd.Timedelta(days=1)
+    out = out[(out["start_madrid"] >= start_dt) & (out["start_madrid"] < end_dt)].copy()
+    out["month"] = out["start_madrid"].dt.to_period("M").astype(str)
+    return out
+
+
+def build_events_summary(events_df: pd.DataFrame) -> pd.DataFrame:
+    if events_df.empty:
+        return pd.DataFrame()
+    return (
+        events_df.groupby(["agent_name", "svar_name", "event_apcode", "event_name"], dropna=False, as_index=False)
+        .agg(
+            events=("event_id", "count"),
+            total_duration_h=("duration_h", "sum"),
+            first_event=("start_madrid", "min"),
+            last_event=("start_madrid", "max"),
+        )
+        .sort_values(["events", "total_duration_h"], ascending=False)
+    )
+
+
+# =========================================================
+# Production price-limit reference line
+# =========================================================
+def production_price_limit_eur_mwh(ts) -> float:
+    """
+    Reference price threshold below which the site should not produce.
+
+    Rule supplied by user:
+      - 13-16 May 2026 inclusive: -1 €/MWh
+      - From 25 May 2026 onwards: -1 €/MWh
+      - All other periods: 0.75 €/MWh
+
+    This is shown as reference only. It does not filter or remove generation/revenue data.
+    """
+    d = pd.Timestamp(ts).date()
+    if date(2026, 5, 13) <= d <= date(2026, 5, 16):
+        return -1.0
+    if d >= date(2026, 5, 25):
+        return -1.0
+    return 0.75
+
+
 # =========================================================
 # Revenues
 # =========================================================
@@ -1068,7 +1227,7 @@ show_diagnostics = st.sidebar.checkbox("Show diagnostics", value=True)
 # Main
 # =========================================================
 st.title("IS2 SCADA generation & day-ahead revenues")
-st.caption("Auth debug build active: if auth fails, the error should say 'failed for all auth methods' and list the auth methods attempted.")
+st.caption("Auth debug build active. Production threshold and curtailment/control events are shown as diagnostics only; generation/revenue calculations still use all SCADA production.")
 st.caption(
     "SCADA 10-min power is split into 5-min energy packets and aggregated to QH. "
     "Revenues use QH Day Ahead prices when available, otherwise hourly prices are expanded to QH."
@@ -1095,6 +1254,7 @@ with st.expander("Solarpark auth diagnostics — no secret values shown", expand
         "SOLARPARK_AUTHORIZATION_TOKEN_loaded": bool(_auth_preview.get("authorization_token")),
         "SOLARPARK_PRIVATE_KEY_loaded": bool(_auth_preview.get("private_key")),
         "auth_methods_to_try": [label for label, _headers in build_solarpark_auth_headers(_auth_preview)],
+        "SOLARPARK_CURTAILMENT_SVAR_IDS_loaded": bool(get_secret_or_env("SOLARPARK_CURTAILMENT_SVAR_IDS")),
     })
 
 run = st.button("Fetch SCADA and calculate revenues", type="primary", use_container_width=True)
@@ -1255,6 +1415,7 @@ portfolio_qh = (
     )
     .merge(price_qh[["qh_madrid", "price_eur_mwh", "price_granularity"]], on="qh_madrid", how="left")
 )
+portfolio_qh["price_limit_eur_mwh"] = portfolio_qh["qh_madrid"].apply(production_price_limit_eur_mwh)
 
 fig_rev = go.Figure()
 fig_rev.add_trace(
@@ -1279,10 +1440,21 @@ fig_rev.add_trace(
         hovertemplate="%{x|%d-%b %H:%M}<br>Price: %{y:,.2f} €/MWh<extra></extra>",
     )
 )
+fig_rev.add_trace(
+    go.Scatter(
+        x=portfolio_qh["qh_madrid"],
+        y=portfolio_qh["price_limit_eur_mwh"],
+        name="Production threshold",
+        yaxis="y2",
+        mode="lines",
+        line=dict(color=CORP_RED, width=1.8, dash="dash"),
+        hovertemplate="%{x|%d-%b %H:%M}<br>Threshold: %{y:,.2f} €/MWh<extra></extra>",
+    )
+)
 fig_rev.update_layout(
     **chart_layout(
-        "QH SCADA generation and day-ahead price",
-        "QH prices used where available; historical hourly prices expanded to QH",
+        "QH SCADA generation, day-ahead price and production threshold",
+        "Production threshold is shown only as reference; no production data is filtered or removed",
         480,
     )
 )
@@ -1293,6 +1465,77 @@ fig_rev.update_layout(
 )
 fig_rev.update_xaxes(title="Madrid date and QH", showgrid=False)
 st.plotly_chart(fig_rev, use_container_width=True)
+
+section_header("Curtailment / control events tracker")
+st.caption(
+    "Tracks IFMS svar event histories such as PVCurtailmentStatus or ActivePowerControlAlgorithm. "
+    "Set SOLARPARK_CURTAILMENT_SVAR_IDS as a comma-separated list of svar IDs. "
+    "Events are diagnostics only; generation and revenue calculations are not modified."
+)
+
+default_curtailment_svars = "b574d090-065e-11f0-980e-42010afa015a,b574a430-065e-11f0-980e-42010afa015a"
+curtailment_svar_ids = csv_secret_list("SOLARPARK_CURTAILMENT_SVAR_IDS", default=default_curtailment_svars)
+
+ev_frames = []
+ev_infos = []
+with st.spinner("Fetching Solarpark / UNITY curtailment/control events..."):
+    for svar_id in curtailment_svar_ids:
+        try:
+            ev_df, ev_info = fetch_svar_events(svar_id, solarpark_auth)
+            ev_frames.append(ev_df)
+            ev_infos.append(ev_info)
+        except Exception as exc:
+            ev_infos.append({"svar_id": svar_id, "error": str(exc)[:500], "rows": 0})
+
+events_all = pd.concat([f for f in ev_frames if f is not None and not f.empty], ignore_index=True) if ev_frames else pd.DataFrame()
+events_sel = filter_events_by_madrid_range(events_all, start_day, end_day) if not events_all.empty else pd.DataFrame()
+events_summary = build_events_summary(events_sel)
+
+with st.expander("Event tracker diagnostics", expanded=False):
+    st.json(ev_infos)
+
+if events_sel.empty:
+    st.info("No curtailment/control events returned for the selected date range, or the configured svar IDs did not return event history.")
+else:
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Events in range", f"{len(events_sel):,.0f}")
+    e2.metric("Total event duration", f"{events_sel['duration_h'].sum(skipna=True):,.2f} h")
+    e3.metric("Tracked svars", f"{events_sel['svar_id'].nunique():,.0f}")
+
+    if not events_summary.empty:
+        st.dataframe(
+            style_table(events_summary).format(
+                {
+                    "events": "{:,.0f}",
+                    "total_duration_h": "{:,.2f}",
+                    "first_event": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
+                    "last_event": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    timeline = events_sel.copy()
+    timeline["y_label"] = timeline["agent_name"].fillna("Unknown agent") + " | " + timeline["svar_name"].fillna(timeline["svar_id"])
+    fig_ev = px.scatter(
+        timeline,
+        x="start_madrid",
+        y="y_label",
+        color="event_apcode",
+        size=np.maximum(timeline["duration_h"].fillna(0.05), 0.05),
+        hover_data=["event_name", "duration_h", "severity", "quality", "ack", "svar_id"],
+        title="Curtailment / control events timeline",
+    )
+    fig_ev.update_layout(height=420, margin=dict(l=20, r=20, t=55, b=25), yaxis_title=None, xaxis_title="Madrid time")
+    st.plotly_chart(fig_ev, use_container_width=True)
+
+    st.download_button(
+        "Download curtailment/control events",
+        data=events_sel.to_csv(index=False).encode("utf-8"),
+        file_name="is2_curtailment_control_events.csv",
+        mime="text/csv",
+    )
 
 st.markdown("#### Portfolio monthly summary")
 display_revenue_table(portfolio_month.sort_values("month"))
