@@ -89,6 +89,13 @@ DEFAULT_ENERGY_EXPORTED_SOURCE_IDS = {
     "Guarroman Solar 81": "e1e43356-1382-11f0-85ad-42010afa015a",
 }
 
+DEFAULT_CURTAILMENT_SVAR_IDS = {
+    "Carmona Central 36": "b574d090-065e-11f0-980e-42010afa015a",
+    "Carmona Central 36.1": "b0e42bb2-0892-11f0-9eeb-42010afa015a",
+    "Palma del Condado Solar 555": "57908b0c-2726-11f0-b9a2-42010afa015a",
+    "Guarroman Solar 81": "c5fffff8-1382-11f0-85ad-42010afa015a",
+}
+
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
 CORP_BLUE = "#1D4ED8"
@@ -1780,19 +1787,21 @@ fig_cum.update_layout(
 fig_cum.update_xaxes(title="Madrid date and QH", showgrid=False)
 st.plotly_chart(fig_cum, use_container_width=True)
 
-section_header("Curtailment / control events tracker")
-st.caption(
-    "Tracks IFMS svar event histories such as PVCurtailmentStatus or ActivePowerControlAlgorithm. "
-    "Set SOLARPARK_CURTAILMENT_SVAR_IDS as a comma-separated list of svar IDs. "
-    "Events are diagnostics only; generation and revenue calculations are not modified. Affected-generation bars show actual SCADA generation during active curtailment intervals, not estimated lost generation."
-)
+section_header("Monthly cumulative production and revenue")
+st.caption("Cumulative monthly portfolio production and revenue. Values reset at the start of each month.")
+fig_cum = go.Figure()
+fig_cum.add_trace(go.Scatter(x=portfolio_qh["qh_madrid"], y=portfolio_qh["monthly_cum_generation_mwh"], name="Cumulative production", yaxis="y", mode="lines", line=dict(color=CORP_GREEN, width=2.8), hovertemplate="%{x|%d-%b %H:%M}<br>Cum. production: %{y:,.2f} MWh<extra></extra>"))
+fig_cum.add_trace(go.Scatter(x=portfolio_qh["qh_madrid"], y=portfolio_qh["monthly_cum_revenue_eur"], name="Cumulative revenue", yaxis="y2", mode="lines", line=dict(color=CORP_BLUE, width=2.8), hovertemplate="%{x|%d-%b %H:%M}<br>Cum. revenue: €%{y:,.0f}<extra></extra>"))
+fig_cum.update_layout(**chart_layout("Monthly cumulative generation and day-ahead revenue", "Cumulative values reset at each month boundary"), yaxis=dict(title="Cumulative production (MWh)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8"), yaxis2=dict(title="Cumulative revenue (€)", overlaying="y", side="right", showgrid=False))
+fig_cum.update_xaxes(title="Madrid date and QH", showgrid=False)
+st.plotly_chart(fig_cum, use_container_width=True)
 
-default_curtailment_svars = "b574d090-065e-11f0-980e-42010afa015a,b574a430-065e-11f0-980e-42010afa015a"
-curtailment_svar_ids = csv_secret_list("SOLARPARK_CURTAILMENT_SVAR_IDS", default=default_curtailment_svars)
+section_header("PV curtailment events and affected generation")
+st.caption("Tracks IFMS PVCurtailmentStatus events for the selected sites. Affected-generation bars show actual generation observed during active curtailment intervals; this is not estimated lost generation.")
 
-ev_frames = []
-ev_infos = []
-with st.spinner("Fetching Solarpark / UNITY curtailment/control events..."):
+curtailment_svar_ids = get_curtailment_svar_ids_for_sites(selected_sites)
+ev_frames, ev_infos = [], []
+with st.spinner("Fetching Solarpark / UNITY PV curtailment events..."):
     for svar_id in curtailment_svar_ids:
         try:
             ev_df, ev_info = fetch_svar_events(svar_id, solarpark_cookie)
@@ -1804,159 +1813,63 @@ with st.spinner("Fetching Solarpark / UNITY curtailment/control events..."):
 events_all = pd.concat([f for f in ev_frames if f is not None and not f.empty], ignore_index=True) if ev_frames else pd.DataFrame()
 events_sel = filter_events_by_madrid_range(events_all, start_day, end_day) if not events_all.empty else pd.DataFrame()
 if not events_sel.empty and "duration_h" in events_sel.columns:
-    # Some IFMS status events return a technical duration that is not a true interval duration.
-    # Keep the raw duration in the download, but clean clearly unrealistic values for summaries/charts.
     events_sel["duration_h_raw"] = events_sel["duration_h"]
     events_sel["duration_h"] = pd.to_numeric(events_sel["duration_h"], errors="coerce")
     events_sel.loc[events_sel["duration_h"] > 24 * 366, "duration_h"] = np.nan
+
 events_summary = build_events_summary(events_sel)
-curtailment_intervals = build_curtailment_intervals(events_sel, start_day, end_day, list(POWER_SOURCE_IDS.keys())) if not events_sel.empty else pd.DataFrame()
+curtailment_intervals = build_curtailment_intervals(events_sel, start_day, end_day, selected_sites) if not events_sel.empty else pd.DataFrame()
 affected_hourly, affected_interval_summary = affected_generation_by_curtailment_hour(curtailment_intervals, gen15)
 
 with st.expander("Event tracker diagnostics", expanded=False):
-    st.json(ev_infos)
+    st.json({"configured_svar_ids": curtailment_svar_ids, "fetch_results": ev_infos})
 
 if events_sel.empty:
-    st.info("No curtailment/control events returned for the selected date range, or the configured svar IDs did not return event history.")
+    st.info("No PV curtailment events returned for the selected date range/sites.")
 else:
     e1, e2, e3 = st.columns(3)
     e1.metric("Events in range", f"{len(events_sel):,.0f}")
-    e2.metric("Total event duration", f"{events_sel['duration_h'].sum(skipna=True):,.2f} h")
+    e2.metric("Reconstructed intervals", f"{len(curtailment_intervals):,.0f}")
     e3.metric("Tracked svars", f"{events_sel['svar_id'].nunique():,.0f}")
 
     if not events_summary.empty:
-        st.dataframe(
-            style_table(events_summary).format(
-                {
-                    "events": "{:,.0f}",
-                    "total_duration_h": "{:,.2f}",
-                    "first_event": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
-                    "last_event": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(style_table(events_summary).format({"events": "{:,.0f}", "total_duration_h": "{:,.2f}", "first_event": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"), "last_event": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M")}), use_container_width=True, hide_index=True)
 
     if affected_hourly.empty:
-        st.info(
-            "No affected-generation bars can be calculated yet. This usually means only one park/svar is configured, "
-            "the event agent name could not be mapped to a selected site, or there were no Active→Inactive curtailment intervals in range."
-        )
+        st.info("No affected-generation bars could be calculated. This can happen if the selected range contains no Active→Inactive curtailment intervals.")
     else:
-        affected_total_mwh = affected_hourly["affected_generation_mwh"].sum()
-        affected_hours = affected_hourly["hour_madrid"].nunique()
         c1, c2, c3 = st.columns(3)
-        c1.metric("Generation during curtailment", fmt_mwh(affected_total_mwh))
-        c2.metric("Hours with curtailment generation", f"{affected_hours:,.0f}")
-        c3.metric("Curtailment intervals reconstructed", f"{len(curtailment_intervals):,.0f}")
-
+        c1.metric("Generation during curtailment", fmt_mwh(affected_hourly["affected_generation_mwh"].sum()))
+        c2.metric("Hours with curtailment generation", f"{affected_hourly['hour_madrid'].nunique():,.0f}")
+        c3.metric("Sites with affected generation", f"{affected_hourly['site'].nunique():,.0f}")
         fig_aff = go.Figure()
         for site, grp in affected_hourly.groupby("site"):
-            fig_aff.add_trace(
-                go.Bar(
-                    x=grp["hour_madrid"],
-                    y=grp["affected_generation_mwh"],
-                    name=str(site),
-                    hovertemplate="%{x|%d-%b %H:%M}<br>Site: " + str(site) + "<br>Generation affected: %{y:,.2f} MWh/h<extra></extra>",
-                )
-            )
-
-        fig_aff.update_layout(
-            **chart_layout(
-                "Hourly generation during active curtailment intervals",
-                "Columns show actual SCADA generation observed while PVCurtailmentStatus was active; this is not estimated lost energy.",
-                height=430,
-            ),
-            barmode="stack",
-            yaxis=dict(title="Generation during curtailment (MWh/h)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8"),
-        )
+            fig_aff.add_trace(go.Bar(x=grp["hour_madrid"], y=grp["affected_generation_mwh"], name=str(site), hovertemplate="%{x|%d-%b %H:%M}<br>Site: " + str(site) + "<br>Generation during curtailment: %{y:,.2f} MWh/h<extra></extra>"))
+        aff_layout = chart_layout("Hourly generation during active curtailment intervals", "Actual generation observed while PVCurtailmentStatus was active; not estimated lost generation.", height=430)
+        aff_layout["barmode"] = "stack"
+        aff_layout["yaxis"] = dict(title="Generation during curtailment (MWh/h)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8")
+        fig_aff.update_layout(**aff_layout)
         fig_aff.update_xaxes(title="Madrid hour", showgrid=False)
         st.plotly_chart(fig_aff, use_container_width=True)
-
-        with st.expander("Curtailment intervals and affected-generation detail", expanded=False):
-            if not affected_interval_summary.empty:
-                st.dataframe(
-                    style_table(affected_interval_summary).format({
-                        "start_madrid": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
-                        "end_madrid": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
-                        "duration_h": "{:,.2f}",
-                        "affected_generation_mwh": "{:,.2f}",
-                        "affected_qh": "{:,.0f}",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
     timeline = events_sel.copy()
     timeline["y_label"] = timeline["agent_name"].fillna("Unknown agent") + " | " + timeline["svar_name"].fillna(timeline["svar_id"])
     timeline["event_apcode"] = timeline["event_apcode"].fillna("Unknown")
     timeline["duration_h_for_size"] = np.maximum(pd.to_numeric(timeline["duration_h"], errors="coerce").fillna(0.05), 0.05)
-
     fig_ev = go.Figure()
     for event_code, grp in timeline.groupby("event_apcode", dropna=False):
-        fig_ev.add_trace(
-            go.Scatter(
-                x=grp["start_madrid"],
-                y=grp["y_label"],
-                mode="markers",
-                name=str(event_code),
-                marker=dict(
-                    size=np.clip(grp["duration_h_for_size"] * 2.0 + 7.0, 7.0, 26.0),
-                    opacity=0.78,
-                    line=dict(width=0.5, color="white"),
-                ),
-                customdata=np.stack(
-                    [
-                        grp["event_name"].fillna(""),
-                        grp["duration_h"].fillna(np.nan),
-                        grp["severity"].fillna(""),
-                        grp["quality"].fillna(""),
-                        grp["ack"].fillna(""),
-                        grp["svar_id"].fillna(""),
-                    ],
-                    axis=-1,
-                ),
-                hovertemplate=(
-                    "%{x|%d-%b-%Y %H:%M}<br>"
-                    "Series: %{y}<br>"
-                    "Event: %{customdata[0]}<br>"
-                    "Duration: %{customdata[1]:,.2f} h<br>"
-                    "Severity: %{customdata[2]}<br>"
-                    "Quality: %{customdata[3]}<br>"
-                    "Ack: %{customdata[4]}<br>"
-                    "Svar: %{customdata[5]}<extra></extra>"
-                ),
-            )
-        )
-
-    ev_layout = chart_layout("Curtailment / control events timeline", "Madrid time", height=420)
+        fig_ev.add_trace(go.Scatter(x=grp["start_madrid"], y=grp["y_label"], mode="markers", name=str(event_code), marker=dict(size=np.clip(grp["duration_h_for_size"] * 2.0 + 7.0, 7.0, 26.0), opacity=0.78, line=dict(width=0.5, color="white")), hovertemplate="%{x|%d-%b-%Y %H:%M}<br>%{y}<extra></extra>"))
+    ev_layout = chart_layout("Curtailment events timeline", "Madrid time", height=420)
     ev_layout["margin"] = dict(l=20, r=20, t=55, b=25)
     ev_layout["yaxis"] = dict(title=None)
     ev_layout["xaxis"] = dict(title="Madrid time")
     fig_ev.update_layout(**ev_layout)
     st.plotly_chart(fig_ev, use_container_width=True)
 
-    st.download_button(
-        "Download curtailment/control events",
-        data=events_sel.to_csv(index=False).encode("utf-8"),
-        file_name="is2_curtailment_control_events.csv",
-        mime="text/csv",
-    )
-    if not affected_hourly.empty:
-        st.download_button(
-            "Download hourly generation during curtailment",
-            data=affected_hourly.to_csv(index=False).encode("utf-8"),
-            file_name="is2_hourly_generation_during_curtailment.csv",
-            mime="text/csv",
-        )
-    if not affected_interval_summary.empty:
-        st.download_button(
-            "Download reconstructed curtailment intervals",
-            data=affected_interval_summary.to_csv(index=False).encode("utf-8"),
-            file_name="is2_reconstructed_curtailment_intervals.csv",
-            mime="text/csv",
-        )
+    d_ev1, d_ev2, d_ev3 = st.columns(3)
+    d_ev1.download_button("Download curtailment events", data=events_sel.to_csv(index=False).encode("utf-8"), file_name="is2_curtailment_events.csv", mime="text/csv")
+    d_ev2.download_button("Download hourly generation during curtailment", data=affected_hourly.to_csv(index=False).encode("utf-8"), file_name="is2_hourly_generation_during_curtailment.csv", mime="text/csv", disabled=affected_hourly.empty)
+    d_ev3.download_button("Download reconstructed curtailment intervals", data=affected_interval_summary.to_csv(index=False).encode("utf-8"), file_name="is2_reconstructed_curtailment_intervals.csv", mime="text/csv", disabled=affected_interval_summary.empty)
 
 st.markdown("#### Portfolio monthly summary")
 display_revenue_table(portfolio_month.sort_values("month"))
