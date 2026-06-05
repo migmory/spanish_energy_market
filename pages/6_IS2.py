@@ -1494,6 +1494,12 @@ with st.spinner("Fetching Solarpark / UNITY curtailment/control events..."):
 
 events_all = pd.concat([f for f in ev_frames if f is not None and not f.empty], ignore_index=True) if ev_frames else pd.DataFrame()
 events_sel = filter_events_by_madrid_range(events_all, start_day, end_day) if not events_all.empty else pd.DataFrame()
+if not events_sel.empty and "duration_h" in events_sel.columns:
+    # Some IFMS status events return a technical duration that is not a true interval duration.
+    # Keep the raw duration in the download, but clean clearly unrealistic values for summaries/charts.
+    events_sel["duration_h_raw"] = events_sel["duration_h"]
+    events_sel["duration_h"] = pd.to_numeric(events_sel["duration_h"], errors="coerce")
+    events_sel.loc[events_sel["duration_h"] > 24 * 366, "duration_h"] = np.nan
 events_summary = build_events_summary(events_sel)
 
 with st.expander("Event tracker diagnostics", expanded=False):
@@ -1523,16 +1529,53 @@ else:
 
     timeline = events_sel.copy()
     timeline["y_label"] = timeline["agent_name"].fillna("Unknown agent") + " | " + timeline["svar_name"].fillna(timeline["svar_id"])
-    fig_ev = px.scatter(
-        timeline,
-        x="start_madrid",
-        y="y_label",
-        color="event_apcode",
-        size=np.maximum(timeline["duration_h"].fillna(0.05), 0.05),
-        hover_data=["event_name", "duration_h", "severity", "quality", "ack", "svar_id"],
-        title="Curtailment / control events timeline",
+    timeline["event_apcode"] = timeline["event_apcode"].fillna("Unknown")
+    timeline["duration_h_for_size"] = np.maximum(pd.to_numeric(timeline["duration_h"], errors="coerce").fillna(0.05), 0.05)
+
+    fig_ev = go.Figure()
+    for event_code, grp in timeline.groupby("event_apcode", dropna=False):
+        fig_ev.add_trace(
+            go.Scatter(
+                x=grp["start_madrid"],
+                y=grp["y_label"],
+                mode="markers",
+                name=str(event_code),
+                marker=dict(
+                    size=np.clip(grp["duration_h_for_size"] * 2.0 + 7.0, 7.0, 26.0),
+                    opacity=0.78,
+                    line=dict(width=0.5, color="white"),
+                ),
+                customdata=np.stack(
+                    [
+                        grp["event_name"].fillna(""),
+                        grp["duration_h"].fillna(np.nan),
+                        grp["severity"].fillna(""),
+                        grp["quality"].fillna(""),
+                        grp["ack"].fillna(""),
+                        grp["svar_id"].fillna(""),
+                    ],
+                    axis=-1,
+                ),
+                hovertemplate=(
+                    "%{x|%d-%b-%Y %H:%M}<br>"
+                    "Series: %{y}<br>"
+                    "Event: %{customdata[0]}<br>"
+                    "Duration: %{customdata[1]:,.2f} h<br>"
+                    "Severity: %{customdata[2]}<br>"
+                    "Quality: %{customdata[3]}<br>"
+                    "Ack: %{customdata[4]}<br>"
+                    "Svar: %{customdata[5]}<extra></extra>"
+                ),
+            )
+        )
+
+    fig_ev.update_layout(
+        **chart_layout("Curtailment / control events timeline", "Madrid time"),
+        height=420,
+        margin=dict(l=20, r=20, t=55, b=25),
+        yaxis_title=None,
+        xaxis_title="Madrid time",
     )
-    fig_ev.update_layout(height=420, margin=dict(l=20, r=20, t=55, b=25), yaxis_title=None, xaxis_title="Madrid time")
     st.plotly_chart(fig_ev, use_container_width=True)
 
     st.download_button(
