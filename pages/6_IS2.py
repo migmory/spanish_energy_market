@@ -1569,13 +1569,11 @@ else:
             )
         )
 
-    fig_ev.update_layout(
-        **chart_layout("Curtailment / control events timeline", "Madrid time"),
-        height=420,
-        margin=dict(l=20, r=20, t=55, b=25),
-        yaxis_title=None,
-        xaxis_title="Madrid time",
-    )
+    ev_layout = chart_layout("Curtailment / control events timeline", "Madrid time", height=420)
+    ev_layout["margin"] = dict(l=20, r=20, t=55, b=25)
+    ev_layout["yaxis"] = dict(title=None)
+    ev_layout["xaxis"] = dict(title="Madrid time")
+    fig_ev.update_layout(**ev_layout)
     st.plotly_chart(fig_ev, use_container_width=True)
 
     st.download_button(
