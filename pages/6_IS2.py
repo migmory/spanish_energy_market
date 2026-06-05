@@ -24,7 +24,12 @@
 #       revenue_eur = generation_mwh_15min * qh_or_expanded_price_eur_mwh
 #
 # Required .env / Streamlit secret:
-#       SOLARPARK_COOKIE='IFMSCK=...'
+#       SOLARPARK_COOKIE='IFMSCK=...; apt.sid=...; apt.uid=...'
+#   Optional if your UNITY tenant supports it:
+#       SOLARPARK_API_KEY='...'
+#       SOLARPARK_APPLICATION_KEY='...'
+#       SOLARPARK_AUTHORIZATION_TOKEN='...'
+#       SOLARPARK_PRIVATE_KEY='...'
 #
 # Run:
 #       streamlit run is2_solarpark_scada_revenues_qh_corporate.py
@@ -290,25 +295,100 @@ def clean_numeric(s: pd.Series) -> pd.Series:
 # =========================================================
 # Solarpark API
 # =========================================================
-def get_cookie() -> str:
-    cookie = ""
+def get_secret_or_env(name: str) -> str:
+    value = ""
     try:
-        cookie = str(st.secrets.get("SOLARPARK_COOKIE", "") or "")
+        value = str(st.secrets.get(name, "") or "")
     except Exception:
-        cookie = ""
+        value = ""
+    if not value:
+        value = os.getenv(name, "")
+    return str(value).strip().strip('"').strip("'")
 
-    if not cookie:
-        cookie = os.getenv("SOLARPARK_COOKIE", "")
 
-    cookie = str(cookie).strip().strip('"').strip("'")
-    if not cookie:
+def get_solarpark_auth_config() -> dict:
+    """
+    Auth options for Solarpark / UNITY.
+
+    Current working browser endpoint /ifms/sources/values/v2 usually authenticates with the
+    full browser Cookie header. Some UNITY tenants also expose API credentials, so this page
+    can try them too, but cookie auth remains the most reliable for this specific endpoint.
+    """
+    cfg = {
+        "cookie": get_secret_or_env("SOLARPARK_COOKIE"),
+        "api_key": get_secret_or_env("SOLARPARK_API_KEY"),
+        "application_key": get_secret_or_env("SOLARPARK_APPLICATION_KEY"),
+        "authorization_token": get_secret_or_env("SOLARPARK_AUTHORIZATION_TOKEN"),
+        "private_key": get_secret_or_env("SOLARPARK_PRIVATE_KEY"),
+    }
+
+    if not any(cfg.values()):
         box(
             "danger",
-            "Missing <code>SOLARPARK_COOKIE</code>. Put it in local <code>.env</code> or Streamlit Secrets. "
-            "Example: <code>SOLARPARK_COOKIE='IFMSCK=...'</code>",
+            "Missing Solarpark auth. Add at least <code>SOLARPARK_COOKIE</code> or <code>SOLARPARK_API_KEY</code> "
+            "in local <code>.env</code> or Streamlit Secrets. For this web endpoint, the safest value is the full "
+            "browser <code>Cookie</code> header from a Network request that returns HTTP 200.",
         )
         st.stop()
-    return cookie
+
+    return cfg
+
+
+def build_solarpark_auth_headers(auth_cfg: dict) -> list[tuple[str, dict]]:
+    """
+    Try several auth header styles without exposing secrets in the UI.
+
+    Notes:
+    - /ifms/sources/values/v2 is the browser endpoint, so Cookie auth is tried first.
+    - SOLARPARK_API_KEY is tried with common API-key header conventions.
+    - CMMS fields are included only as an optional last attempt because CMMS credentials
+      may belong to a different integration API, not to IFMS SCADA source-values.
+    """
+    base_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": BASE,
+        "Referer": f"{BASE}/",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    candidates: list[tuple[str, dict]] = []
+
+    cookie = (auth_cfg.get("cookie") or "").strip()
+    if cookie:
+        h = dict(base_headers)
+        h["Cookie"] = cookie
+        candidates.append(("browser Cookie header", h))
+
+    api_key = (auth_cfg.get("api_key") or "").strip()
+    if api_key:
+        for label, header_name, header_value in [
+            ("SOLARPARK_API_KEY as x-api-key", "x-api-key", api_key),
+            ("SOLARPARK_API_KEY as X-API-Key", "X-API-Key", api_key),
+            ("SOLARPARK_API_KEY as Authorization Bearer", "Authorization", f"Bearer {api_key}"),
+            ("SOLARPARK_API_KEY as ApiKey Authorization", "Authorization", f"ApiKey {api_key}"),
+        ]:
+            h = dict(base_headers)
+            h[header_name] = header_value
+            candidates.append((label, h))
+
+    application_key = (auth_cfg.get("application_key") or "").strip()
+    authorization_token = (auth_cfg.get("authorization_token") or "").strip()
+    private_key = (auth_cfg.get("private_key") or "").strip()
+    if application_key or authorization_token or private_key:
+        h = dict(base_headers)
+        if application_key:
+            h["Application-Key"] = application_key
+            h["x-application-key"] = application_key
+        if authorization_token:
+            h["Authorization"] = f"Bearer {authorization_token}"
+        if private_key:
+            # This is only a best-effort guess. If the vendor requires signed requests,
+            # this will not work without their exact signing documentation.
+            h["Private-Key"] = private_key
+        candidates.append(("CMMS credential headers best-effort", h))
+
+    return candidates
 
 
 def madrid_day_to_utc_str(d: date, end_of_day: bool = False) -> str:
@@ -319,7 +399,7 @@ def madrid_day_to_utc_str(d: date, end_of_day: bool = False) -> str:
 
 
 @st.cache_data(show_spinner=True, ttl=900)
-def fetch_power_values(start_utc: str, end_utc: str, cookie: str, source_ids: list[str]) -> dict | list:
+def fetch_power_values(start_utc: str, end_utc: str, auth_cfg: dict, source_ids: list[str]) -> dict | list:
     url = f"{BASE}/ifms/sources/values/v2"
     params = {
         "start_date": start_utc,
@@ -327,21 +407,27 @@ def fetch_power_values(start_utc: str, end_utc: str, cookie: str, source_ids: li
         "millis": "false",
         "lang": "en",
     }
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Cookie": cookie,
-        "Origin": BASE,
-        "Referer": f"{BASE}/",
-        "User-Agent": "Mozilla/5.0",
-    }
 
-    r = requests.post(url, params=params, json=source_ids, headers=headers, timeout=120)
-    if not r.ok:
-        raise RuntimeError(
-            f"Solarpark request failed: HTTP {r.status_code}. URL={r.url}. Body preview={r.text[:500]}"
+    attempts = []
+    for auth_label, headers in build_solarpark_auth_headers(auth_cfg):
+        r = requests.post(url, params=params, json=source_ids, headers=headers, timeout=120)
+        if r.ok:
+            return r.json()
+
+        attempts.append(
+            {
+                "auth": auth_label,
+                "http": r.status_code,
+                "body": (r.text or "")[:220],
+            }
         )
-    return r.json()
+
+    summary = " | ".join(
+        f"{a['auth']}: HTTP {a['http']} {a['body']}" for a in attempts
+    )
+    raise RuntimeError(
+        f"Solarpark request failed for all auth methods. URL={url}. Attempts: {summary}"
+    )
 
 
 def events_payload_to_power_df(payload: dict | list) -> pd.DataFrame:
@@ -982,6 +1068,7 @@ show_diagnostics = st.sidebar.checkbox("Show diagnostics", value=True)
 # Main
 # =========================================================
 st.title("IS2 SCADA generation & day-ahead revenues")
+st.caption("Auth debug build active: if auth fails, the error should say 'failed for all auth methods' and list the auth methods attempted.")
 st.caption(
     "SCADA 10-min power is split into 5-min energy packets and aggregated to QH. "
     "Revenues use QH Day Ahead prices when available, otherwise hourly prices are expanded to QH."
@@ -999,6 +1086,17 @@ selected_source_ids = [POWER_SOURCE_IDS[s] for s in selected_sites]
 start_utc = madrid_day_to_utc_str(start_day)
 end_utc = madrid_day_to_utc_str(end_day, end_of_day=True)
 
+with st.expander("Solarpark auth diagnostics — no secret values shown", expanded=False):
+    _auth_preview = get_solarpark_auth_config()
+    st.write({
+        "SOLARPARK_COOKIE_loaded": bool(_auth_preview.get("cookie")),
+        "SOLARPARK_API_KEY_loaded": bool(_auth_preview.get("api_key")),
+        "SOLARPARK_APPLICATION_KEY_loaded": bool(_auth_preview.get("application_key")),
+        "SOLARPARK_AUTHORIZATION_TOKEN_loaded": bool(_auth_preview.get("authorization_token")),
+        "SOLARPARK_PRIVATE_KEY_loaded": bool(_auth_preview.get("private_key")),
+        "auth_methods_to_try": [label for label, _headers in build_solarpark_auth_headers(_auth_preview)],
+    })
+
 run = st.button("Fetch SCADA and calculate revenues", type="primary", use_container_width=True)
 
 if not run:
@@ -1009,11 +1107,11 @@ if not run:
     )
     st.stop()
 
-cookie = get_cookie()
+solarpark_auth = get_solarpark_auth_config()
 
 with st.spinner("Fetching Solarpark / UNITY SCADA power values..."):
     try:
-        payload = fetch_power_values(start_utc, end_utc, cookie, selected_source_ids)
+        payload = fetch_power_values(start_utc, end_utc, solarpark_auth, selected_source_ids)
     except Exception as exc:
         box("danger", f"Could not fetch Solarpark values: {exc}")
         st.stop()
