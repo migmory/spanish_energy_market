@@ -25,8 +25,10 @@
 #
 # Required .env / Streamlit secret:
 #       SOLARPARK_COOKIE='apt.uid=...; apt.sid=...; IFMSCK=...'
+#       # Optional override only; the four Energy Exported Source IDs are already embedded below.
+#       # SOLARPARK_ENERGY_EXPORTED_SOURCE_IDS='Carmona Central 36=d192590a-...; Carmona Central 36.1=...; Palma del Condado Solar 555=...; Guarroman Solar 81=...'
 #       ESIOS_TOKEN='...'
-#       SOLARPARK_CURTAILMENT_SVAR_IDS='b574d090-065e-11f0-980e-42010afa015a,b574a430-065e-11f0-980e-42010afa015a'
+#       SOLARPARK_CURTAILMENT_SVAR_IDS='PVCurtailmentStatus_svar_id_site1,PVCurtailmentStatus_svar_id_site2,...'
 #
 # Run:
 #       streamlit run is2_solarpark_scada_revenues_qh_corporate.py
@@ -34,6 +36,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -75,6 +78,16 @@ POWER_SOURCE_IDS = {
     "Guarroman Solar 81": "e1e421b8-1382-11f0-85ad-42010afa015a",
 }
 ID_TO_SITE = {v: k for k, v in POWER_SOURCE_IDS.items()}
+
+# Optional alternative production source:
+# Energy Exported is a 10-min kWh parameter. It is usually better for metered/reconciled
+# production than integrating SCADA power, but each plant needs its own Source Id.
+DEFAULT_ENERGY_EXPORTED_SOURCE_IDS = {
+    "Carmona Central 36": "d192590a-065e-11f0-980e-42010afa015a",
+    "Carmona Central 36.1": "cc2125ce-0892-11f0-9eeb-42010afa015a",
+    "Palma del Condado Solar 555": "7113bd9c-2726-11f0-b9a2-42010afa015a",
+    "Guarroman Solar 81": "e1e43356-1382-11f0-85ad-42010afa015a",
+}
 
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
@@ -303,6 +316,48 @@ def get_secret_or_env(name: str) -> str:
     return str(value).strip().strip('"').strip("'")
 
 
+def parse_site_id_mapping(raw: str) -> dict[str, str]:
+    """
+    Parse a site=id mapping from .env / Streamlit Secrets.
+
+    Accepted separators:
+      Site A=uuid; Site B=uuid
+      Site A=uuid, Site B=uuid
+      Site A|uuid; Site B|uuid
+    """
+    if not raw:
+        return {}
+
+    out: dict[str, str] = {}
+    chunks = re.split(r"[;\n]+", str(raw))
+    # If user used comma as separator, also handle it, but avoid splitting site names
+    # that could theoretically contain commas by requiring each chunk to contain '=' or '|'.
+    if len(chunks) == 1 and "," in raw:
+        chunks = [c for c in raw.split(",") if ("=" in c or "|" in c)]
+
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" in chunk:
+            site, sid = chunk.split("=", 1)
+        elif "|" in chunk:
+            site, sid = chunk.split("|", 1)
+        else:
+            continue
+        site = site.strip()
+        sid = sid.strip()
+        if site and sid:
+            out[site] = sid
+    return out
+
+
+def get_energy_exported_source_ids() -> dict[str, str]:
+    mapping = dict(DEFAULT_ENERGY_EXPORTED_SOURCE_IDS)
+    mapping.update(parse_site_id_mapping(get_secret_or_env("SOLARPARK_ENERGY_EXPORTED_SOURCE_IDS")))
+    return mapping
+
+
 def get_solarpark_cookie() -> str:
     cookie = get_secret_or_env("SOLARPARK_COOKIE")
     if not cookie:
@@ -375,6 +430,67 @@ def events_payload_to_power_df(payload: dict | list) -> pd.DataFrame:
     df = df.dropna(subset=["datetime_utc", "datetime_madrid", "site", "power_kw"]).copy()
     df["power_kw"] = df["power_kw"].clip(lower=0)
     return df[["datetime_utc", "datetime_madrid", "site", "source_id", "power_kw"]].sort_values(["site", "datetime_madrid"])
+
+
+def events_payload_to_energy_exported_df(payload: dict | list, id_to_site: dict[str, str]) -> pd.DataFrame:
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        events = payload[0].get("events", [])
+    elif isinstance(payload, dict):
+        events = payload.get("events", [])
+    else:
+        events = []
+
+    if not events:
+        return pd.DataFrame(columns=["datetime_utc", "datetime_madrid", "site", "source_id", "energy_exported_kwh_10min"])
+
+    df = pd.DataFrame(events, columns=["datetime_utc", "value", "source_id"])
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], format="%Y%m%dT%H%M%SZ", utc=True, errors="coerce")
+    df["datetime_madrid"] = df["datetime_utc"].dt.tz_convert("Europe/Madrid")
+    df["energy_exported_kwh_10min"] = pd.to_numeric(df["value"], errors="coerce")
+    df["site"] = df["source_id"].map(id_to_site)
+
+    df = df.dropna(subset=["datetime_utc", "datetime_madrid", "site", "energy_exported_kwh_10min"]).copy()
+    df["energy_exported_kwh_10min"] = df["energy_exported_kwh_10min"].clip(lower=0)
+    return df[["datetime_utc", "datetime_madrid", "site", "source_id", "energy_exported_kwh_10min"]].sort_values(["site", "datetime_madrid"])
+
+
+def energy_exported_10min_to_generation_15min_via_5min(energy_df: pd.DataFrame, timestamp_position: str) -> pd.DataFrame:
+    """
+    Convert 10-min Energy Exported kWh to QH generation.
+
+    The 10-min kWh value is split into two equal 5-min energy packets, then summed
+    into 15-min buckets. This mirrors the existing kW integration logic but avoids
+    assuming that the 10-min point is an average power sample.
+    """
+    if energy_df.empty:
+        return pd.DataFrame(columns=["site", "datetime_madrid", "generation_kwh_15min"])
+
+    tmp = energy_df.copy()
+    if timestamp_position == "interval end":
+        tmp["interval_start"] = tmp["datetime_madrid"] - pd.Timedelta(minutes=10)
+    else:
+        tmp["interval_start"] = tmp["datetime_madrid"]
+
+    first = tmp[["site", "source_id", "interval_start", "energy_exported_kwh_10min"]].copy()
+    first["datetime_madrid"] = first["interval_start"]
+    second = tmp[["site", "source_id", "interval_start", "energy_exported_kwh_10min"]].copy()
+    second["datetime_madrid"] = second["interval_start"] + pd.Timedelta(minutes=5)
+
+    five = pd.concat([first, second], ignore_index=True)
+    five["generation_kwh_5min"] = five["energy_exported_kwh_10min"] / 2.0
+
+    gen15 = (
+        five.set_index("datetime_madrid")
+            .groupby("site")["generation_kwh_5min"]
+            .resample("15min", label="left", closed="left")
+            .sum()
+            .reset_index()
+            .rename(columns={"generation_kwh_5min": "generation_kwh_15min"})
+    )
+
+    gen15["generation_kwh_15min"] = gen15["generation_kwh_15min"].clip(lower=0)
+    gen15 = gen15.sort_values(["site", "datetime_madrid"]).reset_index(drop=True)
+    return gen15
 
 
 def power_10min_to_generation_15min_via_5min(power_df: pd.DataFrame, timestamp_position: str) -> pd.DataFrame:
@@ -995,6 +1111,167 @@ def build_events_summary(events_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _norm_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def infer_site_from_agent(agent_name: str, site_names: list[str]) -> str | None:
+    agent_norm = _norm_name(agent_name)
+    best = None
+    best_len = 0
+    for site in site_names:
+        site_norm = _norm_name(site)
+        if site_norm and site_norm in agent_norm and len(site_norm) > best_len:
+            best = site
+            best_len = len(site_norm)
+    return best
+
+
+def is_curtailment_event_row(row: pd.Series) -> bool:
+    text = " ".join(
+        str(row.get(col, "") or "")
+        for col in ["svar_name", "svar_apcode", "event_apcode", "event_name"]
+    ).lower()
+    return "curtail" in text
+
+
+def is_active_curtailment_event(row: pd.Series) -> bool:
+    text = " ".join(str(row.get(col, "") or "") for col in ["event_apcode", "event_name"]).lower()
+    return ("active" in text) and ("inactive" not in text)
+
+
+def is_inactive_curtailment_event(row: pd.Series) -> bool:
+    text = " ".join(str(row.get(col, "") or "") for col in ["event_apcode", "event_name"]).lower()
+    return "inactive" in text
+
+
+def build_curtailment_intervals(events_df: pd.DataFrame, start_day: date, end_day: date, site_names: list[str]) -> pd.DataFrame:
+    """
+    Convert Active/Inactive curtailment status events into intervals.
+
+    Affected-generation calculations use these intervals as diagnostics only.
+    They do not modify SCADA generation or revenue calculations.
+    """
+    if events_df.empty:
+        return pd.DataFrame()
+
+    ev = events_df.copy()
+    ev = ev[ev.apply(is_curtailment_event_row, axis=1)].copy()
+    if ev.empty:
+        return pd.DataFrame()
+
+    ev["start_madrid"] = pd.to_datetime(ev["start_madrid"], errors="coerce")
+    ev = ev.dropna(subset=["start_madrid"]).sort_values(["svar_id", "agent_name", "start_madrid"]).reset_index(drop=True)
+
+    range_start = pd.Timestamp(start_day)
+    range_end = pd.Timestamp(end_day) + pd.Timedelta(days=1)
+
+    rows = []
+    for (svar_id, agent_name), grp in ev.groupby(["svar_id", "agent_name"], dropna=False):
+        open_event = None
+        for _, row in grp.iterrows():
+            if is_active_curtailment_event(row):
+                open_event = row
+            elif is_inactive_curtailment_event(row) and open_event is not None:
+                start_ts = pd.Timestamp(open_event["start_madrid"])
+                end_ts = pd.Timestamp(row["start_madrid"])
+                if end_ts > start_ts:
+                    rows.append({
+                        "svar_id": svar_id,
+                        "agent_name": agent_name,
+                        "site": infer_site_from_agent(agent_name, site_names),
+                        "start_madrid": max(start_ts, range_start),
+                        "end_madrid": min(end_ts, range_end),
+                        "event_start_apcode": open_event.get("event_apcode"),
+                        "event_end_apcode": row.get("event_apcode"),
+                    })
+                open_event = None
+
+        # If the last state is Active inside the selected range, close it at the selected range end.
+        if open_event is not None:
+            start_ts = pd.Timestamp(open_event["start_madrid"])
+            end_ts = range_end
+            if end_ts > start_ts:
+                rows.append({
+                    "svar_id": svar_id,
+                    "agent_name": agent_name,
+                    "site": infer_site_from_agent(agent_name, site_names),
+                    "start_madrid": max(start_ts, range_start),
+                    "end_madrid": end_ts,
+                    "event_start_apcode": open_event.get("event_apcode"),
+                    "event_end_apcode": "open_until_range_end",
+                })
+
+    intervals = pd.DataFrame(rows)
+    if intervals.empty:
+        return intervals
+
+    intervals = intervals[intervals["end_madrid"] > intervals["start_madrid"]].copy()
+    intervals["duration_h"] = (intervals["end_madrid"] - intervals["start_madrid"]).dt.total_seconds() / 3600.0
+    return intervals.sort_values(["site", "start_madrid"]).reset_index(drop=True)
+
+
+def affected_generation_by_curtailment_hour(curtailment_intervals: pd.DataFrame, gen15: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Aggregate actual SCADA generation during curtailment-active intervals by hour.
+
+    This is not lost generation. It is generation observed while a curtailment status was active.
+    """
+    if curtailment_intervals.empty or gen15.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    gen = gen15.copy()
+    gen["qh_madrid"] = pd.to_datetime(gen["qh_madrid"], errors="coerce")
+    gen = gen.dropna(subset=["qh_madrid", "site", "generation_mwh_15min"])
+
+    affected_rows = []
+    interval_rows = []
+
+    for _, interval in curtailment_intervals.iterrows():
+        site = interval.get("site")
+        if not site:
+            continue
+
+        mask = (
+            (gen["site"] == site)
+            & (gen["qh_madrid"] >= interval["start_madrid"])
+            & (gen["qh_madrid"] < interval["end_madrid"])
+        )
+        affected = gen.loc[mask, ["site", "qh_madrid", "generation_mwh_15min"]].copy()
+        if affected.empty:
+            interval_rows.append({**interval.to_dict(), "affected_generation_mwh": 0.0, "affected_qh": 0})
+            continue
+
+        affected["agent_name"] = interval.get("agent_name")
+        affected["svar_id"] = interval.get("svar_id")
+        affected["curtailment_start"] = interval["start_madrid"]
+        affected["curtailment_end"] = interval["end_madrid"]
+        affected_rows.append(affected)
+
+        interval_rows.append({
+            **interval.to_dict(),
+            "affected_generation_mwh": float(affected["generation_mwh_15min"].sum()),
+            "affected_qh": int(len(affected)),
+        })
+
+    if not affected_rows:
+        return pd.DataFrame(), pd.DataFrame(interval_rows)
+
+    affected_qh = pd.concat(affected_rows, ignore_index=True)
+    affected_qh["hour_madrid"] = affected_qh["qh_madrid"].dt.floor("h")
+    affected_hour = (
+        affected_qh.groupby(["hour_madrid", "site"], as_index=False)
+        .agg(
+            affected_generation_mwh=("generation_mwh_15min", "sum"),
+            affected_qh=("generation_mwh_15min", "size"),
+        )
+        .sort_values(["hour_madrid", "site"])
+    )
+
+    interval_summary = pd.DataFrame(interval_rows)
+    return affected_hour, interval_summary
+
+
 # =========================================================
 # Production price-limit reference line
 # =========================================================
@@ -1160,6 +1437,13 @@ timestamp_position = st.sidebar.selectbox(
     help="If the 10-min event timestamp is the end of the interval, select interval end.",
 )
 
+production_source = st.sidebar.selectbox(
+    "Production source",
+    ["SCADA power integration", "Energy Exported kWh"],
+    index=0,
+    help="Energy Exported uses 10-min kWh parameters and is usually closer to metered/exported generation if all plant Source Ids are configured.",
+)
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("Solar cleaning")
 clean_night = st.sidebar.checkbox("Set impossible night generation to zero", value=True)
@@ -1176,7 +1460,7 @@ show_diagnostics = st.sidebar.checkbox("Show diagnostics", value=True)
 st.title("IS2 SCADA generation & day-ahead revenues")
 st.caption("Production threshold is shown only when breached; curtailment/control events are diagnostics only; generation/revenue calculations still use all SCADA production.")
 st.caption(
-    "SCADA 10-min power is split into 5-min energy packets and aggregated to QH. "
+    "Production can use SCADA 10-min power integration or Energy Exported 10-min kWh split into QH. "
     "Revenues use QH Day Ahead prices when available, otherwise hourly prices are expanded to QH."
 )
 
@@ -1188,7 +1472,23 @@ if not selected_sites:
     box("warning", "Select at least one site.")
     st.stop()
 
-selected_source_ids = [POWER_SOURCE_IDS[s] for s in selected_sites]
+energy_exported_source_ids = get_energy_exported_source_ids()
+if production_source == "Energy Exported kWh":
+    missing_energy_ids = [s for s in selected_sites if s not in energy_exported_source_ids]
+    if missing_energy_ids:
+        box(
+            "danger",
+            "Missing Energy Exported Source Ids for: "
+            + ", ".join(missing_energy_ids)
+            + ". Add them in SOLARPARK_ENERGY_EXPORTED_SOURCE_IDS or switch Production source back to SCADA power integration."
+        )
+        st.stop()
+    selected_source_ids = [energy_exported_source_ids[s] for s in selected_sites]
+    selected_id_to_site = {v: k for k, v in energy_exported_source_ids.items()}
+else:
+    selected_source_ids = [POWER_SOURCE_IDS[s] for s in selected_sites]
+    selected_id_to_site = ID_TO_SITE
+
 start_utc = madrid_day_to_utc_str(start_day)
 end_utc = madrid_day_to_utc_str(end_day, end_of_day=True)
 
@@ -1198,6 +1498,7 @@ with st.expander("Solarpark connection", expanded=False):
     st.write({
         "SOLARPARK_COOKIE_loaded": _cookie_loaded,
         "SOLARPARK_CURTAILMENT_SVAR_IDS_loaded": _event_ids_loaded,
+        "Energy Exported configured sites": sorted(get_energy_exported_source_ids().keys()),
         "auth_mode": "browser Cookie header only",
     })
 
@@ -1213,19 +1514,26 @@ if not run:
 
 solarpark_cookie = get_solarpark_cookie()
 
-with st.spinner("Fetching Solarpark / UNITY SCADA power values..."):
+with st.spinner(f"Fetching Solarpark / UNITY values for {production_source}..."):
     try:
         payload = fetch_power_values(start_utc, end_utc, solarpark_cookie, selected_source_ids)
     except Exception as exc:
         box("danger", f"Could not fetch Solarpark values: {exc}")
         st.stop()
 
-power_df = events_payload_to_power_df(payload)
-if power_df.empty:
-    box("danger", "No SCADA power events returned for the selected source IDs and period.")
-    st.stop()
+if production_source == "Energy Exported kWh":
+    energy_df = events_payload_to_energy_exported_df(payload, selected_id_to_site)
+    if energy_df.empty:
+        box("danger", "No Energy Exported events returned for the selected source IDs and period.")
+        st.stop()
+    gen15_raw = energy_exported_10min_to_generation_15min_via_5min(energy_df, timestamp_position=timestamp_position)
+else:
+    power_df = events_payload_to_power_df(payload)
+    if power_df.empty:
+        box("danger", "No SCADA power events returned for the selected source IDs and period.")
+        st.stop()
+    gen15_raw = power_10min_to_generation_15min_via_5min(power_df, timestamp_position=timestamp_position)
 
-gen15_raw = power_10min_to_generation_15min_via_5min(power_df, timestamp_position=timestamp_position)
 gen15, gen_diag = clean_night_generation(
     gen15_raw,
     night_start=int(night_start),
@@ -1246,7 +1554,8 @@ price_qh = price_qh_all[
 section_header("SCADA generation profile")
 
 pill(f"UTC request window: {start_utc} → {end_utc}")
-pill(f"SCADA conversion: 10-min kW → 2 × 5-min kWh → QH")
+pill(f"Production source: {production_source}")
+pill("Conversion: 10-min values → 2 × 5-min energy packets → QH")
 pill(f"Price sources: {price_source_notes}")
 
 total_gen = gen15["generation_mwh_15min"].sum()
@@ -1255,7 +1564,7 @@ raw_night = gen_diag["raw_night_generation_mwh"].sum()
 raw_night_pct = raw_night / raw_total * 100 if raw_total > 0 else 0.0
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Clean SCADA generation", fmt_mwh(total_gen))
+m1.metric("Clean generation", fmt_mwh(total_gen))
 m2.metric("Raw night generation", fmt_mwh(raw_night), f"{raw_night_pct:.2f}% raw")
 m3.metric("Sites", f"{gen15['site'].nunique():,.0f}")
 m4.metric("QH intervals", f"{len(gen15):,.0f}")
@@ -1475,7 +1784,7 @@ section_header("Curtailment / control events tracker")
 st.caption(
     "Tracks IFMS svar event histories such as PVCurtailmentStatus or ActivePowerControlAlgorithm. "
     "Set SOLARPARK_CURTAILMENT_SVAR_IDS as a comma-separated list of svar IDs. "
-    "Events are diagnostics only; generation and revenue calculations are not modified."
+    "Events are diagnostics only; generation and revenue calculations are not modified. Affected-generation bars show actual SCADA generation during active curtailment intervals, not estimated lost generation."
 )
 
 default_curtailment_svars = "b574d090-065e-11f0-980e-42010afa015a,b574a430-065e-11f0-980e-42010afa015a"
@@ -1501,6 +1810,8 @@ if not events_sel.empty and "duration_h" in events_sel.columns:
     events_sel["duration_h"] = pd.to_numeric(events_sel["duration_h"], errors="coerce")
     events_sel.loc[events_sel["duration_h"] > 24 * 366, "duration_h"] = np.nan
 events_summary = build_events_summary(events_sel)
+curtailment_intervals = build_curtailment_intervals(events_sel, start_day, end_day, list(POWER_SOURCE_IDS.keys())) if not events_sel.empty else pd.DataFrame()
+affected_hourly, affected_interval_summary = affected_generation_by_curtailment_hour(curtailment_intervals, gen15)
 
 with st.expander("Event tracker diagnostics", expanded=False):
     st.json(ev_infos)
@@ -1526,6 +1837,56 @@ else:
             use_container_width=True,
             hide_index=True,
         )
+
+    if affected_hourly.empty:
+        st.info(
+            "No affected-generation bars can be calculated yet. This usually means only one park/svar is configured, "
+            "the event agent name could not be mapped to a selected site, or there were no Active→Inactive curtailment intervals in range."
+        )
+    else:
+        affected_total_mwh = affected_hourly["affected_generation_mwh"].sum()
+        affected_hours = affected_hourly["hour_madrid"].nunique()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Generation during curtailment", fmt_mwh(affected_total_mwh))
+        c2.metric("Hours with curtailment generation", f"{affected_hours:,.0f}")
+        c3.metric("Curtailment intervals reconstructed", f"{len(curtailment_intervals):,.0f}")
+
+        fig_aff = go.Figure()
+        for site, grp in affected_hourly.groupby("site"):
+            fig_aff.add_trace(
+                go.Bar(
+                    x=grp["hour_madrid"],
+                    y=grp["affected_generation_mwh"],
+                    name=str(site),
+                    hovertemplate="%{x|%d-%b %H:%M}<br>Site: " + str(site) + "<br>Generation affected: %{y:,.2f} MWh/h<extra></extra>",
+                )
+            )
+
+        fig_aff.update_layout(
+            **chart_layout(
+                "Hourly generation during active curtailment intervals",
+                "Columns show actual SCADA generation observed while PVCurtailmentStatus was active; this is not estimated lost energy.",
+                height=430,
+            ),
+            barmode="stack",
+            yaxis=dict(title="Generation during curtailment (MWh/h)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8"),
+        )
+        fig_aff.update_xaxes(title="Madrid hour", showgrid=False)
+        st.plotly_chart(fig_aff, use_container_width=True)
+
+        with st.expander("Curtailment intervals and affected-generation detail", expanded=False):
+            if not affected_interval_summary.empty:
+                st.dataframe(
+                    style_table(affected_interval_summary).format({
+                        "start_madrid": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
+                        "end_madrid": lambda x: "—" if pd.isna(x) else pd.Timestamp(x).strftime("%d-%b-%Y %H:%M"),
+                        "duration_h": "{:,.2f}",
+                        "affected_generation_mwh": "{:,.2f}",
+                        "affected_qh": "{:,.0f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     timeline = events_sel.copy()
     timeline["y_label"] = timeline["agent_name"].fillna("Unknown agent") + " | " + timeline["svar_name"].fillna(timeline["svar_id"])
@@ -1582,6 +1943,20 @@ else:
         file_name="is2_curtailment_control_events.csv",
         mime="text/csv",
     )
+    if not affected_hourly.empty:
+        st.download_button(
+            "Download hourly generation during curtailment",
+            data=affected_hourly.to_csv(index=False).encode("utf-8"),
+            file_name="is2_hourly_generation_during_curtailment.csv",
+            mime="text/csv",
+        )
+    if not affected_interval_summary.empty:
+        st.download_button(
+            "Download reconstructed curtailment intervals",
+            data=affected_interval_summary.to_csv(index=False).encode("utf-8"),
+            file_name="is2_reconstructed_curtailment_intervals.csv",
+            mime="text/csv",
+        )
 
 st.markdown("#### Portfolio monthly summary")
 display_revenue_table(portfolio_month.sort_values("month"))
