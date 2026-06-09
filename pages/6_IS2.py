@@ -365,13 +365,33 @@ def get_energy_exported_source_ids() -> dict[str, str]:
     return mapping
 
 
+def get_user_solarpark_cookie_override() -> str:
+    """
+    Optional runtime override typed by the user in the IS2 tab.
+
+    This has precedence over Streamlit/GitHub secrets and local .env values for the
+    current app session, so an expired SOLARPARK_COOKIE can be replaced without a
+    deploy or repository secret change.
+    """
+    return str(st.session_state.get("solarpark_cookie_override", "") or "").strip().strip('"').strip("'")
+
+
+def get_solarpark_cookie_source() -> str:
+    if get_user_solarpark_cookie_override():
+        return "User override in this tab"
+    if get_secret_or_env("SOLARPARK_COOKIE"):
+        return "Streamlit/GitHub secret or local .env"
+    return "Not configured"
+
+
 def get_solarpark_cookie() -> str:
-    cookie = get_secret_or_env("SOLARPARK_COOKIE")
+    cookie = get_user_solarpark_cookie_override() or get_secret_or_env("SOLARPARK_COOKIE")
     if not cookie:
         box(
             "danger",
-            "Missing <code>SOLARPARK_COOKIE</code>. Add the full browser Cookie header in local "
-            "<code>.env</code> or Streamlit Secrets, for example: "
+            "Missing <code>SOLARPARK_COOKIE</code>. Paste the full browser Cookie header in the "
+            "sidebar field <b>SOLARPARK_COOKIE override</b>, or add it in local "
+            "<code>.env</code> / Streamlit Secrets, for example: "
             "<code>SOLARPARK_COOKIE='apt.uid=...; apt.sid=...; IFMSCK=...'</code>",
         )
         st.stop()
@@ -1411,6 +1431,185 @@ def calculate_revenues_qh(gen15: pd.DataFrame, price_qh: pd.DataFrame) -> tuple[
     return joined, monthly, annual, portfolio
 
 
+
+def add_curtailment_flag_to_revenues(revenues_df: pd.DataFrame, curtailment_intervals: pd.DataFrame) -> pd.DataFrame:
+    """Flag actual generation intervals that overlap an active PVCurtailmentStatus interval."""
+    out = revenues_df.copy()
+    out["is_curtailment_active"] = False
+
+    if out.empty or curtailment_intervals is None or curtailment_intervals.empty:
+        return out
+
+    out["qh_madrid"] = pd.to_datetime(out["qh_madrid"], errors="coerce")
+    intervals = curtailment_intervals.copy()
+    intervals["start_madrid"] = pd.to_datetime(intervals["start_madrid"], errors="coerce")
+    intervals["end_madrid"] = pd.to_datetime(intervals["end_madrid"], errors="coerce")
+    intervals = intervals.dropna(subset=["site", "start_madrid", "end_madrid"])
+
+    for _, interval in intervals.iterrows():
+        site = interval.get("site")
+        if not site:
+            continue
+        mask = (
+            (out["site"] == site)
+            & (out["qh_madrid"] >= interval["start_madrid"])
+            & (out["qh_madrid"] < interval["end_madrid"])
+        )
+        out.loc[mask, "is_curtailment_active"] = True
+
+    return out
+
+
+def _weighted_captured_price(df: pd.DataFrame, gen_col: str = "generation_mwh_15min") -> float:
+    gen = pd.to_numeric(df.get(gen_col, pd.Series(dtype=float)), errors="coerce").sum()
+    rev = pd.to_numeric(df.get("revenue_eur", pd.Series(dtype=float)), errors="coerce").sum()
+    return float(rev / gen) if gen > 0 else np.nan
+
+
+def build_merchant_monthly_comparison(revenues_df: pd.DataFrame, price_qh: pd.DataFrame, curtailment_intervals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Portfolio merchant monthly comparison.
+
+    Curtailed = actual metered generation during active PVCurtailmentStatus intervals.
+    Uncurtailed = actual metered generation outside those active intervals.
+    This does not estimate lost generation.
+    """
+    if revenues_df is None or revenues_df.empty:
+        return pd.DataFrame()
+
+    df = add_curtailment_flag_to_revenues(revenues_df, curtailment_intervals)
+    df["month"] = pd.to_datetime(df["qh_madrid"], errors="coerce").dt.to_period("M").astype(str)
+    df["generation_mwh_15min"] = pd.to_numeric(df["generation_mwh_15min"], errors="coerce").fillna(0.0)
+    df["price_eur_mwh"] = pd.to_numeric(df["price_eur_mwh"], errors="coerce")
+    df["revenue_eur"] = pd.to_numeric(df["revenue_eur"], errors="coerce").fillna(0.0)
+    df["is_spot_zero"] = df["price_eur_mwh"].notna() & np.isclose(df["price_eur_mwh"], 0.0, atol=1e-9)
+    df["is_spot_negative"] = df["price_eur_mwh"].notna() & (df["price_eur_mwh"] < 0.0)
+    df["is_spot_zero_or_negative"] = df["price_eur_mwh"].notna() & (df["price_eur_mwh"] <= 0.0)
+
+    price_month = price_qh.copy()
+    price_month["month"] = pd.to_datetime(price_month["qh_madrid"], errors="coerce").dt.to_period("M").astype(str)
+    baseload = (
+        price_month.groupby("month", as_index=False)["price_eur_mwh"]
+        .mean()
+        .rename(columns={"price_eur_mwh": "baseload_price_eur_mwh"})
+    )
+
+    rows = []
+    for month, grp in df.groupby("month"):
+        total_gen = grp["generation_mwh_15min"].sum()
+        total_rev = grp["revenue_eur"].sum()
+        curtailed = grp[grp["is_curtailment_active"]]
+        uncurtailed = grp[~grp["is_curtailment_active"]]
+        zero_gen = grp.loc[grp["is_spot_zero"], "generation_mwh_15min"].sum()
+        neg_gen = grp.loc[grp["is_spot_negative"], "generation_mwh_15min"].sum()
+        zero_or_neg_gen = grp.loc[grp["is_spot_zero_or_negative"], "generation_mwh_15min"].sum()
+        rows.append({
+            "month": month,
+            "generation_mwh": total_gen,
+            "merchant_revenue_eur": total_rev,
+            "captured_price_all_eur_mwh": total_rev / total_gen if total_gen > 0 else np.nan,
+            "captured_price_curtailed_eur_mwh": _weighted_captured_price(curtailed),
+            "captured_price_uncurtailed_eur_mwh": _weighted_captured_price(uncurtailed),
+            "curtailed_generation_mwh": curtailed["generation_mwh_15min"].sum(),
+            "uncurtailed_generation_mwh": uncurtailed["generation_mwh_15min"].sum(),
+            "spot_zero_generation_mwh": zero_gen,
+            "spot_negative_generation_mwh": neg_gen,
+            "spot_zero_or_negative_generation_mwh": zero_or_neg_gen,
+            "spot_zero_generation_pct": zero_gen / total_gen * 100 if total_gen > 0 else np.nan,
+            "spot_negative_generation_pct": neg_gen / total_gen * 100 if total_gen > 0 else np.nan,
+            "spot_zero_or_negative_generation_pct": zero_or_neg_gen / total_gen * 100 if total_gen > 0 else np.nan,
+        })
+
+    out = pd.DataFrame(rows).merge(baseload, on="month", how="left").sort_values("month").reset_index(drop=True)
+    for col in [
+        "baseload_price_eur_mwh",
+        "captured_price_all_eur_mwh",
+        "captured_price_curtailed_eur_mwh",
+        "captured_price_uncurtailed_eur_mwh",
+        "generation_mwh",
+        "spot_zero_generation_pct",
+        "spot_negative_generation_pct",
+        "spot_zero_or_negative_generation_pct",
+    ]:
+        out[f"mom_{col}"] = out[col].diff()
+    return out
+
+
+def display_merchant_monthly_comparison(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        st.info("No monthly merchant revenue comparison could be built for the selected period.")
+        return
+
+    view = df.rename(columns={
+        "month": "Month",
+        "baseload_price_eur_mwh": "Baseload (€/MWh)",
+        "captured_price_all_eur_mwh": "Captured all (€/MWh)",
+        "captured_price_curtailed_eur_mwh": "Captured curtailed (€/MWh)",
+        "captured_price_uncurtailed_eur_mwh": "Captured uncurtailed (€/MWh)",
+        "generation_mwh": "Generation (MWh)",
+        "merchant_revenue_eur": "Merchant revenue (€)",
+        "curtailed_generation_mwh": "Curtailed-period gen. (MWh)",
+        "uncurtailed_generation_mwh": "Uncurtailed gen. (MWh)",
+        "spot_zero_generation_mwh": "Gen. at spot = 0 (MWh)",
+        "spot_zero_generation_pct": "Gen. at spot = 0 (%)",
+        "spot_negative_generation_mwh": "Gen. at spot < 0 (MWh)",
+        "spot_negative_generation_pct": "Gen. at spot < 0 (%)",
+        "spot_zero_or_negative_generation_mwh": "Gen. at spot ≤ 0 (MWh)",
+        "spot_zero_or_negative_generation_pct": "Gen. at spot ≤ 0 (%)",
+        "mom_baseload_price_eur_mwh": "MoM baseload Δ",
+        "mom_captured_price_curtailed_eur_mwh": "MoM captured curtailed Δ",
+        "mom_captured_price_uncurtailed_eur_mwh": "MoM captured uncurtailed Δ",
+        "mom_generation_mwh": "MoM generation Δ",
+        "mom_spot_zero_or_negative_generation_pct": "MoM spot ≤ 0 pp",
+    })
+
+    ordered = [
+        "Month",
+        "Baseload (€/MWh)",
+        "MoM baseload Δ",
+        "Captured all (€/MWh)",
+        "Captured curtailed (€/MWh)",
+        "MoM captured curtailed Δ",
+        "Captured uncurtailed (€/MWh)",
+        "MoM captured uncurtailed Δ",
+        "Generation (MWh)",
+        "MoM generation Δ",
+        "Merchant revenue (€)",
+        "Curtailed-period gen. (MWh)",
+        "Uncurtailed gen. (MWh)",
+        "Gen. at spot = 0 (MWh)",
+        "Gen. at spot = 0 (%)",
+        "Gen. at spot < 0 (MWh)",
+        "Gen. at spot < 0 (%)",
+        "Gen. at spot ≤ 0 (MWh)",
+        "Gen. at spot ≤ 0 (%)",
+        "MoM spot ≤ 0 pp",
+    ]
+    ordered = [c for c in ordered if c in view.columns]
+
+    fmt = {
+        "Baseload (€/MWh)": "{:,.2f}",
+        "MoM baseload Δ": "{:+,.2f}",
+        "Captured all (€/MWh)": "{:,.2f}",
+        "Captured curtailed (€/MWh)": "{:,.2f}",
+        "MoM captured curtailed Δ": "{:+,.2f}",
+        "Captured uncurtailed (€/MWh)": "{:,.2f}",
+        "MoM captured uncurtailed Δ": "{:+,.2f}",
+        "Generation (MWh)": "{:,.2f}",
+        "MoM generation Δ": "{:+,.2f}",
+        "Merchant revenue (€)": "€{:,.0f}",
+        "Curtailed-period gen. (MWh)": "{:,.2f}",
+        "Uncurtailed gen. (MWh)": "{:,.2f}",
+        "Gen. at spot = 0 (MWh)": "{:,.2f}",
+        "Gen. at spot = 0 (%)": "{:,.2f}%",
+        "Gen. at spot < 0 (MWh)": "{:,.2f}",
+        "Gen. at spot < 0 (%)": "{:,.2f}%",
+        "Gen. at spot ≤ 0 (MWh)": "{:,.2f}",
+        "Gen. at spot ≤ 0 (%)": "{:,.2f}%",
+        "MoM spot ≤ 0 pp": "{:+,.2f} pp",
+    }
+    st.dataframe(style_table(view[ordered]).format({k: v for k, v in fmt.items() if k in ordered}, na_rep="—"), use_container_width=True, hide_index=True)
+
 def display_revenue_table(df: pd.DataFrame) -> None:
     out = df.copy()
     rename = {
@@ -1486,6 +1685,29 @@ night_end = c2.number_input("Night ends", min_value=0, max_value=9, value=5, ste
 
 show_diagnostics = st.sidebar.checkbox("Show diagnostics", value=True)
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Solarpark cookie override")
+def clear_solarpark_cookie_override() -> None:
+    st.session_state["solarpark_cookie_override"] = ""
+
+
+st.sidebar.text_input(
+    "SOLARPARK_COOKIE override",
+    type="password",
+    key="solarpark_cookie_override",
+    placeholder="apt.uid=...; apt.sid=...; IFMSCK=...",
+    help=(
+        "Paste a fresh browser Cookie header here if the Streamlit/GitHub secret has expired. "
+        "When this field is not empty, it is used instead of the SOLARPARK_COOKIE value from secrets/.env "
+        "for this session."
+    ),
+)
+st.sidebar.button(
+    "Clear cookie override",
+    use_container_width=True,
+    on_click=clear_solarpark_cookie_override,
+)
+
 
 # =========================================================
 # Main
@@ -1526,14 +1748,23 @@ start_utc = madrid_day_to_utc_str(start_day)
 end_utc = madrid_day_to_utc_str(end_day, end_of_day=True)
 
 with st.expander("Solarpark connection", expanded=False):
-    _cookie_loaded = bool(get_secret_or_env("SOLARPARK_COOKIE"))
+    _cookie_override_loaded = bool(get_user_solarpark_cookie_override())
+    _cookie_secret_loaded = bool(get_secret_or_env("SOLARPARK_COOKIE"))
     _event_ids_loaded = bool(get_secret_or_env("SOLARPARK_CURTAILMENT_SVAR_IDS"))
     st.write({
-        "SOLARPARK_COOKIE_loaded": _cookie_loaded,
+        "SOLARPARK_COOKIE_user_override_loaded": _cookie_override_loaded,
+        "SOLARPARK_COOKIE_secret_or_env_loaded": _cookie_secret_loaded,
+        "SOLARPARK_COOKIE_active_source": get_solarpark_cookie_source(),
         "SOLARPARK_CURTAILMENT_SVAR_IDS_loaded": _event_ids_loaded,
         "Energy Exported configured sites": sorted(get_energy_exported_source_ids().keys()),
         "auth_mode": "browser Cookie header only",
     })
+    if _cookie_override_loaded:
+        box(
+            "ok",
+            "Using the SOLARPARK_COOKIE pasted in this tab. This runtime value overrides the "
+            "Streamlit/GitHub secret for Solarpark requests in the current session."
+        )
 
 run = st.button("Fetch SCADA and calculate revenues", type="primary", use_container_width=True)
 
@@ -1553,6 +1784,9 @@ with st.spinner(f"Fetching Solarpark / UNITY values for {production_source}...")
     except Exception as exc:
         box("danger", f"Could not fetch Solarpark values: {exc}")
         st.stop()
+
+power_df = pd.DataFrame()
+energy_df = pd.DataFrame()
 
 if production_source == "Energy Exported kWh":
     energy_df = events_payload_to_energy_exported_df(payload, selected_id_to_site)
@@ -1813,14 +2047,6 @@ fig_cum.update_layout(
 fig_cum.update_xaxes(title="Madrid date and QH", showgrid=False)
 st.plotly_chart(fig_cum, use_container_width=True)
 
-section_header("Monthly cumulative production and revenue")
-st.caption("Cumulative monthly portfolio production and revenue. Values reset at the start of each month.")
-fig_cum = go.Figure()
-fig_cum.add_trace(go.Scatter(x=portfolio_qh["qh_madrid"], y=portfolio_qh["monthly_cum_generation_mwh"], name="Cumulative production", yaxis="y", mode="lines", line=dict(color=CORP_GREEN, width=2.8), hovertemplate="%{x|%d-%b %H:%M}<br>Cum. production: %{y:,.2f} MWh<extra></extra>"))
-fig_cum.add_trace(go.Scatter(x=portfolio_qh["qh_madrid"], y=portfolio_qh["monthly_cum_revenue_eur"], name="Cumulative revenue", yaxis="y2", mode="lines", line=dict(color=CORP_BLUE, width=2.8), hovertemplate="%{x|%d-%b %H:%M}<br>Cum. revenue: €%{y:,.0f}<extra></extra>"))
-fig_cum.update_layout(**chart_layout("Monthly cumulative generation and day-ahead revenue", "Cumulative values reset at each month boundary"), yaxis=dict(title="Cumulative production (MWh)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8"), yaxis2=dict(title="Cumulative revenue (€)", overlaying="y", side="right", showgrid=False))
-fig_cum.update_xaxes(title="Madrid date and QH", showgrid=False)
-st.plotly_chart(fig_cum, use_container_width=True)
 
 section_header("PV curtailment events and affected generation")
 st.caption("Tracks IFMS PVCurtailmentStatus events for the selected sites. Affected-generation bars show actual generation observed during active curtailment intervals; this is not estimated lost generation.")
@@ -1846,6 +2072,40 @@ if not events_sel.empty and "duration_h" in events_sel.columns:
 events_summary = build_events_summary(events_sel)
 curtailment_intervals = build_curtailment_intervals(events_sel, start_day, end_day, selected_sites) if not events_sel.empty else pd.DataFrame()
 affected_hourly, affected_interval_summary = affected_generation_by_curtailment_hour(curtailment_intervals, gen15)
+
+section_header("Merchant revenues — monthly comparison")
+st.caption(
+    "Portfolio merchant metrics by month. Curtailed captured price means actual generation during active "
+    "PVCurtailmentStatus intervals; uncurtailed captured price means actual generation outside those intervals. "
+    "This does not estimate lost generation; it only classifies metered production by event status."
+)
+merchant_monthly = build_merchant_monthly_comparison(revenues_df, price_qh, curtailment_intervals)
+display_merchant_monthly_comparison(merchant_monthly)
+
+if not merchant_monthly.empty:
+    fig_merchant = go.Figure()
+    fig_merchant.add_trace(go.Bar(
+        x=merchant_monthly["month"],
+        y=merchant_monthly["spot_zero_generation_pct"],
+        name="Generation at spot = 0",
+        hovertemplate="Month %{x}<br>Share: %{y:,.2f}%<extra></extra>",
+    ))
+    fig_merchant.add_trace(go.Bar(
+        x=merchant_monthly["month"],
+        y=merchant_monthly["spot_negative_generation_pct"],
+        name="Generation at spot < 0",
+        hovertemplate="Month %{x}<br>Share: %{y:,.2f}%<extra></extra>",
+    ))
+    merchant_layout = chart_layout(
+        "Monthly share of generation at zero and negative spot prices",
+        "Share of total monthly metered production",
+        height=390,
+    )
+    merchant_layout["barmode"] = "group"
+    merchant_layout["yaxis"] = dict(title="Share of monthly generation (%)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8")
+    fig_merchant.update_layout(**merchant_layout)
+    fig_merchant.update_xaxes(title="Month", showgrid=False)
+    st.plotly_chart(fig_merchant, use_container_width=True)
 
 with st.expander("Event tracker diagnostics", expanded=False):
     st.json({"configured_svar_ids": curtailment_svar_ids, "fetch_results": ev_infos})
@@ -1946,8 +2206,13 @@ with tab_detail:
 if show_diagnostics:
     section_header("Diagnostics")
 
-    with st.expander("SCADA raw power sample", expanded=False):
-        st.dataframe(power_df.head(100), use_container_width=True, hide_index=True)
+    with st.expander("Raw Solarpark sample", expanded=False):
+        if production_source == "Energy Exported kWh":
+            st.dataframe(energy_df.head(100), use_container_width=True, hide_index=True)
+        elif not power_df.empty:
+            st.dataframe(power_df.head(100), use_container_width=True, hide_index=True)
+        else:
+            st.info("No raw SCADA power dataframe is available for the selected production source.")
 
     with st.expander("Generation diagnostics", expanded=False):
         st.dataframe(
@@ -1975,13 +2240,25 @@ if show_diagnostics:
         st.dataframe(price_qh.head(120), use_container_width=True, hide_index=True)
 
     with st.expander("Conversion check: 10-min → 5-min → QH", expanded=False):
-        check = power_df.copy()
-        check["date"] = check["datetime_madrid"].dt.date
-        raw_energy = (
-            check.assign(generation_kwh_10min=check["power_kw"] * (10.0 / 60.0))
-            .groupby(["site", "date"], as_index=False)["generation_kwh_10min"]
-            .sum()
-        )
+        if production_source == "Energy Exported kWh":
+            check = energy_df.copy()
+            check["date"] = check["datetime_madrid"].dt.date
+            raw_energy = (
+                check.groupby(["site", "date"], as_index=False)["energy_exported_kwh_10min"]
+                .sum()
+                .rename(columns={"energy_exported_kwh_10min": "generation_kwh_10min"})
+            )
+        elif not power_df.empty:
+            check = power_df.copy()
+            check["date"] = check["datetime_madrid"].dt.date
+            raw_energy = (
+                check.assign(generation_kwh_10min=check["power_kw"] * (10.0 / 60.0))
+                .groupby(["site", "date"], as_index=False)["generation_kwh_10min"]
+                .sum()
+            )
+        else:
+            raw_energy = pd.DataFrame(columns=["site", "date", "generation_kwh_10min"])
+
         qh_energy = (
             gen15.assign(date=gen15["datetime_madrid_naive"].dt.date)
             .groupby(["site", "date"], as_index=False)["generation_kwh_15min"]
