@@ -102,6 +102,7 @@ CORP_BLUE = "#1D4ED8"
 CORP_GREY = "#4B5563"
 CORP_BORDER = "#E5E7EB"
 CORP_RED = "#DC2626"
+YELLOW_DARK = "#D97706"
 
 
 # =========================================================
@@ -254,17 +255,17 @@ def corporate_kpi_card(
         "red": ("#DC2626", "#FEF2F2", "#FECACA"),
     }
     accent, bg, border = tone_map.get(tone, tone_map["green"])
-    delta_html = f'<div class="corp-kpi-delta">{delta}</div>' if delta else ""
+    delta_html = f'<span class="corp-kpi-delta">{delta}</span>' if delta else ""
     subtitle_html = f'<div class="corp-kpi-subtitle">{subtitle}</div>' if subtitle else ""
-    return f"""
-        <div class="corp-kpi-card" style="border-color:{border}; background:linear-gradient(180deg, #FFFFFF 0%, {bg} 100%);">
-            <div class="corp-kpi-accent" style="background:{accent};"></div>
-            <div class="corp-kpi-title">{title}</div>
-            <div class="corp-kpi-value" style="color:{accent};">{value}</div>
-            {subtitle_html}
-            {delta_html}
-        </div>
-    """
+    return (
+        f'<div class="corp-kpi-card" style="border-color:{border}; background:linear-gradient(180deg, #FFFFFF 0%, {bg} 100%);">'
+        f'<div class="corp-kpi-accent" style="background:{accent};"></div>'
+        f'<div class="corp-kpi-title">{title}</div>'
+        f'<div class="corp-kpi-value" style="color:{accent};">{value}</div>'
+        f'{subtitle_html}'
+        f'<div class="corp-kpi-delta-row">{delta_html}</div>'
+        f'</div>'
+    )
 
 
 def render_selected_period_revenue_cards(
@@ -289,7 +290,7 @@ def render_selected_period_revenue_cards(
         <style>
         .corp-kpi-grid {
             display:grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(5, minmax(180px, 1fr));
             gap:14px;
             margin: 12px 0 14px 0;
         }
@@ -305,7 +306,7 @@ def render_selected_period_revenue_cards(
             border:1px solid;
             border-radius:16px;
             padding:15px 16px 13px 16px;
-            min-height:126px;
+            min-height:118px;
             box-shadow:0 8px 22px rgba(15, 23, 42, 0.055);
         }
         .corp-kpi-accent {
@@ -326,7 +327,7 @@ def render_selected_period_revenue_cards(
             min-height:32px;
         }
         .corp-kpi-value {
-            font-size:1.75rem;
+            font-size:1.55rem;
             line-height:1.05;
             font-weight:900;
             letter-spacing:-0.03em;
