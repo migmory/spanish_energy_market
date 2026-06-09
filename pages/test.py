@@ -1026,7 +1026,7 @@ if run:
             .mark_point(size=40, opacity=0.001, filled=True)
             .encode(
                 x="datetime:T",
-                y="price:Q",
+                y=alt.Y("price:Q", axis=None, scale=alt.Scale(domain=price_y_domain)),
                 tooltip=[
                     alt.Tooltip("datetime_label:N", title="Madrid time"),
                     alt.Tooltip("price:Q", title="Spot price (€/MWh)", format=",.2f"),
