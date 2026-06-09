@@ -946,7 +946,7 @@ if run:
     st.caption(
         "Columns: hourly thermal gap. Line: hourly spot price. "
         "Hover over the columns or the price line to see exact values. "
-        "X-axis is Europe/Madrid local time. When enabled, both Y-axes are scaled so 0 is at the same height."
+        "X-axis is Europe/Madrid local time. The top chart only shows thermal gap on the left axis and spot price on the right axis."
     )
 
     plot_df = df.copy()
@@ -1000,8 +1000,6 @@ if run:
         )
     )
 
-    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(stroke="black", opacity=0.45).encode(y="y:Q")
-
     if "price" in plot_df.columns and plot_df["price"].notna().any():
         price_source_in_tooltip = [alt.Tooltip("price_source:N", title="Price source")] if "price_source" in plot_df.columns else []
         price_line = (
@@ -1036,10 +1034,10 @@ if run:
                 ],
             )
         )
-        main_chart = alt.layer(thermal_bars, zero_line, price_line, price_points).resolve_scale(y="independent")
+        main_chart = alt.layer(thermal_bars, price_line, price_points).resolve_scale(y="independent")
     else:
         st.warning("No price data matched the hourly thermal-gap data. Showing only thermal-gap bars.")
-        main_chart = alt.layer(thermal_bars, zero_line)
+        main_chart = alt.layer(thermal_bars)
 
     st.altair_chart(
         main_chart.properties(height=470).interactive(bind_y=False),
@@ -1061,9 +1059,9 @@ if run:
     # -----------------------------------------------------
     st.subheader("Thermal Gap composition by technology")
     st.caption(
-        "Stacked hourly columns using only the net PBF conventional technologies after bilateral netting. "
-        "The chart now prioritizes the thermal-gap generation mix by technology. The left Y-axis shows conventional technologies / thermal gap in MWh, while the right Y-axis shows the hourly spot price only as a lighter reference. "
-        "No residual is shown as a technology. If demand minus non-thermal PBF does not exactly equal the listed conventional PBF technologies, the difference is shown only as a diagnostic below."
+        "For each hour, the stacked technologies below are distributed so that their total equals the hourly thermal gap shown in the top chart. "
+        "This bottom chart does not overlay price, so the technology composition is easier to read. "
+        "Technology shares are based on the listed net conventional PBF technologies after bilateral netting."
     )
 
     composition_cols = []
@@ -1075,20 +1073,29 @@ if run:
     if not composition_cols:
         st.warning("No conventional net PBF technology columns are available for the composition chart.")
     else:
-        comp_base_cols = ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh", "price"] + [c for _, c in composition_cols]
-        comp_base_cols = [c for c in comp_base_cols if c in plot_df.columns]
+        comp_base_cols = ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh"] + [c for _, c in composition_cols]
         comp_wide = plot_df[comp_base_cols].copy()
         value_cols = [c for _, c in composition_cols]
         comp_wide[value_cols] = comp_wide[value_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
         comp_wide["conventional_stack_mwh"] = comp_wide[value_cols].sum(axis=1)
         comp_wide["unallocated_gap_mwh"] = comp_wide["raw_thermal_gap_mwh"] - comp_wide["conventional_stack_mwh"]
 
-        tech_rename = {col: tech for tech, col in composition_cols}
-        melt_cols = value_cols.copy()
+        # Reallocate each hour proportionally so the stacked technologies sum exactly to the hourly thermal gap.
+        comp_alloc = comp_wide.copy()
+        valid_mask = comp_alloc["conventional_stack_mwh"].abs() > 1e-9
+        for col in value_cols:
+            comp_alloc[col] = 0.0
+            comp_alloc.loc[valid_mask, col] = (
+                comp_wide.loc[valid_mask, col]
+                / comp_wide.loc[valid_mask, "conventional_stack_mwh"]
+                * comp_wide.loc[valid_mask, "raw_thermal_gap_mwh"]
+            )
+        comp_alloc["allocated_total_mwh"] = comp_alloc[value_cols].sum(axis=1)
 
-        stack_df = comp_wide.melt(
-            id_vars=[c for c in ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh", "price"] if c in comp_wide.columns],
-            value_vars=melt_cols,
+        tech_rename = {col: tech for tech, col in composition_cols}
+        stack_df = comp_alloc.melt(
+            id_vars=["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh", "allocated_total_mwh"],
+            value_vars=value_cols,
             var_name="technology_col",
             value_name="mwh",
         )
@@ -1100,14 +1107,8 @@ if run:
             st.warning("All conventional technology contributions are zero for the selected period.")
         else:
             comp_y_domain = padded_zero_domain(
-                pd.concat([stack_df["mwh"], comp_wide["raw_thermal_gap_mwh"], comp_wide["conventional_stack_mwh"]], ignore_index=True)
+                pd.concat([stack_df["mwh"], comp_alloc["raw_thermal_gap_mwh"], comp_alloc["allocated_total_mwh"]], ignore_index=True)
             )
-            comp_price_y_domain = None
-            if "price" in comp_wide.columns and comp_wide["price"].notna().any():
-                if align_zero_axes:
-                    comp_price_y_domain = align_second_axis_zero_domain(comp_y_domain, comp_wide["price"])
-                else:
-                    comp_price_y_domain = padded_zero_domain(comp_wide["price"])
 
             stacked_bars = (
                 alt.Chart(stack_df)
@@ -1117,7 +1118,7 @@ if run:
                     y=alt.Y(
                         "mwh:Q",
                         stack="zero",
-                        title="Conventional technologies / Thermal gap (MWh)",
+                        title="Thermal gap distributed by technology (MWh)",
                         axis=alt.Axis(format="~s", orient="left", titleColor="#2F73C8", labelColor="#2F73C8"),
                         scale=alt.Scale(domain=comp_y_domain),
                     ),
@@ -1130,84 +1131,31 @@ if run:
                         alt.Tooltip("datetime_label:N", title="Madrid time"),
                         alt.Tooltip("hour_1_24:Q", title="Hour", format=".0f"),
                         alt.Tooltip("technology:N", title="Technology"),
-                        alt.Tooltip("mwh:Q", title="Technology contribution (MWh)", format=",.0f"),
+                        alt.Tooltip("mwh:Q", title="Allocated technology contribution (MWh)", format=",.0f"),
+                        alt.Tooltip("allocated_total_mwh:Q", title="Stack total (MWh)", format=",.0f"),
                         alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
                     ],
                 )
             )
 
-            thermal_total_line = (
-                alt.Chart(comp_wide)
-                .mark_line(color="black", strokeWidth=2.8)
-                .encode(
-                    x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
-                    y=alt.Y(
-                        "raw_thermal_gap_mwh:Q",
-                        title="Conventional technologies / Thermal gap (MWh)",
-                        axis=alt.Axis(format="~s", orient="left", titleColor="#2F73C8", labelColor="#2F73C8"),
-                        scale=alt.Scale(domain=comp_y_domain),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("datetime_label:N", title="Madrid time"),
-                        alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
-                        alt.Tooltip("conventional_stack_mwh:Q", title="Listed conventional techs (MWh)", format=",.0f"),
-                        alt.Tooltip("unallocated_gap_mwh:Q", title="Unallocated difference (MWh)", format=",.0f"),
-                    ],
-                )
-            )
-
-            layers = [stacked_bars, thermal_total_line]
-            if "price" in comp_wide.columns and comp_wide["price"].notna().any():
-                price_line_comp = (
-                    alt.Chart(comp_wide.dropna(subset=["price"]))
-                    .mark_line(color="#F59E0B", strokeWidth=1.35, opacity=0.55, strokeDash=[6,4])
-                    .encode(
-                        x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
-                        y=alt.Y(
-                            "price:Q",
-                            title="Spot price reference (€/MWh)",
-                            axis=alt.Axis(format=".0f", orient="right", titleColor="#F59E0B", labelColor="#F59E0B"),
-                            scale=alt.Scale(domain=comp_price_y_domain),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("datetime_label:N", title="Madrid time"),
-                            alt.Tooltip("price:Q", title="Spot price (€/MWh)", format=",.2f"),
-                            alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
-                        ],
-                    )
-                )
-                price_points_comp = (
-                    alt.Chart(comp_wide.dropna(subset=["price"]))
-                    .mark_point(size=35, opacity=0.001, filled=True)
-                    .encode(
-                        x="datetime:T",
-                        y="price:Q",
-                        tooltip=[
-                            alt.Tooltip("datetime_label:N", title="Madrid time"),
-                            alt.Tooltip("price:Q", title="Spot price (€/MWh)", format=",.2f"),
-                            alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
-                        ],
-                    )
-                )
-                layers.extend([price_line_comp, price_points_comp])
-
-            composition_chart = alt.layer(*layers).resolve_scale(y="independent").properties(height=500).interactive(bind_y=False)
+            composition_chart = alt.layer(stacked_bars).properties(height=520).interactive(bind_y=False)
             st.altair_chart(composition_chart, use_container_width=True)
 
             unallocated_abs = float(comp_wide["unallocated_gap_mwh"].abs().sum())
             thermal_abs = float(comp_wide["raw_thermal_gap_mwh"].abs().sum())
             if unallocated_abs > max(1e-6, 0.01 * thermal_abs):
                 st.info(
-                    "The black line is the calculated thermal gap. The stacked bars contain only named conventional PBF technologies. "
-                    "Any difference is not a technology; it is an unallocated reconciliation difference from the formula demand PBF minus non-thermal net PBF versus the listed conventional PBF series."
+                    "To make the bottom chart match the top thermal-gap total hour by hour, each hour's listed conventional technologies are proportionally scaled to the hourly thermal gap. "
+                    "The original difference between the listed conventional technologies and the thermal-gap formula is still shown in the diagnostics below."
                 )
 
             with st.expander("Thermal-gap composition data", expanded=False):
                 st.dataframe(
-                    stack_df[["datetime_label", "technology", "mwh", "raw_thermal_gap_mwh"]]
+                    stack_df[["datetime_label", "technology", "mwh", "allocated_total_mwh", "raw_thermal_gap_mwh"]]
                     .rename(columns={
                         "datetime_label": "Madrid time",
-                        "mwh": "Technology contribution (MWh)",
+                        "mwh": "Allocated technology contribution (MWh)",
+                        "allocated_total_mwh": "Stack total (MWh)",
                         "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
                     }),
                     use_container_width=True,
@@ -1215,16 +1163,12 @@ if run:
                 )
 
             with st.expander("Thermal-gap reconciliation diagnostics", expanded=False):
-                diag_cols = ["datetime_label", "raw_thermal_gap_mwh", "conventional_stack_mwh", "unallocated_gap_mwh"]
-                if "price" in comp_wide.columns:
-                    diag_cols.append("price")
                 st.dataframe(
-                    comp_wide[diag_cols].rename(columns={
+                    comp_wide[["datetime_label", "raw_thermal_gap_mwh", "conventional_stack_mwh", "unallocated_gap_mwh"]].rename(columns={
                         "datetime_label": "Madrid time",
                         "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
-                        "conventional_stack_mwh": "Listed conventional techs (MWh)",
-                        "unallocated_gap_mwh": "Unallocated difference (MWh)",
-                        "price": "Spot price (€/MWh)",
+                        "conventional_stack_mwh": "Original listed conventional techs (MWh)",
+                        "unallocated_gap_mwh": "Original difference vs thermal gap (MWh)",
                     }),
                     use_container_width=True,
                     hide_index=True,
