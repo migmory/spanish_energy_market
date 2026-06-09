@@ -1627,7 +1627,7 @@ with left:
 
     optimization_method_label = st.radio(
         "Optimisation method",
-        ["Fixed 24h window (daily)", "Rolling 24h window (MPC)"],
+        ["Fixed 24h window (daily)", "Rolling 24h window"],
         index=0,
         horizontal=True,
         help=(
