@@ -760,6 +760,51 @@ def delta_text(value: float | None, suffix: str = "", decimals: int = 1, good_wh
     return f"{arrow} {value:+,.{decimals}f}{suffix}"
 
 
+def padded_zero_domain(values: pd.Series, pad: float = 0.08) -> list[float]:
+    """Return a y-domain that includes zero and adds light padding."""
+    clean = pd.to_numeric(values, errors="coerce").dropna()
+    if clean.empty:
+        return [-1.0, 1.0]
+    vmin = min(float(clean.min()), 0.0)
+    vmax = max(float(clean.max()), 0.0)
+    if abs(vmax - vmin) < 1e-9:
+        span = max(abs(vmax), 1.0)
+        return [-span, span]
+    span = vmax - vmin
+    return [vmin - span * pad, vmax + span * pad]
+
+
+def align_second_axis_zero_domain(primary_domain: list[float], secondary_values: pd.Series, pad: float = 0.08) -> list[float]:
+    """
+    Build a secondary-axis domain whose zero is at the same relative height as
+    zero in primary_domain. This keeps both Y axes visually zero-aligned.
+    """
+    clean = pd.to_numeric(secondary_values, errors="coerce").dropna()
+    if clean.empty:
+        return [-1.0, 1.0]
+
+    left_min, left_max = float(primary_domain[0]), float(primary_domain[1])
+    if abs(left_max - left_min) < 1e-9 or not (left_min < 0 < left_max):
+        return padded_zero_domain(clean, pad=pad)
+
+    zero_frac = (0.0 - left_min) / (left_max - left_min)
+    if not (0.0 < zero_frac < 1.0):
+        return padded_zero_domain(clean, pad=pad)
+
+    pmin = min(float(clean.min()), 0.0)
+    pmax = max(float(clean.max()), 0.0)
+    pspan = max(pmax - pmin, 1.0)
+    pmin -= pspan * pad
+    pmax += pspan * pad
+
+    required_range = max(
+        pmax / (1.0 - zero_frac) if pmax > 0 else 0.0,
+        (-pmin) / zero_frac if pmin < 0 else 0.0,
+        1.0,
+    )
+    return [-zero_frac * required_range, (1.0 - zero_frac) * required_range]
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -901,7 +946,7 @@ if run:
     st.caption(
         "Columns: hourly thermal gap. Line: hourly spot price. "
         "Hover over the columns or the price line to see exact values. "
-        "X-axis is Europe/Madrid local time."
+        "X-axis is Europe/Madrid local time. When enabled, both Y-axes are scaled so 0 is at the same height."
     )
 
     plot_df = df.copy()
@@ -919,6 +964,14 @@ if run:
     plot_df["hour_1_24"] = plot_df["datetime"].dt.hour + 1
     plot_df["date_label"] = plot_df["datetime"].dt.strftime("%Y-%m-%d")
 
+    thermal_y_domain = padded_zero_domain(plot_df["raw_thermal_gap_mwh"])
+    price_y_domain = None
+    if "price" in plot_df.columns and plot_df["price"].notna().any():
+        if align_zero_axes:
+            price_y_domain = align_second_axis_zero_domain(thermal_y_domain, plot_df["price"])
+        else:
+            price_y_domain = padded_zero_domain(plot_df["price"])
+
     x_axis = alt.Axis(
         title="Madrid local time",
         format="%H" if x_axis_style == "Day label + hourly numbers 1-24" else "%d-%b %H:%M",
@@ -934,6 +987,7 @@ if run:
                 "raw_thermal_gap_mwh:Q",
                 title="Thermal Gap (MWh)",
                 axis=alt.Axis(format="~s"),
+                scale=alt.Scale(domain=thermal_y_domain),
             ),
             tooltip=[
                 alt.Tooltip("datetime_label:N", title="Madrid time"),
@@ -958,6 +1012,7 @@ if run:
                     "price:Q",
                     title="Price (€/MWh)",
                     axis=alt.Axis(format=".0f"),
+                    scale=alt.Scale(domain=price_y_domain),
                 ),
                 tooltip=[
                     alt.Tooltip("datetime_label:N", title="Madrid time"),
@@ -991,10 +1046,7 @@ if run:
     )
 
     if align_zero_axes:
-        st.caption(
-            "Note: the interactive chart uses independent Y-axes for hover support. "
-            "The zero-alignment option is therefore not forced in this Altair view."
-        )
+        st.caption("Zero alignment enabled: the thermal-gap and price axes are scaled so 0 appears at the same vertical height.")
 
     st.markdown(
         "- **Left Y-axis**: hourly thermal gap, MWh/h\n"
@@ -1008,8 +1060,8 @@ if run:
     # -----------------------------------------------------
     st.subheader("Thermal Gap composition by technology")
     st.caption(
-        "Stacked hourly columns using the net PBF conventional technologies after bilateral netting. "
-        "Hover over each segment to see the technology contribution and the hourly thermal-gap total."
+        "Stacked hourly columns using only the net PBF conventional technologies after bilateral netting. "
+        "No residual is shown as a technology. If demand minus non-thermal PBF does not exactly equal the listed conventional PBF technologies, the difference is shown only as a diagnostic below."
     )
 
     composition_cols = []
@@ -1026,13 +1078,10 @@ if run:
         value_cols = [c for _, c in composition_cols]
         comp_wide[value_cols] = comp_wide[value_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
         comp_wide["conventional_stack_mwh"] = comp_wide[value_cols].sum(axis=1)
-        comp_wide["Other / residual"] = comp_wide["raw_thermal_gap_mwh"] - comp_wide["conventional_stack_mwh"]
+        comp_wide["unallocated_gap_mwh"] = comp_wide["raw_thermal_gap_mwh"] - comp_wide["conventional_stack_mwh"]
 
         tech_rename = {col: tech for tech, col in composition_cols}
         melt_cols = value_cols.copy()
-        if comp_wide["Other / residual"].abs().sum() > 1e-6:
-            melt_cols.append("Other / residual")
-            tech_rename["Other / residual"] = "Other / residual"
 
         stack_df = comp_wide.melt(
             id_vars=["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh"],
@@ -1047,7 +1096,11 @@ if run:
         if stack_df.empty:
             st.warning("All conventional technology contributions are zero for the selected period.")
         else:
-            composition_chart = (
+            comp_y_domain = padded_zero_domain(
+                pd.concat([stack_df["mwh"], comp_wide["raw_thermal_gap_mwh"], comp_wide["conventional_stack_mwh"]], ignore_index=True)
+            )
+
+            stacked_bars = (
                 alt.Chart(stack_df)
                 .mark_bar(opacity=0.92)
                 .encode(
@@ -1055,8 +1108,9 @@ if run:
                     y=alt.Y(
                         "mwh:Q",
                         stack="zero",
-                        title="Net PBF generation composing thermal gap (MWh)",
+                        title="Net PBF conventional technologies (MWh)",
                         axis=alt.Axis(format="~s"),
+                        scale=alt.Scale(domain=comp_y_domain),
                     ),
                     color=alt.Color(
                         "technology:N",
@@ -1067,14 +1121,37 @@ if run:
                         alt.Tooltip("datetime_label:N", title="Madrid time"),
                         alt.Tooltip("hour_1_24:Q", title="Hour", format=".0f"),
                         alt.Tooltip("technology:N", title="Technology"),
-                        alt.Tooltip("mwh:Q", title="Contribution (MWh)", format=",.0f"),
+                        alt.Tooltip("mwh:Q", title="Technology contribution (MWh)", format=",.0f"),
                         alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
                     ],
                 )
-                .properties(height=390)
-                .interactive(bind_y=False)
             )
+
+            thermal_total_line = (
+                alt.Chart(comp_wide)
+                .mark_line(color="black", strokeWidth=2.0)
+                .encode(
+                    x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
+                    y=alt.Y("raw_thermal_gap_mwh:Q", scale=alt.Scale(domain=comp_y_domain)),
+                    tooltip=[
+                        alt.Tooltip("datetime_label:N", title="Madrid time"),
+                        alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
+                        alt.Tooltip("conventional_stack_mwh:Q", title="Listed conventional techs (MWh)", format=",.0f"),
+                        alt.Tooltip("unallocated_gap_mwh:Q", title="Unallocated difference (MWh)", format=",.0f"),
+                    ],
+                )
+            )
+
+            composition_chart = alt.layer(stacked_bars, thermal_total_line).properties(height=390).interactive(bind_y=False)
             st.altair_chart(composition_chart, use_container_width=True)
+
+            unallocated_abs = float(comp_wide["unallocated_gap_mwh"].abs().sum())
+            thermal_abs = float(comp_wide["raw_thermal_gap_mwh"].abs().sum())
+            if unallocated_abs > max(1e-6, 0.01 * thermal_abs):
+                st.info(
+                    "The black line is the calculated thermal gap. The stacked bars contain only named conventional PBF technologies. "
+                    "Any difference is not a technology; it is an unallocated reconciliation difference from the formula demand PBF minus non-thermal net PBF versus the listed conventional PBF series."
+                )
 
             with st.expander("Thermal-gap composition data", expanded=False):
                 st.dataframe(
@@ -1084,6 +1161,18 @@ if run:
                         "technology": "Technology",
                         "mwh": "Contribution (MWh)",
                         "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("**Reconciliation by hour**")
+                st.dataframe(
+                    comp_wide[["datetime_label", "raw_thermal_gap_mwh", "conventional_stack_mwh", "unallocated_gap_mwh"]]
+                    .rename(columns={
+                        "datetime_label": "Madrid time",
+                        "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
+                        "conventional_stack_mwh": "Listed conventional techs (MWh)",
+                        "unallocated_gap_mwh": "Unallocated difference (MWh)",
                     }),
                     use_container_width=True,
                     hide_index=True,
