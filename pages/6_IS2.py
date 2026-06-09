@@ -1466,25 +1466,30 @@ def _weighted_captured_price(df: pd.DataFrame, gen_col: str = "generation_mwh_15
     return float(rev / gen) if gen > 0 else np.nan
 
 
-def build_merchant_monthly_comparison(revenues_df: pd.DataFrame, price_qh: pd.DataFrame, curtailment_intervals: pd.DataFrame) -> pd.DataFrame:
+def build_merchant_monthly_comparison(revenues_df: pd.DataFrame, price_qh: pd.DataFrame) -> pd.DataFrame:
     """
-    Portfolio merchant monthly comparison.
+    Portfolio merchant monthly comparison using the same captured-price convention
+    as the Day Ahead page:
+      - uncurtailed captured price = generation-weighted average using all metered production
+      - curtailed captured price = generation-weighted average after removing hours/QH with spot price <= 0
 
-    Curtailed = actual metered generation during active PVCurtailmentStatus intervals.
-    Uncurtailed = actual metered generation outside those active intervals.
-    This does not estimate lost generation.
+    In this section, "curtailed" therefore means market-price curtailment logic, not
+    PVCurtailmentStatus event intervals. Event-based curtailment is displayed in the
+    dedicated section below.
     """
     if revenues_df is None or revenues_df.empty:
         return pd.DataFrame()
 
-    df = add_curtailment_flag_to_revenues(revenues_df, curtailment_intervals)
+    df = revenues_df.copy()
     df["month"] = pd.to_datetime(df["qh_madrid"], errors="coerce").dt.to_period("M").astype(str)
     df["generation_mwh_15min"] = pd.to_numeric(df["generation_mwh_15min"], errors="coerce").fillna(0.0)
     df["price_eur_mwh"] = pd.to_numeric(df["price_eur_mwh"], errors="coerce")
+    df["revenue_eur"] = df["generation_mwh_15min"] * df["price_eur_mwh"]
     df["revenue_eur"] = pd.to_numeric(df["revenue_eur"], errors="coerce").fillna(0.0)
     df["is_spot_zero"] = df["price_eur_mwh"].notna() & np.isclose(df["price_eur_mwh"], 0.0, atol=1e-9)
     df["is_spot_negative"] = df["price_eur_mwh"].notna() & (df["price_eur_mwh"] < 0.0)
     df["is_spot_zero_or_negative"] = df["price_eur_mwh"].notna() & (df["price_eur_mwh"] <= 0.0)
+    df["is_positive_spot"] = df["price_eur_mwh"].notna() & (df["price_eur_mwh"] > 0.0)
 
     price_month = price_qh.copy()
     price_month["month"] = pd.to_datetime(price_month["qh_madrid"], errors="coerce").dt.to_period("M").astype(str)
@@ -1498,20 +1503,19 @@ def build_merchant_monthly_comparison(revenues_df: pd.DataFrame, price_qh: pd.Da
     for month, grp in df.groupby("month"):
         total_gen = grp["generation_mwh_15min"].sum()
         total_rev = grp["revenue_eur"].sum()
-        curtailed = grp[grp["is_curtailment_active"]]
-        uncurtailed = grp[~grp["is_curtailment_active"]]
+        positive_spot = grp[grp["is_positive_spot"]].copy()
         zero_gen = grp.loc[grp["is_spot_zero"], "generation_mwh_15min"].sum()
         neg_gen = grp.loc[grp["is_spot_negative"], "generation_mwh_15min"].sum()
         zero_or_neg_gen = grp.loc[grp["is_spot_zero_or_negative"], "generation_mwh_15min"].sum()
+        positive_gen = positive_spot["generation_mwh_15min"].sum()
+        positive_rev = positive_spot["revenue_eur"].sum()
         rows.append({
             "month": month,
             "generation_mwh": total_gen,
             "merchant_revenue_eur": total_rev,
-            "captured_price_all_eur_mwh": total_rev / total_gen if total_gen > 0 else np.nan,
-            "captured_price_curtailed_eur_mwh": _weighted_captured_price(curtailed),
-            "captured_price_uncurtailed_eur_mwh": _weighted_captured_price(uncurtailed),
-            "curtailed_generation_mwh": curtailed["generation_mwh_15min"].sum(),
-            "uncurtailed_generation_mwh": uncurtailed["generation_mwh_15min"].sum(),
+            "captured_price_uncurtailed_eur_mwh": total_rev / total_gen if total_gen > 0 else np.nan,
+            "captured_price_curtailed_eur_mwh": positive_rev / positive_gen if positive_gen > 0 else np.nan,
+            "positive_spot_generation_mwh": positive_gen,
             "spot_zero_generation_mwh": zero_gen,
             "spot_negative_generation_mwh": neg_gen,
             "spot_zero_or_negative_generation_mwh": zero_or_neg_gen,
@@ -1521,9 +1525,9 @@ def build_merchant_monthly_comparison(revenues_df: pd.DataFrame, price_qh: pd.Da
         })
 
     out = pd.DataFrame(rows).merge(baseload, on="month", how="left").sort_values("month").reset_index(drop=True)
+    out["captured_price_all_eur_mwh"] = out["captured_price_uncurtailed_eur_mwh"]
     for col in [
         "baseload_price_eur_mwh",
-        "captured_price_all_eur_mwh",
         "captured_price_curtailed_eur_mwh",
         "captured_price_uncurtailed_eur_mwh",
         "generation_mwh",
@@ -1543,13 +1547,12 @@ def display_merchant_monthly_comparison(df: pd.DataFrame) -> None:
     view = df.rename(columns={
         "month": "Month",
         "baseload_price_eur_mwh": "Baseload (€/MWh)",
-        "captured_price_all_eur_mwh": "Captured all (€/MWh)",
-        "captured_price_curtailed_eur_mwh": "Captured curtailed (€/MWh)",
-        "captured_price_uncurtailed_eur_mwh": "Captured uncurtailed (€/MWh)",
+        "captured_price_all_eur_mwh": "Captured all legacy (€/MWh)",
+        "captured_price_curtailed_eur_mwh": "Captured curtailed >0 spot (€/MWh)",
+        "captured_price_uncurtailed_eur_mwh": "Captured uncurtailed/all (€/MWh)",
         "generation_mwh": "Generation (MWh)",
         "merchant_revenue_eur": "Merchant revenue (€)",
-        "curtailed_generation_mwh": "Curtailed-period gen. (MWh)",
-        "uncurtailed_generation_mwh": "Uncurtailed gen. (MWh)",
+        "positive_spot_generation_mwh": "Gen. at spot > 0 (MWh)",
         "spot_zero_generation_mwh": "Gen. at spot = 0 (MWh)",
         "spot_zero_generation_pct": "Gen. at spot = 0 (%)",
         "spot_negative_generation_mwh": "Gen. at spot < 0 (MWh)",
@@ -1567,16 +1570,14 @@ def display_merchant_monthly_comparison(df: pd.DataFrame) -> None:
         "Month",
         "Baseload (€/MWh)",
         "MoM baseload Δ",
-        "Captured all (€/MWh)",
-        "Captured curtailed (€/MWh)",
+        "Captured uncurtailed/all (€/MWh)",
+        "Captured curtailed >0 spot (€/MWh)",
         "MoM captured curtailed Δ",
-        "Captured uncurtailed (€/MWh)",
         "MoM captured uncurtailed Δ",
         "Generation (MWh)",
         "MoM generation Δ",
         "Merchant revenue (€)",
-        "Curtailed-period gen. (MWh)",
-        "Uncurtailed gen. (MWh)",
+        "Gen. at spot > 0 (MWh)",
         "Gen. at spot = 0 (MWh)",
         "Gen. at spot = 0 (%)",
         "Gen. at spot < 0 (MWh)",
@@ -1590,16 +1591,14 @@ def display_merchant_monthly_comparison(df: pd.DataFrame) -> None:
     fmt = {
         "Baseload (€/MWh)": "{:,.2f}",
         "MoM baseload Δ": "{:+,.2f}",
-        "Captured all (€/MWh)": "{:,.2f}",
-        "Captured curtailed (€/MWh)": "{:,.2f}",
+        "Captured uncurtailed/all (€/MWh)": "{:,.2f}",
+        "Captured curtailed >0 spot (€/MWh)": "{:,.2f}",
         "MoM captured curtailed Δ": "{:+,.2f}",
-        "Captured uncurtailed (€/MWh)": "{:,.2f}",
         "MoM captured uncurtailed Δ": "{:+,.2f}",
         "Generation (MWh)": "{:,.2f}",
         "MoM generation Δ": "{:+,.2f}",
         "Merchant revenue (€)": "€{:,.0f}",
-        "Curtailed-period gen. (MWh)": "{:,.2f}",
-        "Uncurtailed gen. (MWh)": "{:,.2f}",
+        "Gen. at spot > 0 (MWh)": "{:,.2f}",
         "Gen. at spot = 0 (MWh)": "{:,.2f}",
         "Gen. at spot = 0 (%)": "{:,.2f}%",
         "Gen. at spot < 0 (MWh)": "{:,.2f}",
@@ -2048,38 +2047,14 @@ fig_cum.update_xaxes(title="Madrid date and QH", showgrid=False)
 st.plotly_chart(fig_cum, use_container_width=True)
 
 
-section_header("PV curtailment events and affected generation")
-st.caption("Tracks IFMS PVCurtailmentStatus events for the selected sites. Affected-generation bars show actual generation observed during active curtailment intervals; this is not estimated lost generation.")
-
-curtailment_svar_ids = get_curtailment_svar_ids_for_sites(selected_sites)
-ev_frames, ev_infos = [], []
-with st.spinner("Fetching Solarpark / UNITY PV curtailment events..."):
-    for svar_id in curtailment_svar_ids:
-        try:
-            ev_df, ev_info = fetch_svar_events(svar_id, solarpark_cookie)
-            ev_frames.append(ev_df)
-            ev_infos.append(ev_info)
-        except Exception as exc:
-            ev_infos.append({"svar_id": svar_id, "error": str(exc)[:500], "rows": 0})
-
-events_all = pd.concat([f for f in ev_frames if f is not None and not f.empty], ignore_index=True) if ev_frames else pd.DataFrame()
-events_sel = filter_events_by_madrid_range(events_all, start_day, end_day) if not events_all.empty else pd.DataFrame()
-if not events_sel.empty and "duration_h" in events_sel.columns:
-    events_sel["duration_h_raw"] = events_sel["duration_h"]
-    events_sel["duration_h"] = pd.to_numeric(events_sel["duration_h"], errors="coerce")
-    events_sel.loc[events_sel["duration_h"] > 24 * 366, "duration_h"] = np.nan
-
-events_summary = build_events_summary(events_sel)
-curtailment_intervals = build_curtailment_intervals(events_sel, start_day, end_day, selected_sites) if not events_sel.empty else pd.DataFrame()
-affected_hourly, affected_interval_summary = affected_generation_by_curtailment_hour(curtailment_intervals, gen15)
-
 section_header("Merchant revenues — monthly comparison")
 st.caption(
-    "Portfolio merchant metrics by month. Curtailed captured price means actual generation during active "
-    "PVCurtailmentStatus intervals; uncurtailed captured price means actual generation outside those intervals. "
-    "This does not estimate lost generation; it only classifies metered production by event status."
+    "Portfolio merchant metrics by month. Captured uncurtailed/all follows the Day Ahead convention: "
+    "generation-weighted spot price using all metered production. Captured curtailed removes production "
+    "at spot price <= 0, so it represents the captured price after market-price curtailment logic. "
+    "PVCurtailmentStatus event diagnostics are shown in the dedicated section below."
 )
-merchant_monthly = build_merchant_monthly_comparison(revenues_df, price_qh, curtailment_intervals)
+merchant_monthly = build_merchant_monthly_comparison(revenues_df, price_qh)
 display_merchant_monthly_comparison(merchant_monthly)
 
 if not merchant_monthly.empty:
@@ -2106,6 +2081,33 @@ if not merchant_monthly.empty:
     fig_merchant.update_layout(**merchant_layout)
     fig_merchant.update_xaxes(title="Month", showgrid=False)
     st.plotly_chart(fig_merchant, use_container_width=True)
+
+
+
+section_header("PV curtailment events and affected generation")
+st.caption("Tracks IFMS PVCurtailmentStatus events for the selected sites. Affected-generation bars show actual generation observed during active curtailment intervals; this is not estimated lost generation.")
+
+curtailment_svar_ids = get_curtailment_svar_ids_for_sites(selected_sites)
+ev_frames, ev_infos = [], []
+with st.spinner("Fetching Solarpark / UNITY PV curtailment events..."):
+    for svar_id in curtailment_svar_ids:
+        try:
+            ev_df, ev_info = fetch_svar_events(svar_id, solarpark_cookie)
+            ev_frames.append(ev_df)
+            ev_infos.append(ev_info)
+        except Exception as exc:
+            ev_infos.append({"svar_id": svar_id, "error": str(exc)[:500], "rows": 0})
+
+events_all = pd.concat([f for f in ev_frames if f is not None and not f.empty], ignore_index=True) if ev_frames else pd.DataFrame()
+events_sel = filter_events_by_madrid_range(events_all, start_day, end_day) if not events_all.empty else pd.DataFrame()
+if not events_sel.empty and "duration_h" in events_sel.columns:
+    events_sel["duration_h_raw"] = events_sel["duration_h"]
+    events_sel["duration_h"] = pd.to_numeric(events_sel["duration_h"], errors="coerce")
+    events_sel.loc[events_sel["duration_h"] > 24 * 366, "duration_h"] = np.nan
+
+events_summary = build_events_summary(events_sel)
+curtailment_intervals = build_curtailment_intervals(events_sel, start_day, end_day, selected_sites) if not events_sel.empty else pd.DataFrame()
+affected_hourly, affected_interval_summary = affected_generation_by_curtailment_hour(curtailment_intervals, gen15)
 
 with st.expander("Event tracker diagnostics", expanded=False):
     st.json({"configured_svar_ids": curtailment_svar_ids, "fetch_results": ev_infos})
