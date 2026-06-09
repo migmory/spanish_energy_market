@@ -226,6 +226,196 @@ def fmt_price(x: float) -> str:
     return "—" if pd.isna(x) else f"{x:,.1f} €/MWh"
 
 
+def fmt_delta_value(x: float, decimals: int = 1, suffix: str = "") -> str:
+    if x is None or pd.isna(x):
+        return "—"
+    return f"{float(x):+,.{decimals}f}{suffix}"
+
+
+def selected_period_label(start_day: date, end_day: date) -> str:
+    if start_day == end_day:
+        return start_day.strftime("%d %b %Y")
+    return f"{start_day:%d %b %Y} – {end_day:%d %b %Y}"
+
+
+def corporate_kpi_card(
+    title: str,
+    value: str,
+    *,
+    subtitle: str = "",
+    delta: str = "",
+    tone: str = "green",
+) -> str:
+    tone_map = {
+        "green": ("#0F766E", "#ECFDF5", "#A7F3D0"),
+        "blue": ("#1D4ED8", "#EFF6FF", "#BFDBFE"),
+        "amber": ("#D97706", "#FFFBEB", "#FDE68A"),
+        "slate": ("#334155", "#F8FAFC", "#CBD5E1"),
+        "red": ("#DC2626", "#FEF2F2", "#FECACA"),
+    }
+    accent, bg, border = tone_map.get(tone, tone_map["green"])
+    delta_html = f'<div class="corp-kpi-delta">{delta}</div>' if delta else ""
+    subtitle_html = f'<div class="corp-kpi-subtitle">{subtitle}</div>' if subtitle else ""
+    return f"""
+        <div class="corp-kpi-card" style="border-color:{border}; background:linear-gradient(180deg, #FFFFFF 0%, {bg} 100%);">
+            <div class="corp-kpi-accent" style="background:{accent};"></div>
+            <div class="corp-kpi-title">{title}</div>
+            <div class="corp-kpi-value" style="color:{accent};">{value}</div>
+            {subtitle_html}
+            {delta_html}
+        </div>
+    """
+
+
+def render_selected_period_revenue_cards(
+    *,
+    period_text: str,
+    total_revenue: float,
+    captured_all: float,
+    captured_curtailed: float,
+    baseload_price: float,
+    capture_factor_all: float,
+    capture_factor_curtailed: float,
+    total_gen_mwh: float,
+    positive_spot_gen_mwh: float,
+    zero_or_negative_gen_mwh: float,
+    priced_ratio: float,
+) -> None:
+    zero_or_neg_pct = zero_or_negative_gen_mwh / total_gen_mwh * 100 if total_gen_mwh > 0 else np.nan
+    positive_pct = positive_spot_gen_mwh / total_gen_mwh * 100 if total_gen_mwh > 0 else np.nan
+
+    st.markdown(
+        """
+        <style>
+        .corp-kpi-grid {
+            display:grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap:14px;
+            margin: 12px 0 14px 0;
+        }
+        @media (max-width: 1200px) {
+            .corp-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 720px) {
+            .corp-kpi-grid { grid-template-columns: 1fr; }
+        }
+        .corp-kpi-card {
+            position:relative;
+            overflow:hidden;
+            border:1px solid;
+            border-radius:16px;
+            padding:15px 16px 13px 16px;
+            min-height:126px;
+            box-shadow:0 8px 22px rgba(15, 23, 42, 0.055);
+        }
+        .corp-kpi-accent {
+            position:absolute;
+            top:0;
+            left:0;
+            right:0;
+            height:5px;
+        }
+        .corp-kpi-title {
+            color:#475569;
+            font-size:0.78rem;
+            line-height:1.25;
+            font-weight:800;
+            text-transform:uppercase;
+            letter-spacing:0.04em;
+            margin-top:4px;
+            min-height:32px;
+        }
+        .corp-kpi-value {
+            font-size:1.75rem;
+            line-height:1.05;
+            font-weight:900;
+            letter-spacing:-0.03em;
+            margin-top:7px;
+        }
+        .corp-kpi-subtitle {
+            color:#64748B;
+            font-size:0.82rem;
+            line-height:1.25;
+            margin-top:7px;
+            font-weight:600;
+        }
+        .corp-kpi-delta {
+            display:inline-block;
+            color:#0F766E;
+            background:#ECFDF5;
+            border:1px solid #BBF7D0;
+            border-radius:999px;
+            padding:3px 8px;
+            font-size:0.72rem;
+            font-weight:800;
+            margin-top:8px;
+        }
+        .corp-note {
+            background:#F8FAFC;
+            border:1px solid #E2E8F0;
+            border-radius:14px;
+            padding:11px 13px;
+            color:#334155;
+            font-size:0.86rem;
+            line-height:1.45;
+            margin: 6px 0 14px 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cards_html = "".join([
+        corporate_kpi_card(
+            f"Selected-period revenue",
+            fmt_eur(total_revenue),
+            subtitle=f"Portfolio merchant revenue | {period_text}",
+            delta=f"{priced_ratio:.1f}% priced QH",
+            tone="green",
+        ),
+        corporate_kpi_card(
+            "Selected-period captured price",
+            fmt_price(captured_all),
+            subtitle="All metered generation, weighted by production",
+            delta=f"Capture factor {capture_factor_all:.1f}%" if not pd.isna(capture_factor_all) else "",
+            tone="blue",
+        ),
+        corporate_kpi_card(
+            "Captured price excl. spot ≤ 0",
+            fmt_price(captured_curtailed),
+            subtitle="Day Ahead curtailment convention: only spot > 0 intervals",
+            delta=f"Capture factor {capture_factor_curtailed:.1f}%" if not pd.isna(capture_factor_curtailed) else "",
+            tone="amber",
+        ),
+        corporate_kpi_card(
+            "Selected-period baseload",
+            fmt_price(baseload_price),
+            subtitle="Simple average day-ahead price over selected period",
+            tone="slate",
+        ),
+        corporate_kpi_card(
+            "Generation at spot ≤ 0",
+            fmt_mwh(zero_or_negative_gen_mwh),
+            subtitle=f"{fmt_delta_value(zero_or_neg_pct, 1, '%')} of selected-period generation",
+            delta=f"{positive_pct:.1f}% at spot > 0" if not pd.isna(positive_pct) else "",
+            tone="red" if zero_or_negative_gen_mwh > 0 else "green",
+        ),
+    ])
+
+    st.markdown(f'<div class="corp-kpi-grid">{cards_html}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="corp-note">
+            <b>Selected-period KPIs:</b> the cards above refer to the full selected range
+            <b>{period_text}</b> and the selected sites. Monthly comparisons are shown below.
+            “Captured price excl. spot ≤ 0” follows the Day Ahead convention and is not based on
+            <code>PVCurtailmentStatus</code> events.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def chart_layout(title: str, subtitle: str = "", height: int = 470) -> dict:
     title_text = f"<b>{title}</b><br><sup>{subtitle}</sup>" if subtitle else f"<b>{title}</b>"
     return dict(
@@ -1919,11 +2109,30 @@ captured_price = total_revenue / total_gen if total_gen > 0 else np.nan
 baseload_price = price_qh["price_eur_mwh"].mean()
 capture_factor = captured_price / baseload_price * 100 if baseload_price and not pd.isna(captured_price) else np.nan
 
-r1, r2, r3, r4 = st.columns(4)
-r1.metric("Portfolio revenue", fmt_eur(total_revenue))
-r2.metric("Captured price", fmt_price(captured_price))
-r3.metric("Baseload price", fmt_price(baseload_price))
-r4.metric("Capture factor", f"{capture_factor:.1f}%" if not pd.isna(capture_factor) else "—", f"{priced_ratio:.1f}% priced QH")
+selected_period_text = selected_period_label(start_day, end_day)
+positive_spot_period = revenues_df[revenues_df["price_eur_mwh"].notna() & (revenues_df["price_eur_mwh"] > 0)].copy()
+positive_spot_gen = positive_spot_period["generation_mwh_15min"].sum()
+positive_spot_revenue = positive_spot_period["revenue_eur"].sum(skipna=True)
+captured_price_curtailed = positive_spot_revenue / positive_spot_gen if positive_spot_gen > 0 else np.nan
+capture_factor_curtailed = captured_price_curtailed / baseload_price * 100 if baseload_price and not pd.isna(captured_price_curtailed) else np.nan
+zero_or_negative_gen_period = revenues_df.loc[
+    revenues_df["price_eur_mwh"].notna() & (revenues_df["price_eur_mwh"] <= 0),
+    "generation_mwh_15min",
+].sum()
+
+render_selected_period_revenue_cards(
+    period_text=selected_period_text,
+    total_revenue=total_revenue,
+    captured_all=captured_price,
+    captured_curtailed=captured_price_curtailed,
+    baseload_price=baseload_price,
+    capture_factor_all=capture_factor,
+    capture_factor_curtailed=capture_factor_curtailed,
+    total_gen_mwh=total_gen,
+    positive_spot_gen_mwh=positive_spot_gen,
+    zero_or_negative_gen_mwh=zero_or_negative_gen_period,
+    priced_ratio=priced_ratio,
+)
 
 # Revenue overlay at QH
 portfolio_qh = (
@@ -2058,17 +2267,54 @@ merchant_monthly = build_merchant_monthly_comparison(revenues_df, price_qh)
 display_merchant_monthly_comparison(merchant_monthly)
 
 if not merchant_monthly.empty:
+    fig_captured = go.Figure()
+    fig_captured.add_trace(go.Scatter(
+        x=merchant_monthly["month"],
+        y=merchant_monthly["baseload_price_eur_mwh"],
+        name="Baseload",
+        mode="lines+markers",
+        line=dict(color=CORP_GREY, width=2.4, dash="dot"),
+        hovertemplate="Month %{x}<br>Baseload: %{y:,.2f} €/MWh<extra></extra>",
+    ))
+    fig_captured.add_trace(go.Scatter(
+        x=merchant_monthly["month"],
+        y=merchant_monthly["captured_price_uncurtailed_eur_mwh"],
+        name="Captured all / uncurtailed",
+        mode="lines+markers",
+        line=dict(color=CORP_BLUE, width=3.0),
+        hovertemplate="Month %{x}<br>Captured all: %{y:,.2f} €/MWh<extra></extra>",
+    ))
+    fig_captured.add_trace(go.Scatter(
+        x=merchant_monthly["month"],
+        y=merchant_monthly["captured_price_curtailed_eur_mwh"],
+        name="Captured excl. spot ≤ 0",
+        mode="lines+markers",
+        line=dict(color=YELLOW_DARK, width=3.0),
+        hovertemplate="Month %{x}<br>Captured excl. spot ≤ 0: %{y:,.2f} €/MWh<extra></extra>",
+    ))
+    captured_layout = chart_layout(
+        "Monthly baseload and captured price",
+        "Captured all uses all metered production; captured excl. spot ≤ 0 follows the Day Ahead curtailment convention",
+        height=380,
+    )
+    captured_layout["yaxis"] = dict(title="Price (€/MWh)", gridcolor="#E5E7EB", zeroline=True, zerolinecolor="#94A3B8")
+    fig_captured.update_layout(**captured_layout)
+    fig_captured.update_xaxes(title="Month", showgrid=False)
+    st.plotly_chart(fig_captured, use_container_width=True)
+
     fig_merchant = go.Figure()
     fig_merchant.add_trace(go.Bar(
         x=merchant_monthly["month"],
         y=merchant_monthly["spot_zero_generation_pct"],
         name="Generation at spot = 0",
+        marker=dict(color=CORP_BLUE),
         hovertemplate="Month %{x}<br>Share: %{y:,.2f}%<extra></extra>",
     ))
     fig_merchant.add_trace(go.Bar(
         x=merchant_monthly["month"],
         y=merchant_monthly["spot_negative_generation_pct"],
         name="Generation at spot < 0",
+        marker=dict(color=YELLOW_DARK),
         hovertemplate="Month %{x}<br>Share: %{y:,.2f}%<extra></extra>",
     ))
     merchant_layout = chart_layout(
