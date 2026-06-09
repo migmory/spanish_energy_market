@@ -218,6 +218,14 @@ FORWARD_PROVIDER_FILES = {
     ),
 }
 
+FORWARD_PROVIDER_LABELS = {
+    "Aurora": "Aurora Dec-25",
+    "Baringa": "Baringa Apr-26",
+}
+FORWARD_LABEL_TO_PROVIDER = {v: k for k, v in FORWARD_PROVIDER_LABELS.items()}
+CUSTOM_FORWARD_LABEL = "Upload custom price curve"
+
+
 
 # =========================================================
 # HELPERS
@@ -453,13 +461,19 @@ def build_template_generation_excel(example_path: Path) -> bytes:
     return bio.getvalue()
 
 
-def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Forward price file not found: {path}")
+def normalize_forward_price_dataframe(df: pd.DataFrame, source_name: str = "forward curve") -> pd.DataFrame:
+    """
+    Standardise a forward price curve into the hourly format used by the BESS optimiser.
 
-    df = pd.read_excel(path)
+    Accepted columns:
+      - date/dia and hour/hora
+      - either price/precio/market_price, or omie_venta plus optional omie_compra
+
+    The file must contain one row per hour. Forward years from 2027 onwards can be
+    supplied by the user as an uploaded Excel/CSV file.
+    """
     if df.empty:
-        raise ValueError("Forward price file is empty.")
+        raise ValueError(f"{source_name} is empty.")
 
     col_map = {c.lower().strip(): c for c in df.columns}
     date_col = None
@@ -478,7 +492,7 @@ def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
             hour_col = col_map[candidate]
             break
 
-    for candidate in ["price", "precio", "market_price"]:
+    for candidate in ["price", "precio", "market_price", "price_eur_mwh", "eur_mwh"]:
         if candidate in col_map:
             price_col = col_map[candidate]
             break
@@ -494,14 +508,14 @@ def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
             break
 
     if date_col is None or hour_col is None:
-        raise ValueError("Forward price file must contain dia/date and hora/hour columns.")
+        raise ValueError(f"{source_name} must contain dia/date and hora/hour columns.")
 
     keep = [date_col, hour_col]
     if price_col is not None:
         keep.append(price_col)
     else:
         if sell_col is None:
-            raise ValueError("Forward price file must contain omie_venta or price.")
+            raise ValueError(f"{source_name} must contain omie_venta or price/precio.")
         keep.append(sell_col)
         if buy_col is not None:
             keep.append(buy_col)
@@ -519,6 +533,8 @@ def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
     tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
     tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
     tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
+    tmp["Hour"] = tmp["Hour"].astype(int)
+    tmp = tmp[(tmp["Hour"] >= 1) & (tmp["Hour"] <= 24)].copy()
     tmp["year"] = tmp["Date"].dt.year
 
     if "price" in tmp.columns:
@@ -533,9 +549,43 @@ def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
         else:
             tmp["omie_compra"] = pd.to_numeric(tmp["omie_compra"], errors="coerce").fillna(tmp["omie_venta"])
 
+    tmp = tmp.dropna(subset=["omie_venta", "omie_compra"]).copy()
     tmp["timestamp"] = pd.to_datetime(tmp["Date"]) + pd.to_timedelta(tmp["Hour"] - 1, unit="h")
-    tmp = tmp.sort_values("timestamp").reset_index(drop=True)
+    tmp = tmp.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
     return tmp[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]]
+
+
+def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Forward price file not found: {path}")
+    df = pd.read_excel(path)
+    return normalize_forward_price_dataframe(df, source_name=path.name)
+
+
+def normalize_uploaded_forward_price_file(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"])
+    filename = getattr(uploaded_file, "name", "uploaded forward curve")
+    lower = str(filename).lower()
+    if lower.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+    out = normalize_forward_price_dataframe(df, source_name=filename)
+    if not out.empty and out["year"].min() < 2027:
+        raise ValueError("Uploaded custom forward curves are intended for 2027 onwards. Please remove years before 2027 from the uploaded file.")
+    return out
+
+
+def build_template_forward_price_excel(start_year: int = 2027) -> bytes:
+    idx = make_year_hour_index(start_year)
+    out = idx[["Date", "Hour"]].copy()
+    out["price"] = ""
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="forward_price_template")
+    bio.seek(0)
+    return bio.getvalue()
 
 
 def choose_historical_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) -> pd.DataFrame:
@@ -864,6 +914,207 @@ def optimize_day_pulp(
     return res, stats
 
 
+
+def build_dispatch_stats(dispatch: pd.DataFrame, eta_ch: float) -> pd.DataFrame:
+    """Aggregate hourly dispatch into daily stats with the same fields as the fixed-window output."""
+    if dispatch is None or dispatch.empty:
+        return pd.DataFrame(
+            columns=[
+                "Date",
+                "total_cost",
+                "total_sold",
+                "total_bought",
+                "total_charged",
+                "total_discharged",
+                "Revenue BESS (€)",
+                "hybrid profile (MWh)",
+            ]
+        )
+
+    df = dispatch.copy()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    df["total_cost_hour"] = (
+        df["grid_purchase"] * df["omie_compra"]
+        + df["grid_charge"] * df["omie_compra"] / max(eta_ch, 1e-9)
+        - df["g_to_grid"] * df["omie_venta"]
+        - df["batt_for_sell"] * df["omie_venta"]
+    )
+
+    out = (
+        df.groupby("Date", as_index=False)
+        .agg(
+            total_cost=("total_cost_hour", "sum"),
+            total_sold_direct=("g_to_grid", "sum"),
+            total_sold_batt=("batt_for_sell", "sum"),
+            total_bought=("grid_purchase", "sum"),
+            total_charged=("charge_mwh", "sum"),
+            total_discharged=("batt_for_load", "sum"),
+            Revenue_BESS_EUR=("Revenue BESS (€)", "sum"),
+            Hybrid_Profile_MWh=("hybrid profile (MWh)", "sum"),
+        )
+        .rename(columns={"Revenue_BESS_EUR": "Revenue BESS (€)", "Hybrid_Profile_MWh": "hybrid profile (MWh)"})
+    )
+    out["total_sold"] = out["total_sold_direct"] + out["total_sold_batt"]
+    out["total_discharged"] = out["total_discharged"] + out["total_sold_batt"]
+    return out[
+        [
+            "Date",
+            "total_cost",
+            "total_sold",
+            "total_bought",
+            "total_charged",
+            "total_discharged",
+            "Revenue BESS (€)",
+            "hybrid profile (MWh)",
+        ]
+    ]
+
+
+def optimize_window_pulp(
+    df_win: pd.DataFrame,
+    capacity_mwh: float,
+    power_mw: float,
+    soc0: float,
+    eta_ch: float = 1.0,
+    eta_dis: float = 1.0,
+    cycle_limit_factor: float = 1.0,
+) -> pd.DataFrame:
+    """Optimize a forward-looking window starting at soc0; used by rolling 24h MPC."""
+    df_win = df_win.sort_values("timestamp").reset_index(drop=True).copy()
+    n = len(df_win)
+    if n == 0:
+        return pd.DataFrame()
+
+    omie_sell = df_win["omie_venta"].astype(float).tolist()
+    omie_buy = df_win["omie_compra"].astype(float).tolist()
+    gen = df_win["generacion"].astype(float).tolist()
+    load = df_win["consumo"].astype(float).tolist()
+
+    max_power = power_mw
+    max_grid_flow = max(max_power, 1e-9)
+
+    model = pulp.LpProblem("bess_rolling_24h_window", pulp.LpMaximize)
+
+    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
+    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
+    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
+    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
+    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
+    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
+    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
+    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
+    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
+    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
+
+    model += soc[0] == float(soc0)
+
+    for t in range(n):
+        model += g_to_batt[t] + grid_charge[t] <= max_power * is_charging[t]
+        model += batt_for_load[t] + batt_for_sell[t] <= max_power * (1 - is_charging[t])
+
+        model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
+        model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
+
+        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == gen[t]
+        model += load[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
+
+        model += soc[t + 1] == (
+            soc[t]
+            + eta_ch * (g_to_batt[t] + grid_charge[t])
+            - (1 / eta_dis) * (batt_for_load[t] + batt_for_sell[t])
+        )
+        model += soc[t] <= capacity_mwh
+
+    model += soc[n] <= capacity_mwh
+    model += pulp.lpSum(g_to_batt[t] + grid_charge[t] for t in range(n)) <= cycle_limit_factor * capacity_mwh / max(eta_ch, 1e-9)
+    model += pulp.lpSum(batt_for_load[t] + batt_for_sell[t] for t in range(n)) <= pulp.lpSum(
+        g_to_batt[t] + grid_charge[t] for t in range(n)
+    )
+
+    model += pulp.lpSum(
+        g_to_grid[t] * omie_sell[t]
+        + batt_for_sell[t] * omie_sell[t]
+        - grid_purchase[t] * omie_buy[t]
+        - grid_charge[t] * omie_buy[t]
+        for t in range(n)
+    )
+
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    model.solve(solver)
+
+    def vals(var_dict):
+        return [pulp.value(var_dict[i]) if pulp.value(var_dict[i]) is not None else 0.0 for i in range(n)]
+
+    res = pd.DataFrame(
+        {
+            "Date": df_win["dia"].values,
+            "Hour": df_win["hora"].values,
+            "omie_venta": omie_sell,
+            "omie_compra": omie_buy,
+            "generacion": gen,
+            "consumo": load,
+            "g_to_grid": vals(g_to_grid),
+            "g_to_batt": vals(g_to_batt),
+            "g_to_self": vals(g_to_self),
+            "grid_charge": vals(grid_charge),
+            "batt_for_load": vals(batt_for_load),
+            "batt_for_sell": vals(batt_for_sell),
+            "grid_purchase": vals(grid_purchase),
+            "soc": [pulp.value(soc[i + 1]) if pulp.value(soc[i + 1]) is not None else 0.0 for i in range(n)],
+        }
+    )
+    res["Revenue BESS (€)"] = (
+        -res["g_to_batt"] * res["omie_venta"]
+        -res["grid_charge"] * res["omie_compra"]
+        +res["batt_for_sell"] * res["omie_venta"]
+    )
+    res["hybrid profile (MWh)"] = res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
+    res["charge_mwh"] = res["g_to_batt"] + res["grid_charge"]
+    res["discharge_mwh"] = res["batt_for_sell"]
+    return res
+
+
+def simulate_rolling_24h_pulp(
+    df_year: pd.DataFrame,
+    capacity_mwh: float,
+    power_mw: float,
+    eta_ch: float = 1.0,
+    eta_dis: float = 1.0,
+    cycle_limit_factor: float = 1.0,
+    horizon: int = 24,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rolling/MPC 24h: optimize the next 24h, apply only the first hour, update SOC, repeat."""
+    df_year = df_year.sort_values("timestamp").reset_index(drop=True).copy()
+    if df_year.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    soc_now = 0.0
+    applied_rows = []
+    n_rows = len(df_year)
+
+    for start_idx in range(n_rows):
+        end_idx = min(start_idx + horizon, n_rows)
+        df_win = df_year.iloc[start_idx:end_idx].copy()
+        res_win = optimize_window_pulp(
+            df_win=df_win,
+            capacity_mwh=capacity_mwh,
+            power_mw=power_mw,
+            soc0=soc_now,
+            eta_ch=eta_ch,
+            eta_dis=eta_dis,
+            cycle_limit_factor=cycle_limit_factor,
+        )
+        if res_win.empty:
+            continue
+        applied = res_win.iloc[[0]].copy()
+        soc_now = float(applied["soc"].iloc[0])
+        applied_rows.append(applied)
+
+    dispatch = pd.concat(applied_rows, ignore_index=True) if applied_rows else pd.DataFrame()
+    stats = build_dispatch_stats(dispatch, eta_ch=eta_ch)
+    return dispatch, stats
+
+
 def run_optimization(
     data_df: pd.DataFrame,
     years: list[int],
@@ -872,6 +1123,7 @@ def run_optimization(
     eta_ch: float,
     eta_dis: float,
     cycle_limit_factor: float,
+    optimization_method: str = "fixed_24h",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     results_all = []
     stats_all = []
@@ -891,37 +1143,66 @@ def run_optimization(
         year_status = status_map.get(year, "undegraded")
         year_soh = float(soh_map.get(year, 1.0))
 
-        for day, df_day in df_year.groupby("dia"):
-            res, stats = optimize_day_pulp(
-                df_day=df_day,
+        if optimization_method == "rolling_24h":
+            year_dispatch, year_stats = simulate_rolling_24h_pulp(
+                df_year=df_year,
                 capacity_mwh=year_capacity,
                 power_mw=power_mw,
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
                 cycle_limit_factor=cycle_limit_factor,
+                horizon=24,
             )
-            res["Year"] = year
-            res["effective_capacity_mwh"] = year_capacity
-            res["SOH"] = year_soh
-            res["degradation_status"] = year_status
-            results_all.append(res)
+            if not year_dispatch.empty:
+                year_dispatch["Year"] = year
+                year_dispatch["effective_capacity_mwh"] = year_capacity
+                year_dispatch["SOH"] = year_soh
+                year_dispatch["degradation_status"] = year_status
+                year_dispatch["optimization_method"] = "rolling_24h"
+                results_all.append(year_dispatch)
 
-            stats_all.append(
-                {
-                    "Date": day,
-                    "Year": year,
-                    "total_cost": stats["total_cost"],
-                    "total_sold": stats["total_sold"],
-                    "total_bought": stats["total_bought"],
-                    "total_charged": stats["total_charged"],
-                    "total_discharged": stats["total_discharged"],
-                    "Revenue BESS (€)": stats["revenue_bess"],
-                    "hybrid profile (MWh)": stats["hybrid_profile_mwh"],
-                    "effective_capacity_mwh": year_capacity,
-                    "SOH": year_soh,
-                    "degradation_status": year_status,
-                }
-            )
+            if not year_stats.empty:
+                year_stats["Year"] = year
+                year_stats["effective_capacity_mwh"] = year_capacity
+                year_stats["SOH"] = year_soh
+                year_stats["degradation_status"] = year_status
+                year_stats["optimization_method"] = "rolling_24h"
+                stats_all.extend(year_stats.to_dict("records"))
+
+        else:
+            for day, df_day in df_year.groupby("dia"):
+                res, stats = optimize_day_pulp(
+                    df_day=df_day,
+                    capacity_mwh=year_capacity,
+                    power_mw=power_mw,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    cycle_limit_factor=cycle_limit_factor,
+                )
+                res["Year"] = year
+                res["effective_capacity_mwh"] = year_capacity
+                res["SOH"] = year_soh
+                res["degradation_status"] = year_status
+                res["optimization_method"] = "fixed_24h"
+                results_all.append(res)
+
+                stats_all.append(
+                    {
+                        "Date": day,
+                        "Year": year,
+                        "total_cost": stats["total_cost"],
+                        "total_sold": stats["total_sold"],
+                        "total_bought": stats["total_bought"],
+                        "total_charged": stats["total_charged"],
+                        "total_discharged": stats["total_discharged"],
+                        "Revenue BESS (€)": stats["revenue_bess"],
+                        "hybrid profile (MWh)": stats["hybrid_profile_mwh"],
+                        "effective_capacity_mwh": year_capacity,
+                        "SOH": year_soh,
+                        "degradation_status": year_status,
+                        "optimization_method": "fixed_24h",
+                    }
+                )
 
     dispatch = pd.concat(results_all, ignore_index=True) if results_all else pd.DataFrame()
     stats = pd.DataFrame(stats_all)
@@ -1227,6 +1508,7 @@ for key, default in {
     "mode_result": None,
     "eta_dis_result": None,
     "cycle_limit_label": None,
+    "optimization_method_label": None,
     "xlsx_bytes": None,
 }.items():
     if key not in st.session_state:
@@ -1250,22 +1532,63 @@ with left:
     provider_available_years = []
     valid_forward_pwd = False
     provider_pwd = ""
+    forward_price_source_label = ""
+    uploaded_forward_curve = None
 
     if use_forward_prices:
-        provider_pwd = st.text_input("Forward prices password", type="password")
-        valid_forward_pwd = ("forward_prices_password" in st.secrets and provider_pwd == st.secrets["forward_prices_password"])
+        available_repo_providers = [name for name, path in FORWARD_PROVIDER_FILES.items() if path.exists()]
+        repo_provider_labels = [FORWARD_PROVIDER_LABELS.get(name, name) for name in available_repo_providers]
+        forward_source_options = repo_provider_labels + [CUSTOM_FORWARD_LABEL]
 
-        if valid_forward_pwd:
-            available_providers = [name for name, path in FORWARD_PROVIDER_FILES.items() if path.exists()]
-            if not available_providers:
-                st.error("No forward price files were found in the repo.")
-            else:
-                forward_provider = st.selectbox("Forward provider", available_providers, index=0)
+        forward_price_source_label = st.selectbox(
+            "Forward price source",
+            forward_source_options,
+            index=0 if forward_source_options else None,
+            help="Aurora means Aurora Dec-25; Baringa means Baringa Apr-26. You can also upload a custom hourly curve for 2027 onwards.",
+        )
+
+        if forward_price_source_label == CUSTOM_FORWARD_LABEL:
+            uploaded_forward_curve = st.file_uploader(
+                "Upload custom forward price curve",
+                type=["xlsx", "csv"],
+                help=(
+                    "Expected columns: date/dia, hour/hora and price/precio. "
+                    "Alternatively use omie_venta and optional omie_compra. "
+                    "The custom curve must start in 2027 or later."
+                ),
+                key="custom_forward_curve_upload",
+            )
+            st.download_button(
+                "Download forward price template",
+                data=build_template_forward_price_excel(2027),
+                file_name="forward_price_curve_template_2027.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            if uploaded_forward_curve is not None:
+                try:
+                    forward_provider = "Custom upload"
+                    forward_prices = normalize_uploaded_forward_price_file(uploaded_forward_curve)
+                    provider_available_years = sorted(forward_prices["year"].unique().tolist())
+                    st.success(
+                        "Custom forward curve loaded: "
+                        + ", ".join(str(y) for y in provider_available_years)
+                    )
+                except Exception as exc:
+                    st.error(f"Could not read custom forward curve: {exc}")
+                    forward_prices = None
+                    provider_available_years = []
+        else:
+            provider_pwd = st.text_input("Forward prices password", type="password")
+            valid_forward_pwd = ("forward_prices_password" in st.secrets and provider_pwd == st.secrets["forward_prices_password"])
+
+            if valid_forward_pwd:
+                forward_provider = FORWARD_LABEL_TO_PROVIDER.get(forward_price_source_label, forward_price_source_label)
                 provider_path = FORWARD_PROVIDER_FILES[forward_provider]
                 forward_prices = normalize_provider_forward_price_file(provider_path)
                 provider_available_years = sorted(forward_prices["year"].unique().tolist())
-        else:
-            st.warning("Enter the correct password to unlock forward nominal prices from the repo.")
+                st.caption(f"Loaded repo curve: {FORWARD_PROVIDER_LABELS.get(forward_provider, forward_provider)}")
+            else:
+                st.warning("Enter the correct password to unlock repo forward nominal prices.")
 
     all_available_years = sorted(set(available_hist_years + provider_available_years))
     if not all_available_years:
@@ -1302,6 +1625,18 @@ with left:
     )
     cycle_limit_factor = 1.0 if cycle_limit_option == "Limit 1 cycle/day" else 5.0
 
+    optimization_method_label = st.radio(
+        "Optimisation method",
+        ["Fixed 24h window (daily)", "Rolling 24h window (MPC)"],
+        index=0,
+        horizontal=True,
+        help=(
+            "Fixed 24h window is the default daily optimisation used for TB4/revenue reporting. "
+            "Rolling 24h optimises the next 24 hours, applies only the first hour, updates SOC and repeats."
+        ),
+    )
+    optimization_method = "rolling_24h" if optimization_method_label.startswith("Rolling") else "fixed_24h"
+
     st.markdown("### Generation profile")
     use_uploaded_generation = st.checkbox("Upload a custom yearly generation profile", value=False)
     uploaded_generation = None
@@ -1326,7 +1661,10 @@ with left:
 with right:
     st.markdown("### Price sourcing")
     st.info("Historical years use the hourly prices generated and stored by the Day Ahead module in historical_data/day_ahead_spain_spot_600_raw.csv.")
-    st.info("If unlocked, forward years use nominal hourly prices stored in the repo and selected by provider (Aurora or Baringa).")
+    st.info("Forward years can use repo nominal curves — Aurora Dec-25 or Baringa Apr-26 — or a user-uploaded custom hourly price curve from 2027 onwards.")
+
+    st.markdown("### Optimisation method")
+    st.info("The BESS tab can run either Fixed 24h window or Rolling 24h window. All embedded TB4 / revenue BESS calculations in other report pages remain on the Fixed 24h window by default.")
 
     st.markdown("### Scenario rules")
     if mode == "Standalone BESS":
@@ -1352,16 +1690,22 @@ if run_button:
         st.stop()
 
     if use_forward_prices:
-        if not valid_forward_pwd:
-            st.error("Forward prices were selected but the password is missing or incorrect.")
-            st.stop()
-        if forward_prices is None or forward_provider is None:
-            st.error("No forward provider data is available.")
-            st.stop()
+        using_custom_forward_curve = forward_price_source_label == CUSTOM_FORWARD_LABEL
+        if using_custom_forward_curve:
+            if uploaded_forward_curve is None or forward_prices is None:
+                st.error("Forward prices were selected with a custom source. Upload a custom forward price curve for 2027 onwards.")
+                st.stop()
+        else:
+            if not valid_forward_pwd:
+                st.error("Repo forward prices were selected but the password is missing or incorrect.")
+                st.stop()
+            if forward_prices is None or forward_provider is None:
+                st.error("No repo forward provider data is available.")
+                st.stop()
 
     forward_years_selected = [y for y in years if max_hist_year is not None and y > max_hist_year]
     if forward_years_selected and forward_prices is None:
-        st.error("Your selected year range includes forward years, but no forward price curve is unlocked.")
+        st.error("Your selected year range includes forward years, but no forward price curve is loaded. Select Aurora Dec-25, Baringa Apr-26, or upload a custom curve.")
         st.stop()
 
     if use_uploaded_generation and uploaded_generation is None:
@@ -1389,7 +1733,7 @@ if run_button:
             max_historical_year=max_hist_year,
         )
 
-        with st.spinner("Running daily optimisation..."):
+        with st.spinner(f"Running {optimization_method_label.lower()} optimisation..."):
             dispatch, stats = run_optimization(
                 data_df=data_used,
                 years=years,
@@ -1398,6 +1742,7 @@ if run_button:
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
                 cycle_limit_factor=cycle_limit_factor,
+                optimization_method=optimization_method,
             )
 
         if dispatch.empty:
@@ -1414,8 +1759,10 @@ if run_button:
                     "mode",
                     "analysis_year_start",
                     "analysis_year_end",
+                    "forward_price_source",
                     "forward_provider",
                     "forward_prices_type",
+                    "uploaded_forward_curve",
                     "base_capacity_mwh",
                     "c_rate",
                     "bess_mw_constant",
@@ -1423,6 +1770,7 @@ if run_button:
                     "eta_dis",
                     "cycles_day_setting",
                     "cycles_day_factor",
+                    "optimization_method",
                     "assume_degradation",
                     "degradation_status_output",
                     "uploaded_generation",
@@ -1433,8 +1781,10 @@ if run_button:
                     mode,
                     year_start,
                     year_end,
+                    forward_price_source_label if use_forward_prices else "",
                     forward_provider if forward_provider is not None else "",
                     "nominal" if use_forward_prices else "",
+                    getattr(uploaded_forward_curve, "name", "") if uploaded_forward_curve is not None else "",
                     base_capacity_mwh,
                     c_rate,
                     bess_mw,
@@ -1442,6 +1792,7 @@ if run_button:
                     eta_dis,
                     cycle_limit_option,
                     cycle_limit_factor,
+                    optimization_method_label,
                     "yes" if use_degradation else "no",
                     "degraded for forward years only" if use_degradation else "undegraded",
                     "yes" if uploaded_generation is not None else "no",
@@ -1472,6 +1823,7 @@ if run_button:
         st.session_state.mode_result = mode
         st.session_state.eta_dis_result = eta_dis
         st.session_state.cycle_limit_label = cycle_limit_option
+        st.session_state.optimization_method_label = optimization_method_label
         st.session_state.xlsx_bytes = xlsx_bytes
 
     except Exception as e:
@@ -1493,6 +1845,7 @@ if st.session_state.dispatch is not None:
     eta_dis_result = st.session_state.eta_dis_result
     xlsx_bytes = st.session_state.xlsx_bytes
     cycle_limit_label = st.session_state.cycle_limit_label
+    optimization_method_label = st.session_state.optimization_method_label
 
     yearly_rollup = stats.groupby("Year", as_index=False).agg(
         total_charged=("total_charged", "sum"),
@@ -1518,6 +1871,8 @@ if st.session_state.dispatch is not None:
     c3.metric("Revenue BESS (€/MW)", f"{revenue_bess_display:,.2f}")
     if metrics_caption:
         st.caption(metrics_caption)
+    if optimization_method_label:
+        st.caption(f"Optimisation method used in this run: {optimization_method_label}.")
 
     hero_header("Monthly Revenue BESS (€/MW)")
     monthly_chart_df = monthly_summary[monthly_summary["month"] != "TOTAL"].copy()
