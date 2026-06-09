@@ -1062,7 +1062,7 @@ if run:
     st.subheader("Thermal Gap composition by technology")
     st.caption(
         "Stacked hourly columns using only the net PBF conventional technologies after bilateral netting. "
-        "The left Y-axis shows conventional technologies / thermal gap in MWh, and the right Y-axis shows the hourly spot price in €/MWh. "
+        "The chart now prioritizes the thermal-gap generation mix by technology. The left Y-axis shows conventional technologies / thermal gap in MWh, while the right Y-axis shows the hourly spot price only as a lighter reference. "
         "No residual is shown as a technology. If demand minus non-thermal PBF does not exactly equal the listed conventional PBF technologies, the difference is shown only as a diagnostic below."
     )
 
@@ -1111,7 +1111,7 @@ if run:
 
             stacked_bars = (
                 alt.Chart(stack_df)
-                .mark_bar(opacity=0.92)
+                .mark_bar(opacity=0.97)
                 .encode(
                     x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
                     y=alt.Y(
@@ -1138,7 +1138,7 @@ if run:
 
             thermal_total_line = (
                 alt.Chart(comp_wide)
-                .mark_line(color="black", strokeWidth=2.0)
+                .mark_line(color="black", strokeWidth=2.8)
                 .encode(
                     x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
                     y=alt.Y(
@@ -1160,13 +1160,13 @@ if run:
             if "price" in comp_wide.columns and comp_wide["price"].notna().any():
                 price_line_comp = (
                     alt.Chart(comp_wide.dropna(subset=["price"]))
-                    .mark_line(color="#D97706", strokeWidth=2.2)
+                    .mark_line(color="#F59E0B", strokeWidth=1.35, opacity=0.55, strokeDash=[6,4])
                     .encode(
                         x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
                         y=alt.Y(
                             "price:Q",
-                            title="Spot price (€/MWh)",
-                            axis=alt.Axis(format=".0f", orient="right", titleColor="#D97706", labelColor="#D97706"),
+                            title="Spot price reference (€/MWh)",
+                            axis=alt.Axis(format=".0f", orient="right", titleColor="#F59E0B", labelColor="#F59E0B"),
                             scale=alt.Scale(domain=comp_price_y_domain),
                         ),
                         tooltip=[
@@ -1191,7 +1191,7 @@ if run:
                 )
                 layers.extend([price_line_comp, price_points_comp])
 
-            composition_chart = alt.layer(*layers).resolve_scale(y="independent").properties(height=390).interactive(bind_y=False)
+            composition_chart = alt.layer(*layers).resolve_scale(y="independent").properties(height=500).interactive(bind_y=False)
             st.altair_chart(composition_chart, use_container_width=True)
 
             unallocated_abs = float(comp_wide["unallocated_gap_mwh"].abs().sum())
