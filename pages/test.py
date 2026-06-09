@@ -895,14 +895,13 @@ if run:
         st.dataframe(df.head(50), use_container_width=True, hide_index=True)
 
     # -----------------------------------------------------
-    # Main chart like the reference image
+    # Main interactive chart + thermal-gap composition
     # -----------------------------------------------------
     st.subheader("Thermal Gap and Price")
     st.caption(
         "Columns: hourly thermal gap. Line: hourly spot price. "
-        "X-axis is Europe/Madrid local time. The chart is rendered with matplotlib to avoid "
-        "browser/Altair timezone conversions. Exact matching with the LinkedIn chart depends on using the same "
-        "thermal-gap definition and the same underlying PBF/bilateral indicator set."
+        "Hover over the columns or the price line to see exact values. "
+        "X-axis is Europe/Madrid local time."
     )
 
     plot_df = df.copy()
@@ -916,135 +915,179 @@ if run:
         st.dataframe(df.head(100), use_container_width=True, hide_index=True)
         st.stop()
 
-    x = list(range(len(plot_df)))
-    labels = plot_df["datetime"].dt.strftime("%Y-%m-%d\\n%H").tolist()
+    plot_df["datetime_label"] = plot_df["datetime"].dt.strftime("%Y-%m-%d %H:%M")
+    plot_df["hour_1_24"] = plot_df["datetime"].dt.hour + 1
+    plot_df["date_label"] = plot_df["datetime"].dt.strftime("%Y-%m-%d")
 
-    fig, ax_gap = plt.subplots(figsize=(18, 6.2))
-
-    ax_gap.bar(
-        x,
-        plot_df["raw_thermal_gap_mwh"],
-        width=0.82,
-        color="#F5B041",
-        alpha=0.90,
-        label="Thermal Gap",
-        zorder=2,
+    x_axis = alt.Axis(
+        title="Madrid local time",
+        format="%H" if x_axis_style == "Day label + hourly numbers 1-24" else "%d-%b %H:%M",
+        labelAngle=-90,
     )
 
-    ax_gap.axhline(0, color="black", linewidth=0.8, alpha=0.65, zorder=3)
-    ax_gap.set_ylabel("Thermal Gap (MWh)", fontweight="bold")
-    ax_gap.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if abs(v) >= 1000 else f"{v:.0f}"))
-    ax_gap.grid(axis="y", alpha=0.25, zorder=1)
-    ax_gap.set_xlim(-0.8, len(plot_df) - 0.2)
-
-    ax_price = ax_gap.twinx()
-    if "price" in plot_df.columns and plot_df["price"].notna().any():
-        price_df = plot_df[plot_df["price"].notna()].copy()
-        price_x = price_df.index.tolist()
-        ax_price.plot(
-            price_x,
-            price_df["price"],
-            color="black",
-            linewidth=2.2,
-            label="Price",
-            zorder=4,
+    thermal_bars = (
+        alt.Chart(plot_df)
+        .mark_bar(opacity=0.88)
+        .encode(
+            x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
+            y=alt.Y(
+                "raw_thermal_gap_mwh:Q",
+                title="Thermal Gap (MWh)",
+                axis=alt.Axis(format="~s"),
+            ),
+            tooltip=[
+                alt.Tooltip("datetime_label:N", title="Madrid time"),
+                alt.Tooltip("date_label:N", title="Date"),
+                alt.Tooltip("hour_1_24:Q", title="Hour", format=".0f"),
+                alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap (MWh)", format=",.0f"),
+                alt.Tooltip("Total scheduled demand PBF:Q", title="Demand PBF (MWh)", format=",.0f"),
+                alt.Tooltip("non_thermal_net_pbf_mwh:Q", title="Non-thermal net PBF (MWh)", format=",.0f"),
+            ],
         )
-        ax_price.set_ylabel("Price (€/MWh)", fontweight="bold")
-        ax_price.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}"))
-
-        if align_zero_axes:
-            left_min, left_max = ax_gap.get_ylim()
-            if left_min < 0 < left_max:
-                zero_frac = (0 - left_min) / (left_max - left_min)
-                p_min = float(price_df["price"].min())
-                p_max = float(price_df["price"].max())
-
-                # Add light padding.
-                p_min = p_min * 1.10 if p_min < 0 else p_min * 0.90
-                p_max = p_max * 1.10 if p_max > 0 else p_max * 0.90
-
-                if 0 < zero_frac < 1:
-                    required_range = max(
-                        p_max / (1 - zero_frac) if p_max > 0 else 0,
-                        (-p_min) / zero_frac if p_min < 0 else 0,
-                        1.0,
-                    )
-                    ax_price.set_ylim(
-                        -zero_frac * required_range,
-                        (1 - zero_frac) * required_range,
-                    )
-    else:
-        ax_price.set_ylabel("Price (€/MWh)", fontweight="bold")
-        st.warning("No price data matched the hourly thermal-gap data. Showing only thermal-gap bars.")
-
-    if x_axis_style == "Day label + hourly numbers 1-24":
-        # Match the reference chart style:
-        #   bottom row = hour numbers 1-24
-        #   second row = date label once per day
-        # For long ranges, avoid overloading the axis by showing every 3rd hour.
-        hour_step = 1 if len(plot_df) <= 14 * 24 else 3
-        tick_positions = list(range(0, len(plot_df), hour_step))
-        hour_labels = [
-            str(int(plot_df.loc[i, "datetime"].hour) + 1)
-            for i in tick_positions
-        ]
-        ax_gap.set_xticks(tick_positions)
-        ax_gap.set_xticklabels(hour_labels, rotation=90, ha="center", fontsize=8)
-        ax_gap.set_xlabel("")
-
-        # Draw vertical separators and centered date labels under the hour row.
-        day_groups = plot_df.groupby(plot_df["datetime"].dt.date).indices
-        for day, idxs in day_groups.items():
-            idxs = sorted(list(idxs))
-            first_i = idxs[0]
-            last_i = idxs[-1]
-            center_i = (first_i + last_i) / 2
-
-            ax_gap.axvline(first_i - 0.5, color="#D1D5DB", linewidth=0.8, alpha=0.8, zorder=1)
-            ax_gap.text(
-                center_i,
-                -0.20,
-                pd.Timestamp(day).strftime("%Y-%m-%d"),
-                ha="center",
-                va="top",
-                fontsize=8,
-                transform=ax_gap.get_xaxis_transform(),
-            )
-
-        # last separator
-        ax_gap.axvline(len(plot_df) - 0.5, color="#D1D5DB", linewidth=0.8, alpha=0.8, zorder=1)
-    else:
-        # Fallback: compact datetime labels.
-        step = 4 if len(plot_df) <= 120 else max(4, int(len(plot_df) / 32))
-        tick_positions = list(range(0, len(plot_df), step))
-        if (len(plot_df) - 1) not in tick_positions:
-            tick_positions.append(len(plot_df) - 1)
-        ax_gap.set_xticks(tick_positions)
-        ax_gap.set_xticklabels([labels[i] for i in tick_positions], rotation=90, ha="center", fontsize=8)
-
-    ax_gap.set_title("Thermal Gap and Price", loc="left", fontweight="bold", fontsize=14, pad=18)
-
-    handles1, labels1 = ax_gap.get_legend_handles_labels()
-    handles2, labels2 = ax_price.get_legend_handles_labels()
-    fig.legend(
-        handles1 + handles2,
-        labels1 + labels2,
-        loc="lower center",
-        ncol=2,
-        frameon=False,
-        bbox_to_anchor=(0.5, -0.02),
     )
 
-    fig.tight_layout(rect=[0, 0.12, 1, 1])
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(stroke="black", opacity=0.45).encode(y="y:Q")
+
+    if "price" in plot_df.columns and plot_df["price"].notna().any():
+        price_line = (
+            alt.Chart(plot_df.dropna(subset=["price"]))
+            .mark_line(strokeWidth=2.5, color="black")
+            .encode(
+                x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
+                y=alt.Y(
+                    "price:Q",
+                    title="Price (€/MWh)",
+                    axis=alt.Axis(format=".0f"),
+                ),
+                tooltip=[
+                    alt.Tooltip("datetime_label:N", title="Madrid time"),
+                    alt.Tooltip("price:Q", title="Spot price (€/MWh)", format=",.2f"),
+                    alt.Tooltip("price_source:N", title="Price source"),
+                    alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap (MWh)", format=",.0f"),
+                ],
+            )
+        )
+        price_points = (
+            alt.Chart(plot_df.dropna(subset=["price"]))
+            .mark_point(size=35, opacity=0.001, filled=True)
+            .encode(
+                x="datetime:T",
+                y="price:Q",
+                tooltip=[
+                    alt.Tooltip("datetime_label:N", title="Madrid time"),
+                    alt.Tooltip("price:Q", title="Spot price (€/MWh)", format=",.2f"),
+                    alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap (MWh)", format=",.0f"),
+                ],
+            )
+        )
+        main_chart = alt.layer(thermal_bars, zero_line, price_line, price_points).resolve_scale(y="independent")
+    else:
+        st.warning("No price data matched the hourly thermal-gap data. Showing only thermal-gap bars.")
+        main_chart = alt.layer(thermal_bars, zero_line)
+
+    st.altair_chart(
+        main_chart.properties(height=470).interactive(bind_y=False),
+        use_container_width=True,
+    )
+
+    if align_zero_axes:
+        st.caption(
+            "Note: the interactive chart uses independent Y-axes for hover support. "
+            "The zero-alignment option is therefore not forced in this Altair view."
+        )
 
     st.markdown(
         "- **Left Y-axis**: hourly thermal gap, MWh/h\n"
-        "- **Right Y-axis**: hourly spot price, €/MWh. If zero alignment is enabled, the visible right-axis range may be wider than the actual price range.\n"
-        "- **X-axis**: Madrid local time, with day labels and hour numbers 1-24\n"
-        "- **Bilateral schedules**: yes, they are deducted before calculating the thermal gap"
+        "- **Right Y-axis**: hourly spot price, €/MWh\n"
+        "- **X-axis**: Madrid local time\n"
+        "- **Bilateral schedules**: deducted before calculating the thermal gap"
     )
+
+    # -----------------------------------------------------
+    # Thermal-gap composition by technology
+    # -----------------------------------------------------
+    st.subheader("Thermal Gap composition by technology")
+    st.caption(
+        "Stacked hourly columns using the net PBF conventional technologies after bilateral netting. "
+        "Hover over each segment to see the technology contribution and the hourly thermal-gap total."
+    )
+
+    composition_cols = []
+    for tech in CONVENTIONAL_TECHS_DEFAULT:
+        col = f"{tech} net PBF"
+        if col in plot_df.columns:
+            composition_cols.append((tech, col))
+
+    if not composition_cols:
+        st.warning("No conventional net PBF technology columns are available for the composition chart.")
+    else:
+        comp_base_cols = ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh"] + [c for _, c in composition_cols]
+        comp_wide = plot_df[comp_base_cols].copy()
+        value_cols = [c for _, c in composition_cols]
+        comp_wide[value_cols] = comp_wide[value_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        comp_wide["conventional_stack_mwh"] = comp_wide[value_cols].sum(axis=1)
+        comp_wide["Other / residual"] = comp_wide["raw_thermal_gap_mwh"] - comp_wide["conventional_stack_mwh"]
+
+        tech_rename = {col: tech for tech, col in composition_cols}
+        melt_cols = value_cols.copy()
+        if comp_wide["Other / residual"].abs().sum() > 1e-6:
+            melt_cols.append("Other / residual")
+            tech_rename["Other / residual"] = "Other / residual"
+
+        stack_df = comp_wide.melt(
+            id_vars=["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh"],
+            value_vars=melt_cols,
+            var_name="technology_col",
+            value_name="mwh",
+        )
+        stack_df["technology"] = stack_df["technology_col"].map(tech_rename).fillna(stack_df["technology_col"])
+        stack_df["mwh"] = pd.to_numeric(stack_df["mwh"], errors="coerce").fillna(0.0)
+        stack_df = stack_df[stack_df["mwh"].abs() > 1e-9].copy()
+
+        if stack_df.empty:
+            st.warning("All conventional technology contributions are zero for the selected period.")
+        else:
+            composition_chart = (
+                alt.Chart(stack_df)
+                .mark_bar(opacity=0.92)
+                .encode(
+                    x=alt.X("datetime:T", title="Madrid local time", axis=x_axis),
+                    y=alt.Y(
+                        "mwh:Q",
+                        stack="zero",
+                        title="Net PBF generation composing thermal gap (MWh)",
+                        axis=alt.Axis(format="~s"),
+                    ),
+                    color=alt.Color(
+                        "technology:N",
+                        title="Technology",
+                        legend=alt.Legend(orient="top", direction="horizontal", labelLimit=260, columns=3),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("datetime_label:N", title="Madrid time"),
+                        alt.Tooltip("hour_1_24:Q", title="Hour", format=".0f"),
+                        alt.Tooltip("technology:N", title="Technology"),
+                        alt.Tooltip("mwh:Q", title="Contribution (MWh)", format=",.0f"),
+                        alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
+                    ],
+                )
+                .properties(height=390)
+                .interactive(bind_y=False)
+            )
+            st.altair_chart(composition_chart, use_container_width=True)
+
+            with st.expander("Thermal-gap composition data", expanded=False):
+                st.dataframe(
+                    stack_df[["datetime_label", "technology", "mwh", "raw_thermal_gap_mwh"]]
+                    .rename(columns={
+                        "datetime_label": "Madrid time",
+                        "technology": "Technology",
+                        "mwh": "Contribution (MWh)",
+                        "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
     # -----------------------------------------------------
