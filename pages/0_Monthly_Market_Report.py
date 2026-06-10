@@ -2944,7 +2944,12 @@ def build_economic_curtailment_audit_excel(
     bio.seek(0)
     return bio.getvalue()
 
-def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFrame, forward_2026: pd.DataFrame):
+def monthly_curtailment_chart(
+    actual_2025: pd.DataFrame,
+    actual_2026: pd.DataFrame,
+    forward_2026: pd.DataFrame,
+    generation_basis_label: str = "P48 Solar PV Spain",
+):
     if actual_2025.empty and actual_2026.empty and forward_2026.empty:
         return None
     month_order = [calendar.month_abbr[m] for m in range(1, 13)]
@@ -2953,12 +2958,15 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
     actual_frames = []
     if actual_2025 is not None and not actual_2025.empty:
         a25 = actual_2025.copy()
-        a25["Series"] = "2025 actual"
+        a25["Series"] = f"2025 actual | {generation_basis_label}"
         actual_frames.append(a25[["month_num", "month_name", "pct_curtailment", "Series"]])
     if actual_2026 is not None and not actual_2026.empty:
         a26 = actual_2026.copy()
-        a26["Series"] = "2026 actual"
+        a26["Series"] = f"2026 actual | {generation_basis_label}"
         actual_frames.append(a26[["month_num", "month_name", "pct_curtailment", "Series"]])
+
+    actual_domain = [f"2025 actual | {generation_basis_label}", f"2026 actual | {generation_basis_label}"]
+
     if actual_frames:
         actual_plot = pd.concat(actual_frames, ignore_index=True)
         layers.append(
@@ -2968,7 +2976,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                 x=alt.X("month_name:N", title=None, sort=month_order, scale=alt.Scale(paddingInner=0.38, paddingOuter=0.12)),
                 xOffset=alt.XOffset(
                     "Series:N",
-                    sort=["2025 actual", "2026 actual"],
+                    sort=actual_domain,
                     scale=alt.Scale(paddingInner=0, paddingOuter=0),
                 ),
                 y=alt.Y(
@@ -2980,7 +2988,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                 color=alt.Color(
                     "Series:N",
                     title="Actual",
-                    scale=alt.Scale(domain=["2025 actual", "2026 actual"], range=["#F7C948", YELLOW_DARK]),
+                    scale=alt.Scale(domain=actual_domain, range=["#F7C948", YELLOW_DARK]),
                 ),
                 tooltip=[
                     alt.Tooltip("Series:N", title="Series"),
@@ -2993,6 +3001,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
     if forward_2026 is not None and not forward_2026.empty:
         forward_2026 = forward_2026.copy()
         forward_2026["model_display"] = forward_2026["model"].map(model_display_label)
+        forward_2026["generation_basis"] = generation_basis_label
         layers.append(
             alt.Chart(forward_2026)
             .mark_line(point=alt.OverlayMarkDef(filled=True, size=65), strokeWidth=3.0)
@@ -3006,7 +3015,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                 ),
                 color=alt.Color(
                     "model_display:N",
-                    title="Forecast",
+                    title=f"Forecast | {generation_basis_label}",
                     scale=alt.Scale(domain=[AURORA_LABEL, BARINGA_LABEL], range=[AURORA_COLOR, BARINGA_COLOR]),
                 ),
                 strokeDash=alt.StrokeDash(
@@ -3017,6 +3026,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                 detail="model_display:N",
                 tooltip=[
                     alt.Tooltip("model_display:N", title="Model"),
+                    alt.Tooltip("generation_basis:N", title="Generation basis"),
                     alt.Tooltip("month_name:N", title="Month"),
                     alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
                 ],
@@ -3024,11 +3034,9 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
         )
 
     chart = alt.layer(*layers).resolve_scale(color="independent", strokeDash="independent").properties(
-        title="Actual economic curtailment (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26"
+        title=f"Economic curtailment using {generation_basis_label} (%) vs Aurora central Dec25 / Baringa reference Apr26"
     )
     return apply_chart_style(chart, height=360)
-
-
 
 def _clean_col_name(col) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
@@ -5669,8 +5677,8 @@ tb4_prev = top_bottom_summary(price_hourly, prev_month, month_end(prev_month)).g
 tb4_yoy = top_bottom_summary(price_hourly, yoy, month_end(yoy)).get("TB4")
 zero_neg_selected = zero_negative_hours_in_period(price_hourly, selected_month, report_end)
 zero_neg_prev = zero_negative_hours_in_period(price_hourly, prev_month, month_end(prev_month))
-curt_selected = economic_curtailment_period_value(price_hourly, solar_hourly, selected_month, report_end)
-curt_prev = economic_curtailment_period_value(price_hourly, solar_hourly, prev_month, month_end(prev_month))
+curt_selected = economic_curtailment_period_value(price_hourly, pbf_solar_hourly, selected_month, report_end)
+curt_prev = economic_curtailment_period_value(price_hourly, pbf_solar_hourly, prev_month, month_end(prev_month))
 
 kpi_generation_current = build_generation_month_metrics(
     historical_mix_daily,
@@ -5708,9 +5716,9 @@ with k2_2:
     )
 with k2_3:
     st.metric(
-        f"Economic curtailment | {month_label(selected_month, is_current_mtd)}",
+        f"Economic curtailment PBF Solar PV | {month_label(selected_month, is_current_mtd)}",
         fmt_pct(curt_selected),
-        help="Share of solar generation produced during zero or negative day-ahead price hours.",
+        help="Share of PBF Solar PV generation produced during zero or negative day-ahead price hours.",
     )
     st.markdown(
         f'<div class="metric-footnote">{adverse_delta_pp_arrow_html(curt_selected, curt_prev, "prev. month")}<br>Prev. month: <b>{fmt_pct(curt_prev)}</b></div>',
@@ -5866,6 +5874,7 @@ if hourly_overlay is not None:
     st.altair_chart(hourly_overlay, use_container_width=True)
 
 subsection("Actual economic curtailment using PBF Solar PV (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
+st.info("This section uses PBF Solar PV from ESIOS indicator 14 as the generation basis, not P48 Spain.")
 
 ytd_curt_actual = economic_curtailment_ytd_value(
     price_hourly,
@@ -5900,7 +5909,7 @@ st.caption(
 actual_curt_2026 = monthly_economic_curtailment(price_hourly, pbf_solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
 forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, pbf_solar_hourly, pd.Timestamp(latest_data_ts.date()))
 actual_curt_2025 = pd.DataFrame(columns=["year", "month_num", "month_name", "affected_mwh", "total_mwh", "pct_curtailment"])
-curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026)
+curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026, "PBF Solar PV")
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
 
