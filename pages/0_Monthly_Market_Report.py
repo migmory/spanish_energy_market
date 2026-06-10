@@ -5559,7 +5559,8 @@ with st.spinner("Loading market data and refreshing live 2026 figures..."):
     historical_solar = load_historical_solar()
     live_prices = load_live_prices(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "price"])
     live_solar = load_live_solar(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "solar_best_mw"])
-    live_pbf_solar = load_live_2026_pbf_solar_pv_for_report(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "solar_best_mw", "generation_basis"])
+    pbf_solar_start = date(2025, 1, 1)
+    live_pbf_solar = load_live_2026_pbf_solar_pv_for_report(token, pbf_solar_start, live_end) if token else pd.DataFrame(columns=["datetime", "solar_best_mw", "generation_basis"])
     price_hourly = combine_hist_live(historical_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_live(historical_solar, live_solar, ["datetime"])
     pbf_solar_hourly = live_pbf_solar.copy()
@@ -5874,7 +5875,7 @@ if hourly_overlay is not None:
     st.altair_chart(hourly_overlay, use_container_width=True)
 
 subsection("Actual economic curtailment using PBF Solar PV (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
-st.info("This section uses PBF Solar PV from ESIOS indicator 14 as the generation basis, not P48 Spain.")
+st.info("This section uses PBF Solar PV from ESIOS indicator 14 as the generation basis, not P48 Spain. 2025 actual is included again through December.")
 
 ytd_curt_actual = economic_curtailment_ytd_value(
     price_hourly,
@@ -5903,12 +5904,12 @@ with yc3:
     st.metric("YTD Baringa reference Apr26 economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_baringa))
 
 st.caption(
-    "This chart now uses ESIOS PBF Solar PV (indicator 14, hourly sum) as the generation basis. "
-    "Because this PBF series is loaded as live 2026 ESIOS data, the chart focuses on 2026 actual plus Aurora and Baringa forward scenarios."
+    "This chart uses ESIOS PBF Solar PV (indicator 14, hourly sum) as the generation basis. "
+    "2025 actual is shown again through December, and 2026 actual is shown YTD through the latest available market day."
 )
 actual_curt_2026 = monthly_economic_curtailment(price_hourly, pbf_solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
 forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, pbf_solar_hourly, pd.Timestamp(latest_data_ts.date()))
-actual_curt_2025 = pd.DataFrame(columns=["year", "month_num", "month_name", "affected_mwh", "total_mwh", "pct_curtailment"])
+actual_curt_2025 = monthly_economic_curtailment(price_hourly, pbf_solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
 curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026, "PBF Solar PV")
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
