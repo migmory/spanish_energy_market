@@ -2694,6 +2694,154 @@ def monthly_economic_curtailment_forward(forward_scenarios: pd.DataFrame, solar_
         return pd.DataFrame(columns=["model", "month_num", "month_name", "pct_curtailment"])
     return pd.concat(frames, ignore_index=True)
 
+def build_economic_curtailment_audit_tables(
+    price_hourly: pd.DataFrame,
+    forward_scenarios: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    end_ts: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the exact hourly overlap used for economic-curtailment checks.
+
+    Economic curtailment = P48 solar generation during price <= 0 intervals / total P48 solar generation.
+    The forward scenarios are filtered with the same 2026/YTD cut-off used in the report chart.
+    """
+    detail_frames: list[pd.DataFrame] = []
+
+    s = solar_hourly.copy() if solar_hourly is not None else pd.DataFrame()
+    if not s.empty:
+        s = s[["datetime", "solar_best_mw"]].copy()
+        s["datetime"] = pd.to_datetime(s["datetime"], errors="coerce")
+        s["solar_best_mw"] = pd.to_numeric(s["solar_best_mw"], errors="coerce")
+        s = s.dropna(subset=["datetime", "solar_best_mw"])
+        s = s[(s["datetime"].dt.year == 2026) & (s["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
+
+    if not s.empty and price_hourly is not None and not price_hourly.empty:
+        actual = price_hourly[["datetime", "price"]].copy()
+        actual["datetime"] = pd.to_datetime(actual["datetime"], errors="coerce")
+        actual["price"] = pd.to_numeric(actual["price"], errors="coerce")
+        actual = actual.dropna(subset=["datetime", "price"])
+        actual = actual[(actual["datetime"].dt.year == 2026) & (actual["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
+        if not actual.empty:
+            actual["model"] = "Actual OMIE"
+            actual["source_file"] = "Day Ahead / ESIOS + workbook"
+            actual["source_sheet"] = "price_hourly"
+            detail_frames.append(actual)
+
+    if forward_scenarios is not None and not forward_scenarios.empty:
+        fwd = forward_scenarios.copy()
+        fwd["datetime"] = pd.to_datetime(fwd["datetime"], errors="coerce")
+        fwd["price"] = pd.to_numeric(fwd["price"], errors="coerce")
+        fwd = fwd.dropna(subset=["datetime", "price", "model"])
+        fwd = fwd[(fwd["datetime"].dt.year == 2026) & (fwd["datetime"] <= end_ts + pd.Timedelta(days=1))].copy()
+        fwd = fwd[fwd["model"].isin(["Aurora", "Baringa"])].copy()
+        if not fwd.empty:
+            for col in ["source_file", "source_sheet"]:
+                if col not in fwd.columns:
+                    fwd[col] = pd.NA
+            detail_frames.append(fwd[["datetime", "price", "model", "source_file", "source_sheet"]])
+
+    if not detail_frames or s.empty:
+        empty_detail = pd.DataFrame(columns=[
+            "model", "model_display", "datetime", "year", "month_num", "month_name",
+            "price_eur_mwh", "p48_solar_mwh", "is_zero_or_negative_price",
+            "affected_p48_mwh", "source_file", "source_sheet",
+        ])
+        empty_summary = pd.DataFrame(columns=[
+            "model", "model_display", "year", "month_num", "month_name",
+            "affected_p48_mwh", "total_p48_mwh", "economic_curtailment_pct",
+            "hours_with_price", "hours_with_p48", "zero_or_negative_hours",
+        ])
+        return empty_detail, empty_summary
+
+    prices = pd.concat(detail_frames, ignore_index=True)
+    merged = prices.merge(s, on="datetime", how="inner")
+    merged["solar_best_mw"] = pd.to_numeric(merged["solar_best_mw"], errors="coerce")
+    merged["price"] = pd.to_numeric(merged["price"], errors="coerce")
+    merged = merged.dropna(subset=["solar_best_mw", "price"]).copy()
+    merged = merged[merged["solar_best_mw"] > 0].copy()
+
+    if merged.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    merged["year"] = merged["datetime"].dt.year
+    merged["month_num"] = merged["datetime"].dt.month
+    merged["month_name"] = merged["datetime"].dt.strftime("%b")
+    merged["model_display"] = merged["model"].map(lambda x: "Actual OMIE" if x == "Actual OMIE" else model_display_label(x))
+    merged["p48_solar_mwh"] = merged["solar_best_mw"]
+    merged["price_eur_mwh"] = merged["price"]
+    merged["is_zero_or_negative_price"] = merged["price_eur_mwh"] <= 0
+    merged["affected_p48_mwh"] = np.where(merged["is_zero_or_negative_price"], merged["p48_solar_mwh"], 0.0)
+
+    summary = (
+        merged.groupby(["model", "model_display", "year", "month_num", "month_name"], as_index=False)
+        .agg(
+            affected_p48_mwh=("affected_p48_mwh", "sum"),
+            total_p48_mwh=("p48_solar_mwh", "sum"),
+            hours_with_price=("datetime", "count"),
+            zero_or_negative_hours=("is_zero_or_negative_price", "sum"),
+        )
+        .sort_values(["model", "year", "month_num"])
+        .reset_index(drop=True)
+    )
+    summary["economic_curtailment_pct"] = summary["affected_p48_mwh"] / summary["total_p48_mwh"].where(summary["total_p48_mwh"] != 0)
+    summary["hours_with_p48"] = summary["hours_with_price"]
+    summary = summary[[
+        "model", "model_display", "year", "month_num", "month_name",
+        "affected_p48_mwh", "total_p48_mwh", "economic_curtailment_pct",
+        "hours_with_price", "hours_with_p48", "zero_or_negative_hours",
+    ]]
+
+    detail = merged[[
+        "model", "model_display", "datetime", "year", "month_num", "month_name",
+        "price_eur_mwh", "p48_solar_mwh", "is_zero_or_negative_price",
+        "affected_p48_mwh", "source_file", "source_sheet",
+    ]].sort_values(["model", "datetime"]).reset_index(drop=True)
+
+    return detail, summary
+
+
+def build_economic_curtailment_audit_excel(
+    price_hourly: pd.DataFrame,
+    forward_scenarios: pd.DataFrame,
+    solar_hourly: pd.DataFrame,
+    end_ts: pd.Timestamp,
+) -> bytes:
+    detail, summary = build_economic_curtailment_audit_tables(price_hourly, forward_scenarios, solar_hourly, end_ts)
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        summary.to_excel(writer, index=False, sheet_name="monthly_summary")
+
+        if not detail.empty:
+            for model, sheet_name in [("Baringa", "hourly_baringa"), ("Aurora", "hourly_aurora"), ("Actual OMIE", "hourly_actual")]:
+                sub = detail[detail["model"] == model].copy()
+                if not sub.empty:
+                    sub.to_excel(writer, index=False, sheet_name=sheet_name)
+            detail.to_excel(writer, index=False, sheet_name="hourly_all")
+        else:
+            detail.to_excel(writer, index=False, sheet_name="hourly_all")
+
+        notes = pd.DataFrame({
+            "field": [
+                "economic_curtailment_pct",
+                "affected_p48_mwh",
+                "total_p48_mwh",
+                "p48_solar_mwh",
+                "price_eur_mwh",
+                "cut_off",
+            ],
+            "definition": [
+                "affected_p48_mwh / total_p48_mwh",
+                "P48 solar generation where price_eur_mwh <= 0",
+                "All positive P48 solar generation in the same month/model",
+                "Hourly P48 PV generation used as MWh because the series is hourly",
+                "Hourly price from Actual OMIE, Aurora central Dec25 or Baringa reference Apr26",
+                f"Rows are filtered to 2026 and datetime <= {pd.Timestamp(end_ts).date()} + 1 day, matching the report chart logic",
+            ],
+        })
+        notes.to_excel(writer, index=False, sheet_name="methodology")
+    bio.seek(0)
+    return bio.getvalue()
+
 def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFrame, forward_2026: pd.DataFrame):
     if actual_2025.empty and actual_2026.empty and forward_2026.empty:
         return None
@@ -5647,6 +5795,34 @@ actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025
 curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026)
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
+
+curt_detail, curt_summary = build_economic_curtailment_audit_tables(
+    price_hourly,
+    forward_hourly,
+    solar_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+)
+curt_xlsx = build_economic_curtailment_audit_excel(
+    price_hourly,
+    forward_hourly,
+    solar_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+)
+st.download_button(
+    "Download economic curtailment audit Excel",
+    data=curt_xlsx,
+    file_name=f"economic_curtailment_p48_price_overlap_{pd.Timestamp(latest_data_ts).date()}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+    disabled=curt_detail.empty,
+)
+with st.expander("Economic curtailment audit preview", expanded=False):
+    st.caption("Hourly overlap used for the calculation: P48 solar generation × price scenario. Economic curtailment is P48 generation where price <= 0 divided by total P48 generation.")
+    if curt_summary.empty:
+        st.info("No audit rows available for the current data selection.")
+    else:
+        st.dataframe(curt_summary, use_container_width=True, hide_index=True)
+        st.dataframe(curt_detail.head(500), use_container_width=True, hide_index=True)
 
 
 subsection("Monthly generation injection and renewable share | selected month vs previous month")
