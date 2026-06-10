@@ -425,6 +425,7 @@ BESS_REPORT_UNRESTRICTED_CYCLE_FACTOR = 5.0  # Mirrors BESS-tab 'No limit cycles
 
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
+PBF_SOLAR_PV_INDICATOR_ID = 14
 SOLAR_FORECAST_INDICATOR_ID = 542
 LIVE_START_DATE = date(2026, 1, 1)
 
@@ -635,6 +636,82 @@ def load_live_solar(token: str, start_day: date, end_day: date) -> pd.DataFrame:
     else:
         fc = pd.DataFrame(columns=["datetime", "solar_forecast_mw"])
     return build_best_solar_hourly(p48, fc)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_esios_range_hourly_sum_for_report(
+    indicator_id: int,
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> pd.DataFrame:
+    """Fetch hourly ESIOS programme/energy indicators with time_agg=sum.
+
+    Used for PBF indicators, mirroring the thermal-gap test page convention.
+    """
+    if not token or start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    frames: list[pd.DataFrame] = []
+    chunk_start = start_day
+
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=30))
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        params = {
+            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_trunc": "hour",
+            "time_agg": "sum",
+        }
+
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers=build_headers(token), params=params, timeout=(15, 120))
+                resp.raise_for_status()
+                parsed = parse_esios_indicator(resp.json(), f"esios_{indicator_id}")
+                if not parsed.empty:
+                    frames.append(parsed)
+                break
+            except requests.exceptions.RequestException:
+                sleep(1.2 * (attempt + 1))
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["datetime", "source"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_pbf_solar_pv_for_report(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    """Load PBF Solar PV hourly programme.
+
+    This uses ESIOS indicator 14 with hourly sum, consistent with the PBF/thermal-gap
+    page where Solar PV is one of the PBF gross generation components.
+    The returned value is named solar_best_mw for compatibility with the existing
+    economic-curtailment functions, but it represents PBF Solar PV MWh/h.
+    """
+    raw = fetch_esios_range_hourly_sum_for_report(PBF_SOLAR_PV_INDICATOR_ID, start_day, end_day, token)
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "solar_best_mw", "generation_basis"])
+
+    out = raw[["datetime", "value"]].rename(columns={"value": "solar_best_mw"}).copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["solar_best_mw"] = pd.to_numeric(out["solar_best_mw"], errors="coerce")
+    out = out.dropna(subset=["datetime", "solar_best_mw"])
+    out = out.groupby("datetime", as_index=False)["solar_best_mw"].sum().sort_values("datetime")
+    out["generation_basis"] = "PBF Solar PV indicator 14"
+    return out[["datetime", "solar_best_mw", "generation_basis"]]
+
 
 def combine_hist_live(hist: pd.DataFrame, live: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
     out = pd.concat([hist, live], ignore_index=True)
@@ -2699,14 +2776,15 @@ def build_economic_curtailment_audit_tables(
     forward_scenarios: pd.DataFrame,
     solar_hourly: pd.DataFrame,
     end_ts: pd.Timestamp,
+    generation_basis_label: str = "P48 Solar PV",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build the hourly audit table used for economic-curtailment checks.
 
     The report calculation is energy based:
-        economic curtailment = sum(P48 solar generation where price <= 0) / sum(P48 solar generation)
+        economic curtailment = sum(generation where price <= 0) / sum(generation)
 
-    For auditability this export now keeps every hourly price row and left-joins P48.
-    Missing / non-producing P48 hours are shown as 0 MWh instead of being removed,
+    For auditability this export keeps every hourly price row and left-joins the selected generation basis.
+    Missing / non-producing generation hours are shown as 0 MWh instead of being removed,
     so the Excel timestamp column is continuous hour by hour whenever the price
     curve itself is continuous.
     """
@@ -2759,12 +2837,12 @@ def build_economic_curtailment_audit_tables(
 
     if not detail_frames:
         empty_detail = pd.DataFrame(columns=[
-            "model", "model_display", "datetime", "year", "month_num", "month_name",
+            "model", "model_display", "generation_basis", "datetime", "year", "month_num", "month_name",
             "price_eur_mwh", "p48_solar_mwh", "has_p48_row", "is_zero_or_negative_price",
             "affected_p48_mwh", "source_file", "source_sheet",
         ])
         empty_summary = pd.DataFrame(columns=[
-            "model", "model_display", "year", "month_num", "month_name",
+            "model", "model_display", "generation_basis", "year", "month_num", "month_name",
             "affected_p48_mwh", "total_p48_mwh", "economic_curtailment_pct",
             "hours_with_price", "hours_with_p48_row", "zero_or_negative_hours",
         ])
@@ -2788,13 +2866,14 @@ def build_economic_curtailment_audit_tables(
     merged["month_num"] = merged["datetime"].dt.month
     merged["month_name"] = merged["datetime"].dt.strftime("%b")
     merged["model_display"] = merged["model"].map(lambda x: "Actual OMIE" if x == "Actual OMIE" else model_display_label(x))
+    merged["generation_basis"] = generation_basis_label
     merged["p48_solar_mwh"] = merged["solar_best_mw"]
     merged["price_eur_mwh"] = merged["price"]
     merged["is_zero_or_negative_price"] = merged["price_eur_mwh"] <= 0
     merged["affected_p48_mwh"] = np.where(merged["is_zero_or_negative_price"], merged["p48_solar_mwh"], 0.0)
 
     summary = (
-        merged.groupby(["model", "model_display", "year", "month_num", "month_name"], as_index=False)
+        merged.groupby(["model", "model_display", "generation_basis", "year", "month_num", "month_name"], as_index=False)
         .agg(
             affected_p48_mwh=("affected_p48_mwh", "sum"),
             total_p48_mwh=("p48_solar_mwh", "sum"),
@@ -2807,13 +2886,13 @@ def build_economic_curtailment_audit_tables(
     )
     summary["economic_curtailment_pct"] = summary["affected_p48_mwh"] / summary["total_p48_mwh"].where(summary["total_p48_mwh"] != 0)
     summary = summary[[
-        "model", "model_display", "year", "month_num", "month_name",
+        "model", "model_display", "generation_basis", "year", "month_num", "month_name",
         "affected_p48_mwh", "total_p48_mwh", "economic_curtailment_pct",
         "hours_with_price", "hours_with_p48_row", "zero_or_negative_hours",
     ]]
 
     detail = merged[[
-        "model", "model_display", "datetime", "year", "month_num", "month_name",
+        "model", "model_display", "generation_basis", "datetime", "year", "month_num", "month_name",
         "price_eur_mwh", "p48_solar_mwh", "has_p48_row", "is_zero_or_negative_price",
         "affected_p48_mwh", "source_file", "source_sheet",
     ]].sort_values(["model", "datetime"]).reset_index(drop=True)
@@ -2825,8 +2904,9 @@ def build_economic_curtailment_audit_excel(
     forward_scenarios: pd.DataFrame,
     solar_hourly: pd.DataFrame,
     end_ts: pd.Timestamp,
+    generation_basis_label: str = "P48 Solar PV",
 ) -> bytes:
-    detail, summary = build_economic_curtailment_audit_tables(price_hourly, forward_scenarios, solar_hourly, end_ts)
+    detail, summary = build_economic_curtailment_audit_tables(price_hourly, forward_scenarios, solar_hourly, end_ts, generation_basis_label)
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="monthly_summary")
@@ -5471,8 +5551,10 @@ with st.spinner("Loading market data and refreshing live 2026 figures..."):
     historical_solar = load_historical_solar()
     live_prices = load_live_prices(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "price"])
     live_solar = load_live_solar(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "solar_best_mw"])
+    live_pbf_solar = load_live_2026_pbf_solar_pv_for_report(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "solar_best_mw", "generation_basis"])
     price_hourly = combine_hist_live(historical_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_live(historical_solar, live_solar, ["datetime"])
+    pbf_solar_hourly = live_pbf_solar.copy()
     forward_hourly = load_forward_hourly_scenarios()
     forward_history = load_forward_market_history()
 
@@ -5783,37 +5865,41 @@ if hourly_overlay is not None:
     )
     st.altair_chart(hourly_overlay, use_container_width=True)
 
-subsection("Actual economic curtailment (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
+subsection("Actual economic curtailment using PBF Solar PV (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
 
 ytd_curt_actual = economic_curtailment_ytd_value(
     price_hourly,
-    solar_hourly,
+    pbf_solar_hourly,
     2026,
     pd.Timestamp(latest_data_ts.date()),
 )
 ytd_curt_aurora = economic_curtailment_ytd_forecast_value(
     forward_hourly,
-    solar_hourly,
+    pbf_solar_hourly,
     "Aurora",
     pd.Timestamp(latest_data_ts.date()),
 )
 ytd_curt_baringa = economic_curtailment_ytd_forecast_value(
     forward_hourly,
-    solar_hourly,
+    pbf_solar_hourly,
     "Baringa",
     pd.Timestamp(latest_data_ts.date()),
 )
 yc1, yc2, yc3 = st.columns(3)
 with yc1:
-    st.metric("YTD 2026 actual economic curtailment", fmt_pct(ytd_curt_actual))
+    st.metric("YTD 2026 actual economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_actual))
 with yc2:
-    st.metric("YTD Aurora central Dec25 economic curtailment", fmt_pct(ytd_curt_aurora))
+    st.metric("YTD Aurora central Dec25 economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_aurora))
 with yc3:
-    st.metric("YTD Baringa reference Apr26 economic curtailment", fmt_pct(ytd_curt_baringa))
+    st.metric("YTD Baringa reference Apr26 economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_baringa))
 
-actual_curt_2026 = monthly_economic_curtailment(price_hourly, solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
-forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, pd.Timestamp(latest_data_ts.date()))
-actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
+st.caption(
+    "This chart now uses ESIOS PBF Solar PV (indicator 14, hourly sum) as the generation basis. "
+    "Because this PBF series is loaded as live 2026 ESIOS data, the chart focuses on 2026 actual plus Aurora and Baringa forward scenarios."
+)
+actual_curt_2026 = monthly_economic_curtailment(price_hourly, pbf_solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
+forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, pbf_solar_hourly, pd.Timestamp(latest_data_ts.date()))
+actual_curt_2025 = pd.DataFrame(columns=["year", "month_num", "month_name", "affected_mwh", "total_mwh", "pct_curtailment"])
 curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026)
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
@@ -5823,28 +5909,70 @@ curt_detail, curt_summary = build_economic_curtailment_audit_tables(
     forward_hourly,
     solar_hourly,
     pd.Timestamp(latest_data_ts.date()),
+    "P48 Solar PV Spain",
 )
 curt_xlsx = build_economic_curtailment_audit_excel(
     price_hourly,
     forward_hourly,
     solar_hourly,
     pd.Timestamp(latest_data_ts.date()),
+    "P48 Solar PV Spain",
 )
-st.download_button(
-    "Download economic curtailment audit Excel",
-    data=curt_xlsx,
-    file_name=f"economic_curtailment_p48_price_overlap_{pd.Timestamp(latest_data_ts).date()}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-    disabled=curt_detail.empty,
+
+pbf_curt_detail, pbf_curt_summary = build_economic_curtailment_audit_tables(
+    price_hourly,
+    forward_hourly,
+    pbf_solar_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+    "PBF Solar PV indicator 14",
 )
+pbf_curt_xlsx = build_economic_curtailment_audit_excel(
+    price_hourly,
+    forward_hourly,
+    pbf_solar_hourly,
+    pd.Timestamp(latest_data_ts.date()),
+    "PBF Solar PV indicator 14",
+)
+
+dl1, dl2 = st.columns(2)
+with dl1:
+    st.download_button(
+        "Download economic curtailment audit Excel | P48",
+        data=curt_xlsx,
+        file_name=f"economic_curtailment_p48_price_overlap_{pd.Timestamp(latest_data_ts).date()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        disabled=curt_detail.empty,
+    )
+with dl2:
+    st.download_button(
+        "Download economic curtailment audit Excel | PBF Solar PV",
+        data=pbf_curt_xlsx,
+        file_name=f"economic_curtailment_pbf_solar_pv_price_overlap_{pd.Timestamp(latest_data_ts).date()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        disabled=pbf_curt_detail.empty,
+    )
+
 with st.expander("Economic curtailment audit preview", expanded=False):
-    st.caption("Hourly overlap used for the calculation: P48 solar generation × price scenario. Economic curtailment is P48 generation where price <= 0 divided by total P48 generation.")
-    if curt_summary.empty:
+    st.caption(
+        "Hourly overlap used for the calculation. The report chart now uses PBF Solar PV by default. "
+        "The P48 and PBF audit downloads are both kept so you can compare methodologies."
+    )
+    if curt_summary.empty and pbf_curt_summary.empty:
         st.info("No audit rows available for the current data selection.")
     else:
-        st.dataframe(curt_summary, use_container_width=True, hide_index=True)
-        st.dataframe(curt_detail.head(500), use_container_width=True, hide_index=True)
+        preview_summary = pd.concat(
+            [x for x in [curt_summary, pbf_curt_summary] if x is not None and not x.empty],
+            ignore_index=True,
+        )
+        st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+        if not pbf_curt_detail.empty:
+            st.markdown("**PBF Solar PV hourly preview**")
+            st.dataframe(pbf_curt_detail.head(500), use_container_width=True, hide_index=True)
+        elif not curt_detail.empty:
+            st.markdown("**P48 hourly preview**")
+            st.dataframe(curt_detail.head(500), use_container_width=True, hide_index=True)
 
 
 subsection("Monthly generation injection and renewable share | selected month vs previous month")
