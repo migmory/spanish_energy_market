@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from datetime import date, datetime, time, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -83,6 +84,18 @@ BALANCING_ENERGY_SECTIONS = {
     "Secondary energy": {"up": [680], "down": [681]},
 }
 BALANCING_SECONDARY_RESERVE_IDS = {"Downward": [633], "Upward": [632]}
+
+# Official ESIOS average-price indicators used in the hover tooltip.
+# Real-time constraints are intentionally left empty because the CT/RTD/EST/RSI buckets
+# do not have one clean public price indicator that is directly comparable to the
+# aggregated volume bucket used in this chart.
+BALANCING_PRICE_SECTIONS = {
+    "Day-ahead constraints Phase I": {"up": [705], "down": [706]},
+    "Day-ahead constraints Phase II": {"up": [707], "down": [708]},
+    "Real-time constraints": {"up": [], "down": []},
+    "Tertiary / mFRR": {"up": [10386], "down": [10387]},
+    "Secondary energy": {"up": [682], "down": [683]},
+}
 
 # PBF gross generation.
 # IMPORTANT:
@@ -920,7 +933,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
             "avg_price_eur_mwh": float(up_price) if pd.notna(up_price) else None,
             "cost_meur": float(up_cost) if pd.notna(up_cost) else None,
             "price_ids": row.get("upward_price_ids", "n/a"),
-            "label": f"{float(up_gwh):,.0f} GWh" if pd.notna(up_gwh) else "",
+            "label": (f"{float(up_gwh):,.0f} GWh | {float(up_price):,.0f} €/MWh" if pd.notna(up_gwh) and pd.notna(up_price) else (f"{float(up_gwh):,.0f} GWh" if pd.notna(up_gwh) else "")),
         })
         long_rows.append({
             "category": row.get("category"),
@@ -930,7 +943,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
             "avg_price_eur_mwh": float(down_price) if pd.notna(down_price) else None,
             "cost_meur": float(down_cost) if pd.notna(down_cost) else None,
             "price_ids": row.get("downward_price_ids", "n/a"),
-            "label": f"{float(down_gwh):,.0f} GWh" if pd.notna(down_gwh) else "",
+            "label": (f"{float(down_gwh):,.0f} GWh | {float(down_price):,.0f} €/MWh" if pd.notna(down_gwh) and pd.notna(down_price) else (f"{float(down_gwh):,.0f} GWh" if pd.notna(down_gwh) else "")),
         })
 
     energy_long = pd.DataFrame(long_rows)
@@ -965,7 +978,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
         ],
     )
 
-    energy_text = energy_base.mark_text(fontSize=11, color="#444444").encode(
+    energy_text = energy_base.mark_text(fontSize=10, color="#444444").encode(
         y=alt.Y("label_y:Q", scale=alt.Scale(domain=energy_domain)),
         text="label:N",
     )
@@ -1108,6 +1121,212 @@ BILATERAL_TO_GROSS_TECH = {
 }
 
 
+
+
+# =========================================================
+# Official restrictions detail technology breakdown
+# =========================================================
+def _norm_col_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text
+
+
+def _read_tabular_upload(uploaded_file: Any) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame()
+    name = str(getattr(uploaded_file, "name", "")).lower()
+    data = uploaded_file.getvalue()
+    try:
+        if name.endswith((".xlsx", ".xls")):
+            return pd.read_excel(BytesIO(data), sheet_name=0)
+    except Exception:
+        pass
+
+    # ESIOS downloads are commonly ; separated and can use utf-8-sig or latin1.
+    for enc in ("utf-8-sig", "utf-8", "latin1"):
+        for sep in (";", ",", "\t", "|"):
+            try:
+                df = pd.read_csv(BytesIO(data), sep=sep, encoding=enc)
+                if len(df.columns) > 1:
+                    return df
+            except Exception:
+                continue
+    return pd.DataFrame()
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [_norm_col_name(c) for c in out.columns]
+    return out
+
+
+def _find_col(columns: list[str], include_any: list[str], include_all: list[str] | None = None, exclude_any: list[str] | None = None) -> str | None:
+    include_all = include_all or []
+    exclude_any = exclude_any or []
+    for col in columns:
+        if include_any and not any(token in col for token in include_any):
+            continue
+        if include_all and not all(token in col for token in include_all):
+            continue
+        if exclude_any and any(token in col for token in exclude_any):
+            continue
+        return col
+    return None
+
+
+def _parse_energy_mwh(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce").abs()
+
+
+def _parse_price(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _direction_matches(series: pd.Series, direction: str) -> pd.Series:
+    direction = direction.lower()
+    text = series.astype(str).map(_norm_col_name)
+    if direction == "upward":
+        return text.str.contains("subir|upward|up", regex=True, na=False)
+    return text.str.contains("bajar|downward|down", regex=True, na=False)
+
+
+def _phase_matches(series: pd.Series, category: str) -> pd.Series:
+    text = series.astype(str).map(_norm_col_name)
+    if "Phase I" in category:
+        return text.str.contains(r"fase_?i$|fase_?1|phase_?i$|phase_?1", regex=True, na=False)
+    if "Phase II" in category:
+        return text.str.contains(r"fase_?ii|fase_?2|phase_?ii|phase_?2", regex=True, na=False)
+    return pd.Series(True, index=series.index)
+
+
+def build_technology_breakdown_from_official_files(
+    restrictions_df: pd.DataFrame,
+    mapping_df: pd.DataFrame | None,
+    category: str,
+    direction: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Aggregate official detailed restrictions rows by technology.
+
+    This does not infer technologies from aggregate ESIOS indicators. It uses a detailed
+    official restrictions file and, when needed, an official structural UP/UF mapping file.
+    """
+    notes: list[str] = []
+    if restrictions_df is None or restrictions_df.empty:
+        return pd.DataFrame(), ["No restrictions detail file loaded."]
+
+    df = _normalize_columns(restrictions_df)
+    cols = df.columns.tolist()
+
+    energy_col = _find_col(cols, ["energia", "energy", "mwh"], exclude_any=["precio", "price"])
+    price_col = _find_col(cols, ["precio", "price", "eur", "euro"])
+    tech_col = _find_col(cols, ["tecnologia", "technology", "tipo_produccion", "combustible", "fuel"])
+    unit_col = _find_col(cols, ["unidad_programacion", "up", "unidad", "programming_unit", "codigo_unidad"], exclude_any=["fisica", "physical"])
+    direction_col = _find_col(cols, ["sentido", "direction", "tipo_asignacion", "tipo"])
+    phase_col = _find_col(cols, ["fase", "phase", "proceso", "mercado"])
+
+    if energy_col is None:
+        return pd.DataFrame(), [f"Could not detect an energy/MWh column. Columns found: {cols}"]
+
+    if direction_col is not None:
+        mask = _direction_matches(df[direction_col], direction)
+        if mask.any():
+            df = df.loc[mask].copy()
+        else:
+            notes.append(f"Direction column '{direction_col}' found but no rows matched {direction}; no direction filter applied.")
+    else:
+        notes.append("No direction/sentido column found; using all rows.")
+
+    if phase_col is not None and ("Phase I" in category or "Phase II" in category):
+        mask = _phase_matches(df[phase_col], category)
+        if mask.any():
+            df = df.loc[mask].copy()
+        else:
+            notes.append(f"Phase column '{phase_col}' found but no rows matched {category}; no phase filter applied.")
+    elif "Phase" in category:
+        notes.append("No phase/fase column found; using all rows in the uploaded file. Upload a file already filtered to the phase if needed.")
+
+    # Add technology by mapping file if not present directly.
+    if tech_col is None and mapping_df is not None and not mapping_df.empty and unit_col is not None:
+        map_df = _normalize_columns(mapping_df)
+        mcols = map_df.columns.tolist()
+        map_unit_col = _find_col(mcols, ["unidad_programacion", "up", "unidad", "programming_unit", "codigo_unidad"], exclude_any=["fisica", "physical"])
+        map_tech_col = _find_col(mcols, ["tecnologia", "technology", "tipo_produccion", "combustible", "fuel"])
+        if map_unit_col is not None and map_tech_col is not None:
+            left = df.copy()
+            left["_unit_key"] = left[unit_col].astype(str).str.strip().str.upper()
+            right = map_df[[map_unit_col, map_tech_col]].copy()
+            right["_unit_key"] = right[map_unit_col].astype(str).str.strip().str.upper()
+            right = right.drop_duplicates("_unit_key")
+            df = left.merge(right[["_unit_key", map_tech_col]], on="_unit_key", how="left")
+            tech_col = map_tech_col
+            notes.append("Technology taken from uploaded official structural mapping file.")
+        else:
+            notes.append("Mapping file loaded, but unit/technology columns could not be detected.")
+
+    if tech_col is None:
+        if unit_col is not None:
+            tech_col = unit_col
+            notes.append("No technology column/mapping found; grouping by programming unit instead.")
+        else:
+            df["technology"] = "Unknown / unmapped"
+            tech_col = "technology"
+            notes.append("No technology or unit column found; rows grouped as Unknown / unmapped.")
+
+    df["_energy_mwh"] = _parse_energy_mwh(df[energy_col])
+    df["_price_eur_mwh"] = _parse_price(df[price_col]) if price_col is not None else pd.NA
+    df["_technology"] = df[tech_col].astype(str).replace({"nan": "Unknown / unmapped", "None": "Unknown / unmapped"}).fillna("Unknown / unmapped")
+    df = df.dropna(subset=["_energy_mwh"]).copy()
+
+    if df.empty:
+        return pd.DataFrame(), notes + ["No rows with numeric energy after filters."]
+
+    rows = []
+    for tech, g in df.groupby("_technology", dropna=False):
+        energy_mwh = float(g["_energy_mwh"].sum())
+        price_vals = pd.to_numeric(g["_price_eur_mwh"], errors="coerce")
+        if price_vals.notna().any() and energy_mwh > 0:
+            weighted_price = float((g["_energy_mwh"] * price_vals.fillna(0)).sum() / g.loc[price_vals.notna(), "_energy_mwh"].sum()) if g.loc[price_vals.notna(), "_energy_mwh"].sum() > 0 else pd.NA
+        else:
+            weighted_price = pd.NA
+        rows.append({
+            "technology": str(tech),
+            "energy_gwh": energy_mwh / 1000.0,
+            "avg_price_eur_mwh": weighted_price,
+            "cost_meur": (energy_mwh * weighted_price / 1_000_000.0) if pd.notna(weighted_price) else pd.NA,
+            "rows": int(len(g)),
+        })
+
+    out = pd.DataFrame(rows).sort_values("energy_gwh", ascending=False).reset_index(drop=True)
+    return out, notes
+
+
+def plot_technology_breakdown_altair(tech_df: pd.DataFrame, category: str, direction: str) -> alt.Chart:
+    data = tech_df.copy()
+    data["energy_gwh"] = pd.to_numeric(data["energy_gwh"], errors="coerce")
+    data["avg_price_eur_mwh"] = pd.to_numeric(data["avg_price_eur_mwh"], errors="coerce")
+    data["cost_meur"] = pd.to_numeric(data["cost_meur"], errors="coerce")
+    return alt.Chart(data).mark_bar().encode(
+        y=alt.Y("technology:N", sort="-x", title=None),
+        x=alt.X("energy_gwh:Q", title="Energy (GWh)"),
+        tooltip=[
+            alt.Tooltip("technology:N", title="Technology / unit"),
+            alt.Tooltip("energy_gwh:Q", title="Energy (GWh)", format=",.1f"),
+            alt.Tooltip("avg_price_eur_mwh:Q", title="Avg price (€/MWh)", format=",.2f"),
+            alt.Tooltip("cost_meur:Q", title="Cost estimate (M€)", format=",.2f"),
+            alt.Tooltip("rows:Q", title="Rows", format=",d"),
+        ],
+    ).properties(
+        height=max(260, min(720, 28 * len(data))),
+        title=alt.TitleParams(
+            text=f"Technology breakdown — {category} {direction.lower()}",
+            subtitle="Built from official detailed restrictions file, not from aggregate indicator IDs",
+            anchor="start",
+        ),
+    ).interactive()
 
 # =========================================================
 # REE public demand profile helpers
@@ -1328,6 +1547,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
+st.success("Version loaded: OFFICIAL balancing volumes + avg prices + hover + optional technology upload")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -1719,7 +1939,32 @@ if run:
             title_suffix = f" | {start_day:%d-%b-%Y} to {end_day:%d-%b-%Y}"
             balancing_chart = plot_balancing_energy_summary_altair(balancing_energy, balancing_reserve, title_suffix=title_suffix)
             st.altair_chart(balancing_chart, use_container_width=True)
-            st.caption("Hover over the bars to see the exact values used in the chart.")
+            st.caption("Hover over the bars to see the exact values used in the chart. Price also appears in the bar label when an official price indicator exists.")
+
+            price_view_cols = [
+                "category",
+                "upward_gwh",
+                "upward_avg_price_eur_mwh",
+                "upward_cost_meur",
+                "downward_gwh",
+                "downward_avg_price_eur_mwh",
+                "downward_cost_meur",
+            ]
+            price_view_cols = [c for c in price_view_cols if c in balancing_energy.columns]
+            st.markdown("**Visible volume / average price table**")
+            st.dataframe(
+                balancing_energy[price_view_cols].rename(columns={
+                    "category": "Category",
+                    "upward_gwh": "Upward volume (GWh)",
+                    "upward_avg_price_eur_mwh": "Upward avg price (€/MWh)",
+                    "upward_cost_meur": "Upward cost estimate (M€)",
+                    "downward_gwh": "Downward volume (GWh)",
+                    "downward_avg_price_eur_mwh": "Downward avg price (€/MWh)",
+                    "downward_cost_meur": "Downward cost estimate (M€)",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1750,6 +1995,76 @@ if run:
                 if balancing_missing:
                     st.markdown("**Missing/empty indicators**")
                     st.write(balancing_missing)
+
+            with st.expander("Technology breakdown from official REE/e·sios detail files", expanded=False):
+                st.markdown(
+                    "This part cannot be derived from aggregate indicators like 701/702. "
+                    "Upload the official detailed restrictions file from e·sios downloads, and optionally the official structural UP/UF mapping file. "
+                    "If the restrictions file already contains a technology column, the mapping file is not needed."
+                )
+                st.markdown(
+                    "Official sources: [e·sios downloads](https://www.esios.ree.es/es/descargas) and "
+                    "[Unidades de programación](https://www.esios.ree.es/es/unidades-de-programacion)."
+                )
+                tech_col1, tech_col2 = st.columns(2)
+                with tech_col1:
+                    tech_category = st.selectbox(
+                        "Balancing bucket to break down",
+                        options=list(BALANCING_ENERGY_SECTIONS.keys()),
+                        index=0,
+                        key="balancing_tech_category",
+                    )
+                with tech_col2:
+                    tech_direction = st.selectbox(
+                        "Direction",
+                        options=["Upward", "Downward"],
+                        index=0,
+                        key="balancing_tech_direction",
+                    )
+
+                restrictions_upload = st.file_uploader(
+                    "Official restrictions detail file CSV/XLSX",
+                    type=["csv", "txt", "xlsx", "xls"],
+                    key="official_restrictions_detail_upload",
+                )
+                mapping_upload = st.file_uploader(
+                    "Optional official UP/UF technology mapping CSV/XLSX",
+                    type=["csv", "txt", "xlsx", "xls"],
+                    key="official_unit_technology_mapping_upload",
+                )
+
+                if restrictions_upload is not None:
+                    detail_df = _read_tabular_upload(restrictions_upload)
+                    mapping_df = _read_tabular_upload(mapping_upload) if mapping_upload is not None else pd.DataFrame()
+                    tech_breakdown, tech_notes = build_technology_breakdown_from_official_files(
+                        detail_df,
+                        mapping_df,
+                        tech_category,
+                        tech_direction,
+                    )
+                    if tech_notes:
+                        for note in tech_notes:
+                            st.caption(note)
+                    if tech_breakdown.empty:
+                        st.warning("Could not build a technology breakdown from the uploaded file. Open the preview below and check column names.")
+                    else:
+                        st.altair_chart(
+                            plot_technology_breakdown_altair(tech_breakdown, tech_category, tech_direction),
+                            use_container_width=True,
+                        )
+                        st.dataframe(tech_breakdown, use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download technology breakdown CSV",
+                            tech_breakdown.to_csv(index=False).encode("utf-8"),
+                            file_name=f"technology_breakdown_{tech_category}_{tech_direction}_{start_day}_{end_day}.csv".replace(" ", "_"),
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    with st.expander("Uploaded restrictions file preview", expanded=False):
+                        st.write({"columns": list(detail_df.columns), "rows": int(len(detail_df))})
+                        st.dataframe(detail_df.head(50), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Upload the official detailed restrictions file to calculate the technology split.")
 
             csv_buf = pd.concat(
                 [
