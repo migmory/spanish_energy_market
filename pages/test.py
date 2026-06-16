@@ -84,8 +84,8 @@ BALANCING_ENERGY_SECTIONS = {
     "Secondary energy": {"up": [680], "down": [681]},
 }
 BALANCING_SECONDARY_RESERVE_IDS = {"Downward": [633], "Upward": [632]}
-# Official ESIOS secondary-reserve band marginal price. This is a capacity/band price,
-# so it is shown as €/MW in the reserve chart, not as €/MWh energy price.
+# Official ESIOS secondary-reserve band marginal price. In this app it is shown as
+# an hourly-equivalent capacity price, €/MW/h = published €/MW/15min × 4.
 BALANCING_SECONDARY_RESERVE_PRICE_IDS = {"Downward": [634], "Upward": [634]}
 
 # Official ESIOS average-price indicators used in the hover tooltip.
@@ -833,7 +833,8 @@ def build_balancing_energy_summary(
             {
                 "direction": direction,
                 "avg_mw": avg_mw,
-                "avg_price_eur_mw": avg_price_eur_mw,
+                "avg_price_eur_mw_15min": avg_price_eur_mw,
+                "avg_price_eur_mw_h": (avg_price_eur_mw * 4.0) if avg_price_eur_mw is not None else None,
                 "price_ids": ", ".join(map(str, reserve_price_map.get(direction, []))) or "n/a",
             }
         )
@@ -940,7 +941,7 @@ def build_balancing_indicator_breakdown(
                     "direction": direction_key,
                     "indicator_id": indicator_id,
                     "value": float(vals.mean()) if not vals.empty else pd.NA,
-                    "unit": "€/MW",
+                    "unit": "€/MW/15min",
                     "rows": int(len(vals)),
                 }
             )
@@ -1041,11 +1042,24 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
 
     reserve_plot = reserve.copy()
     reserve_plot["avg_mw"] = pd.to_numeric(reserve_plot["avg_mw"], errors="coerce")
-    reserve_plot["avg_price_eur_mw"] = pd.to_numeric(reserve_plot.get("avg_price_eur_mw"), errors="coerce") if "avg_price_eur_mw" in reserve_plot.columns else pd.NA
+    # ESIOS/balancing-services-style capacity price can be understood as €/MW/15min.
+    # Display the hourly equivalent in the chart label: €/MW/h = €/MW/15min × 4.
+    if "avg_price_eur_mw_h" not in reserve_plot.columns:
+        if "avg_price_eur_mw_15min" in reserve_plot.columns:
+            reserve_plot["avg_price_eur_mw_h"] = pd.to_numeric(reserve_plot["avg_price_eur_mw_15min"], errors="coerce") * 4.0
+        elif "avg_price_eur_mw" in reserve_plot.columns:
+            reserve_plot["avg_price_eur_mw_h"] = pd.to_numeric(reserve_plot["avg_price_eur_mw"], errors="coerce") * 4.0
+        else:
+            reserve_plot["avg_price_eur_mw_h"] = pd.NA
+    reserve_plot["avg_price_eur_mw_h"] = pd.to_numeric(reserve_plot["avg_price_eur_mw_h"], errors="coerce")
+    if "avg_price_eur_mw_15min" in reserve_plot.columns:
+        reserve_plot["avg_price_eur_mw_15min"] = pd.to_numeric(reserve_plot["avg_price_eur_mw_15min"], errors="coerce")
+    else:
+        reserve_plot["avg_price_eur_mw_15min"] = reserve_plot["avg_price_eur_mw_h"] / 4.0
     reserve_plot["label"] = reserve_plot.apply(
         lambda r: (
-            f"{r['avg_mw']:,.0f} MW | {r['avg_price_eur_mw']:,.2f} €/MW"
-            if pd.notna(r.get("avg_mw")) and pd.notna(r.get("avg_price_eur_mw"))
+            f"{r['avg_mw']:,.0f} MW | {r['avg_price_eur_mw_h']:,.2f} €/MW/h"
+            if pd.notna(r.get("avg_mw")) and pd.notna(r.get("avg_price_eur_mw_h"))
             else (f"{r['avg_mw']:,.0f} MW" if pd.notna(r.get("avg_mw")) else "")
         ),
         axis=1,
@@ -1066,7 +1080,8 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
         tooltip=[
             alt.Tooltip("direction:N", title="Direction"),
             alt.Tooltip("avg_mw:Q", title="Average reserve (MW)", format=",.0f"),
-            alt.Tooltip("avg_price_eur_mw:Q", title="Avg band price (€/MW)", format=",.2f"),
+            alt.Tooltip("avg_price_eur_mw_h:Q", title="Avg band price hourly eq. (€/MW/h)", format=",.2f"),
+            alt.Tooltip("avg_price_eur_mw_15min:Q", title="Published / 15-min price (€/MW/15min)", format=",.2f"),
             alt.Tooltip("price_ids:N", title="Price indicator IDs"),
         ],
     )
@@ -1601,7 +1616,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v3 — larger chart + volume prices + secondary reserve €/MW + hover + optional technology upload")
+st.success("Version loaded: OFFICIAL balancing v4 — secondary reserve shown as €/MW/h hourly equivalent + hover + optional technology upload")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -1981,7 +1996,7 @@ if run:
         st.caption(
             "ESIOS indicators are summed over the selected range for balancing energy volumes. "
             "Upward and downward are kept separate; downward is only plotted below zero for visual comparison. "
-            "Secondary reserve is averaged in MW and its official band price is averaged in €/MW when available."
+            "Secondary reserve is averaged in MW and its band price is displayed as hourly-equivalent €/MW/h (= published €/MW/15min × 4) when available."
         )
 
         with st.spinner("Fetching ESIOS balancing-energy indicators..."):
@@ -2019,14 +2034,15 @@ if run:
                 use_container_width=True,
                 hide_index=True,
             )
-            reserve_view_cols = [c for c in ["direction", "avg_mw", "avg_price_eur_mw", "price_ids"] if c in balancing_reserve.columns]
+            reserve_view_cols = [c for c in ["direction", "avg_mw", "avg_price_eur_mw_h", "avg_price_eur_mw_15min", "price_ids"] if c in balancing_reserve.columns]
             if reserve_view_cols:
                 st.markdown("**Visible secondary reserve / average band price table**")
                 st.dataframe(
                     balancing_reserve[reserve_view_cols].rename(columns={
                         "direction": "Direction",
                         "avg_mw": "Average reserve (MW)",
-                        "avg_price_eur_mw": "Average band price (€/MW)",
+                        "avg_price_eur_mw_h": "Average band price hourly eq. (€/MW/h)",
+                        "avg_price_eur_mw_15min": "Published band price (€/MW/15min)",
                         "price_ids": "Price indicator IDs",
                     }),
                     use_container_width=True,
