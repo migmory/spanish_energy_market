@@ -70,6 +70,20 @@ REE_PENINSULAR_PARAMS = {
 PRICE_INDICATOR_ID = 600
 DEMAND_PBF_ID = 10141
 
+# Balancing-energy graph IDs.
+# Goal: replicate the slide/chart: upward and downward balancing energy should not be blended.
+# Energy indicators are summed over the selected period and converted MWh -> GWh.
+# Reserve indicators are averaged over the selected period and shown in MW.
+# Keep the mapping explicit so it is easy to adjust if ESIOS changes/renames an indicator.
+BALANCING_ENERGY_SECTIONS = {
+    "Day-ahead constraints Phase I": {"up": [701], "down": [702]},
+    "Day-ahead constraints Phase II": {"up": [703], "down": [704]},
+    "Real-time constraints": {"up": [1806, 1808, 1810, 1814], "down": [1807, 1809, 1811, 1815]},
+    "Tertiary / mFRR": {"up": [10395, 10396], "down": [10394, 10397]},
+    "Secondary energy": {"up": [680], "down": [681]},
+}
+BALANCING_SECONDARY_RESERVE_IDS = {"Downward": [633], "Upward": [632]}
+
 # PBF gross generation.
 # IMPORTANT:
 # Avoid non-working aggregated IDs such as 10167/10077/10086 where ESIOS returns no rows.
@@ -564,6 +578,162 @@ def calculate_monthly_stats(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# =========================================================
+# Balancing energy: upward vs downward
+# =========================================================
+def _sum_esios_indicators_over_period_gwh(
+    indicator_ids: list[int],
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[float, list[str]]:
+    """
+    Fetch one or more hourly ESIOS indicators, sum their values over the selected
+    period, and convert MWh -> GWh. Values are absolute for volume reporting so
+    downward energy is not netted against upward energy.
+    """
+    total_mwh = 0.0
+    missing: list[str] = []
+
+    for indicator_id in indicator_ids:
+        raw = fetch_esios_range(
+            indicator_id,
+            start_day,
+            end_day,
+            token,
+            time_trunc="hour",
+            time_agg="sum",
+        )
+        if raw.empty:
+            missing.append(str(indicator_id))
+            continue
+        vals = pd.to_numeric(raw["value"], errors="coerce").dropna()
+        total_mwh += float(vals.abs().sum())
+
+    return total_mwh / 1000.0, missing
+
+
+def _avg_esios_indicators_over_period_mw(
+    indicator_ids: list[int],
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[float | None, list[str]]:
+    """Fetch one or more hourly ESIOS indicators and return their average MW."""
+    frames = []
+    missing: list[str] = []
+
+    for indicator_id in indicator_ids:
+        raw = fetch_esios_range(
+            indicator_id,
+            start_day,
+            end_day,
+            token,
+            time_trunc="hour",
+        )
+        if raw.empty:
+            missing.append(str(indicator_id))
+            continue
+        frames.append(pd.to_numeric(raw["value"], errors="coerce"))
+
+    if not frames:
+        return None, missing
+
+    vals = pd.concat(frames, ignore_index=True).dropna()
+    if vals.empty:
+        return None, missing
+    return float(vals.mean()), missing
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def build_balancing_energy_summary(
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """
+    Build the summary tables needed to reproduce the balancing-energy chart.
+    Upward and downward are kept as separate positive volumes; only the plot draws
+    downward below zero.
+    """
+    rows = []
+    missing: list[str] = []
+
+    for category, sides in BALANCING_ENERGY_SECTIONS.items():
+        up_gwh, miss_up = _sum_esios_indicators_over_period_gwh(sides.get("up", []), start_day, end_day, token)
+        down_gwh, miss_down = _sum_esios_indicators_over_period_gwh(sides.get("down", []), start_day, end_day, token)
+        missing.extend([f"{category} upward: {x}" for x in miss_up])
+        missing.extend([f"{category} downward: {x}" for x in miss_down])
+        rows.append({"category": category, "upward_gwh": up_gwh, "downward_gwh": down_gwh})
+
+    reserve_rows = []
+    for direction, ids in BALANCING_SECONDARY_RESERVE_IDS.items():
+        avg_mw, miss = _avg_esios_indicators_over_period_mw(ids, start_day, end_day, token)
+        missing.extend([f"Secondary reserve {direction}: {x}" for x in miss])
+        reserve_rows.append({"direction": direction, "avg_mw": avg_mw})
+
+    energy = pd.DataFrame(rows)
+    reserve = pd.DataFrame(reserve_rows)
+    return energy, reserve, missing
+
+
+def plot_balancing_energy_summary(energy: pd.DataFrame, reserve: pd.DataFrame, title_suffix: str = "") -> plt.Figure:
+    """Matplotlib version of the slide-style balancing chart."""
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(15, 5.6),
+        gridspec_kw={"width_ratios": [2.35, 1]},
+        constrained_layout=True,
+    )
+
+    fig.suptitle(
+        f"Upward and downward balancing energy should not be blended{title_suffix}",
+        x=0.02,
+        ha="left",
+        fontsize=16,
+    )
+
+    x = list(range(len(energy)))
+    up = pd.to_numeric(energy["upward_gwh"], errors="coerce").fillna(0.0)
+    down = pd.to_numeric(energy["downward_gwh"], errors="coerce").fillna(0.0)
+
+    axes[0].bar(x, up, color="#0F7F73", label="Upward")
+    axes[0].bar(x, -down, color="#C81046", label="Downward")
+    axes[0].axhline(0, color="#AEB6BF", linewidth=1)
+    axes[0].set_title("Balancing energy volume: upward vs downward")
+    axes[0].set_ylabel("GWh (+ upward / - downward)")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(energy["category"].tolist(), rotation=13, ha="right")
+    axes[0].grid(axis="y", alpha=0.22)
+    axes[0].spines[["top", "right"]].set_visible(False)
+    axes[0].legend(loc="lower center", bbox_to_anchor=(0.73, -0.28), ncol=2, frameon=False)
+
+    y_span = max(float(up.max() if len(up) else 0), float(down.max() if len(down) else 0), 1.0)
+    for i, val in enumerate(up):
+        if abs(val) > 1e-9:
+            axes[0].text(i, val + y_span * 0.025, f"{val:,.0f} GWh", ha="center", va="bottom", fontsize=9)
+    for i, val in enumerate(down):
+        if abs(val) > 1e-9:
+            axes[0].text(i, -val - y_span * 0.025, f"{val:,.0f} GWh", ha="center", va="top", fontsize=9)
+
+    reserve_plot = reserve.copy()
+    reserve_plot["avg_mw"] = pd.to_numeric(reserve_plot["avg_mw"], errors="coerce")
+    axes[1].bar(reserve_plot["direction"], reserve_plot["avg_mw"], color=["#1CA7DF", "#0B6FA4"])
+    axes[1].set_title("Average secondary reserve")
+    axes[1].set_ylabel("MW")
+    axes[1].grid(axis="y", alpha=0.22)
+    axes[1].spines[["top", "right"]].set_visible(False)
+
+    reserve_max = reserve_plot["avg_mw"].max(skipna=True)
+    reserve_span = float(reserve_max) if pd.notna(reserve_max) and reserve_max else 1.0
+    for i, val in enumerate(reserve_plot["avg_mw"]):
+        if pd.notna(val):
+            axes[1].text(i, val + reserve_span * 0.015, f"{val:,.0f} MW", ha="center", va="bottom", fontsize=9)
+
+    return fig
+
+
 # Nice bilingual names for bilaterals. These columns are fetched and mapped back to gross techs.
 BILATERAL_FETCH_NAMES = {
     "Programa bilateral PBF Hidráulica UGH": 421,
@@ -863,6 +1033,11 @@ auto_fix_price_scale = st.checkbox(
     "Auto-fix suspicious ESIOS price scale",
     value=True,
     help="If live ESIOS prices look 10x too high versus normal Spanish spot prices, divide that live series by 10 before merging.",
+)
+show_balancing_chart = st.checkbox(
+    "Show balancing energy upward/downward chart",
+    value=True,
+    help="Adds the monthly-style ESIOS balancing chart: upward and downward energy volumes plus average secondary reserve.",
 )
 
 if end_day < start_day:
@@ -1173,6 +1348,70 @@ if run:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+
+    # -----------------------------------------------------
+    # Balancing energy: upward vs downward
+    # -----------------------------------------------------
+    if show_balancing_chart:
+        st.subheader("Balancing energy — upward vs downward")
+        st.caption(
+            "ESIOS indicators are summed over the selected range for balancing energy volumes. "
+            "Upward and downward are kept separate; downward is only plotted below zero for visual comparison. "
+            "Secondary reserve is averaged in MW."
+        )
+
+        with st.spinner("Fetching ESIOS balancing-energy indicators..."):
+            balancing_energy, balancing_reserve, balancing_missing = build_balancing_energy_summary(start_day, end_day, token)
+
+        if balancing_energy.empty:
+            st.warning("No balancing-energy rows could be built for the selected period.")
+        else:
+            title_suffix = f" | {start_day:%d-%b-%Y} to {end_day:%d-%b-%Y}"
+            fig = plot_balancing_energy_summary(balancing_energy, balancing_reserve, title_suffix=title_suffix)
+            st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Upward balancing energy", f"{balancing_energy['upward_gwh'].sum():,.0f} GWh")
+            with c2:
+                st.metric("Downward balancing energy", f"{balancing_energy['downward_gwh'].sum():,.0f} GWh")
+            with c3:
+                net_gwh = balancing_energy["upward_gwh"].sum() - balancing_energy["downward_gwh"].sum()
+                st.metric("Upward minus downward", f"{net_gwh:,.0f} GWh")
+
+            with st.expander("Balancing-energy data and indicator diagnostics", expanded=False):
+                st.markdown("**Energy volumes by product**")
+                st.dataframe(balancing_energy, use_container_width=True, hide_index=True)
+                st.markdown("**Average secondary reserve**")
+                st.dataframe(balancing_reserve, use_container_width=True, hide_index=True)
+                st.markdown("**Indicator IDs used**")
+                st.json({
+                    "energy_sections": BALANCING_ENERGY_SECTIONS,
+                    "secondary_reserve": BALANCING_SECONDARY_RESERVE_IDS,
+                })
+                if balancing_missing:
+                    st.markdown("**Missing/empty indicators**")
+                    st.write(balancing_missing)
+
+            csv_buf = pd.concat(
+                [
+                    balancing_energy.assign(table="energy_gwh"),
+                    balancing_reserve.rename(columns={"direction": "category", "avg_mw": "upward_gwh"}).assign(
+                        downward_gwh=pd.NA,
+                        table="secondary_reserve_avg_mw",
+                    ),
+                ],
+                ignore_index=True,
+                sort=False,
+            )
+            st.download_button(
+                "Download balancing chart data CSV",
+                csv_buf.to_csv(index=False).encode("utf-8"),
+                file_name=f"balancing_energy_up_down_{start_day}_{end_day}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 
     # -----------------------------------------------------
