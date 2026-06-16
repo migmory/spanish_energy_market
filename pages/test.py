@@ -47,6 +47,18 @@ except Exception:
 
 st.set_page_config(page_title="Hueco térmico PBF + REE demand profile", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    div[data-testid="stVegaLiteChart"] {
+        max-width: 100% !important;
+        overflow-x: hidden !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Same path convention as the main app pages.
 BASE_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
 ENV_PATH = BASE_DIR / ".env"
@@ -911,7 +923,7 @@ def build_hourly_price_profile(
 
 
 def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, Any]) -> alt.Chart:
-    """Static full-width H1-H24 line chart in monthly-report style (photo mode, no hover)."""
+    """Static H1-H24 line chart sized to fit inside the Streamlit content column."""
     title = str(meta.get("profile", "Hourly price profile"))
     unit = str(meta.get("unit", ""))
     published_unit = str(meta.get("published_unit", unit))
@@ -931,14 +943,14 @@ def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, A
         subtitle = f"Average by delivery hour over the selected period | published {published_unit} × {multiplier:g} = {unit}"
 
     chart = alt.Chart(plot).mark_line(
-        point=alt.OverlayMarkDef(filled=True, size=55),
-        strokeWidth=3,
+        point=alt.OverlayMarkDef(filled=True, size=42),
+        strokeWidth=2.6,
     ).encode(
         x=alt.X(
-            "hour:O",
+            "hour:Q",
             title="Hour",
-            sort=list(range(1, 25)),
-            axis=alt.Axis(labelAngle=0, labelOverlap=False),
+            scale=alt.Scale(domain=[1, 24], nice=False),
+            axis=alt.Axis(values=list(range(1, 25)), labelAngle=0, labelFontSize=10),
         ),
         y=alt.Y(
             "value:Q",
@@ -957,44 +969,42 @@ def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, A
             scale=alt.Scale(domain=order, range=dashes),
             legend=None,
         ),
-    ).properties(title=f"{title} | H1-H24")
+    ).properties(
+        title=f"{title} | H1-H24",
+        width=980,
+    )
 
-    return apply_monthly_report_chart_style(chart, height=340)
+    return apply_monthly_report_chart_style(chart, height=330)
 
 
 def build_hourly_price_profile_table(profile_df: pd.DataFrame, meta: dict[str, Any]) -> pd.DataFrame:
-    """Visible table under each static chart so the user can read exact values without hover."""
+    """Compact visible table under each static chart so the page does not create horizontal overflow."""
     if profile_df is None or profile_df.empty:
         return pd.DataFrame()
 
     unit = str(meta.get("unit", ""))
-    published_unit = str(meta.get("published_unit", unit))
 
     tmp = profile_df.copy()
     tmp["value"] = pd.to_numeric(tmp["value"], errors="coerce")
-    tmp["published_value"] = pd.to_numeric(tmp["published_value"], errors="coerce")
     tmp["obs"] = pd.to_numeric(tmp["obs"], errors="coerce")
 
     value_wide = tmp.pivot(index="hour", columns="direction", values="value") if not tmp.empty else pd.DataFrame()
-    pub_wide = tmp.pivot(index="hour", columns="direction", values="published_value") if not tmp.empty else pd.DataFrame()
     obs_wide = tmp.pivot(index="hour", columns="direction", values="obs") if not tmp.empty else pd.DataFrame()
 
-    hours = sorted(tmp["hour"].dropna().astype(int).unique().tolist())
+    hours = list(range(1, 25))
     rows = []
     for h in hours:
         rows.append({
             "Hour": f"H{h:02d}",
             f"Upward avg ({unit})": value_wide.loc[h, "Upward"] if (not value_wide.empty and "Upward" in value_wide.columns and h in value_wide.index) else pd.NA,
             f"Downward avg ({unit})": value_wide.loc[h, "Downward"] if (not value_wide.empty and "Downward" in value_wide.columns and h in value_wide.index) else pd.NA,
-            f"Upward published ({published_unit})": pub_wide.loc[h, "Upward"] if (not pub_wide.empty and "Upward" in pub_wide.columns and h in pub_wide.index) else pd.NA,
-            f"Downward published ({published_unit})": pub_wide.loc[h, "Downward"] if (not pub_wide.empty and "Downward" in pub_wide.columns and h in pub_wide.index) else pd.NA,
             "Upward obs": obs_wide.loc[h, "Upward"] if (not obs_wide.empty and "Upward" in obs_wide.columns and h in obs_wide.index) else pd.NA,
             "Downward obs": obs_wide.loc[h, "Downward"] if (not obs_wide.empty and "Downward" in obs_wide.columns and h in obs_wide.index) else pd.NA,
         })
 
     out = pd.DataFrame(rows)
     for col in out.columns:
-        if col.startswith("Upward avg") or col.startswith("Downward avg") or col.startswith("Upward published") or col.startswith("Downward published"):
+        if col.startswith("Upward avg") or col.startswith("Downward avg"):
             out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
         if col.endswith("obs"):
             out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
@@ -1843,7 +1853,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v9 — static photo-mode hourly charts with visible tables underneath")
+st.success("Version loaded: OFFICIAL balancing v10 — 24h charts fixed to fit screen + compact tables")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -2253,7 +2263,7 @@ if run:
                     st.warning(f"No data returned for {profile_name}.")
                     continue
                 hourly_profile_rows.append(profile_df)
-                st.altair_chart(plot_hourly_price_profile_altair(profile_df, profile_meta), use_container_width=True)
+                st.altair_chart(plot_hourly_price_profile_altair(profile_df, profile_meta), use_container_width=False)
                 st.caption("Static chart mode: exact values are shown in the table below.")
                 profile_table = build_hourly_price_profile_table(profile_df, profile_meta)
                 if not profile_table.empty:
