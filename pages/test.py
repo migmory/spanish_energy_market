@@ -879,8 +879,16 @@ def build_hourly_price_profile(
     return out, meta, missing
 
 
-def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, Any]) -> alt.Chart:
-    """Line chart for H1-H24 average price profiles with hover."""
+def plot_hourly_price_profile_altair(
+    profile_df: pd.DataFrame,
+    meta: dict[str, Any],
+    *,
+    hour_min: int = 1,
+    hour_max: int = 24,
+    height: int = 420,
+    title_suffix: str = "",
+) -> alt.Chart:
+    """Readable line chart for H1-H24 average price profiles with hover."""
     title = str(meta.get("profile", "Hourly price profile"))
     unit = str(meta.get("unit", ""))
     published_unit = str(meta.get("published_unit", unit))
@@ -889,27 +897,47 @@ def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, A
     if profile_df.empty:
         return alt.Chart(pd.DataFrame({"hour_label": [], "value": []})).mark_line()
 
-    y_title = f"Average price ({unit})" if unit else "Average price"
-    subtitle = "Average by delivery hour over selected period"
-    if abs(multiplier - 1.0) > 1e-9:
-        subtitle = f"Average by delivery hour over selected period; published {published_unit} × {multiplier:g} = {unit}"
+    plot_df = profile_df.copy()
+    plot_df = plot_df[(plot_df["hour"] >= hour_min) & (plot_df["hour"] <= hour_max)].copy()
+    plot_df["hour_label"] = plot_df["hour"].map(lambda x: f"H{int(x):02d}")
+    plot_df["hour_num_label"] = plot_df["hour"].map(lambda x: f"{int(x):02d}")
 
+    y_title = f"Average price ({unit})" if unit else "Average price"
+    subtitle = f"Average by delivery hour over selected period — H{hour_min:02d} to H{hour_max:02d}"
+    if abs(multiplier - 1.0) > 1e-9:
+        subtitle = (
+            f"Average by delivery hour over selected period — H{hour_min:02d} to H{hour_max:02d}; "
+            f"published {published_unit} × {multiplier:g} = {unit}"
+        )
+
+    hour_order = list(range(hour_min, hour_max + 1))
     return (
-        alt.Chart(profile_df)
-        .mark_line(point=True, strokeWidth=3)
+        alt.Chart(plot_df)
+        .mark_line(point=alt.OverlayMarkDef(size=70, filled=True), strokeWidth=3.5)
         .encode(
             x=alt.X(
                 "hour:O",
                 title="Delivery hour",
-                sort=list(range(1, 25)),
-                axis=alt.Axis(labelAngle=0, labelFontSize=12),
+                sort=hour_order,
+                axis=alt.Axis(
+                    values=hour_order,
+                    labelExpr="'H' + (datum.value < 10 ? '0' + datum.value : datum.value)",
+                    labelAngle=0,
+                    labelFontSize=14,
+                    titleFontSize=14,
+                ),
             ),
-            y=alt.Y("value:Q", title=y_title, scale=alt.Scale(zero=False)),
+            y=alt.Y(
+                "value:Q",
+                title=y_title,
+                scale=alt.Scale(zero=False, nice=True),
+                axis=alt.Axis(labelFontSize=13, titleFontSize=14),
+            ),
             color=alt.Color(
                 "direction:N",
                 title="Direction",
                 scale=alt.Scale(domain=["Downward", "Upward"], range=["#1CA7DF", "#0F7F73"]),
-                legend=alt.Legend(orient="top", direction="horizontal"),
+                legend=alt.Legend(orient="top", direction="horizontal", labelFontSize=13, titleFontSize=13),
             ),
             tooltip=[
                 alt.Tooltip("hour_label:N", title="Hour"),
@@ -921,12 +949,17 @@ def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, A
             ],
         )
         .properties(
-            height=360,
-            title=alt.TitleParams(text=title, subtitle=subtitle, anchor="start", fontSize=18, subtitleFontSize=12),
+            width=1050,
+            height=height,
+            title=alt.TitleParams(
+                text=f"{title}{title_suffix}",
+                subtitle=subtitle,
+                anchor="start",
+                fontSize=18,
+                subtitleFontSize=12,
+            ),
         )
         .interactive(bind_y=False)
-        .configure_axis(labelFontSize=12, titleFontSize=13)
-        .configure_legend(labelFontSize=12, titleFontSize=12)
         .configure_view(strokeWidth=0)
     )
 
@@ -1773,7 +1806,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v6 — volume/price chart + H1-H24 price profiles for aFRR, RRTT Phase I and Phase II")
+st.success("Version loaded: OFFICIAL balancing v7 — readable H1-H24 price profiles with tabs and split view")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -2168,14 +2201,27 @@ if run:
             st.caption("Hover over the bars to see the exact values used in the chart. Price also appears in the bar label when an official price indicator exists.")
 
             st.subheader("Average hourly price profiles — H1 to H24")
-            st.caption("Each line is the average of official ESIOS price indicators by Madrid delivery hour over the selected period. Hover over a point to see the exact value and indicator IDs.")
-            hourly_profile_rows = []
-            hourly_profile_missing: list[str] = []
-            for profile_name in [
+            st.caption(
+                "Each line is the average of official ESIOS price indicators by Madrid delivery hour over the selected period. "
+                "To keep H1-H24 readable, the default view is one profile at a time and split into H01-H12 / H13-H24."
+            )
+
+            profile_names = [
                 "aFRR capacity price",
                 "Day-ahead constraints Phase I price",
                 "Day-ahead constraints Phase II price",
-            ]:
+            ]
+            profile_labels = {
+                "aFRR capacity price": "aFRR capacity",
+                "Day-ahead constraints Phase I price": "RRTT Phase I",
+                "Day-ahead constraints Phase II price": "RRTT Phase II",
+            }
+
+            hourly_profile_rows = []
+            hourly_profile_missing: list[str] = []
+            hourly_profile_results: dict[str, tuple[pd.DataFrame, dict[str, Any]]] = {}
+
+            for profile_name in profile_names:
                 with st.spinner(f"Fetching {profile_name} hourly profile..."):
                     profile_df, profile_meta, profile_missing = build_hourly_price_profile(profile_name, start_day, end_day, token)
                 hourly_profile_missing.extend(profile_missing)
@@ -2183,11 +2229,44 @@ if run:
                     st.warning(f"No data returned for {profile_name}.")
                     continue
                 hourly_profile_rows.append(profile_df)
-                st.altair_chart(plot_hourly_price_profile_altair(profile_df, profile_meta), use_container_width=True)
+                hourly_profile_results[profile_name] = (profile_df, profile_meta)
 
-            if hourly_profile_rows:
+            if hourly_profile_results:
+                display_mode = st.radio(
+                    "Hourly price chart display",
+                    ["Split 12h panels (recommended)", "Full H1-H24 chart", "Table only"],
+                    index=0,
+                    horizontal=True,
+                    key="hourly_profile_display_mode",
+                )
+                selected_profile = st.selectbox(
+                    "Profile to display",
+                    list(hourly_profile_results.keys()),
+                    format_func=lambda x: profile_labels.get(x, x),
+                    key="selected_hourly_profile",
+                )
+                selected_df, selected_meta = hourly_profile_results[selected_profile]
+
+                if display_mode == "Split 12h panels (recommended)":
+                    st.altair_chart(
+                        plot_hourly_price_profile_altair(selected_df, selected_meta, hour_min=1, hour_max=12, height=360, title_suffix=" — H01-H12"),
+                        use_container_width=True,
+                    )
+                    st.altair_chart(
+                        plot_hourly_price_profile_altair(selected_df, selected_meta, hour_min=13, hour_max=24, height=360, title_suffix=" — H13-H24"),
+                        use_container_width=True,
+                    )
+                elif display_mode == "Full H1-H24 chart":
+                    st.altair_chart(
+                        plot_hourly_price_profile_altair(selected_df, selected_meta, hour_min=1, hour_max=24, height=520),
+                        use_container_width=True,
+                    )
+
+                pivot = selected_df.pivot_table(index="hour_label", columns="direction", values="value", aggfunc="mean").reset_index()
+                st.dataframe(pivot, use_container_width=True, hide_index=True)
+
                 hourly_profiles_all = pd.concat(hourly_profile_rows, ignore_index=True)
-                with st.expander("Hourly price profile data", expanded=False):
+                with st.expander("Hourly price profile data and downloads", expanded=False):
                     st.dataframe(hourly_profiles_all, use_container_width=True, hide_index=True)
                     if hourly_profile_missing:
                         st.markdown("**Missing/empty hourly price profile indicators**")
