@@ -1364,6 +1364,135 @@ def demand_peak_week_metrics(
     return {"peak_demand_gw": weekly.get("avg_demand_gw"), "peak_demand_is_fallback": True}
 
 
+
+def _week_hourly_demand_profile(demand_hourly: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, label: str) -> pd.DataFrame:
+    """Average 24h demand shape for one week/WTD period from REE hourly demand."""
+    cols = ["hour", "avg_demand_gw", "min_demand_gw", "max_demand_gw", "obs", "series"]
+    if demand_hourly is None or demand_hourly.empty:
+        return pd.DataFrame(columns=cols)
+
+    tmp = demand_hourly.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp["demand_gw"] = pd.to_numeric(tmp["demand_gw"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime", "demand_gw"])
+    start_ts = pd.Timestamp(start_ts).normalize()
+    end_ts = pd.Timestamp(end_ts).normalize()
+    mask = (tmp["datetime"] >= start_ts) & (tmp["datetime"] < end_ts + pd.Timedelta(days=1))
+    tmp = tmp.loc[mask].copy()
+
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+
+    tmp["hour"] = tmp["datetime"].dt.hour
+    out = tmp.groupby("hour", as_index=False).agg(
+        avg_demand_gw=("demand_gw", "mean"),
+        min_demand_gw=("demand_gw", "min"),
+        max_demand_gw=("demand_gw", "max"),
+        obs=("demand_gw", "count"),
+    )
+    out["series"] = label
+    return out[cols]
+
+
+def weekly_average_demand_profile_chart(
+    demand_hourly: pd.DataFrame,
+    selected_week_start: pd.Timestamp,
+    selected_week_end: pd.Timestamp,
+    previous_week_start: pd.Timestamp,
+    previous_week_end: pd.Timestamp,
+    selected_label: str,
+    previous_label: str,
+):
+    """Weekly average hourly demand profile, selected week/WTD vs previous week."""
+    frames = [
+        _week_hourly_demand_profile(demand_hourly, selected_week_start, selected_week_end, selected_label),
+        _week_hourly_demand_profile(demand_hourly, previous_week_start, previous_week_end, previous_label),
+    ]
+    valid_frames = [f for f in frames if f is not None and not f.empty]
+    if not valid_frames:
+        return None
+    plot = pd.concat(valid_frames, ignore_index=True)
+    if plot.empty:
+        return None
+
+    order = [s for s in [selected_label, previous_label] if s in plot["series"].unique().tolist()]
+    colors = [BLUE, GREY_DARK][: len(order)]
+    dashes = [[1, 0], [5, 3]][: len(order)]
+
+    chart = alt.Chart(plot).mark_line(point=alt.OverlayMarkDef(filled=True, size=55), strokeWidth=3).encode(
+        x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("avg_demand_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "series:N",
+            title="Week",
+            scale=alt.Scale(domain=order, range=colors),
+            legend=alt.Legend(orient="top", direction="horizontal", columns=3, labelLimit=420, titleLimit=420, symbolLimit=420),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N",
+            title="Week",
+            scale=alt.Scale(domain=order, range=dashes),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("series:N", title="Week"),
+            alt.Tooltip("hour:O", title="Hour"),
+            alt.Tooltip("avg_demand_gw:Q", title="Average demand", format=",.2f"),
+            alt.Tooltip("min_demand_gw:Q", title="Min demand", format=",.2f"),
+            alt.Tooltip("max_demand_gw:Q", title="Max demand", format=",.2f"),
+            alt.Tooltip("obs:Q", title="Hourly observations", format=",d"),
+        ],
+    ).properties(title="Weekly average 24h demand profile | selected week vs previous week")
+
+    return apply_chart_style(chart, height=340)
+
+
+def weekly_average_demand_profile_fallback_chart(
+    current_metrics: dict,
+    previous_metrics: dict,
+    selected_label: str,
+    previous_label: str,
+):
+    """Fallback 24h demand profile using official weekly average demand when hourly REE demand is unavailable."""
+    rows = []
+    for label, metrics in [(selected_label, current_metrics), (previous_label, previous_metrics)]:
+        avg = metrics.get("avg_demand_gw") if metrics else None
+        if avg is None or pd.isna(avg):
+            continue
+        for hour in range(24):
+            rows.append({"hour": hour, "avg_demand_gw": float(avg), "series": label})
+    plot = pd.DataFrame(rows)
+    if plot.empty:
+        return None
+
+    order = [s for s in [selected_label, previous_label] if s in plot["series"].unique().tolist()]
+    colors = [BLUE, GREY][:len(order)]
+    dashes = [[1, 0], [5, 3]][:len(order)]
+
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("hour:O", title="Hour of day", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("avg_demand_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "series:N",
+            title="Week",
+            scale=alt.Scale(domain=order, range=colors),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=420, titleLimit=420),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N",
+            title="Week",
+            scale=alt.Scale(domain=order, range=dashes),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("series:N", title="Week"),
+            alt.Tooltip("hour:O", title="Hour"),
+            alt.Tooltip("avg_demand_gw:Q", title="Avg GW", format=",.2f"),
+        ],
+    ).properties(title="Average 24h demand profile | selected week vs previous week")
+
+    return apply_chart_style(chart, height=380)
+
 def fmt_gw(value: float | int | None, decimals: int = 2) -> str:
     if value is None or pd.isna(value):
         return "—"
@@ -2221,7 +2350,7 @@ def negative_zero_price_overlay_chart(
     report_end: pd.Timestamp,
     metric_label: str,
 ):
-    """Overlay annual cumulative counts plus 2026 Aurora/Baringa forecasts."""
+    """Overlay annual cumulative counts plus 2026 scenario forecasts."""
     metric = "Negative hours" if metric_label == "Only negative prices" else "Zero / negative hours"
     frames: list[pd.DataFrame] = []
     actual_years = sorted(
@@ -2249,7 +2378,7 @@ def negative_zero_price_overlay_chart(
                 metric=metric,
                 end_ts=None,
                 model=model,
-                series_label=model,
+                series_label=model_display_label(model),
                 curve_type="Forecast",
             )
             if not frame.empty:
@@ -2258,16 +2387,14 @@ def negative_zero_price_overlay_chart(
     if not frames:
         return None
     plot = pd.concat(frames, ignore_index=True)
-    series_order = [str(y) for y in actual_years] + [m for m in ["Aurora", "Baringa"] if m in plot["Series"].astype(str).unique().tolist()]
-    actual_palette = {
-        "2021": "#2563EB",
-        "2022": "#10B981",
-        "2023": "#D97706",
-        "2024": "#7C3AED",
-        "2025": "#DC2626",
-        "2026": "#0EA5E9",
-    }
-    palette = [actual_palette.get(s, GREY) if s not in {"Aurora", "Baringa"} else (AURORA_COLOR if s == "Aurora" else BARINGA_COLOR) for s in series_order]
+    scenario_labels = [label for label in [AURORA_LABEL, BARINGA_LABEL] if label in plot["Series"].astype(str).unique().tolist()]
+    series_order = [str(y) for y in actual_years] + scenario_labels
+    # Same monthly-report visual convention: actual years use one green family,
+    # older years lighter and latest year darkest; scenarios keep corporate colours.
+    green_fade = ["#D1FAE5", "#A7F3D0", "#6EE7B7", "#34D399", "#10B981", "#047857"]
+    actual_palette = {str(y): green_fade[i] for i, y in enumerate(actual_years[-len(green_fade):])}
+    scenario_palette = {AURORA_LABEL: AURORA_COLOR, BARINGA_LABEL: BARINGA_COLOR}
+    palette = [actual_palette.get(s, GREY) if s not in scenario_palette else scenario_palette[s] for s in series_order]
     title = "Cumulative negative-price hours" if metric == "Negative hours" else "Cumulative zero / negative-price hours"
     chart = alt.Chart(plot).mark_line(point=alt.OverlayMarkDef(filled=True, size=54), strokeWidth=2.8).encode(
         x=alt.X(
@@ -2284,22 +2411,29 @@ def negative_zero_price_overlay_chart(
             "Series:N",
             title="Series",
             scale=alt.Scale(domain=series_order, range=palette),
-            legend=alt.Legend(symbolStrokeWidth=3),
+            legend=alt.Legend(
+                orient="top",
+                direction="horizontal",
+                columns=5,
+                labelLimit=360,
+                titleLimit=360,
+                symbolLimit=360,
+                symbolStrokeWidth=3,
+            ),
         ),
         strokeDash=alt.StrokeDash(
             "Curve type:N",
             title="Line style",
-            scale=alt.Scale(domain=["Actual", "Forecast"], range=[[1, 0], [7, 3]]),
+            scale=alt.Scale(domain=["Actual", "Forecast"], range=[[1, 0], [6, 3]]),
         ),
         tooltip=[
             alt.Tooltip("Series:N", title="Series"),
             alt.Tooltip("Curve type:N", title="Type"),
-            alt.Tooltip("Month:N", title="Month"),
-            alt.Tooltip("cum_hours:Q", title="Cumulative hours", format=",.0f"),
+            alt.Tooltip("month_num:O", title="Month"),
+            alt.Tooltip("cum_hours:Q", title=title, format=",.0f"),
         ],
     ).properties(title=title)
     return apply_chart_style(chart, height=360)
-
 
 def negative_zero_summary_table(
     price_hourly: pd.DataFrame,
@@ -2650,7 +2784,12 @@ def monthly_economic_curtailment_forward(forward_scenarios: pd.DataFrame, solar_
         return pd.DataFrame(columns=["model", "month_num", "month_name", "pct_curtailment"])
     return pd.concat(frames, ignore_index=True)
 
-def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFrame, forward_2026: pd.DataFrame):
+def monthly_curtailment_chart(
+    actual_2025: pd.DataFrame,
+    actual_2026: pd.DataFrame,
+    forward_2026: pd.DataFrame,
+    generation_basis_label: str = "P48 Solar PV Spain",
+):
     if actual_2025.empty and actual_2026.empty and forward_2026.empty:
         return None
     month_order = [calendar.month_abbr[m] for m in range(1, 13)]
@@ -2659,12 +2798,15 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
     actual_frames = []
     if actual_2025 is not None and not actual_2025.empty:
         a25 = actual_2025.copy()
-        a25["Series"] = "2025 actual"
+        a25["Series"] = f"2025 actual | {generation_basis_label}"
         actual_frames.append(a25[["month_num", "month_name", "pct_curtailment", "Series"]])
     if actual_2026 is not None and not actual_2026.empty:
         a26 = actual_2026.copy()
-        a26["Series"] = "2026 actual"
+        a26["Series"] = f"2026 actual | {generation_basis_label}"
         actual_frames.append(a26[["month_num", "month_name", "pct_curtailment", "Series"]])
+
+    actual_domain = [f"2025 actual | {generation_basis_label}", f"2026 actual | {generation_basis_label}"]
+
     if actual_frames:
         actual_plot = pd.concat(actual_frames, ignore_index=True)
         layers.append(
@@ -2674,7 +2816,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                 x=alt.X("month_name:N", title=None, sort=month_order, scale=alt.Scale(paddingInner=0.38, paddingOuter=0.12)),
                 xOffset=alt.XOffset(
                     "Series:N",
-                    sort=["2025 actual", "2026 actual"],
+                    sort=actual_domain,
                     scale=alt.Scale(paddingInner=0, paddingOuter=0),
                 ),
                 y=alt.Y(
@@ -2686,7 +2828,7 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                 color=alt.Color(
                     "Series:N",
                     title="Actual",
-                    scale=alt.Scale(domain=["2025 actual", "2026 actual"], range=["#F7C948", YELLOW_DARK]),
+                    scale=alt.Scale(domain=actual_domain, range=["#F7C948", YELLOW_DARK]),
                 ),
                 tooltip=[
                     alt.Tooltip("Series:N", title="Series"),
@@ -2697,6 +2839,9 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
         )
 
     if forward_2026 is not None and not forward_2026.empty:
+        forward_2026 = forward_2026.copy()
+        forward_2026["model_display"] = forward_2026["model"].map(model_display_label)
+        forward_2026["generation_basis"] = generation_basis_label
         layers.append(
             alt.Chart(forward_2026)
             .mark_line(point=alt.OverlayMarkDef(filled=True, size=65), strokeWidth=3.0)
@@ -2709,18 +2854,19 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
                     scale=alt.Scale(domain=[0, 1.0]),
                 ),
                 color=alt.Color(
-                    "model:N",
-                    title="Forecast",
-                    scale=alt.Scale(domain=["Aurora", "Baringa"], range=[AURORA_COLOR, BARINGA_COLOR]),
+                    "model_display:N",
+                    title=f"Forecast | {generation_basis_label}",
+                    scale=alt.Scale(domain=[AURORA_LABEL, BARINGA_LABEL], range=[AURORA_COLOR, BARINGA_COLOR]),
                 ),
                 strokeDash=alt.StrokeDash(
-                    "model:N",
+                    "model_display:N",
                     title="Forecast",
-                    scale=alt.Scale(domain=["Aurora", "Baringa"], range=[[7, 3], [3, 2]]),
+                    scale=alt.Scale(domain=[AURORA_LABEL, BARINGA_LABEL], range=[[7, 3], [3, 2]]),
                 ),
-                detail="model:N",
+                detail="model_display:N",
                 tooltip=[
-                    alt.Tooltip("model:N", title="Model"),
+                    alt.Tooltip("model_display:N", title="Model"),
+                    alt.Tooltip("generation_basis:N", title="Generation basis"),
                     alt.Tooltip("month_name:N", title="Month"),
                     alt.Tooltip("pct_curtailment:Q", title="Economic curtailment", format=".1%"),
                 ],
@@ -2728,11 +2874,9 @@ def monthly_curtailment_chart(actual_2025: pd.DataFrame, actual_2026: pd.DataFra
         )
 
     chart = alt.layer(*layers).resolve_scale(color="independent", strokeDash="independent").properties(
-        title="Actual economic curtailment (%) vs forecasts Aurora / Baringa"
+        title=f"Economic curtailment using {generation_basis_label} (%) vs Aurora central Dec25 / Baringa reference Apr26"
     )
     return apply_chart_style(chart, height=360)
-
-
 
 def _clean_col_name(col) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(col).strip().lower()).strip("_")
@@ -5532,7 +5676,7 @@ with k2_5:
         help="Official REE demanda/evolucion demand summed for the selected week, converted to GWh.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. week")}<br>Prev. week: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. week")}<br>Prev. week: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand current: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b> | Avg demand prev.: <b>{fmt_gw(kpi_demand_prev.get("avg_demand_gw"))}</b></div>',
         unsafe_allow_html=True,
     )
 
@@ -5661,7 +5805,7 @@ hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, 
 if hourly_overlay is not None:
     st.altair_chart(hourly_overlay, use_container_width=True)
 
-subsection("Actual economic curtailment (%) vs forecasts Aurora / Baringa")
+subsection("Actual economic curtailment using P48 Solar PV Spain (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
 
 ytd_curt_actual = economic_curtailment_ytd_value(
     price_hourly,
@@ -5685,9 +5829,9 @@ yc1, yc2, yc3 = st.columns(3)
 with yc1:
     st.metric("YTD 2026 actual economic curtailment", fmt_pct(ytd_curt_actual))
 with yc2:
-    st.metric("YTD Aurora economic curtailment", fmt_pct(ytd_curt_aurora))
+    st.metric(f"YTD {AURORA_LABEL} economic curtailment", fmt_pct(ytd_curt_aurora))
 with yc3:
-    st.metric("YTD Baringa economic curtailment", fmt_pct(ytd_curt_baringa))
+    st.metric(f"YTD {BARINGA_LABEL} economic curtailment", fmt_pct(ytd_curt_baringa))
 
 actual_curt_2026 = monthly_economic_curtailment(price_hourly, solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
 forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, pd.Timestamp(latest_data_ts.date()))
@@ -5724,6 +5868,28 @@ generation_comparison = build_generation_month_comparison_table(
 )
 st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
 st.caption("Solar = Solar PV + Solar thermal. For 2026, the renewable-share metric uses the REE daily generation-mix pull aggregated to the selected week, with the same detailed-technology filtering used in the Monthly Report.")
+
+weekly_demand_profile = weekly_average_demand_profile_chart(
+    official_demand_hourly,
+    selected_week,
+    report_end,
+    prev_week,
+    week_end(prev_week),
+    week_label(selected_week, is_current_wtd),
+    week_label(prev_week, False),
+)
+if weekly_demand_profile is None:
+    weekly_demand_profile = weekly_average_demand_profile_fallback_chart(
+        selected_demand_metrics,
+        previous_demand_metrics,
+        week_label(selected_week, is_current_wtd),
+        week_label(prev_week, False),
+    )
+if weekly_demand_profile is not None:
+    subsection("Weekly average 24h demand profile | selected week vs previous week")
+    st.altair_chart(weekly_demand_profile, use_container_width=True)
+    st.caption("Demand profile uses official REE demanda/evolucion hourly data where available; fallback uses the official weekly average demand.")
+
 
 
 # =========================================================
@@ -5862,7 +6028,7 @@ pdf_charts = pdf_spot_heatmaps + [
     ("2025 zero / negative price frequency heatmap", neg_heatmap_2025),
     ("Negative / zero-price cumulative hours | scenario overlay", negative_overlay_chart),
     ("YTD 24h average market profile vs solar generation", hourly_overlay),
-    ("Actual economic curtailment (%) vs forecasts Aurora / Baringa", curt_chart),
+    ("Actual economic curtailment (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26", curt_chart),
     ("Forward market history / latest snapshot", forward_chart),
     ("BESS-model hybrid captured price", hybrid_plot),
 ]
