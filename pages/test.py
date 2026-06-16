@@ -90,6 +90,29 @@ BALANCING_SECONDARY_RESERVE_IDS = {"Downward": [633], "Upward": [632]}
 # €/MW/h = published €/MW/15min × 4.
 BALANCING_SECONDARY_RESERVE_PRICE_IDS = {"Downward": [10463], "Upward": [10388]}
 
+# Hourly average price profiles shown below the main balancing chart.
+# aFRR capacity prices are converted from published €/MW/15min to hourly-equivalent €/MW/h.
+BALANCING_HOURLY_PRICE_PROFILE_SECTIONS = {
+    "aFRR capacity price": {
+        "unit": "€/MW/h",
+        "published_unit": "€/MW/15min",
+        "multiplier": 4.0,
+        "series": {"Downward": [10463], "Upward": [10388]},
+    },
+    "Day-ahead constraints Phase I price": {
+        "unit": "€/MWh",
+        "published_unit": "€/MWh",
+        "multiplier": 1.0,
+        "series": {"Downward": [706], "Upward": [705]},
+    },
+    "Day-ahead constraints Phase II price": {
+        "unit": "€/MWh",
+        "published_unit": "€/MWh",
+        "multiplier": 1.0,
+        "series": {"Downward": [708], "Upward": [707]},
+    },
+}
+
 # Official ESIOS average-price indicators used in the hover tooltip.
 # Real-time constraints are intentionally left empty because the CT/RTD/EST/RSI buckets
 # do not have one clean public price indicator that is directly comparable to the
@@ -774,6 +797,138 @@ def _avg_esios_indicators_over_period_mw(
     if vals.empty:
         return None, missing
     return float(vals.mean()), missing
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def build_hourly_price_profile(
+    profile_name: str,
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[pd.DataFrame, dict[str, Any], list[str]]:
+    """Return H1-H24 average price profile for an official ESIOS price profile section."""
+    config = globals().get("BALANCING_HOURLY_PRICE_PROFILE_SECTIONS", {}).get(profile_name, {})
+    unit = str(config.get("unit", ""))
+    published_unit = str(config.get("published_unit", unit))
+    multiplier = float(config.get("multiplier", 1.0) or 1.0)
+    series_map = config.get("series", {}) or {}
+
+    rows: list[dict[str, Any]] = []
+    missing: list[str] = []
+
+    for direction, indicator_ids in series_map.items():
+        frames = []
+        for indicator_id in indicator_ids:
+            raw = fetch_esios_range(
+                int(indicator_id),
+                start_day,
+                end_day,
+                token,
+                time_trunc="hour",
+                time_agg="average",
+            )
+            if raw.empty:
+                missing.append(f"{profile_name} {direction}: {indicator_id}")
+                continue
+            tmp = raw[["datetime", "value"]].copy()
+            tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+            tmp["published_value"] = pd.to_numeric(tmp["value"], errors="coerce")
+            tmp = tmp.dropna(subset=["datetime", "published_value"])
+            tmp["indicator_id"] = str(indicator_id)
+            frames.append(tmp[["datetime", "published_value", "indicator_id"]])
+
+        if not frames:
+            continue
+
+        temp = pd.concat(frames, ignore_index=True)
+        temp["hour"] = temp["datetime"].dt.hour + 1
+        temp["value"] = temp["published_value"] * multiplier
+        profile = (
+            temp.groupby("hour", as_index=False)
+            .agg(
+                value=("value", "mean"),
+                published_value=("published_value", "mean"),
+                obs=("value", "count"),
+            )
+        )
+        ids_label = ", ".join(map(str, indicator_ids))
+        for rec in profile.to_dict("records"):
+            rows.append(
+                {
+                    "profile": profile_name,
+                    "direction": direction,
+                    "hour": int(rec["hour"]),
+                    "hour_label": f"H{int(rec['hour']):02d}",
+                    "value": float(rec["value"]),
+                    "published_value": float(rec["published_value"]),
+                    "unit": unit,
+                    "published_unit": published_unit,
+                    "obs": int(rec["obs"]),
+                    "indicator_ids": ids_label,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    meta = {
+        "profile": profile_name,
+        "unit": unit,
+        "published_unit": published_unit,
+        "multiplier": multiplier,
+        "series": series_map,
+    }
+    return out, meta, missing
+
+
+def plot_hourly_price_profile_altair(profile_df: pd.DataFrame, meta: dict[str, Any]) -> alt.Chart:
+    """Line chart for H1-H24 average price profiles with hover."""
+    title = str(meta.get("profile", "Hourly price profile"))
+    unit = str(meta.get("unit", ""))
+    published_unit = str(meta.get("published_unit", unit))
+    multiplier = float(meta.get("multiplier", 1.0) or 1.0)
+
+    if profile_df.empty:
+        return alt.Chart(pd.DataFrame({"hour_label": [], "value": []})).mark_line()
+
+    y_title = f"Average price ({unit})" if unit else "Average price"
+    subtitle = "Average by delivery hour over selected period"
+    if abs(multiplier - 1.0) > 1e-9:
+        subtitle = f"Average by delivery hour over selected period; published {published_unit} × {multiplier:g} = {unit}"
+
+    return (
+        alt.Chart(profile_df)
+        .mark_line(point=True, strokeWidth=3)
+        .encode(
+            x=alt.X(
+                "hour:O",
+                title="Delivery hour",
+                sort=list(range(1, 25)),
+                axis=alt.Axis(labelAngle=0, labelFontSize=12),
+            ),
+            y=alt.Y("value:Q", title=y_title, scale=alt.Scale(zero=False)),
+            color=alt.Color(
+                "direction:N",
+                title="Direction",
+                scale=alt.Scale(domain=["Downward", "Upward"], range=["#1CA7DF", "#0F7F73"]),
+                legend=alt.Legend(orient="top", direction="horizontal"),
+            ),
+            tooltip=[
+                alt.Tooltip("hour_label:N", title="Hour"),
+                alt.Tooltip("direction:N", title="Direction"),
+                alt.Tooltip("value:Q", title=f"Average price ({unit})", format=",.2f"),
+                alt.Tooltip("published_value:Q", title=f"Published value ({published_unit})", format=",.2f"),
+                alt.Tooltip("obs:Q", title="Observations", format=",d"),
+                alt.Tooltip("indicator_ids:N", title="Indicator IDs"),
+            ],
+        )
+        .properties(
+            height=360,
+            title=alt.TitleParams(text=title, subtitle=subtitle, anchor="start", fontSize=18, subtitleFontSize=12),
+        )
+        .interactive(bind_y=False)
+        .configure_axis(labelFontSize=12, titleFontSize=13)
+        .configure_legend(labelFontSize=12, titleFontSize=12)
+        .configure_view(strokeWidth=0)
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -1618,7 +1773,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v5 — directional secondary reserve prices 10388/10463 shown as €/MW/h + hover + optional technology upload")
+st.success("Version loaded: OFFICIAL balancing v6 — volume/price chart + H1-H24 price profiles for aFRR, RRTT Phase I and Phase II")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -2011,6 +2166,39 @@ if run:
             balancing_chart = plot_balancing_energy_summary_altair(balancing_energy, balancing_reserve, title_suffix=title_suffix)
             st.altair_chart(balancing_chart, use_container_width=True)
             st.caption("Hover over the bars to see the exact values used in the chart. Price also appears in the bar label when an official price indicator exists.")
+
+            st.subheader("Average hourly price profiles — H1 to H24")
+            st.caption("Each line is the average of official ESIOS price indicators by Madrid delivery hour over the selected period. Hover over a point to see the exact value and indicator IDs.")
+            hourly_profile_rows = []
+            hourly_profile_missing: list[str] = []
+            for profile_name in [
+                "aFRR capacity price",
+                "Day-ahead constraints Phase I price",
+                "Day-ahead constraints Phase II price",
+            ]:
+                with st.spinner(f"Fetching {profile_name} hourly profile..."):
+                    profile_df, profile_meta, profile_missing = build_hourly_price_profile(profile_name, start_day, end_day, token)
+                hourly_profile_missing.extend(profile_missing)
+                if profile_df.empty:
+                    st.warning(f"No data returned for {profile_name}.")
+                    continue
+                hourly_profile_rows.append(profile_df)
+                st.altair_chart(plot_hourly_price_profile_altair(profile_df, profile_meta), use_container_width=True)
+
+            if hourly_profile_rows:
+                hourly_profiles_all = pd.concat(hourly_profile_rows, ignore_index=True)
+                with st.expander("Hourly price profile data", expanded=False):
+                    st.dataframe(hourly_profiles_all, use_container_width=True, hide_index=True)
+                    if hourly_profile_missing:
+                        st.markdown("**Missing/empty hourly price profile indicators**")
+                        st.write(hourly_profile_missing)
+                    st.download_button(
+                        "Download hourly price profiles CSV",
+                        hourly_profiles_all.to_csv(index=False).encode("utf-8"),
+                        file_name=f"balancing_hourly_price_profiles_{start_day}_{end_day}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
 
             price_view_cols = [
                 "category",
