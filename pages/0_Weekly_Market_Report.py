@@ -64,6 +64,12 @@ WHITE = "#FFFFFF"
 
 AURORA_COLOR = ORANGE
 BARINGA_COLOR = BLUE_DARK
+AURORA_LABEL = "Aurora central Dec25"
+BARINGA_LABEL = "Baringa reference Apr26"
+MODEL_DISPLAY_LABELS = {"Aurora": AURORA_LABEL, "Baringa": BARINGA_LABEL}
+
+def model_display_label(model: str) -> str:
+    return MODEL_DISPLAY_LABELS.get(str(model), str(model))
 
 OMIP_BASE_URL = "https://www.omip.pt/en/dados-mercado"
 OMIP_PRODUCTS = {"Power": "EL"}
@@ -1763,7 +1769,7 @@ def build_report_capture_table(
         final[f"{prefix} Rate curt."] = metrics["capture_rate_curtailed"]
     rows.append(final)
 
-    # 2026 YTD forecast rows for direct Aurora / Baringa comparison
+    # 2026 YTD forecast rows for direct Aurora central Dec25 / Baringa reference Apr26 comparison
     if report_month.year == 2026 and forward_scenarios is not None and not forward_scenarios.empty:
         for model in ["Aurora", "Baringa"]:
             f = forward_scenarios[
@@ -1771,7 +1777,7 @@ def build_report_capture_table(
                 & (forward_scenarios["datetime"].dt.year == 2026)
                 & (forward_scenarios["datetime"] <= ytd26_end + pd.Timedelta(days=1))
             ][["datetime", "price"]].copy()
-            row = {"Month": f"YTD {model}"}
+            row = {"Month": f"YTD {model_display_label(model)}"}
             for col in ["Baseload", "Solar unc.", "Rate unc.", "Solar curt.", "Rate curt."]:
                 row[f"2025 {col}"] = np.nan
             metrics = annual_capture_metrics(f, solar_hourly, 2026, end_ts=ytd26_end) if not f.empty else {
@@ -1812,9 +1818,9 @@ def format_capture_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         label = str(row.get("Month", ""))
         if label == "YR / YTD":
             return ["background-color: #ECFDF5; font-weight: 900; border-top: 2px solid #10B981; border-bottom: 2px solid #10B981;"] * len(row)
-        if label.startswith("YTD Aurora"):
+        if label.startswith(f"YTD {AURORA_LABEL}"):
             return ["background-color: #FFF7ED; font-weight: 800;"] * len(row)
-        if label.startswith("YTD Baringa"):
+        if label.startswith(f"YTD {BARINGA_LABEL}"):
             return ["background-color: #EFF6FF; font-weight: 800;"] * len(row)
         return [""] * len(row)
 
@@ -4726,21 +4732,63 @@ def hybrid_actual_monthly(monthly_capture: pd.DataFrame, hybrid_capture: pd.Data
 
 
 
-def hybrid_chart(hybrid: pd.DataFrame):
+def hybrid_chart(hybrid: pd.DataFrame, monthly_capture: pd.DataFrame | None = None):
     if hybrid.empty:
         return None
+
     h = hybrid[hybrid["period"] >= pd.Timestamp(2025, 1, 1)].copy()
     if h.empty:
         return None
 
     h["period"] = pd.to_datetime(h["period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     h = h.dropna(subset=["period"]).drop_duplicates(subset=["period"], keep="last").sort_values("period")
+
+    # Add monthly PV uncurtailed captured price from monthly_capture_table().
+    # In this app the real column is captured_solar_price_uncurtailed.
+    if monthly_capture is not None and not monthly_capture.empty:
+        cap = monthly_capture.copy()
+
+        if "period" not in cap.columns:
+            for c in ["datetime", "month", "Month"]:
+                if c in cap.columns:
+                    cap["period"] = pd.to_datetime(cap[c], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                    break
+        else:
+            cap["period"] = pd.to_datetime(cap["period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+        pv_col = next(
+            (
+                c for c in [
+                    "captured_solar_price_uncurtailed",
+                    "captured_uncurtailed",
+                    "Captured solar (uncurtailed)",
+                    "captured_solar_uncurtailed",
+                    "Solar unc.",
+                ]
+                if c in cap.columns
+            ),
+            None,
+        )
+
+        if pv_col is not None and "period" in cap.columns:
+            cap = cap[["period", pv_col]].rename(columns={pv_col: "pv_uncurtailed_captured"})
+            cap["pv_uncurtailed_captured"] = pd.to_numeric(cap["pv_uncurtailed_captured"], errors="coerce")
+            h = h.merge(
+                cap.dropna(subset=["period"]).drop_duplicates("period", keep="last"),
+                on="period",
+                how="left",
+            )
+
     h["period_label"] = h["period"].dt.strftime("%b-%y")
     period_order = h["period_label"].tolist()
 
+    value_vars = ["baseload", "hybrid_wo_demand", "hybrid_w_demand"]
+    if "pv_uncurtailed_captured" in h.columns and h["pv_uncurtailed_captured"].notna().any():
+        value_vars.append("pv_uncurtailed_captured")
+
     long = h.melt(
         id_vars=["period", "period_label"],
-        value_vars=["baseload", "hybrid_wo_demand", "hybrid_w_demand"],
+        value_vars=value_vars,
         var_name="series",
         value_name="value",
     ).dropna(subset=["value"])
@@ -4749,10 +4797,25 @@ def hybrid_chart(hybrid: pd.DataFrame):
         "baseload": "Baseload",
         "hybrid_wo_demand": "Hybrid w/o demand",
         "hybrid_w_demand": "Hybrid w. demand",
+        "pv_uncurtailed_captured": "PV uncurtailed captured price",
     }
     long["series"] = long["series"].map(names)
 
-    chart = alt.Chart(long).mark_line(point=True, strokeWidth=3).encode(
+    domain = [names[v] for v in value_vars]
+    color_map = {
+        "Baseload": BLUE,
+        "PV uncurtailed captured price": "#93C5FD",
+        "Hybrid w/o demand": YELLOW_DARK,
+        "Hybrid w. demand": CORP_GREEN,
+    }
+    dash_map = {
+        "Baseload": [1, 0],
+        "PV uncurtailed captured price": [1, 3],
+        "Hybrid w/o demand": [6, 3],
+        "Hybrid w. demand": [3, 2],
+    }
+
+    chart = alt.Chart(long).mark_line(point=True, strokeWidth=3.2).encode(
         x=alt.X(
             "period_label:N",
             title=None,
@@ -4763,22 +4826,30 @@ def hybrid_chart(hybrid: pd.DataFrame):
         color=alt.Color(
             "series:N",
             title="Series",
-            scale=alt.Scale(domain=list(names.values()), range=[BLUE, YELLOW_DARK, CORP_GREEN]),
-            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=260, titleLimit=260, symbolLimit=260),
+            scale=alt.Scale(domain=domain, range=[color_map[d] for d in domain]),
+            legend=alt.Legend(
+                orient="top",
+                direction="horizontal",
+                columns=2,
+                labelLimit=420,
+                titleLimit=420,
+                symbolLimit=420,
+            ),
         ),
         strokeDash=alt.StrokeDash(
             "series:N",
             title="Series",
-            scale=alt.Scale(domain=list(names.values()), range=[[1, 0], [6, 3], [3, 2]]),
+            scale=alt.Scale(domain=domain, range=[dash_map[d] for d in domain]),
             legend=None,
         ),
         tooltip=[
             alt.Tooltip("period:T", title="Month", format="%b %Y"),
             alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("value:Q", title="Captured price", format=",.2f"),
+            alt.Tooltip("value:Q", title="€/MWh", format=",.2f"),
         ],
-    ).properties(title="Monthly baseload vs BESS-model captured hybrid price")
-    return apply_chart_style(chart, height=360)
+    ).properties(title="Monthly baseload vs BESS-model captured hybrid price vs PV uncurtailed captured price")
+
+    return apply_chart_style(chart, height=400)
 
 
 def _period_baseload_average(
@@ -5507,7 +5578,7 @@ with other_col3:
         unsafe_allow_html=True,
     )
 
-subsection("Monthly baseload vs Solar PV capture table | 2025 history and 2026 YTD")
+subsection("Monthly baseload vs Solar PV capture table | 2025 history, 2026 YTD and Aurora/Baringa versions")
 capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, forward_hourly, selected_month, report_end)
 st.dataframe(format_capture_table(capture_report), use_container_width=True, height=520)
 
@@ -5736,14 +5807,15 @@ hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(pri
 hybrid = hybrid_actual_monthly(monthly_capture, hybrid_capture_monthly)
 if not hybrid.empty:
     render_hybrid_summary_cards(hybrid, price_hourly, report_end)
-hybrid_plot = hybrid_chart(hybrid)
+hybrid_plot = hybrid_chart(hybrid, monthly_capture)
 if hybrid_plot is not None:
     st.altair_chart(hybrid_plot, use_container_width=True)
+    st.caption("PV uncurtailed captured price is included as a light-blue dotted line when monthly solar capture data is available.")
     source_note = "dedicated monthly hybrid capture input file" if hybrid_source == "file" else "daily BESS optimisation model embedded in this report"
     st.caption(
         f"Hybrid captured price source: {source_note}. Assumptions: daily optimization window, maximum 1 cycle/day, "
         f"4h BESS (4.0 MWh / 1.0 MW), undegraded capacity, ηch={BESS_REPORT_ETA_CH:.0%}, ηdis={BESS_REPORT_ETA_DIS:.0%}. "
-        "The w/o-demand and w.-demand series are calculated independently with the BESS captured-price logic."
+        "The w/o-demand and w.-demand series are calculated independently with the BESS captured-price logic; PV uncurtailed captured price is overlaid from the monthly solar capture table."
     )
 else:
     st.info("Hybrid captured-price series could not be generated. Add a dedicated hybrid monthly file in /data or ensure the default BESS profile files are available.")
