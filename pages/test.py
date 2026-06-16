@@ -84,9 +84,11 @@ BALANCING_ENERGY_SECTIONS = {
     "Secondary energy": {"up": [680], "down": [681]},
 }
 BALANCING_SECONDARY_RESERVE_IDS = {"Downward": [633], "Upward": [632]}
-# Official ESIOS secondary-reserve band marginal price. In this app it is shown as
-# an hourly-equivalent capacity price, €/MW/h = published €/MW/15min × 4.
-BALANCING_SECONDARY_RESERVE_PRICE_IDS = {"Downward": [634], "Upward": [634]}
+# Official ESIOS secondary-reserve band capacity prices by direction.
+# The public ESIOS page shows 10388 compared with 10463 for upward/downward reserve price.
+# In this app they are displayed as hourly-equivalent capacity prices:
+# €/MW/h = published €/MW/15min × 4.
+BALANCING_SECONDARY_RESERVE_PRICE_IDS = {"Downward": [10463], "Upward": [10388]}
 
 # Official ESIOS average-price indicators used in the hover tooltip.
 # Real-time constraints are intentionally left empty because the CT/RTD/EST/RSI buckets
@@ -1094,7 +1096,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
         .properties(
             width=430,
             height=560,
-            title=alt.TitleParams(text="Average secondary reserve", anchor="middle", fontSize=16),
+            title=alt.TitleParams(text="Average secondary reserve and directional band prices", anchor="middle", fontSize=16),
         )
         .interactive()
     )
@@ -1616,7 +1618,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v4 — secondary reserve shown as €/MW/h hourly equivalent + hover + optional technology upload")
+st.success("Version loaded: OFFICIAL balancing v5 — directional secondary reserve prices 10388/10463 shown as €/MW/h + hover + optional technology upload")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -2061,14 +2063,14 @@ if run:
             with st.expander("Balancing-energy data and indicator diagnostics", expanded=False):
                 st.markdown("**Energy volumes by product**")
                 st.dataframe(balancing_energy, use_container_width=True, hide_index=True)
-                st.markdown("**Average secondary reserve**")
+                st.markdown("**Average secondary reserve and directional band prices**")
                 st.dataframe(balancing_reserve, use_container_width=True, hide_index=True)
                 st.markdown("**Indicator IDs used**")
                 st.json({
                     "energy_sections": BALANCING_ENERGY_SECTIONS,
                     "price_sections": globals().get("BALANCING_PRICE_SECTIONS", {}),
                     "secondary_reserve": BALANCING_SECONDARY_RESERVE_IDS,
-                    "secondary_reserve_price": globals().get("BALANCING_SECONDARY_RESERVE_PRICE_IDS", {}),
+                    "secondary_reserve_price_directional": globals().get("BALANCING_SECONDARY_RESERVE_PRICE_IDS", {}),
                     "secondary_reserve_hourly_aggregation": "average",
                     "price_hourly_aggregation": "average, then volume-weighted when hourly volume alignment is available",
                 })
