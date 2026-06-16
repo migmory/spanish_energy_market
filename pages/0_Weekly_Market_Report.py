@@ -58,6 +58,7 @@ ORANGE = "#EA580C"
 RED = "#DC2626"
 PURPLE = "#7C3AED"
 GREY = "#6B7280"
+GREY_DARK = "#334155"
 GRID = "#E5E7EB"
 TEXT = "#111827"
 WHITE = "#FFFFFF"
@@ -463,6 +464,7 @@ BESS_REPORT_UNRESTRICTED_CYCLE_FACTOR = 5.0  # Mirrors BESS-tab 'No limit cycles
 
 PRICE_INDICATOR_ID = 600
 SOLAR_P48_INDICATOR_ID = 84
+PBF_SOLAR_PV_INDICATOR_ID = 14
 SOLAR_FORECAST_INDICATOR_ID = 542
 LIVE_START_DATE = date(2026, 1, 1)
 
@@ -670,6 +672,80 @@ def load_live_solar(token: str, start_day: date, end_day: date) -> pd.DataFrame:
     else:
         fc = pd.DataFrame(columns=["datetime", "solar_forecast_mw"])
     return build_best_solar_hourly(p48, fc)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_esios_range_hourly_sum_for_report(
+    indicator_id: int,
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> pd.DataFrame:
+    """Fetch hourly ESIOS programme/energy indicators with time_agg=sum.
+
+    Used for PBF indicators, mirroring the thermal-gap test page convention.
+    """
+    if not token or start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    frames: list[pd.DataFrame] = []
+    chunk_start = start_day
+
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=30))
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        params = {
+            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_trunc": "hour",
+            "time_agg": "sum",
+        }
+
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers=build_headers(token), params=params, timeout=(15, 120))
+                resp.raise_for_status()
+                parsed = parse_esios_indicator(resp.json(), f"esios_{indicator_id}")
+                if not parsed.empty:
+                    frames.append(parsed)
+                break
+            except requests.exceptions.RequestException:
+                sleep(1.2 * (attempt + 1))
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["datetime", "source"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_pbf_solar_pv_for_report(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    """Load PBF Solar PV hourly programme.
+
+    This uses ESIOS indicator 14 with hourly sum, consistent with the PBF/thermal-gap
+    test page. The returned value is named solar_best_mw for compatibility with
+    existing economic-curtailment functions, but it represents PBF Solar PV MWh/h.
+    """
+    raw = fetch_esios_range_hourly_sum_for_report(PBF_SOLAR_PV_INDICATOR_ID, start_day, end_day, token)
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "solar_best_mw", "generation_basis"])
+
+    out = raw[["datetime", "value"]].rename(columns={"value": "solar_best_mw"}).copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["solar_best_mw"] = pd.to_numeric(out["solar_best_mw"], errors="coerce")
+    out = out.dropna(subset=["datetime", "solar_best_mw"])
+    out = out.groupby("datetime", as_index=False)["solar_best_mw"].sum().sort_values("datetime")
+    out["generation_basis"] = "PBF Solar PV indicator 14"
+    return out[["datetime", "solar_best_mw", "generation_basis"]]
 
 def combine_hist_live(hist: pd.DataFrame, live: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
     out = pd.concat([hist, live], ignore_index=True)
@@ -1367,7 +1443,7 @@ def demand_peak_week_metrics(
 
 def _week_hourly_demand_profile(demand_hourly: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, label: str) -> pd.DataFrame:
     """Average 24h demand shape for one week/WTD period from REE hourly demand."""
-    cols = ["hour", "avg_demand_gw", "min_demand_gw", "max_demand_gw", "obs", "series"]
+    cols = ["hour", "avg_gw", "min_gw", "max_gw", "obs", "label"]
     if demand_hourly is None or demand_hourly.empty:
         return pd.DataFrame(columns=cols)
 
@@ -1385,12 +1461,12 @@ def _week_hourly_demand_profile(demand_hourly: pd.DataFrame, start_ts: pd.Timest
 
     tmp["hour"] = tmp["datetime"].dt.hour
     out = tmp.groupby("hour", as_index=False).agg(
-        avg_demand_gw=("demand_gw", "mean"),
-        min_demand_gw=("demand_gw", "min"),
-        max_demand_gw=("demand_gw", "max"),
+        avg_gw=("demand_gw", "mean"),
+        min_gw=("demand_gw", "min"),
+        max_gw=("demand_gw", "max"),
         obs=("demand_gw", "count"),
     )
-    out["series"] = label
+    out["label"] = label
     return out[cols]
 
 
@@ -1403,48 +1479,38 @@ def weekly_average_demand_profile_chart(
     selected_label: str,
     previous_label: str,
 ):
-    """Weekly average hourly demand profile, selected week/WTD vs previous week."""
-    frames = [
+    """Weekly average hourly demand profile, selected week/WTD vs previous week.
+
+    This mirrors the working test-page demand profile chart: one line per period,
+    hour-of-day on x, average GW on y, with min/max/obs in the tooltip.
+    """
+    profiles = [
         _week_hourly_demand_profile(demand_hourly, selected_week_start, selected_week_end, selected_label),
         _week_hourly_demand_profile(demand_hourly, previous_week_start, previous_week_end, previous_label),
     ]
-    valid_frames = [f for f in frames if f is not None and not f.empty]
-    if not valid_frames:
-        return None
-    plot = pd.concat(valid_frames, ignore_index=True)
-    if plot.empty:
+    profile_df = pd.concat([p for p in profiles if p is not None and not p.empty], ignore_index=True)
+    if profile_df.empty:
         return None
 
-    order = [s for s in [selected_label, previous_label] if s in plot["series"].unique().tolist()]
-    colors = [BLUE, GREY_DARK][: len(order)]
-    dashes = [[1, 0], [5, 3]][: len(order)]
-
-    chart = alt.Chart(plot).mark_line(point=alt.OverlayMarkDef(filled=True, size=55), strokeWidth=3).encode(
-        x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("avg_demand_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
+    chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("hour:O", title="Hour of day", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
         color=alt.Color(
-            "series:N",
+            "label:N",
             title="Week",
-            scale=alt.Scale(domain=order, range=colors),
-            legend=alt.Legend(orient="top", direction="horizontal", columns=3, labelLimit=420, titleLimit=420, symbolLimit=420),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
         ),
-        strokeDash=alt.StrokeDash(
-            "series:N",
-            title="Week",
-            scale=alt.Scale(domain=order, range=dashes),
-            legend=None,
-        ),
+        strokeDash=alt.StrokeDash("label:N", legend=None),
         tooltip=[
-            alt.Tooltip("series:N", title="Week"),
+            alt.Tooltip("label:N", title="Week"),
             alt.Tooltip("hour:O", title="Hour"),
-            alt.Tooltip("avg_demand_gw:Q", title="Average demand", format=",.2f"),
-            alt.Tooltip("min_demand_gw:Q", title="Min demand", format=",.2f"),
-            alt.Tooltip("max_demand_gw:Q", title="Max demand", format=",.2f"),
-            alt.Tooltip("obs:Q", title="Hourly observations", format=",d"),
+            alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+            alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
+            alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
+            alt.Tooltip("obs:Q", title="Obs", format=",d"),
         ],
-    ).properties(title="Weekly average 24h demand profile | selected week vs previous week")
-
-    return apply_chart_style(chart, height=340)
+    ).properties(height=380, title="Weekly average 24h demand profile | selected week vs previous week")
+    return apply_chart_style(chart, height=380)
 
 
 def weekly_average_demand_profile_fallback_chart(
@@ -1460,38 +1526,28 @@ def weekly_average_demand_profile_fallback_chart(
         if avg is None or pd.isna(avg):
             continue
         for hour in range(24):
-            rows.append({"hour": hour, "avg_demand_gw": float(avg), "series": label})
-    plot = pd.DataFrame(rows)
-    if plot.empty:
+            rows.append({"hour": hour, "avg_gw": float(avg), "min_gw": float(avg), "max_gw": float(avg), "obs": 0, "label": label})
+    profile_df = pd.DataFrame(rows)
+    if profile_df.empty:
         return None
 
-    order = [s for s in [selected_label, previous_label] if s in plot["series"].unique().tolist()]
-    colors = [BLUE, GREY][:len(order)]
-    dashes = [[1, 0], [5, 3]][:len(order)]
-
-    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=3).encode(
+    chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
         x=alt.X("hour:O", title="Hour of day", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("avg_demand_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
+        y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
         color=alt.Color(
-            "series:N",
+            "label:N",
             title="Week",
-            scale=alt.Scale(domain=order, range=colors),
-            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=420, titleLimit=420),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
         ),
-        strokeDash=alt.StrokeDash(
-            "series:N",
-            title="Week",
-            scale=alt.Scale(domain=order, range=dashes),
-            legend=None,
-        ),
+        strokeDash=alt.StrokeDash("label:N", legend=None),
         tooltip=[
-            alt.Tooltip("series:N", title="Week"),
+            alt.Tooltip("label:N", title="Week"),
             alt.Tooltip("hour:O", title="Hour"),
-            alt.Tooltip("avg_demand_gw:Q", title="Avg GW", format=",.2f"),
+            alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
         ],
-    ).properties(title="Average 24h demand profile | selected week vs previous week")
-
+    ).properties(height=380, title="Weekly average 24h demand profile | selected week vs previous week")
     return apply_chart_style(chart, height=380)
+
 
 def fmt_gw(value: float | int | None, decimals: int = 2) -> str:
     if value is None or pd.isna(value):
@@ -2486,13 +2542,13 @@ def negative_zero_summary_table(
                 year=2026,
                 end_ts=report_end,
                 model=model,
-                source=f"YTD {model}",
+                source=f"YTD {model_display_label(model)}",
             )
             if not f.empty:
                 rows.append(pd.DataFrame([{
                     "month_num": 299 if model == "Aurora" else 300,
-                    "Month": f"YTD {model}",
-                    "Source": model,
+                    "Month": f"YTD {model_display_label(model)}",
+                    "Source": model_display_label(model),
                     "Negative hours": int(f["Negative hours"].sum()),
                     "Zero / negative hours": int(f["Zero / negative hours"].sum()),
                 }]))
@@ -2508,9 +2564,9 @@ def style_negative_zero_summary_table(df: pd.DataFrame) -> pd.io.formats.style.S
     def _row_style(row: pd.Series) -> list[str]:
         src = str(row.get("Source", ""))
         month = str(row.get("Month", ""))
-        if src == "Aurora":
+        if src == AURORA_LABEL:
             return ["background-color: #FFF7ED; font-weight: 800;"] * len(row)
-        if src == "Baringa":
+        if src == BARINGA_LABEL:
             return ["background-color: #EFF6FF; font-weight: 800;"] * len(row)
         if src == "2026 actual":
             base = "background-color: #F0F9FF;"
@@ -2617,20 +2673,20 @@ def negative_zero_summary_2026_scenario_table(
     out = base[["month_num", "Month"]].copy()
     out["Actual | Neg."] = actual["Negative hours"].astype(int)
     out["Actual | Zero/Neg."] = actual["Zero / negative hours"].astype(int)
-    out["Aurora | Neg."] = aurora["Negative hours"].astype(int)
-    out["Aurora | Zero/Neg."] = aurora["Zero / negative hours"].astype(int)
-    out["Baringa | Neg."] = baringa["Negative hours"].astype(int)
-    out["Baringa | Zero/Neg."] = baringa["Zero / negative hours"].astype(int)
+    out[f"{AURORA_LABEL} | Neg."] = aurora["Negative hours"].astype(int)
+    out[f"{AURORA_LABEL} | Zero/Neg."] = aurora["Zero / negative hours"].astype(int)
+    out[f"{BARINGA_LABEL} | Neg."] = baringa["Negative hours"].astype(int)
+    out[f"{BARINGA_LABEL} | Zero/Neg."] = baringa["Zero / negative hours"].astype(int)
 
     total = {
         "month_num": 199,
         "Month": "YTD 2026",
         "Actual | Neg.": int(out["Actual | Neg."].sum()),
         "Actual | Zero/Neg.": int(out["Actual | Zero/Neg."].sum()),
-        "Aurora | Neg.": int(out["Aurora | Neg."].sum()),
-        "Aurora | Zero/Neg.": int(out["Aurora | Zero/Neg."].sum()),
-        "Baringa | Neg.": int(out["Baringa | Neg."].sum()),
-        "Baringa | Zero/Neg.": int(out["Baringa | Zero/Neg."].sum()),
+        f"{AURORA_LABEL} | Neg.": int(out[f"{AURORA_LABEL} | Neg."].sum()),
+        f"{AURORA_LABEL} | Zero/Neg.": int(out[f"{AURORA_LABEL} | Zero/Neg."].sum()),
+        f"{BARINGA_LABEL} | Neg.": int(out[f"{BARINGA_LABEL} | Neg."].sum()),
+        f"{BARINGA_LABEL} | Zero/Neg.": int(out[f"{BARINGA_LABEL} | Zero/Neg."].sum()),
     }
     out = pd.concat([out, pd.DataFrame([total])], ignore_index=True)
     return out.drop(columns=["month_num"], errors="ignore")
@@ -2661,8 +2717,8 @@ def style_negative_zero_2025_table(df: pd.DataFrame) -> pd.io.formats.style.Styl
 
 def style_negative_zero_2026_scenario_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     actual_cols = [c for c in df.columns if c.startswith("Actual |")]
-    aurora_cols = [c for c in df.columns if c.startswith("Aurora |")]
-    baringa_cols = [c for c in df.columns if c.startswith("Baringa |")]
+    aurora_cols = [c for c in df.columns if c.startswith(f"{AURORA_LABEL} |")]
+    baringa_cols = [c for c in df.columns if c.startswith(f"{BARINGA_LABEL} |")]
 
     def _row_style(row: pd.Series) -> list[str]:
         is_total = "YTD" in str(row.get("Month", ""))
@@ -2702,7 +2758,7 @@ def ytd_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, f
                 continue
             m["hour"] = m["datetime"].dt.hour
             avg = m.groupby("hour", as_index=False)["price"].mean()
-            avg["series"] = model
+            avg["series"] = model_display_label(model)
             avg["value"] = avg["price"]
             price_frames.append(avg[["hour", "series", "value"]])
     price_plot = pd.concat(price_frames, ignore_index=True)
@@ -2712,12 +2768,12 @@ def ytd_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, f
     else:
         solar_plot = pd.DataFrame(columns=["hour", "solar_best_mw"])
     price_color_scale = alt.Scale(
-        domain=[f"Spot {year} YTD", "Aurora", "Baringa"],
+        domain=[f"Spot {year} YTD", AURORA_LABEL, BARINGA_LABEL],
         range=[BLUE, AURORA_COLOR, BARINGA_COLOR],
     )
     dash = alt.Scale(
-        domain=[f"Spot {year} YTD", "Aurora", "Baringa"],
-        range=[[1, 0], [7, 3], [7, 3]],
+        domain=[f"Spot {year} YTD", AURORA_LABEL, BARINGA_LABEL],
+        range=[[1, 0], [7, 3], [3, 2]],
     )
     layers = []
     if not solar_plot.empty:
@@ -5484,8 +5540,11 @@ with st.spinner("Loading market data and refreshing live 2026 figures..."):
     historical_solar = load_historical_solar()
     live_prices = load_live_prices(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "price"])
     live_solar = load_live_solar(token, live_start, live_end) if token and today >= LIVE_START_DATE else pd.DataFrame(columns=["datetime", "solar_best_mw"])
+    pbf_solar_start = date(2025, 1, 1)
+    live_pbf_solar = load_live_2026_pbf_solar_pv_for_report(token, pbf_solar_start, live_end) if token else pd.DataFrame(columns=["datetime", "solar_best_mw", "generation_basis"])
     price_hourly = combine_hist_live(historical_prices, live_prices, ["datetime"])
     solar_hourly = combine_hist_live(historical_solar, live_solar, ["datetime"])
+    pbf_solar_hourly = live_pbf_solar.copy()
     forward_hourly = load_forward_hourly_scenarios()
     forward_history = load_forward_market_history()
 
@@ -5608,8 +5667,8 @@ tb4_prev = top_bottom_summary(price_hourly, prev_week, week_end(prev_week)).get(
 tb4_yoy = top_bottom_summary(price_hourly, yoy, week_end(yoy)).get("TB4")
 zero_neg_selected = zero_negative_hours_in_period(price_hourly, selected_week, report_end)
 zero_neg_prev = zero_negative_hours_in_period(price_hourly, prev_week, week_end(prev_week))
-curt_selected = economic_curtailment_period_value(price_hourly, solar_hourly, selected_week, report_end)
-curt_prev = economic_curtailment_period_value(price_hourly, solar_hourly, prev_week, week_end(prev_week))
+curt_selected = economic_curtailment_period_value(price_hourly, pbf_solar_hourly, selected_week, report_end)
+curt_prev = economic_curtailment_period_value(price_hourly, pbf_solar_hourly, prev_week, week_end(prev_week))
 
 kpi_generation_current = build_generation_week_metrics(
     historical_mix_daily,
@@ -5651,9 +5710,9 @@ with k2_2:
     )
 with k2_3:
     st.metric(
-        f"Economic curtailment | {week_label(selected_week, is_current_wtd)}",
+        f"Economic curtailment PBF Solar PV | {week_label(selected_week, is_current_wtd)}",
         fmt_pct(curt_selected),
-        help="Share of solar generation produced during zero or negative day-ahead price hours.",
+        help="Share of PBF Solar PV generation produced during zero or negative day-ahead price hours.",
     )
     st.markdown(
         f'<div class="metric-footnote">{adverse_delta_pp_arrow_html(curt_selected, curt_prev, "prev. week")}<br>Prev. week: <b>{fmt_pct(curt_prev)}</b></div>',
@@ -5676,7 +5735,7 @@ with k2_5:
         help="Official REE demanda/evolucion demand summed for the selected week, converted to GWh.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. week")}<br>Prev. week: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand current: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b> | Avg demand prev.: <b>{fmt_gw(kpi_demand_prev.get("avg_demand_gw"))}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. week")}<br>Prev. week: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand current: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b> | Avg demand prev.: <b>{fmt_gw(kpi_demand_prev.get("avg_demand_gw"))}</b><br>Avg daily peak current: <b>{fmt_gw(kpi_peak_current.get("peak_demand_gw"))}</b> | Prev. week: <b>{fmt_gw(kpi_peak_prev.get("peak_demand_gw"))}</b></div>',
         unsafe_allow_html=True,
     )
 
@@ -5714,6 +5773,7 @@ with other_col3:
             <div style="font-weight:800; margin-bottom:0.25rem;">📈 Avg. daily peak demand</div>
             <div><b>{approx_prefix}{fmt_gw(peak_curr)}</b></div>
             <div>{delta_arrow_html(peak_curr, peak_prev, "prev. week")}</div>
+            <div style="font-size:0.74rem; color:#64748B; margin-top:0.15rem;">Prev. week: <b>{fmt_gw(peak_prev)}</b></div>
             <div style="font-size:0.74rem; color:#64748B; margin-top:0.15rem;">
                 Mean of daily hourly peaks
             </div>
@@ -5722,7 +5782,7 @@ with other_col3:
         unsafe_allow_html=True,
     )
 
-subsection("Monthly baseload vs Solar PV capture table | 2025 history, 2026 YTD and Aurora/Baringa versions")
+subsection("Monthly baseload vs Solar PV capture table | 2025 history, 2026 YTD and Aurora central Dec25 / Baringa reference Apr26")
 capture_report = build_report_capture_table(monthly_capture, price_hourly, solar_hourly, forward_hourly, selected_month, report_end)
 st.dataframe(format_capture_table(capture_report), use_container_width=True, height=520)
 
@@ -5794,7 +5854,7 @@ with neg_2025_col:
     else:
         st.info("No 2025 negative-price summary could be calculated.")
 with neg_2026_col:
-    st.markdown('<div class="comparison-note">2026 actual + Aurora + Baringa | monthly counts and YTD benchmark</div>', unsafe_allow_html=True)
+    st.markdown('<div class="comparison-note">2026 actual + Aurora central Dec25 + Baringa reference Apr26 | monthly counts and YTD benchmark</div>', unsafe_allow_html=True)
     if not negative_summary_2026.empty:
         st.dataframe(style_negative_zero_2026_scenario_table(negative_summary_2026), use_container_width=True, height=520)
     else:
@@ -5803,40 +5863,54 @@ with neg_2026_col:
 subsection("YTD 24h average market profile vs solar generation")
 hourly_overlay = ytd_hourly_overlay(price_hourly, solar_hourly, forward_hourly, selected_month.year, report_end)
 if hourly_overlay is not None:
+    st.markdown(
+        f"""
+        <div style="display:flex; flex-wrap:wrap; gap:22px; align-items:center; margin:0.1rem 0 0.45rem 0; font-size:0.86rem;">
+            <span style="font-weight:800;color:#334155;">Price series</span>
+            <span><span style="display:inline-block;width:28px;border-top:3px solid {BLUE};vertical-align:middle;margin-right:6px;"></span>Spot {selected_month.year} YTD</span>
+            <span><span style="display:inline-block;width:28px;border-top:3px dashed {AURORA_COLOR};vertical-align:middle;margin-right:6px;"></span>{AURORA_LABEL}</span>
+            <span><span style="display:inline-block;width:28px;border-top:3px dashed {BARINGA_COLOR};vertical-align:middle;margin-right:6px;"></span>{BARINGA_LABEL}</span>
+            <span><span style="display:inline-block;width:24px;height:10px;background:#FDE68A;opacity:0.65;margin-right:6px;"></span>Solar profile</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.altair_chart(hourly_overlay, use_container_width=True)
 
-subsection("Actual economic curtailment using P48 Solar PV Spain (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
+subsection("Actual economic curtailment using PBF Solar PV (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
+st.info("This section uses PBF Solar PV from ESIOS indicator 14 as the generation basis, not P48 Spain. 2025 actual is included again through December.")
+st.caption("Bars show actual 2025/2026; forecast lines use the full model version names in the legend: Aurora central Dec25 and Baringa reference Apr26.")
 
 ytd_curt_actual = economic_curtailment_ytd_value(
     price_hourly,
-    solar_hourly,
+    pbf_solar_hourly,
     2026,
     pd.Timestamp(latest_data_ts.date()),
 )
 ytd_curt_aurora = economic_curtailment_ytd_forecast_value(
     forward_hourly,
-    solar_hourly,
+    pbf_solar_hourly,
     "Aurora",
     pd.Timestamp(latest_data_ts.date()),
 )
 ytd_curt_baringa = economic_curtailment_ytd_forecast_value(
     forward_hourly,
-    solar_hourly,
+    pbf_solar_hourly,
     "Baringa",
     pd.Timestamp(latest_data_ts.date()),
 )
 yc1, yc2, yc3 = st.columns(3)
 with yc1:
-    st.metric("YTD 2026 actual economic curtailment", fmt_pct(ytd_curt_actual))
+    st.metric("YTD 2026 actual economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_actual))
 with yc2:
-    st.metric(f"YTD {AURORA_LABEL} economic curtailment", fmt_pct(ytd_curt_aurora))
+    st.metric(f"YTD {AURORA_LABEL} economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_aurora))
 with yc3:
-    st.metric(f"YTD {BARINGA_LABEL} economic curtailment", fmt_pct(ytd_curt_baringa))
+    st.metric(f"YTD {BARINGA_LABEL} economic curtailment | PBF Solar PV", fmt_pct(ytd_curt_baringa))
 
-actual_curt_2026 = monthly_economic_curtailment(price_hourly, solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
-forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, solar_hourly, pd.Timestamp(latest_data_ts.date()))
-actual_curt_2025 = monthly_economic_curtailment(price_hourly, solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
-curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026)
+actual_curt_2026 = monthly_economic_curtailment(price_hourly, pbf_solar_hourly, 2026, pd.Timestamp(latest_data_ts.date()))
+forward_curt_2026 = monthly_economic_curtailment_forward(forward_hourly, pbf_solar_hourly, pd.Timestamp(latest_data_ts.date()))
+actual_curt_2025 = monthly_economic_curtailment(price_hourly, pbf_solar_hourly, 2025, pd.Timestamp(2025, 12, 31))
+curt_chart = monthly_curtailment_chart(actual_curt_2025, actual_curt_2026, forward_curt_2026, "PBF Solar PV")
 if curt_chart is not None:
     st.altair_chart(curt_chart, use_container_width=True)
 
@@ -5887,6 +5961,10 @@ if weekly_demand_profile is None:
     )
 if weekly_demand_profile is not None:
     subsection("Weekly average 24h demand profile | selected week vs previous week")
+    st.markdown(
+        f'<div class="comparison-note">Average demand comparison — selected week: <b>{fmt_gw(selected_demand_metrics.get("avg_demand_gw"))}</b> vs previous week: <b>{fmt_gw(previous_demand_metrics.get("avg_demand_gw"))}</b></div>',
+        unsafe_allow_html=True,
+    )
     st.altair_chart(weekly_demand_profile, use_container_width=True)
     st.caption("Demand profile uses official REE demanda/evolucion hourly data where available; fallback uses the official weekly average demand.")
 
@@ -6028,7 +6106,7 @@ pdf_charts = pdf_spot_heatmaps + [
     ("2025 zero / negative price frequency heatmap", neg_heatmap_2025),
     ("Negative / zero-price cumulative hours | scenario overlay", negative_overlay_chart),
     ("YTD 24h average market profile vs solar generation", hourly_overlay),
-    ("Actual economic curtailment (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26", curt_chart),
+    ("Actual economic curtailment PBF Solar PV (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26", curt_chart),
     ("Forward market history / latest snapshot", forward_chart),
     ("BESS-model hybrid captured price", hybrid_plot),
 ]
