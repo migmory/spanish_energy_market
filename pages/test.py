@@ -613,6 +613,118 @@ def _sum_esios_indicators_over_period_gwh(
     return total_mwh / 1000.0, missing
 
 
+def _fetch_hourly_series_for_indicator(
+    indicator_id: int,
+    start_day: date,
+    end_day: date,
+    token: str,
+    *,
+    time_agg: str,
+) -> pd.DataFrame:
+    raw = fetch_esios_range(
+        indicator_id,
+        start_day,
+        end_day,
+        token,
+        time_trunc="hour",
+        time_agg=time_agg,
+    )
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "value", "indicator_id"])
+    out = raw[["datetime", "value"]].copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["datetime", "value"])
+    out = out.groupby("datetime", as_index=False)["value"].mean()
+    out["indicator_id"] = indicator_id
+    return out
+
+
+def _build_hourly_volume_mwh(
+    indicator_ids: list[int],
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    frames = []
+    missing: list[str] = []
+    for indicator_id in indicator_ids:
+        raw = _fetch_hourly_series_for_indicator(indicator_id, start_day, end_day, token, time_agg="sum")
+        if raw.empty:
+            missing.append(str(indicator_id))
+            continue
+        frames.append(raw[["datetime", "value"]].rename(columns={"value": "volume_mwh"}))
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "volume_mwh"]), missing
+
+    out = pd.concat(frames, ignore_index=True)
+    out["volume_mwh"] = pd.to_numeric(out["volume_mwh"], errors="coerce").abs()
+    out = out.groupby("datetime", as_index=False)["volume_mwh"].sum()
+    return out, missing
+
+
+def _build_hourly_price_eur_mwh(
+    indicator_ids: list[int],
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    frames = []
+    missing: list[str] = []
+    for indicator_id in indicator_ids:
+        raw = _fetch_hourly_series_for_indicator(indicator_id, start_day, end_day, token, time_agg="average")
+        if raw.empty:
+            missing.append(str(indicator_id))
+            continue
+        frames.append(raw[["datetime", "value"]].rename(columns={"value": "price_eur_mwh"}))
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "price_eur_mwh"]), missing
+
+    out = pd.concat(frames, ignore_index=True)
+    out["price_eur_mwh"] = pd.to_numeric(out["price_eur_mwh"], errors="coerce")
+    # If multiple official price indicators exist for a side, average them by timestamp.
+    # For the current mapping this is mainly a robust fallback; most sides use one official price indicator.
+    out = out.groupby("datetime", as_index=False)["price_eur_mwh"].mean()
+    return out, missing
+
+
+def _weighted_avg_price_over_period(
+    volume_indicator_ids: list[int],
+    price_indicator_ids: list[int],
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> tuple[float | None, float | None, list[str]]:
+    """Return volume-weighted average €/MWh and implied cost M€.
+
+    If price and volume timestamps do not align, fall back to the simple average of
+    the official price series and still estimate cost using total volume.
+    """
+    if not price_indicator_ids:
+        return None, None, []
+
+    volume, miss_vol = _build_hourly_volume_mwh(volume_indicator_ids, start_day, end_day, token)
+    price, miss_price = _build_hourly_price_eur_mwh(price_indicator_ids, start_day, end_day, token)
+    missing = [f"volume {x}" for x in miss_vol] + [f"price {x}" for x in miss_price]
+
+    if price.empty:
+        return None, None, missing
+
+    total_volume_mwh = float(volume["volume_mwh"].sum()) if not volume.empty else 0.0
+    merged = volume.merge(price, on="datetime", how="inner") if not volume.empty else pd.DataFrame()
+    merged = merged.dropna(subset=["volume_mwh", "price_eur_mwh"]) if not merged.empty else merged
+
+    if not merged.empty and merged["volume_mwh"].sum() > 0:
+        avg_price = float((merged["volume_mwh"] * merged["price_eur_mwh"]).sum() / merged["volume_mwh"].sum())
+    else:
+        avg_price = float(price["price_eur_mwh"].dropna().mean())
+
+    cost_meur = (total_volume_mwh * avg_price) / 1_000_000.0 if total_volume_mwh else None
+    return avg_price, cost_meur, missing
+
+
 def _avg_esios_indicators_over_period_mw(
     indicator_ids: list[int],
     start_day: date,
@@ -630,6 +742,7 @@ def _avg_esios_indicators_over_period_mw(
             end_day,
             token,
             time_trunc="hour",
+            time_agg="average",
         )
         if raw.empty:
             missing.append(str(indicator_id))
@@ -660,11 +773,36 @@ def build_balancing_energy_summary(
     missing: list[str] = []
 
     for category, sides in BALANCING_ENERGY_SECTIONS.items():
-        up_gwh, miss_up = _sum_esios_indicators_over_period_gwh(sides.get("up", []), start_day, end_day, token)
-        down_gwh, miss_down = _sum_esios_indicators_over_period_gwh(sides.get("down", []), start_day, end_day, token)
-        missing.extend([f"{category} upward: {x}" for x in miss_up])
-        missing.extend([f"{category} downward: {x}" for x in miss_down])
-        rows.append({"category": category, "upward_gwh": up_gwh, "downward_gwh": down_gwh})
+        up_ids = sides.get("up", [])
+        down_ids = sides.get("down", [])
+        price_sides = BALANCING_PRICE_SECTIONS.get(category, {"up": [], "down": []})
+
+        up_gwh, miss_up = _sum_esios_indicators_over_period_gwh(up_ids, start_day, end_day, token)
+        down_gwh, miss_down = _sum_esios_indicators_over_period_gwh(down_ids, start_day, end_day, token)
+        up_avg_price, up_cost_meur, miss_up_price = _weighted_avg_price_over_period(
+            up_ids, price_sides.get("up", []), start_day, end_day, token
+        )
+        down_avg_price, down_cost_meur, miss_down_price = _weighted_avg_price_over_period(
+            down_ids, price_sides.get("down", []), start_day, end_day, token
+        )
+
+        missing.extend([f"{category} upward volume: {x}" for x in miss_up])
+        missing.extend([f"{category} downward volume: {x}" for x in miss_down])
+        missing.extend([f"{category} upward price: {x}" for x in miss_up_price])
+        missing.extend([f"{category} downward price: {x}" for x in miss_down_price])
+        rows.append(
+            {
+                "category": category,
+                "upward_gwh": up_gwh,
+                "downward_gwh": down_gwh,
+                "upward_avg_price_eur_mwh": up_avg_price,
+                "downward_avg_price_eur_mwh": down_avg_price,
+                "upward_cost_meur": up_cost_meur,
+                "downward_cost_meur": down_cost_meur,
+                "upward_price_ids": ", ".join(map(str, price_sides.get("up", []))) or "n/a",
+                "downward_price_ids": ", ".join(map(str, price_sides.get("down", []))) or "n/a",
+            }
+        )
 
     reserve_rows = []
     for direction, ids in BALANCING_SECONDARY_RESERVE_IDS.items():
@@ -675,6 +813,217 @@ def build_balancing_energy_summary(
     energy = pd.DataFrame(rows)
     reserve = pd.DataFrame(reserve_rows)
     return energy, reserve, missing
+
+
+def build_balancing_indicator_breakdown(
+    start_day: date,
+    end_day: date,
+    token: str,
+) -> pd.DataFrame:
+    """Detailed per-indicator breakdown to debug methodology differences."""
+    rows: list[dict[str, Any]] = []
+
+    for category, sides in BALANCING_ENERGY_SECTIONS.items():
+        for direction_key, ids in [("Upward", sides.get("up", [])), ("Downward", sides.get("down", []))]:
+            for indicator_id in ids:
+                raw = fetch_esios_range(
+                    indicator_id,
+                    start_day,
+                    end_day,
+                    token,
+                    time_trunc="hour",
+                    time_agg="sum",
+                )
+                vals = pd.to_numeric(raw["value"], errors="coerce").dropna() if not raw.empty else pd.Series(dtype=float)
+                rows.append(
+                    {
+                        "table": "energy",
+                        "category": category,
+                        "direction": direction_key,
+                        "indicator_id": indicator_id,
+                        "value": float(vals.abs().sum()) / 1000.0 if not vals.empty else pd.NA,
+                        "unit": "GWh",
+                        "rows": int(len(vals)),
+                    }
+                )
+
+        price_sides = BALANCING_PRICE_SECTIONS.get(category, {"up": [], "down": []})
+        for direction_key, ids in [("Upward", price_sides.get("up", [])), ("Downward", price_sides.get("down", []))]:
+            for indicator_id in ids:
+                raw = fetch_esios_range(
+                    indicator_id,
+                    start_day,
+                    end_day,
+                    token,
+                    time_trunc="hour",
+                    time_agg="average",
+                )
+                vals = pd.to_numeric(raw["value"], errors="coerce").dropna() if not raw.empty else pd.Series(dtype=float)
+                rows.append(
+                    {
+                        "table": "price",
+                        "category": category,
+                        "direction": direction_key,
+                        "indicator_id": indicator_id,
+                        "value": float(vals.mean()) if not vals.empty else pd.NA,
+                        "unit": "€/MWh",
+                        "rows": int(len(vals)),
+                    }
+                )
+
+    for direction_key, ids in BALANCING_SECONDARY_RESERVE_IDS.items():
+        for indicator_id in ids:
+            raw = fetch_esios_range(
+                indicator_id,
+                start_day,
+                end_day,
+                token,
+                time_trunc="hour",
+                time_agg="average",
+            )
+            vals = pd.to_numeric(raw["value"], errors="coerce").dropna() if not raw.empty else pd.Series(dtype=float)
+            rows.append(
+                {
+                    "table": "secondary_reserve",
+                    "category": "Average secondary reserve",
+                    "direction": direction_key,
+                    "indicator_id": indicator_id,
+                    "value": float(vals.mean()) if not vals.empty else pd.NA,
+                    "unit": "MW",
+                    "rows": int(len(vals)),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataFrame, title_suffix: str = "") -> alt.Chart:
+    """Interactive Altair version with hover tooltips."""
+    energy_plot = energy.copy()
+    energy_plot["upward_gwh"] = pd.to_numeric(energy_plot["upward_gwh"], errors="coerce")
+    energy_plot["downward_gwh"] = pd.to_numeric(energy_plot["downward_gwh"], errors="coerce")
+
+    long_rows = []
+    for _, row in energy_plot.iterrows():
+        up_gwh = pd.to_numeric(row.get("upward_gwh"), errors="coerce")
+        down_gwh = pd.to_numeric(row.get("downward_gwh"), errors="coerce")
+        up_price = pd.to_numeric(row.get("upward_avg_price_eur_mwh"), errors="coerce")
+        down_price = pd.to_numeric(row.get("downward_avg_price_eur_mwh"), errors="coerce")
+        up_cost = pd.to_numeric(row.get("upward_cost_meur"), errors="coerce")
+        down_cost = pd.to_numeric(row.get("downward_cost_meur"), errors="coerce")
+
+        long_rows.append({
+            "category": row.get("category"),
+            "direction": "Upward",
+            "value_gwh": float(up_gwh) if pd.notna(up_gwh) else 0.0,
+            "plot_value": float(up_gwh) if pd.notna(up_gwh) else 0.0,
+            "avg_price_eur_mwh": float(up_price) if pd.notna(up_price) else None,
+            "cost_meur": float(up_cost) if pd.notna(up_cost) else None,
+            "price_ids": row.get("upward_price_ids", "n/a"),
+            "label": f"{float(up_gwh):,.0f} GWh" if pd.notna(up_gwh) else "",
+        })
+        long_rows.append({
+            "category": row.get("category"),
+            "direction": "Downward",
+            "value_gwh": float(down_gwh) if pd.notna(down_gwh) else 0.0,
+            "plot_value": -float(down_gwh) if pd.notna(down_gwh) else 0.0,
+            "avg_price_eur_mwh": float(down_price) if pd.notna(down_price) else None,
+            "cost_meur": float(down_cost) if pd.notna(down_cost) else None,
+            "price_ids": row.get("downward_price_ids", "n/a"),
+            "label": f"{float(down_gwh):,.0f} GWh" if pd.notna(down_gwh) else "",
+        })
+
+    energy_long = pd.DataFrame(long_rows)
+    energy_long["label_y"] = energy_long.apply(
+        lambda r: r["plot_value"] + max(abs(r["plot_value"]) * 0.03, 20.0) if r["plot_value"] >= 0 else r["plot_value"] - max(abs(r["plot_value"]) * 0.03, 20.0),
+        axis=1,
+    )
+    max_energy = max(energy_long["value_gwh"].max() if not energy_long.empty else 0.0, 1.0)
+    energy_domain = [-max_energy * 1.12, max_energy * 1.12]
+
+    color_scale = alt.Scale(domain=["Upward", "Downward"], range=["#0F7F73", "#C81046"])
+    x_sort = energy["category"].tolist()
+
+    energy_base = alt.Chart(energy_long).encode(
+        x=alt.X("category:N", sort=x_sort, axis=alt.Axis(title=None, labelAngle=-15)),
+        color=alt.Color("direction:N", scale=color_scale, legend=alt.Legend(orient="bottom", direction="horizontal", title=None)),
+    )
+
+    energy_bars = energy_base.mark_bar().encode(
+        y=alt.Y(
+            "plot_value:Q",
+            title="GWh (+ upward / - downward)",
+            scale=alt.Scale(domain=energy_domain),
+        ),
+        tooltip=[
+            alt.Tooltip("category:N", title="Category"),
+            alt.Tooltip("direction:N", title="Direction"),
+            alt.Tooltip("value_gwh:Q", title="Volume (GWh)", format=",.0f"),
+            alt.Tooltip("avg_price_eur_mwh:Q", title="Avg price (€/MWh)", format=",.2f"),
+            alt.Tooltip("cost_meur:Q", title="Implied cost (M€)", format=",.1f"),
+            alt.Tooltip("price_ids:N", title="Price indicator IDs"),
+        ],
+    )
+
+    energy_text = energy_base.mark_text(fontSize=11, color="#444444").encode(
+        y=alt.Y("label_y:Q", scale=alt.Scale(domain=energy_domain)),
+        text="label:N",
+    )
+
+    zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#AEB6BF").encode(y="y:Q")
+
+    energy_chart = (
+        (zero_rule + energy_bars + energy_text)
+        .properties(
+            width=760,
+            height=420,
+            title=alt.TitleParams(
+                text=f"Upward and downward balancing energy should not be blended{title_suffix}",
+                subtitle=["Balancing energy volume: upward vs downward"],
+                anchor="start",
+                fontSize=16,
+                subtitleFontSize=13,
+            ),
+        )
+        .interactive()
+    )
+
+    reserve_plot = reserve.copy()
+    reserve_plot["avg_mw"] = pd.to_numeric(reserve_plot["avg_mw"], errors="coerce")
+    reserve_plot["label"] = reserve_plot["avg_mw"].map(lambda x: f"{x:,.0f} MW" if pd.notna(x) else "")
+    reserve_plot["label_y"] = reserve_plot["avg_mw"].fillna(0) + reserve_plot["avg_mw"].fillna(0).clip(lower=1) * 0.02
+    reserve_max = max(reserve_plot["avg_mw"].max(skipna=True) if not reserve_plot.empty else 0.0, 1.0)
+
+    reserve_base = alt.Chart(reserve_plot).encode(
+        x=alt.X("direction:N", sort=["Downward", "Upward"], axis=alt.Axis(title=None)),
+        color=alt.Color(
+            "direction:N",
+            scale=alt.Scale(domain=["Downward", "Upward"], range=["#1CA7DF", "#0B6FA4"]),
+            legend=None,
+        ),
+    )
+    reserve_bars = reserve_base.mark_bar().encode(
+        y=alt.Y("avg_mw:Q", title="MW", scale=alt.Scale(domain=[0, reserve_max * 1.12])),
+        tooltip=[
+            alt.Tooltip("direction:N", title="Direction"),
+            alt.Tooltip("avg_mw:Q", title="Average reserve (MW)", format=",.0f"),
+        ],
+    )
+    reserve_text = reserve_base.mark_text(fontSize=11, color="#444444").encode(
+        y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, reserve_max * 1.12])),
+        text="label:N",
+    )
+    reserve_chart = (
+        (reserve_bars + reserve_text)
+        .properties(
+            width=300,
+            height=420,
+            title=alt.TitleParams(text="Average secondary reserve", anchor="middle", fontSize=13),
+        )
+        .interactive()
+    )
+
+    return alt.hconcat(energy_chart, reserve_chart, spacing=30).resolve_scale(color="independent")
 
 
 def plot_balancing_energy_summary(energy: pd.DataFrame, reserve: pd.DataFrame, title_suffix: str = "") -> plt.Figure:
@@ -1368,8 +1717,9 @@ if run:
             st.warning("No balancing-energy rows could be built for the selected period.")
         else:
             title_suffix = f" | {start_day:%d-%b-%Y} to {end_day:%d-%b-%Y}"
-            fig = plot_balancing_energy_summary(balancing_energy, balancing_reserve, title_suffix=title_suffix)
-            st.pyplot(fig, clear_figure=True, use_container_width=True)
+            balancing_chart = plot_balancing_energy_summary_altair(balancing_energy, balancing_reserve, title_suffix=title_suffix)
+            st.altair_chart(balancing_chart, use_container_width=True)
+            st.caption("Hover over the bars to see the exact values used in the chart.")
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1388,8 +1738,15 @@ if run:
                 st.markdown("**Indicator IDs used**")
                 st.json({
                     "energy_sections": BALANCING_ENERGY_SECTIONS,
+                    "price_sections": BALANCING_PRICE_SECTIONS,
                     "secondary_reserve": BALANCING_SECONDARY_RESERVE_IDS,
+                    "secondary_reserve_hourly_aggregation": "average",
+                    "price_hourly_aggregation": "average, then volume-weighted when hourly volume alignment is available",
                 })
+                breakdown = build_balancing_indicator_breakdown(start_day, end_day, token)
+                if not breakdown.empty:
+                    st.markdown("**Per-indicator contribution breakdown**")
+                    st.dataframe(breakdown, use_container_width=True, hide_index=True)
                 if balancing_missing:
                     st.markdown("**Missing/empty indicators**")
                     st.write(balancing_missing)
