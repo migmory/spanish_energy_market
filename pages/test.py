@@ -788,7 +788,7 @@ def build_balancing_energy_summary(
     for category, sides in BALANCING_ENERGY_SECTIONS.items():
         up_ids = sides.get("up", [])
         down_ids = sides.get("down", [])
-        price_sides = BALANCING_PRICE_SECTIONS.get(category, {"up": [], "down": []})
+        price_sides = globals().get("BALANCING_PRICE_SECTIONS", {}).get(category, {"up": [], "down": []})
 
         up_gwh, miss_up = _sum_esios_indicators_over_period_gwh(up_ids, start_day, end_day, token)
         down_gwh, miss_down = _sum_esios_indicators_over_period_gwh(down_ids, start_day, end_day, token)
@@ -860,7 +860,7 @@ def build_balancing_indicator_breakdown(
                     }
                 )
 
-        price_sides = BALANCING_PRICE_SECTIONS.get(category, {"up": [], "down": []})
+        price_sides = globals().get("BALANCING_PRICE_SECTIONS", {}).get(category, {"up": [], "down": []})
         for direction_key, ids in [("Upward", price_sides.get("up", [])), ("Downward", price_sides.get("down", []))]:
             for indicator_id in ids:
                 raw = fetch_esios_range(
@@ -1547,7 +1547,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing volumes + avg prices + hover + optional technology upload")
+st.success("Version loaded: OFFICIAL balancing v2 fixed — volumes + avg prices + hover + optional technology upload")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -1983,7 +1983,7 @@ if run:
                 st.markdown("**Indicator IDs used**")
                 st.json({
                     "energy_sections": BALANCING_ENERGY_SECTIONS,
-                    "price_sections": BALANCING_PRICE_SECTIONS,
+                    "price_sections": globals().get("BALANCING_PRICE_SECTIONS", {}),
                     "secondary_reserve": BALANCING_SECONDARY_RESERVE_IDS,
                     "secondary_reserve_hourly_aggregation": "average",
                     "price_hourly_aggregation": "average, then volume-weighted when hourly volume alignment is available",
