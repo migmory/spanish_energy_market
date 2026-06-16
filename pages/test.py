@@ -84,6 +84,9 @@ BALANCING_ENERGY_SECTIONS = {
     "Secondary energy": {"up": [680], "down": [681]},
 }
 BALANCING_SECONDARY_RESERVE_IDS = {"Downward": [633], "Upward": [632]}
+# Official ESIOS secondary-reserve band marginal price. This is a capacity/band price,
+# so it is shown as €/MW in the reserve chart, not as €/MWh energy price.
+BALANCING_SECONDARY_RESERVE_PRICE_IDS = {"Downward": [634], "Upward": [634]}
 
 # Official ESIOS average-price indicators used in the hover tooltip.
 # Real-time constraints are intentionally left empty because the CT/RTD/EST/RSI buckets
@@ -818,10 +821,22 @@ def build_balancing_energy_summary(
         )
 
     reserve_rows = []
+    reserve_price_map = globals().get("BALANCING_SECONDARY_RESERVE_PRICE_IDS", {})
     for direction, ids in BALANCING_SECONDARY_RESERVE_IDS.items():
         avg_mw, miss = _avg_esios_indicators_over_period_mw(ids, start_day, end_day, token)
+        avg_price_eur_mw, miss_price = _avg_esios_indicators_over_period_mw(
+            reserve_price_map.get(direction, []), start_day, end_day, token
+        )
         missing.extend([f"Secondary reserve {direction}: {x}" for x in miss])
-        reserve_rows.append({"direction": direction, "avg_mw": avg_mw})
+        missing.extend([f"Secondary reserve price {direction}: {x}" for x in miss_price])
+        reserve_rows.append(
+            {
+                "direction": direction,
+                "avg_mw": avg_mw,
+                "avg_price_eur_mw": avg_price_eur_mw,
+                "price_ids": ", ".join(map(str, reserve_price_map.get(direction, []))) or "n/a",
+            }
+        )
 
     energy = pd.DataFrame(rows)
     reserve = pd.DataFrame(reserve_rows)
@@ -907,6 +922,29 @@ def build_balancing_indicator_breakdown(
                 }
             )
 
+    for direction_key, ids in globals().get("BALANCING_SECONDARY_RESERVE_PRICE_IDS", {}).items():
+        for indicator_id in ids:
+            raw = fetch_esios_range(
+                indicator_id,
+                start_day,
+                end_day,
+                token,
+                time_trunc="hour",
+                time_agg="average",
+            )
+            vals = pd.to_numeric(raw["value"], errors="coerce").dropna() if not raw.empty else pd.Series(dtype=float)
+            rows.append(
+                {
+                    "table": "secondary_reserve_price",
+                    "category": "Average secondary reserve band price",
+                    "direction": direction_key,
+                    "indicator_id": indicator_id,
+                    "value": float(vals.mean()) if not vals.empty else pd.NA,
+                    "unit": "€/MW",
+                    "rows": int(len(vals)),
+                }
+            )
+
     return pd.DataFrame(rows)
 
 
@@ -958,7 +996,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
     x_sort = energy["category"].tolist()
 
     energy_base = alt.Chart(energy_long).encode(
-        x=alt.X("category:N", sort=x_sort, axis=alt.Axis(title=None, labelAngle=-15)),
+        x=alt.X("category:N", sort=x_sort, axis=alt.Axis(title=None, labelAngle=-18, labelLimit=260, labelFontSize=13)),
         color=alt.Color("direction:N", scale=color_scale, legend=alt.Legend(orient="bottom", direction="horizontal", title=None)),
     )
 
@@ -978,7 +1016,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
         ],
     )
 
-    energy_text = energy_base.mark_text(fontSize=10, color="#444444").encode(
+    energy_text = energy_base.mark_text(fontSize=13, color="#222222", fontWeight="bold", dy=-2).encode(
         y=alt.Y("label_y:Q", scale=alt.Scale(domain=energy_domain)),
         text="label:N",
     )
@@ -988,14 +1026,14 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
     energy_chart = (
         (zero_rule + energy_bars + energy_text)
         .properties(
-            width=760,
-            height=420,
+            width=980,
+            height=560,
             title=alt.TitleParams(
                 text=f"Upward and downward balancing energy should not be blended{title_suffix}",
                 subtitle=["Balancing energy volume: upward vs downward"],
                 anchor="start",
-                fontSize=16,
-                subtitleFontSize=13,
+                fontSize=20,
+                subtitleFontSize=15,
             ),
         )
         .interactive()
@@ -1003,12 +1041,20 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
 
     reserve_plot = reserve.copy()
     reserve_plot["avg_mw"] = pd.to_numeric(reserve_plot["avg_mw"], errors="coerce")
-    reserve_plot["label"] = reserve_plot["avg_mw"].map(lambda x: f"{x:,.0f} MW" if pd.notna(x) else "")
-    reserve_plot["label_y"] = reserve_plot["avg_mw"].fillna(0) + reserve_plot["avg_mw"].fillna(0).clip(lower=1) * 0.02
+    reserve_plot["avg_price_eur_mw"] = pd.to_numeric(reserve_plot.get("avg_price_eur_mw"), errors="coerce") if "avg_price_eur_mw" in reserve_plot.columns else pd.NA
+    reserve_plot["label"] = reserve_plot.apply(
+        lambda r: (
+            f"{r['avg_mw']:,.0f} MW | {r['avg_price_eur_mw']:,.2f} €/MW"
+            if pd.notna(r.get("avg_mw")) and pd.notna(r.get("avg_price_eur_mw"))
+            else (f"{r['avg_mw']:,.0f} MW" if pd.notna(r.get("avg_mw")) else "")
+        ),
+        axis=1,
+    )
+    reserve_plot["label_y"] = reserve_plot["avg_mw"].fillna(0) + reserve_plot["avg_mw"].fillna(0).clip(lower=1) * 0.035
     reserve_max = max(reserve_plot["avg_mw"].max(skipna=True) if not reserve_plot.empty else 0.0, 1.0)
 
     reserve_base = alt.Chart(reserve_plot).encode(
-        x=alt.X("direction:N", sort=["Downward", "Upward"], axis=alt.Axis(title=None)),
+        x=alt.X("direction:N", sort=["Downward", "Upward"], axis=alt.Axis(title=None, labelAngle=0, labelFontSize=13)),
         color=alt.Color(
             "direction:N",
             scale=alt.Scale(domain=["Downward", "Upward"], range=["#1CA7DF", "#0B6FA4"]),
@@ -1020,23 +1066,31 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
         tooltip=[
             alt.Tooltip("direction:N", title="Direction"),
             alt.Tooltip("avg_mw:Q", title="Average reserve (MW)", format=",.0f"),
+            alt.Tooltip("avg_price_eur_mw:Q", title="Avg band price (€/MW)", format=",.2f"),
+            alt.Tooltip("price_ids:N", title="Price indicator IDs"),
         ],
     )
-    reserve_text = reserve_base.mark_text(fontSize=11, color="#444444").encode(
+    reserve_text = reserve_base.mark_text(fontSize=13, color="#222222", fontWeight="bold", dy=-4).encode(
         y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, reserve_max * 1.12])),
         text="label:N",
     )
     reserve_chart = (
         (reserve_bars + reserve_text)
         .properties(
-            width=300,
-            height=420,
-            title=alt.TitleParams(text="Average secondary reserve", anchor="middle", fontSize=13),
+            width=430,
+            height=560,
+            title=alt.TitleParams(text="Average secondary reserve", anchor="middle", fontSize=16),
         )
         .interactive()
     )
 
-    return alt.hconcat(energy_chart, reserve_chart, spacing=30).resolve_scale(color="independent")
+    return (
+        alt.hconcat(energy_chart, reserve_chart, spacing=35)
+        .resolve_scale(color="independent")
+        .configure_axis(labelFontSize=12, titleFontSize=14)
+        .configure_legend(labelFontSize=13, titleFontSize=13)
+        .configure_view(strokeWidth=0)
+    )
 
 
 def plot_balancing_energy_summary(energy: pd.DataFrame, reserve: pd.DataFrame, title_suffix: str = "") -> plt.Figure:
@@ -1547,7 +1601,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v2 fixed — volumes + avg prices + hover + optional technology upload")
+st.success("Version loaded: OFFICIAL balancing v3 — larger chart + volume prices + secondary reserve €/MW + hover + optional technology upload")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -1927,7 +1981,7 @@ if run:
         st.caption(
             "ESIOS indicators are summed over the selected range for balancing energy volumes. "
             "Upward and downward are kept separate; downward is only plotted below zero for visual comparison. "
-            "Secondary reserve is averaged in MW."
+            "Secondary reserve is averaged in MW and its official band price is averaged in €/MW when available."
         )
 
         with st.spinner("Fetching ESIOS balancing-energy indicators..."):
@@ -1965,6 +2019,19 @@ if run:
                 use_container_width=True,
                 hide_index=True,
             )
+            reserve_view_cols = [c for c in ["direction", "avg_mw", "avg_price_eur_mw", "price_ids"] if c in balancing_reserve.columns]
+            if reserve_view_cols:
+                st.markdown("**Visible secondary reserve / average band price table**")
+                st.dataframe(
+                    balancing_reserve[reserve_view_cols].rename(columns={
+                        "direction": "Direction",
+                        "avg_mw": "Average reserve (MW)",
+                        "avg_price_eur_mw": "Average band price (€/MW)",
+                        "price_ids": "Price indicator IDs",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1985,6 +2052,7 @@ if run:
                     "energy_sections": BALANCING_ENERGY_SECTIONS,
                     "price_sections": globals().get("BALANCING_PRICE_SECTIONS", {}),
                     "secondary_reserve": BALANCING_SECONDARY_RESERVE_IDS,
+                    "secondary_reserve_price": globals().get("BALANCING_SECONDARY_RESERVE_PRICE_IDS", {}),
                     "secondary_reserve_hourly_aggregation": "average",
                     "price_hourly_aggregation": "average, then volume-weighted when hourly volume alignment is available",
                 })
