@@ -59,6 +59,42 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    """
+    <style>
+    .formula-card {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 14px;
+        padding: 14px 16px;
+        margin: 10px 0 16px 0;
+        color: #0F172A;
+    }
+    .formula-card b { color: #0F172A; }
+    .formula-main {
+        font-size: 1.02rem;
+        line-height: 1.55;
+        font-weight: 650;
+    }
+    .formula-note {
+        color: #475569;
+        font-size: 0.92rem;
+        line-height: 1.45;
+        margin-top: 8px;
+    }
+    .downward-card {
+        background: #FFF7FA;
+        border: 1px solid #FBCFE8;
+        border-left: 6px solid #C81046;
+        border-radius: 12px;
+        padding: 12px 14px;
+        margin: 8px 0 12px 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Same path convention as the main app pages.
 BASE_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
 ENV_PATH = BASE_DIR / ".env"
@@ -1224,11 +1260,11 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
 
     energy_long = pd.DataFrame(long_rows)
     energy_long["label_y"] = energy_long.apply(
-        lambda r: r["plot_value"] + max(abs(r["plot_value"]) * 0.03, 20.0) if r["plot_value"] >= 0 else r["plot_value"] - max(abs(r["plot_value"]) * 0.03, 20.0),
+        lambda r: r["plot_value"] + max(abs(r["plot_value"]) * 0.045, 35.0) if r["plot_value"] >= 0 else r["plot_value"] - max(abs(r["plot_value"]) * 0.055, 45.0),
         axis=1,
     )
     max_energy = max(energy_long["value_gwh"].max() if not energy_long.empty else 0.0, 1.0)
-    energy_domain = [-max_energy * 1.12, max_energy * 1.12]
+    energy_domain = [-max_energy * 1.22, max_energy * 1.18]
 
     color_scale = alt.Scale(domain=["Upward", "Downward"], range=["#0F7F73", "#C81046"])
     x_sort = energy["category"].tolist()
@@ -1254,7 +1290,16 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
         ],
     )
 
-    energy_text = energy_base.mark_text(fontSize=13, color="#222222", fontWeight="bold", dy=-2).encode(
+    # Labels are split by direction so downward volume/price labels sit clearly below the red bars.
+    energy_text_up = energy_base.transform_filter(
+        alt.datum.direction == "Upward"
+    ).mark_text(fontSize=12, color="#0F7F73", fontWeight="bold", dy=-4).encode(
+        y=alt.Y("label_y:Q", scale=alt.Scale(domain=energy_domain)),
+        text="label:N",
+    )
+    energy_text_down = energy_base.transform_filter(
+        alt.datum.direction == "Downward"
+    ).mark_text(fontSize=12, color="#C81046", fontWeight="bold", dy=8).encode(
         y=alt.Y("label_y:Q", scale=alt.Scale(domain=energy_domain)),
         text="label:N",
     )
@@ -1262,7 +1307,7 @@ def plot_balancing_energy_summary_altair(energy: pd.DataFrame, reserve: pd.DataF
     zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#AEB6BF").encode(y="y:Q")
 
     energy_chart = (
-        (zero_rule + energy_bars + energy_text)
+        (zero_rule + energy_bars + energy_text_up + energy_text_down)
         .properties(
             width=980,
             height=560,
@@ -1790,148 +1835,6 @@ def build_demand_weekday_hourly_profile(hourly: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def plot_demand_hourly_profile_altair(profile_df: pd.DataFrame, title: str) -> alt.Chart:
-    """Static H1-H24 demand profile chart sized like the aFRR/RT1 price charts."""
-    if profile_df is None or profile_df.empty:
-        return alt.Chart(pd.DataFrame({"hour": [], "avg_gw": []})).mark_line()
-
-    plot = profile_df.copy()
-    order = plot["label"].dropna().astype(str).unique().tolist()
-    preferred = []
-    if len(order) >= 2:
-        preferred = [order[1], order[0]] if len(order) >= 2 else order
-    order = preferred or order
-    colors = [BLUE, GREY_DARK][: len(order)] if order else [BLUE, GREY_DARK]
-    dashes = [[1, 0], [5, 3]][: len(order)] if order else [[1, 0], [5, 3]]
-
-    chart = alt.Chart(plot).mark_line(
-        point=alt.OverlayMarkDef(filled=True, size=42),
-        strokeWidth=2.6,
-    ).encode(
-        x=alt.X(
-            "hour:Q",
-            title="Hour",
-            scale=alt.Scale(domain=[0, 23], nice=False),
-            axis=alt.Axis(values=list(range(24)), labelAngle=0, labelFontSize=10),
-        ),
-        y=alt.Y(
-            "avg_gw:Q",
-            title="Average hourly demand (GW)",
-            scale=alt.Scale(zero=False),
-        ),
-        color=alt.Color(
-            "label:N",
-            title="Month",
-            scale=alt.Scale(domain=order, range=colors),
-            legend=alt.Legend(orient="top", direction="horizontal", columns=3, labelLimit=420, titleLimit=420),
-        ),
-        strokeDash=alt.StrokeDash(
-            "label:N",
-            title="Month",
-            scale=alt.Scale(domain=order, range=dashes),
-            legend=None,
-        ),
-    ).properties(title=title, width=980)
-
-    return apply_monthly_report_chart_style(chart, height=330)
-
-
-def build_demand_hourly_profile_table(profile_df: pd.DataFrame) -> pd.DataFrame:
-    if profile_df is None or profile_df.empty:
-        return pd.DataFrame()
-    tmp = profile_df.copy()
-    value_wide = tmp.pivot(index="hour", columns="label", values="avg_gw")
-    obs_wide = tmp.pivot(index="hour", columns="label", values="obs")
-    min_wide = tmp.pivot(index="hour", columns="label", values="min_gw")
-    max_wide = tmp.pivot(index="hour", columns="label", values="max_gw")
-    labels = tmp["label"].dropna().astype(str).unique().tolist()
-    rows = []
-    for h in range(24):
-        row = {"Hour": f"H{h:02d}"}
-        for lab in labels:
-            row[f"{lab} avg (GW)"] = value_wide.loc[h, lab] if (h in value_wide.index and lab in value_wide.columns) else pd.NA
-            row[f"{lab} min (GW)"] = min_wide.loc[h, lab] if (h in min_wide.index and lab in min_wide.columns) else pd.NA
-            row[f"{lab} max (GW)"] = max_wide.loc[h, lab] if (h in max_wide.index and lab in max_wide.columns) else pd.NA
-            row[f"{lab} obs"] = obs_wide.loc[h, lab] if (h in obs_wide.index and lab in obs_wide.columns) else pd.NA
-        rows.append(row)
-    out = pd.DataFrame(rows)
-    for c in out.columns:
-        if c.endswith('(GW)'):
-            out[c] = pd.to_numeric(out[c], errors='coerce').round(2)
-        if c.endswith('obs'):
-            out[c] = pd.to_numeric(out[c], errors='coerce').astype('Int64')
-    return out
-
-
-def plot_demand_weekday_profile_altair(wd: pd.DataFrame, title: str) -> alt.Chart:
-    if wd is None or wd.empty:
-        return alt.Chart(pd.DataFrame({"hour": [], "avg_gw": []})).mark_line()
-    plot = wd.copy()
-    order = [s for s in ["Weekday", "Weekend"] if s in plot["day_type"].astype(str).unique().tolist()]
-    colors = [BLUE, GREY_DARK][: len(order)] if order else [BLUE, GREY_DARK]
-    dashes = [[1, 0], [5, 3]][: len(order)] if order else [[1, 0], [5, 3]]
-    chart = alt.Chart(plot).mark_line(
-        point=alt.OverlayMarkDef(filled=True, size=42),
-        strokeWidth=2.6,
-    ).encode(
-        x=alt.X("hour:Q", title="Hour", scale=alt.Scale(domain=[0, 23], nice=False), axis=alt.Axis(values=list(range(24)), labelAngle=0, labelFontSize=10)),
-        y=alt.Y("avg_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
-        color=alt.Color("day_type:N", title="Day type", scale=alt.Scale(domain=order, range=colors), legend=alt.Legend(orient='top', direction='horizontal', columns=3, labelLimit=420, titleLimit=420)),
-        strokeDash=alt.StrokeDash("day_type:N", title='Day type', scale=alt.Scale(domain=order, range=dashes), legend=None),
-    ).properties(title=title, width=980)
-    return apply_monthly_report_chart_style(chart, height=330)
-
-
-def build_demand_weekday_profile_table(wd: pd.DataFrame) -> pd.DataFrame:
-    if wd is None or wd.empty:
-        return pd.DataFrame()
-    tmp = wd.copy()
-    val_wide = tmp.pivot(index='hour', columns='day_type', values='avg_gw')
-    obs_wide = tmp.pivot(index='hour', columns='day_type', values='obs')
-    rows = []
-    for h in range(24):
-        rows.append({
-            'Hour': f'H{h:02d}',
-            'Weekday avg (GW)': val_wide.loc[h, 'Weekday'] if (h in val_wide.index and 'Weekday' in val_wide.columns) else pd.NA,
-            'Weekend avg (GW)': val_wide.loc[h, 'Weekend'] if (h in val_wide.index and 'Weekend' in val_wide.columns) else pd.NA,
-            'Weekday obs': obs_wide.loc[h, 'Weekday'] if (h in obs_wide.index and 'Weekday' in obs_wide.columns) else pd.NA,
-            'Weekend obs': obs_wide.loc[h, 'Weekend'] if (h in obs_wide.index and 'Weekend' in obs_wide.columns) else pd.NA,
-        })
-    out = pd.DataFrame(rows)
-    for c in out.columns:
-        if c.endswith('(GW)'):
-            out[c] = pd.to_numeric(out[c], errors='coerce').round(2)
-        if c.endswith('obs'):
-            out[c] = pd.to_numeric(out[c], errors='coerce').astype('Int64')
-    return out
-
-
-def plot_demand_daily_avg_altair(daily: pd.DataFrame, title: str) -> alt.Chart:
-    if daily is None or daily.empty:
-        return alt.Chart(pd.DataFrame({"date": [], "avg_gw": []})).mark_bar()
-    plot = daily.copy()
-    chart = alt.Chart(plot).mark_bar().encode(
-        x=alt.X('date:T', title='Date', axis=alt.Axis(labelAngle=0, format='%d')),
-        y=alt.Y('avg_gw:Q', title='Daily average demand (GW)', scale=alt.Scale(zero=False)),
-    ).properties(title=title, width=980)
-    return apply_monthly_report_chart_style(chart, height=300)
-
-
-def build_demand_daily_avg_table(daily: pd.DataFrame) -> pd.DataFrame:
-    if daily is None or daily.empty:
-        return pd.DataFrame()
-    out = daily.copy()
-    out['Date'] = pd.to_datetime(out['date'], errors='coerce').dt.strftime('%d-%b-%Y')
-    out = out[['Date', 'avg_gw', 'max_gw', 'min_gw']].rename(columns={
-        'avg_gw': 'Daily avg (GW)',
-        'max_gw': 'Daily max (GW)',
-        'min_gw': 'Daily min (GW)',
-    })
-    for c in ['Daily avg (GW)', 'Daily max (GW)', 'Daily min (GW)']:
-        out[c] = pd.to_numeric(out[c], errors='coerce').round(2)
-    return out
-
-
 def pct_delta(cur: Any, prev: Any) -> float | None:
     if cur is None or prev in [None, 0] or pd.isna(cur) or pd.isna(prev):
         return None
@@ -1991,11 +1894,79 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
     return [-zero_frac * required_range, (1.0 - zero_frac) * required_range]
 
 
+
+# =========================================================
+# Readability helpers
+# =========================================================
+def _fmt_num(value: Any, decimals: int = 0, suffix: str = "") -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.{decimals}f}{suffix}"
+
+
+def _thermal_gap_formula_html(non_thermal_techs: list[str]) -> str:
+    hydro_included = any(t in non_thermal_techs for t in ["Hydro UGH", "Hydro non-UGH"])
+    hydro_piece = " − Net hydro PBF" if hydro_included else ""
+    hydro_note = (
+        "Hydro dispatchable is currently deducted from demand, so hydro lowers the thermal gap."
+        if hydro_included
+        else "Hydro dispatchable is currently not deducted, so hydro remains inside the residual thermal gap."
+    )
+    return (
+        '<div class="formula-card">'
+        '<div class="formula-main">'
+        '<b>Thermal gap formula used in this run</b><br>'
+        f'Thermal gap = PBF demand − Net nuclear PBF − Net wind PBF − Net solar PBF − Net other renewables PBF{hydro_piece}'
+        '</div>'
+        '<div class="formula-note">'
+        f'<b>Net PBF</b> means gross PBF minus bilateral PBF for each technology. {hydro_note}<br>'
+        'If you remove Hydro UGH / Hydro non-UGH from the selector, the formula automatically removes the hydro term and the thermal gap increases by the net hydro PBF amount.'
+        '</div></div>'
+    )
+
+
+def _thermal_gap_formula_table(df: pd.DataFrame, non_thermal_techs: list[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    rows = []
+    demand_avg = pd.to_numeric(df.get("Total scheduled demand PBF"), errors="coerce").mean()
+    nonthermal_avg = pd.to_numeric(df.get("non_thermal_net_pbf_mwh"), errors="coerce").mean()
+    gap_avg = pd.to_numeric(df.get("raw_thermal_gap_mwh"), errors="coerce").mean()
+    rows.append({"Formula block": "PBF demand", "Included": "Always", "Average MWh/h": demand_avg})
+    for tech in non_thermal_techs:
+        col = f"{tech} net PBF"
+        if col in df.columns:
+            rows.append({"Formula block": f"Deduct: {tech}", "Included": "Yes", "Average MWh/h": pd.to_numeric(df[col], errors="coerce").mean()})
+    rows.append({"Formula block": "Total deducted non-thermal", "Included": "Calculated", "Average MWh/h": nonthermal_avg})
+    rows.append({"Formula block": "Thermal gap", "Included": "Result", "Average MWh/h": gap_avg})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["Average MWh/h"] = pd.to_numeric(out["Average MWh/h"], errors="coerce").round(0)
+    return out
+
+
+def _balancing_downward_focus_table(energy: pd.DataFrame) -> pd.DataFrame:
+    if energy is None or energy.empty:
+        return pd.DataFrame()
+    out = energy[[c for c in ["category", "downward_gwh", "downward_avg_price_eur_mwh", "downward_cost_meur", "downward_price_ids"] if c in energy.columns]].copy()
+    out = out.rename(columns={
+        "category": "Product",
+        "downward_gwh": "Downward volume (GWh)",
+        "downward_avg_price_eur_mwh": "Downward avg price (€/MWh)",
+        "downward_cost_meur": "Downward cost estimate (M€)",
+        "downward_price_ids": "Price IDs",
+    })
+    for col in ["Downward volume (GWh)", "Downward avg price (€/MWh)", "Downward cost estimate (M€)"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2 if "price" in col.lower() else 1)
+    return out
+
+
 # =========================================================
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v11 — demand charts restyled like aFRR/RT1 and fitted to screen")
+st.success("Version loaded: OFFICIAL balancing v13 — thermal-gap residual technologies fixed, no negative cogeneration allocation")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -2020,6 +1991,8 @@ non_thermal_techs = st.multiselect(
     options=list(PBF_GROSS_COMPONENTS.keys()),
     default=NON_THERMAL_TECHS_DEFAULT,
 )
+
+st.markdown(_thermal_gap_formula_html(non_thermal_techs), unsafe_allow_html=True)
 
 show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=False)
 align_zero_axes = st.checkbox(
@@ -2113,6 +2086,12 @@ if run:
         f"Bilateral schedules deducted: {total_bilat:,.0f} MWh deducted from {total_gross:,.0f} MWh gross PBF "
         f"({(total_bilat / total_gross * 100) if total_gross else 0:,.1f}%)."
     )
+
+    formula_table = _thermal_gap_formula_table(df, non_thermal_techs)
+    if not formula_table.empty:
+        st.markdown("**Thermal gap formula — average contribution over selected period**")
+        st.dataframe(formula_table, use_container_width=True, hide_index=True)
+
     if "raw_thermal_gap_mwh" in df.columns:
         st.caption(
             f"Thermal gap range: {df['raw_thermal_gap_mwh'].min():,.0f} to {df['raw_thermal_gap_mwh'].max():,.0f} MWh/h. "
@@ -2137,7 +2116,7 @@ if run:
     st.subheader("Thermal Gap and Price")
     st.caption(
         "Columns: hourly thermal gap. Line: hourly spot price. "
-        "Hover over the columns or the price line to see exact values. "
+        "The formula table above shows how the thermal gap changes when hydro is included or removed. "
         "X-axis is Europe/Madrid local time. The top chart only shows thermal gap on the left axis and spot price on the right axis."
     )
 
@@ -2251,40 +2230,50 @@ if run:
     # -----------------------------------------------------
     st.subheader("Thermal Gap composition by technology")
     st.caption(
-        "For each hour, the stacked technologies below are distributed so that their total equals the hourly thermal gap shown in the top chart. "
-        "This bottom chart does not overlay price, so the technology composition is easier to read. "
-        "Technology shares are based on the listed net conventional PBF technologies after bilateral netting."
+        "The bottom chart now shows the technologies that remain inside the residual thermal gap after the selected deductions. "
+        "If Hydro UGH / Hydro non-UGH is removed from the formula selector, it appears here as part of the residual stack. "
+        "When the thermal gap is negative, positive technologies are not forced below zero; the negative value is shown as a separate 'negative residual' bucket."
     )
 
-    composition_cols = []
-    for tech in CONVENTIONAL_TECHS_DEFAULT:
+    # Technologies included in the residual stack are all net PBF technologies NOT deducted in the formula.
+    # This means Hydro non-UGH / Hydro UGH automatically move into the bottom composition chart when removed
+    # from the non-thermal selector above.
+    residual_techs = []
+    for tech in PBF_GROSS_COMPONENTS.keys():
+        if tech in non_thermal_techs:
+            continue
         col = f"{tech} net PBF"
         if col in plot_df.columns:
-            composition_cols.append((tech, col))
+            residual_techs.append((tech, col))
 
-    if not composition_cols:
-        st.warning("No conventional net PBF technology columns are available for the composition chart.")
+    if not residual_techs:
+        st.warning("No residual net PBF technology columns are available for the composition chart.")
     else:
-        comp_base_cols = ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh"] + [c for _, c in composition_cols]
+        comp_base_cols = ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh"] + [c for _, c in residual_techs]
         comp_wide = plot_df[comp_base_cols].copy()
-        value_cols = [c for _, c in composition_cols]
-        comp_wide[value_cols] = comp_wide[value_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-        comp_wide["conventional_stack_mwh"] = comp_wide[value_cols].sum(axis=1)
-        comp_wide["unallocated_gap_mwh"] = comp_wide["raw_thermal_gap_mwh"] - comp_wide["conventional_stack_mwh"]
+        value_cols = [c for _, c in residual_techs]
+        comp_wide[value_cols] = comp_wide[value_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).clip(lower=0.0)
+        comp_wide["listed_residual_stack_mwh"] = comp_wide[value_cols].sum(axis=1)
+        comp_wide["unallocated_gap_mwh"] = comp_wide["raw_thermal_gap_mwh"] - comp_wide["listed_residual_stack_mwh"]
 
-        # Reallocate each hour proportionally so the stacked technologies sum exactly to the hourly thermal gap.
         comp_alloc = comp_wide.copy()
-        valid_mask = comp_alloc["conventional_stack_mwh"].abs() > 1e-9
+        positive_gap_mask = comp_alloc["raw_thermal_gap_mwh"] > 0
+        valid_positive_stack = positive_gap_mask & (comp_alloc["listed_residual_stack_mwh"].abs() > 1e-9)
+
+        # For positive thermal gap hours: scale only positive residual technologies proportionally so the
+        # stack matches the top chart. For negative gap hours: do NOT assign negative values to technologies
+        # like cogeneration; show the negative residual as its own explanatory bucket instead.
         for col in value_cols:
+            original = comp_wide[col].copy()
             comp_alloc[col] = 0.0
-            comp_alloc.loc[valid_mask, col] = (
-                comp_wide.loc[valid_mask, col]
-                / comp_wide.loc[valid_mask, "conventional_stack_mwh"]
-                * comp_wide.loc[valid_mask, "raw_thermal_gap_mwh"]
+            comp_alloc.loc[valid_positive_stack, col] = (
+                original.loc[valid_positive_stack]
+                / comp_wide.loc[valid_positive_stack, "listed_residual_stack_mwh"]
+                * comp_wide.loc[valid_positive_stack, "raw_thermal_gap_mwh"]
             )
         comp_alloc["allocated_total_mwh"] = comp_alloc[value_cols].sum(axis=1)
 
-        tech_rename = {col: tech for tech, col in composition_cols}
+        tech_rename = {col: tech for tech, col in residual_techs}
         stack_df = comp_alloc.melt(
             id_vars=["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh", "allocated_total_mwh"],
             value_vars=value_cols,
@@ -2295,8 +2284,15 @@ if run:
         stack_df["mwh"] = pd.to_numeric(stack_df["mwh"], errors="coerce").fillna(0.0)
         stack_df = stack_df[stack_df["mwh"].abs() > 1e-9].copy()
 
+        negative_rows = comp_alloc.loc[comp_alloc["raw_thermal_gap_mwh"] < 0, ["datetime", "datetime_label", "hour_1_24", "raw_thermal_gap_mwh", "allocated_total_mwh"]].copy()
+        if not negative_rows.empty:
+            negative_rows["technology_col"] = "negative_residual"
+            negative_rows["technology"] = "Negative residual / excess deducted"
+            negative_rows["mwh"] = negative_rows["raw_thermal_gap_mwh"]
+            stack_df = pd.concat([stack_df, negative_rows], ignore_index=True, sort=False)
+
         if stack_df.empty:
-            st.warning("All conventional technology contributions are zero for the selected period.")
+            st.warning("All residual technology contributions are zero for the selected period.")
         else:
             comp_y_domain = padded_zero_domain(
                 pd.concat([stack_df["mwh"], comp_alloc["raw_thermal_gap_mwh"], comp_alloc["allocated_total_mwh"]], ignore_index=True)
@@ -2310,21 +2306,21 @@ if run:
                     y=alt.Y(
                         "mwh:Q",
                         stack="zero",
-                        title="Thermal gap distributed by technology (MWh)",
+                        title="Residual thermal gap by technology (MWh)",
                         axis=alt.Axis(format="~s", orient="left", titleColor="#2F73C8", labelColor="#2F73C8"),
                         scale=alt.Scale(domain=comp_y_domain),
                     ),
                     color=alt.Color(
                         "technology:N",
                         title="Technology",
-                        legend=alt.Legend(orient="top", direction="horizontal", labelLimit=260, columns=3),
+                        legend=alt.Legend(orient="top", direction="horizontal", labelLimit=280, columns=3),
                     ),
                     tooltip=[
                         alt.Tooltip("datetime_label:N", title="Madrid time"),
                         alt.Tooltip("hour_1_24:Q", title="Hour", format=".0f"),
                         alt.Tooltip("technology:N", title="Technology"),
-                        alt.Tooltip("mwh:Q", title="Allocated technology contribution (MWh)", format=",.0f"),
-                        alt.Tooltip("allocated_total_mwh:Q", title="Stack total (MWh)", format=",.0f"),
+                        alt.Tooltip("mwh:Q", title="Displayed contribution (MWh)", format=",.0f"),
+                        alt.Tooltip("allocated_total_mwh:Q", title="Positive stack total (MWh)", format=",.0f"),
                         alt.Tooltip("raw_thermal_gap_mwh:Q", title="Thermal gap total (MWh)", format=",.0f"),
                     ],
                 )
@@ -2333,12 +2329,19 @@ if run:
             composition_chart = alt.layer(stacked_bars).properties(height=520).interactive(bind_y=False)
             st.altair_chart(composition_chart, use_container_width=True)
 
+            neg_hours = int((comp_wide["raw_thermal_gap_mwh"] < 0).sum())
+            if neg_hours:
+                st.info(
+                    f"There are {neg_hours:,} hours with negative thermal gap. In those hours the selected deductions exceed PBF demand, "
+                    "so the chart shows a separate negative residual instead of assigning negative MWh to positive technologies such as cogeneration."
+                )
+
             unallocated_abs = float(comp_wide["unallocated_gap_mwh"].abs().sum())
             thermal_abs = float(comp_wide["raw_thermal_gap_mwh"].abs().sum())
             if unallocated_abs > max(1e-6, 0.01 * thermal_abs):
                 st.info(
-                    "To make the bottom chart match the top thermal-gap total hour by hour, each hour's listed conventional technologies are proportionally scaled to the hourly thermal gap. "
-                    "The original difference between the listed conventional technologies and the thermal-gap formula is still shown in the diagnostics below."
+                    "For positive thermal-gap hours, listed residual technologies are scaled proportionally to match the top thermal-gap total hour by hour. "
+                    "The original difference between listed residual technologies and the thermal-gap formula is shown in diagnostics."
                 )
 
             with st.expander("Thermal-gap composition data", expanded=False):
@@ -2346,8 +2349,8 @@ if run:
                     stack_df[["datetime_label", "technology", "mwh", "allocated_total_mwh", "raw_thermal_gap_mwh"]]
                     .rename(columns={
                         "datetime_label": "Madrid time",
-                        "mwh": "Allocated technology contribution (MWh)",
-                        "allocated_total_mwh": "Stack total (MWh)",
+                        "mwh": "Displayed contribution (MWh)",
+                        "allocated_total_mwh": "Positive stack total (MWh)",
                         "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
                     }),
                     use_container_width=True,
@@ -2356,10 +2359,10 @@ if run:
 
             with st.expander("Thermal-gap reconciliation diagnostics", expanded=False):
                 st.dataframe(
-                    comp_wide[["datetime_label", "raw_thermal_gap_mwh", "conventional_stack_mwh", "unallocated_gap_mwh"]].rename(columns={
+                    comp_wide[["datetime_label", "raw_thermal_gap_mwh", "listed_residual_stack_mwh", "unallocated_gap_mwh"]].rename(columns={
                         "datetime_label": "Madrid time",
                         "raw_thermal_gap_mwh": "Thermal gap total (MWh)",
-                        "conventional_stack_mwh": "Original listed conventional techs (MWh)",
+                        "listed_residual_stack_mwh": "Original listed residual techs (MWh)",
                         "unallocated_gap_mwh": "Original difference vs thermal gap (MWh)",
                     }),
                     use_container_width=True,
@@ -2387,7 +2390,12 @@ if run:
             title_suffix = f" | {start_day:%d-%b-%Y} to {end_day:%d-%b-%Y}"
             balancing_chart = plot_balancing_energy_summary_altair(balancing_energy, balancing_reserve, title_suffix=title_suffix)
             st.altair_chart(balancing_chart, use_container_width=True)
-            st.caption("Hover over the bars to see the exact values used in the chart. Price also appears in the bar label when an official price indicator exists.")
+            st.caption("Volume and price are also shown in the tables below so the downward bars do not depend on reading labels inside the chart.")
+
+            downward_focus = _balancing_downward_focus_table(balancing_energy)
+            if not downward_focus.empty:
+                st.markdown('<div class="downward-card"><b>Downward balancing — volume and average price</b><br>Dedicated table for the red/downward bars in the chart.</div>', unsafe_allow_html=True)
+                st.dataframe(downward_focus, use_container_width=True, hide_index=True)
 
             st.subheader("Average hourly price profiles — H1 to H24")
             st.caption("Charts are shown full-width, one below another, in static photo mode. Exact values are displayed in visible tables underneath each chart, so no hover is needed.")
@@ -2658,38 +2666,58 @@ if run:
 
         profile_df = pd.concat([p for p in profiles if p is not None and not p.empty], ignore_index=True)
         if not profile_df.empty:
-            st.markdown("**Monthly average hourly shape | H1-H24**")
-            st.altair_chart(
-                plot_demand_hourly_profile_altair(profile_df, "Demand monthly average hourly shape | H1-H24"),
-                use_container_width=False,
-            )
-            st.caption("Static chart mode: exact values are shown in the table below.")
-            demand_profile_table = build_demand_hourly_profile_table(profile_df)
-            if not demand_profile_table.empty:
-                st.dataframe(demand_profile_table, use_container_width=True, hide_index=True)
+            profile_chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
+                x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
+                y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
+                color=alt.Color(
+                    "label:N",
+                    title="Month",
+                    legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
+                ),
+                strokeDash=alt.StrokeDash("label:N", legend=None),
+                tooltip=[
+                    alt.Tooltip("label:N", title="Month"),
+                    alt.Tooltip("hour:O", title="Hour"),
+                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+                    alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
+                    alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
+                    alt.Tooltip("obs:Q", title="Obs", format=",d"),
+                ],
+            ).properties(height=380)
+            st.altair_chart(profile_chart, use_container_width=True)
 
         wd = build_demand_weekday_hourly_profile(selected_hourly)
         if not wd.empty:
-            st.markdown("**Weekday vs weekend hourly demand | H1-H24**")
-            st.altair_chart(
-                plot_demand_weekday_profile_altair(wd, "Weekday vs weekend hourly demand | H1-H24"),
-                use_container_width=False,
-            )
-            st.caption("Static chart mode: exact values are shown in the table below.")
-            wd_table = build_demand_weekday_profile_table(wd)
-            if not wd_table.empty:
-                st.dataframe(wd_table, use_container_width=True, hide_index=True)
+            wd_chart = alt.Chart(wd).mark_line(point=True, strokeWidth=3).encode(
+                x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
+                y=alt.Y("avg_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
+                color=alt.Color(
+                    "day_type:N",
+                    title="Day type",
+                    legend=alt.Legend(orient="top", direction="horizontal"),
+                ),
+                tooltip=[
+                    alt.Tooltip("day_type:N", title="Day type"),
+                    alt.Tooltip("hour:O", title="Hour"),
+                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+                    alt.Tooltip("obs:Q", title="Obs", format=",d"),
+                ],
+            ).properties(height=330)
+            st.altair_chart(wd_chart, use_container_width=True)
 
         daily = build_demand_daily_avg_profile(selected_hourly)
         if not daily.empty:
-            st.markdown("**Daily average demand during the selected month**")
-            st.altair_chart(
-                plot_demand_daily_avg_altair(daily, "Daily average demand"),
-                use_container_width=False,
-            )
-            daily_table = build_demand_daily_avg_table(daily)
-            if not daily_table.empty:
-                st.dataframe(daily_table, use_container_width=True, hide_index=True)
+            daily_chart = alt.Chart(daily).mark_bar().encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("avg_gw:Q", title="Daily average demand (GW)", scale=alt.Scale(zero=False)),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date", format="%d-%b-%Y"),
+                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+                    alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
+                    alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
+                ],
+            ).properties(height=300)
+            st.altair_chart(daily_chart, use_container_width=True)
 
         with st.expander("REE demand diagnostics", expanded=False):
             st.json({"selected": sel_info, "previous": prev_info})
