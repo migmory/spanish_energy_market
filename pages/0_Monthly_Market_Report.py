@@ -5611,7 +5611,7 @@ historical_mix_daily = load_historical_generation_mix_daily_for_report()
 live_mix_monthly = load_live_2026_mix_monthly_for_report(date(2026, 1, 1), today)
 live_mix_daily = load_live_2026_mix_daily_for_report(date(2026, 1, 1), today)
 official_demand_monthly = load_ree_official_demand_monthly_for_report(date(2026, 1, 1), today)
-official_demand_hourly = load_ree_official_demand_hourly_for_report(date(2026, 1, 1), today)
+official_demand_hourly = pd.DataFrame(columns=["datetime", "demand_gw", "source"])
 
 # =========================================================
 # SECTION 1 — DAY AHEAD
@@ -5622,6 +5622,14 @@ subsection("Quick read | selected month KPI panel")
 selected_metrics = period_metrics(price_hourly, solar_hourly, selected_month, report_end)
 prev_month = previous_month(selected_month)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_month, month_end(prev_month))
+
+# Fetch hourly demand only for the selected month + previous month. Pulling a
+# full-year hourly REE demanda/evolucion range can return no usable rows and make
+# the 24h demand profile fall back to flat monthly averages.
+demand_hourly_start = pd.Timestamp(prev_month).date()
+demand_hourly_end = pd.Timestamp(report_end).date()
+official_demand_hourly = load_ree_official_demand_hourly_for_report(demand_hourly_start, demand_hourly_end)
+
 yoy = yoy_month(selected_month)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, month_end(yoy))
 mibgas_selected = mibgas_period_value_exact(mibgas_actuals, selected_month, report_end)
