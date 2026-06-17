@@ -5623,12 +5623,29 @@ selected_metrics = period_metrics(price_hourly, solar_hourly, selected_month, re
 prev_month = previous_month(selected_month)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_month, month_end(prev_month))
 
-# Fetch hourly demand only for the selected month + previous month. Pulling a
-# full-year hourly REE demanda/evolucion range can return no usable rows and make
-# the 24h demand profile fall back to flat monthly averages.
-demand_hourly_start = pd.Timestamp(prev_month).date()
-demand_hourly_end = pd.Timestamp(report_end).date()
-official_demand_hourly = load_ree_official_demand_hourly_for_report(demand_hourly_start, demand_hourly_end)
+# Fetch hourly demand in short monthly chunks. Pulling a long hourly REE
+# demanda/evolucion range can return no usable rows and make the 24h demand
+# profile fall back to flat monthly averages. This mirrors the weekly/test
+# approach, but covers the full selected month/MTD and the full previous month.
+_selected_demand_hourly = load_ree_official_demand_hourly_for_report(
+    pd.Timestamp(selected_month).date(),
+    pd.Timestamp(report_end).date(),
+)
+_prev_demand_hourly = load_ree_official_demand_hourly_for_report(
+    pd.Timestamp(prev_month).date(),
+    pd.Timestamp(month_end(prev_month)).date(),
+)
+official_demand_hourly = pd.concat(
+    [_prev_demand_hourly, _selected_demand_hourly],
+    ignore_index=True,
+)
+if not official_demand_hourly.empty:
+    official_demand_hourly = (
+        official_demand_hourly
+        .drop_duplicates(subset=["datetime"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
 
 yoy = yoy_month(selected_month)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, month_end(yoy))
@@ -6057,7 +6074,7 @@ if monthly_demand_profile is not None:
         unsafe_allow_html=True,
     )
     st.altair_chart(monthly_demand_profile, use_container_width=True)
-    st.caption("Demand profile uses official REE demanda/evolucion hourly data where available; fallback uses the official monthly average demand.")
+    st.caption("Demand profile uses month-by-month REE demanda/evolucion hourly pulls for the selected month/MTD and previous month; fallback uses monthly averages only if REE returns no hourly rows.")
 
 
 # =========================================================
