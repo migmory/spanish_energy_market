@@ -241,6 +241,16 @@ PBF_BILATERAL_COMPONENTS = {
 }
 PBF_BILATERAL_TOTAL_SALES_ID = 10235
 
+# PBF programmed interconnection balance indicators.
+# Positive saldo is treated as net exports from the Spanish system, so it increases
+# the domestic generation requirement. Negative saldo is treated as net imports.
+PBF_INTERCONNECTION_COMPONENTS = {
+    "PBF balance France": 10104,
+    "PBF balance Portugal": 10113,
+    "PBF balance Morocco": 10122,
+    "PBF balance Andorra": 10131,
+}
+
 # Aggregations for the thermal gap formula.
 NON_THERMAL_TECHS_DEFAULT = [
     "Hydro UGH",
@@ -641,7 +651,18 @@ def apply_bilateral_netting(wide: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
 def calculate_thermal_gap(
     wide: pd.DataFrame,
     non_thermal_techs: list[str],
+    *,
+    subtract_conventional_bilaterals: bool = True,
+    include_interconnections: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Calculate a pool / price-setting thermal gap.
+
+    price-setting demand = PBF demand
+                          - conventional bilateral PBF programmes
+                          + optional PBF net export balance
+
+    thermal gap = price-setting demand - net non-thermal PBF
+    """
     netted, diag = apply_bilateral_netting(wide)
     out = netted.copy()
 
@@ -655,13 +676,40 @@ def calculate_thermal_gap(
             out[col] = 0.0
         net_cols.append(col)
 
-    out["non_thermal_net_pbf_mwh"] = out[net_cols].sum(axis=1)
-    out["raw_thermal_gap_mwh"] = out["Total scheduled demand PBF"] - out["non_thermal_net_pbf_mwh"]
+    conventional_bilateral_cols = []
+    for tech in CONVENTIONAL_TECHS_DEFAULT:
+        col = f"{tech} bilateral PBF"
+        if col not in out.columns:
+            out[col] = 0.0
+        conventional_bilateral_cols.append(col)
+
+    out["conventional_bilateral_pbf_mwh"] = (
+        out[conventional_bilateral_cols].sum(axis=1) if conventional_bilateral_cols else 0.0
+    )
+    if not subtract_conventional_bilaterals:
+        out["conventional_bilateral_pbf_mwh"] = 0.0
+
+    interconnection_cols = []
+    for name in globals().get("PBF_INTERCONNECTION_COMPONENTS", {}).keys():
+        if name not in out.columns:
+            out[name] = 0.0
+        interconnection_cols.append(name)
+
+    out["net_exports_pbf_mwh"] = out[interconnection_cols].sum(axis=1) if interconnection_cols else 0.0
+    if not include_interconnections:
+        out["net_exports_pbf_mwh"] = 0.0
+
+    out["non_thermal_net_pbf_mwh"] = out[net_cols].sum(axis=1) if net_cols else 0.0
+    out["price_setting_demand_pbf_mwh"] = (
+        out["Total scheduled demand PBF"]
+        - out["conventional_bilateral_pbf_mwh"]
+        + out["net_exports_pbf_mwh"]
+    )
+    out["raw_thermal_gap_mwh"] = out["price_setting_demand_pbf_mwh"] - out["non_thermal_net_pbf_mwh"]
 
     out["date_madrid"] = out["datetime"].dt.date
     out["hour_madrid"] = out["datetime"].dt.hour
     return out, diag
-
 
 def calculate_monthly_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -690,6 +738,9 @@ def calculate_monthly_stats(df: pd.DataFrame) -> pd.DataFrame:
                 "thermal_gap_mwh_sum": gap_sum,
                 "price_weighted_by_gap_eur_mwh": weighted_price,
                 "demand_pbf_mwh": g["Total scheduled demand PBF"].sum(),
+                "conventional_bilateral_pbf_mwh": g.get("conventional_bilateral_pbf_mwh", pd.Series(0.0, index=g.index)).sum(),
+                "net_exports_pbf_mwh": g.get("net_exports_pbf_mwh", pd.Series(0.0, index=g.index)).sum(),
+                "price_setting_demand_pbf_mwh": g.get("price_setting_demand_pbf_mwh", g["Total scheduled demand PBF"]).sum(),
                 "non_thermal_net_pbf_mwh": g["non_thermal_net_pbf_mwh"].sum(),
                 "missing_price_hours": int(g["price"].isna().sum()) if "price" in g.columns else len(g),
             }
@@ -1904,45 +1955,65 @@ def _fmt_num(value: Any, decimals: int = 0, suffix: str = "") -> str:
     return f"{float(value):,.{decimals}f}{suffix}"
 
 
-def _thermal_gap_formula_html(non_thermal_techs: list[str]) -> str:
+def _thermal_gap_formula_html(
+    non_thermal_techs: list[str],
+    *,
+    subtract_conventional_bilaterals: bool = True,
+    include_interconnections: bool = False,
+) -> str:
     hydro_included = any(t in non_thermal_techs for t in ["Hydro UGH", "Hydro non-UGH"])
     hydro_piece = " − Net hydro PBF" if hydro_included else ""
+    conventional_piece = " − Conventional bilateral PBF" if subtract_conventional_bilaterals else ""
+    interconnection_piece = " + Net export balance PBF" if include_interconnections else ""
     hydro_note = (
         "Hydro dispatchable is currently deducted from demand, so hydro lowers the thermal gap."
         if hydro_included
         else "Hydro dispatchable is currently not deducted, so hydro remains inside the residual thermal gap."
     )
+    interconnection_note = (
+        " Net exports are added and net imports reduce the gap."
+        if include_interconnections
+        else " Interconnections are not included in this run."
+    )
     return (
         '<div class="formula-card">'
         '<div class="formula-main">'
         '<b>Thermal gap formula used in this run</b><br>'
-        f'Thermal gap = PBF demand − Net nuclear PBF − Net wind PBF − Net solar PBF − Net other renewables PBF{hydro_piece}'
+        f'Thermal gap = PBF demand{conventional_piece}{interconnection_piece} − Net nuclear PBF − Net wind PBF − Net solar PBF − Net other renewables PBF{hydro_piece}'
         '</div>'
         '<div class="formula-note">'
-        f'<b>Net PBF</b> means gross PBF minus bilateral PBF for each technology. {hydro_note}<br>'
-        'If you remove Hydro UGH / Hydro non-UGH from the selector, the formula automatically removes the hydro term and the thermal gap increases by the net hydro PBF amount.'
+        '<b>Net PBF</b> means gross PBF minus bilateral PBF for each technology deducted in the formula. '
+        '<b>Conventional bilateral PBF</b> is deducted from demand because those conventional volumes are already contracted outside the pool. '
+        f'{hydro_note}{interconnection_note}<br>'
+        'If you remove Hydro UGH / Hydro non-UGH from the selector, the formula removes the hydro term and hydro appears inside the residual technology stack.'
         '</div></div>'
     )
-
 
 def _thermal_gap_formula_table(df: pd.DataFrame, non_thermal_techs: list[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     rows = []
     demand_avg = pd.to_numeric(df.get("Total scheduled demand PBF"), errors="coerce").mean()
+    conv_bilat_avg = pd.to_numeric(df.get("conventional_bilateral_pbf_mwh", pd.Series(0.0, index=df.index)), errors="coerce").mean()
+    net_exports_avg = pd.to_numeric(df.get("net_exports_pbf_mwh", pd.Series(0.0, index=df.index)), errors="coerce").mean()
+    price_setting_avg = pd.to_numeric(df.get("price_setting_demand_pbf_mwh", df.get("Total scheduled demand PBF")), errors="coerce").mean()
     nonthermal_avg = pd.to_numeric(df.get("non_thermal_net_pbf_mwh"), errors="coerce").mean()
     gap_avg = pd.to_numeric(df.get("raw_thermal_gap_mwh"), errors="coerce").mean()
     rows.append({"Formula block": "PBF demand", "Included": "Always", "Average MWh/h": demand_avg})
+    rows.append({"Formula block": "Conventional bilateral PBF", "Included": "Deducted if enabled", "Average MWh/h": -conv_bilat_avg})
+    rows.append({"Formula block": "Net export balance PBF", "Included": "Added if enabled", "Average MWh/h": net_exports_avg})
+    rows.append({"Formula block": "Price-setting demand basis", "Included": "Intermediate", "Average MWh/h": price_setting_avg})
     for tech in non_thermal_techs:
         col = f"{tech} net PBF"
         if col in df.columns:
-            rows.append({"Formula block": f"Deduct: {tech}", "Included": "Yes", "Average MWh/h": pd.to_numeric(df[col], errors="coerce").mean()})
-    rows.append({"Formula block": "Total deducted non-thermal", "Included": "Calculated", "Average MWh/h": nonthermal_avg})
-    rows.append({"Formula block": "Thermal gap", "Included": "Result", "Average MWh/h": gap_avg})
+            rows.append({"Formula block": f"Net {tech} PBF", "Included": "Deducted", "Average MWh/h": -pd.to_numeric(df[col], errors="coerce").mean()})
+    rows.append({"Formula block": "Total net non-thermal PBF", "Included": "Deducted subtotal", "Average MWh/h": -nonthermal_avg})
+    rows.append({"Formula block": "Thermal gap result", "Included": "Result", "Average MWh/h": gap_avg})
     out = pd.DataFrame(rows)
     if not out.empty:
         out["Average MWh/h"] = pd.to_numeric(out["Average MWh/h"], errors="coerce").round(0)
     return out
+
 
 
 def _balancing_downward_focus_table(energy: pd.DataFrame) -> pd.DataFrame:
@@ -1966,7 +2037,7 @@ def _balancing_downward_focus_table(energy: pd.DataFrame) -> pd.DataFrame:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v13 — thermal-gap residual technologies fixed, no negative cogeneration allocation")
+st.success("Version loaded: OFFICIAL balancing v14 — price-setting gap with conventional bilaterals and optional interconnections")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -1992,7 +2063,25 @@ non_thermal_techs = st.multiselect(
     default=NON_THERMAL_TECHS_DEFAULT,
 )
 
-st.markdown(_thermal_gap_formula_html(non_thermal_techs), unsafe_allow_html=True)
+subtract_conventional_bilaterals = st.checkbox(
+    "Deduct conventional bilateral programmes from PBF demand",
+    value=True,
+    help="Use this for a pool / price-setting gap: conventional bilateral volumes are already contracted outside the pool, so they should not be counted as conventional price-setting output.",
+)
+include_interconnections = st.checkbox(
+    "Include PBF interconnection balance",
+    value=False,
+    help="Adds PBF net export balance to the gap. Positive saldo is treated as exports from Spain and increases the domestic generation requirement; negative saldo is treated as imports and reduces it.",
+)
+
+st.markdown(
+    _thermal_gap_formula_html(
+        non_thermal_techs,
+        subtract_conventional_bilaterals=subtract_conventional_bilaterals,
+        include_interconnections=include_interconnections,
+    ),
+    unsafe_allow_html=True,
+)
 
 show_diagnostics = st.checkbox("Show diagnostics and extra tables", value=False)
 align_zero_axes = st.checkbox(
@@ -2047,6 +2136,8 @@ if run:
     indicator_map.update(PBF_GROSS_COMPONENTS)
     indicator_map.update(BILATERAL_FETCH_NAMES)
     indicator_map["Programa bilateral PBF Total Ventas"] = PBF_BILATERAL_TOTAL_SALES_ID
+    if include_interconnections:
+        indicator_map.update(PBF_INTERCONNECTION_COMPONENTS)
 
     raw, missing = fetch_named_indicators(indicator_map, start_day, end_day, token, warn_missing=show_diagnostics)
 
@@ -2055,7 +2146,12 @@ if run:
         st.stop()
 
     wide = build_wide(raw)
-    thermal, bilat_diag = calculate_thermal_gap(wide, non_thermal_techs)
+    thermal, bilat_diag = calculate_thermal_gap(
+        wide,
+        non_thermal_techs,
+        subtract_conventional_bilaterals=subtract_conventional_bilaterals,
+        include_interconnections=include_interconnections,
+    )
 
     prices = load_prices_like_day_ahead(token, start_day, end_day, price_source_mode, auto_fix_price_scale)
 
@@ -2230,7 +2326,8 @@ if run:
     # -----------------------------------------------------
     st.subheader("Thermal Gap composition by technology")
     st.caption(
-        "The bottom chart now shows the technologies that remain inside the residual thermal gap after the selected deductions. "
+        "The bottom chart shows the net PBF technologies that remain inside the price-setting thermal gap after the selected deductions. "
+        "Conventional bilateral volumes are deducted from the demand basis, so the stack represents net conventional volumes that can still help set the day-ahead price. "
         "If Hydro UGH / Hydro non-UGH is removed from the formula selector, it appears here as part of the residual stack. "
         "When the thermal gap is negative, positive technologies are not forced below zero; the negative value is shown as a separate 'negative residual' bucket."
     )
