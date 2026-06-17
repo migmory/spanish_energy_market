@@ -1730,6 +1730,98 @@ def build_generation_week_metrics(
     }
 
 
+def _weekly_hydro_daily_profile(
+    mix_daily_hist: pd.DataFrame,
+    mix_daily_live: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    label: str,
+) -> pd.DataFrame:
+    """Daily hydro generation profile for a selected week/WTD period."""
+    cols = ["day_no", "date", "hydro_gwh", "series"]
+    hist = mix_daily_hist.copy() if mix_daily_hist is not None else pd.DataFrame()
+    live = mix_daily_live.copy() if mix_daily_live is not None else pd.DataFrame()
+    mix = pd.concat([hist, live], ignore_index=True)
+    if mix.empty:
+        return pd.DataFrame(columns=cols)
+
+    mix["datetime"] = pd.to_datetime(mix["datetime"], errors="coerce").dt.normalize()
+    mix["energy_mwh"] = pd.to_numeric(mix["energy_mwh"], errors="coerce")
+    mix = mix.dropna(subset=["datetime", "energy_mwh"]).copy()
+
+    start_ts = pd.Timestamp(start_ts).normalize()
+    end_ts = pd.Timestamp(end_ts).normalize()
+    hydro_techs = ["Hydro", "Hydro UGH", "Hydro non-UGH", "Pumped hydro"]
+    mask = (
+        (mix["datetime"] >= start_ts)
+        & (mix["datetime"] <= end_ts)
+        & (mix["technology"].isin(hydro_techs))
+    )
+    tmp = mix.loc[mask].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+
+    out = tmp.groupby("datetime", as_index=False)["energy_mwh"].sum().sort_values("datetime")
+    out["hydro_gwh"] = out["energy_mwh"] / 1000.0
+    out["day_no"] = ((out["datetime"] - start_ts).dt.days + 1).astype(int)
+    out["date"] = out["datetime"].dt.strftime("%d %b")
+    out["series"] = label
+    return out[cols]
+
+
+def weekly_hydro_generation_chart(
+    mix_daily_hist: pd.DataFrame,
+    mix_daily_live: pd.DataFrame,
+    selected_week_start: pd.Timestamp,
+    selected_week_end: pd.Timestamp,
+    previous_week_start: pd.Timestamp,
+    previous_week_end: pd.Timestamp,
+    selected_label: str,
+    previous_label: str,
+):
+    """Daily hydro generation chart: selected week/WTD vs previous week."""
+    frames = [
+        _weekly_hydro_daily_profile(mix_daily_hist, mix_daily_live, selected_week_start, selected_week_end, selected_label),
+        _weekly_hydro_daily_profile(mix_daily_hist, mix_daily_live, previous_week_start, previous_week_end, previous_label),
+    ]
+    frames = [f for f in frames if f is not None and not f.empty]
+    if not frames:
+        return None
+
+    plot = pd.concat(frames, ignore_index=True)
+    if plot.empty:
+        return None
+
+    order = [s for s in [selected_label, previous_label] if s in plot["series"].dropna().unique().tolist()]
+    colors = [BLUE, GREY_DARK][: len(order)]
+    dashes = [[1, 0], [5, 3]][: len(order)]
+
+    chart = alt.Chart(plot).mark_line(point=alt.OverlayMarkDef(filled=True, size=55), strokeWidth=3).encode(
+        x=alt.X("day_no:O", title="Day of week", sort=list(range(1, 8)), axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("hydro_gwh:Q", title="Hydro generation (GWh)", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "series:N",
+            title="Week",
+            scale=alt.Scale(domain=order, range=colors),
+            legend=alt.Legend(orient="top", direction="horizontal", columns=2, labelLimit=420, titleLimit=420),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N",
+            title="Week",
+            scale=alt.Scale(domain=order, range=dashes),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("series:N", title="Week"),
+            alt.Tooltip("day_no:O", title="Day number"),
+            alt.Tooltip("date:N", title="Date"),
+            alt.Tooltip("hydro_gwh:Q", title="Hydro generation (GWh)", format=",.2f"),
+        ],
+    ).properties(title="Weekly hydro generation profile | selected week vs previous week")
+
+    return apply_chart_style(chart, height=340)
+
+
 def build_generation_month_comparison_table(current: dict[str, float | None], previous: dict[str, float | None], current_label: str, previous_label: str, demand_current: dict[str, float | None] | None = None, demand_previous: dict[str, float | None] | None = None) -> pd.DataFrame:
     if demand_current:
         current = {**current, **demand_current}
@@ -6124,6 +6216,25 @@ if weekly_demand_profile is not None:
     )
     st.altair_chart(weekly_demand_profile, use_container_width=True)
     st.caption("Demand profile uses a week-only REE demanda/evolucion hourly pull, matching the test page methodology; fallback uses weekly averages only if REE returns no hourly rows.")
+
+weekly_hydro_chart = weekly_hydro_generation_chart(
+    historical_mix_daily,
+    live_mix_daily if not live_mix_daily.empty else live_mix_monthly,
+    selected_week,
+    report_end,
+    prev_week,
+    week_end(prev_week),
+    week_label(selected_week, is_current_wtd),
+    week_label(prev_week, False),
+)
+if weekly_hydro_chart is not None:
+    subsection("Weekly hydro generation profile | selected week vs previous week")
+    st.markdown(
+        f'<div class="comparison-note">Hydro generation comparison — selected week: <b>{fmt_gwh(selected_generation_metrics.get("hydro_gwh"))}</b> vs previous week: <b>{fmt_gwh(previous_generation_metrics.get("hydro_gwh"))}</b></div>',
+        unsafe_allow_html=True,
+    )
+    st.altair_chart(weekly_hydro_chart, use_container_width=True)
+    st.caption("Hydro includes Hydro, Hydro UGH, Hydro non-UGH and pumped-hydro rows where present in the REE generation-mix data.")
 
 
 
