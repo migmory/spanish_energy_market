@@ -1790,6 +1790,148 @@ def build_demand_weekday_hourly_profile(hourly: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def plot_demand_hourly_profile_altair(profile_df: pd.DataFrame, title: str) -> alt.Chart:
+    """Static H1-H24 demand profile chart sized like the aFRR/RT1 price charts."""
+    if profile_df is None or profile_df.empty:
+        return alt.Chart(pd.DataFrame({"hour": [], "avg_gw": []})).mark_line()
+
+    plot = profile_df.copy()
+    order = plot["label"].dropna().astype(str).unique().tolist()
+    preferred = []
+    if len(order) >= 2:
+        preferred = [order[1], order[0]] if len(order) >= 2 else order
+    order = preferred or order
+    colors = [BLUE, GREY_DARK][: len(order)] if order else [BLUE, GREY_DARK]
+    dashes = [[1, 0], [5, 3]][: len(order)] if order else [[1, 0], [5, 3]]
+
+    chart = alt.Chart(plot).mark_line(
+        point=alt.OverlayMarkDef(filled=True, size=42),
+        strokeWidth=2.6,
+    ).encode(
+        x=alt.X(
+            "hour:Q",
+            title="Hour",
+            scale=alt.Scale(domain=[0, 23], nice=False),
+            axis=alt.Axis(values=list(range(24)), labelAngle=0, labelFontSize=10),
+        ),
+        y=alt.Y(
+            "avg_gw:Q",
+            title="Average hourly demand (GW)",
+            scale=alt.Scale(zero=False),
+        ),
+        color=alt.Color(
+            "label:N",
+            title="Month",
+            scale=alt.Scale(domain=order, range=colors),
+            legend=alt.Legend(orient="top", direction="horizontal", columns=3, labelLimit=420, titleLimit=420),
+        ),
+        strokeDash=alt.StrokeDash(
+            "label:N",
+            title="Month",
+            scale=alt.Scale(domain=order, range=dashes),
+            legend=None,
+        ),
+    ).properties(title=title, width=980)
+
+    return apply_monthly_report_chart_style(chart, height=330)
+
+
+def build_demand_hourly_profile_table(profile_df: pd.DataFrame) -> pd.DataFrame:
+    if profile_df is None or profile_df.empty:
+        return pd.DataFrame()
+    tmp = profile_df.copy()
+    value_wide = tmp.pivot(index="hour", columns="label", values="avg_gw")
+    obs_wide = tmp.pivot(index="hour", columns="label", values="obs")
+    min_wide = tmp.pivot(index="hour", columns="label", values="min_gw")
+    max_wide = tmp.pivot(index="hour", columns="label", values="max_gw")
+    labels = tmp["label"].dropna().astype(str).unique().tolist()
+    rows = []
+    for h in range(24):
+        row = {"Hour": f"H{h:02d}"}
+        for lab in labels:
+            row[f"{lab} avg (GW)"] = value_wide.loc[h, lab] if (h in value_wide.index and lab in value_wide.columns) else pd.NA
+            row[f"{lab} min (GW)"] = min_wide.loc[h, lab] if (h in min_wide.index and lab in min_wide.columns) else pd.NA
+            row[f"{lab} max (GW)"] = max_wide.loc[h, lab] if (h in max_wide.index and lab in max_wide.columns) else pd.NA
+            row[f"{lab} obs"] = obs_wide.loc[h, lab] if (h in obs_wide.index and lab in obs_wide.columns) else pd.NA
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in out.columns:
+        if c.endswith('(GW)'):
+            out[c] = pd.to_numeric(out[c], errors='coerce').round(2)
+        if c.endswith('obs'):
+            out[c] = pd.to_numeric(out[c], errors='coerce').astype('Int64')
+    return out
+
+
+def plot_demand_weekday_profile_altair(wd: pd.DataFrame, title: str) -> alt.Chart:
+    if wd is None or wd.empty:
+        return alt.Chart(pd.DataFrame({"hour": [], "avg_gw": []})).mark_line()
+    plot = wd.copy()
+    order = [s for s in ["Weekday", "Weekend"] if s in plot["day_type"].astype(str).unique().tolist()]
+    colors = [BLUE, GREY_DARK][: len(order)] if order else [BLUE, GREY_DARK]
+    dashes = [[1, 0], [5, 3]][: len(order)] if order else [[1, 0], [5, 3]]
+    chart = alt.Chart(plot).mark_line(
+        point=alt.OverlayMarkDef(filled=True, size=42),
+        strokeWidth=2.6,
+    ).encode(
+        x=alt.X("hour:Q", title="Hour", scale=alt.Scale(domain=[0, 23], nice=False), axis=alt.Axis(values=list(range(24)), labelAngle=0, labelFontSize=10)),
+        y=alt.Y("avg_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
+        color=alt.Color("day_type:N", title="Day type", scale=alt.Scale(domain=order, range=colors), legend=alt.Legend(orient='top', direction='horizontal', columns=3, labelLimit=420, titleLimit=420)),
+        strokeDash=alt.StrokeDash("day_type:N", title='Day type', scale=alt.Scale(domain=order, range=dashes), legend=None),
+    ).properties(title=title, width=980)
+    return apply_monthly_report_chart_style(chart, height=330)
+
+
+def build_demand_weekday_profile_table(wd: pd.DataFrame) -> pd.DataFrame:
+    if wd is None or wd.empty:
+        return pd.DataFrame()
+    tmp = wd.copy()
+    val_wide = tmp.pivot(index='hour', columns='day_type', values='avg_gw')
+    obs_wide = tmp.pivot(index='hour', columns='day_type', values='obs')
+    rows = []
+    for h in range(24):
+        rows.append({
+            'Hour': f'H{h:02d}',
+            'Weekday avg (GW)': val_wide.loc[h, 'Weekday'] if (h in val_wide.index and 'Weekday' in val_wide.columns) else pd.NA,
+            'Weekend avg (GW)': val_wide.loc[h, 'Weekend'] if (h in val_wide.index and 'Weekend' in val_wide.columns) else pd.NA,
+            'Weekday obs': obs_wide.loc[h, 'Weekday'] if (h in obs_wide.index and 'Weekday' in obs_wide.columns) else pd.NA,
+            'Weekend obs': obs_wide.loc[h, 'Weekend'] if (h in obs_wide.index and 'Weekend' in obs_wide.columns) else pd.NA,
+        })
+    out = pd.DataFrame(rows)
+    for c in out.columns:
+        if c.endswith('(GW)'):
+            out[c] = pd.to_numeric(out[c], errors='coerce').round(2)
+        if c.endswith('obs'):
+            out[c] = pd.to_numeric(out[c], errors='coerce').astype('Int64')
+    return out
+
+
+def plot_demand_daily_avg_altair(daily: pd.DataFrame, title: str) -> alt.Chart:
+    if daily is None or daily.empty:
+        return alt.Chart(pd.DataFrame({"date": [], "avg_gw": []})).mark_bar()
+    plot = daily.copy()
+    chart = alt.Chart(plot).mark_bar().encode(
+        x=alt.X('date:T', title='Date', axis=alt.Axis(labelAngle=0, format='%d')),
+        y=alt.Y('avg_gw:Q', title='Daily average demand (GW)', scale=alt.Scale(zero=False)),
+    ).properties(title=title, width=980)
+    return apply_monthly_report_chart_style(chart, height=300)
+
+
+def build_demand_daily_avg_table(daily: pd.DataFrame) -> pd.DataFrame:
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    out = daily.copy()
+    out['Date'] = pd.to_datetime(out['date'], errors='coerce').dt.strftime('%d-%b-%Y')
+    out = out[['Date', 'avg_gw', 'max_gw', 'min_gw']].rename(columns={
+        'avg_gw': 'Daily avg (GW)',
+        'max_gw': 'Daily max (GW)',
+        'min_gw': 'Daily min (GW)',
+    })
+    for c in ['Daily avg (GW)', 'Daily max (GW)', 'Daily min (GW)']:
+        out[c] = pd.to_numeric(out[c], errors='coerce').round(2)
+    return out
+
+
 def pct_delta(cur: Any, prev: Any) -> float | None:
     if cur is None or prev in [None, 0] or pd.isna(cur) or pd.isna(prev):
         return None
@@ -1853,7 +1995,7 @@ def align_second_axis_zero_domain(primary_domain: list[float], secondary_values:
 # UI
 # =========================================================
 st.title("Thermal Gap and Price + REE Demand Profile")
-st.success("Version loaded: OFFICIAL balancing v10 — 24h charts fixed to fit screen + compact tables")
+st.success("Version loaded: OFFICIAL balancing v11 — demand charts restyled like aFRR/RT1 and fitted to screen")
 st.caption(
     "PBF minus bilateral schedules. Prices are loaded with the same logic as the Day Ahead page. "
     "Everything is displayed in Madrid local time."
@@ -2516,58 +2658,38 @@ if run:
 
         profile_df = pd.concat([p for p in profiles if p is not None and not p.empty], ignore_index=True)
         if not profile_df.empty:
-            profile_chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
-                x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
-                y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
-                color=alt.Color(
-                    "label:N",
-                    title="Month",
-                    legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
-                ),
-                strokeDash=alt.StrokeDash("label:N", legend=None),
-                tooltip=[
-                    alt.Tooltip("label:N", title="Month"),
-                    alt.Tooltip("hour:O", title="Hour"),
-                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
-                    alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
-                    alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
-                    alt.Tooltip("obs:Q", title="Obs", format=",d"),
-                ],
-            ).properties(height=380)
-            st.altair_chart(profile_chart, use_container_width=True)
+            st.markdown("**Monthly average hourly shape | H1-H24**")
+            st.altair_chart(
+                plot_demand_hourly_profile_altair(profile_df, "Demand monthly average hourly shape | H1-H24"),
+                use_container_width=False,
+            )
+            st.caption("Static chart mode: exact values are shown in the table below.")
+            demand_profile_table = build_demand_hourly_profile_table(profile_df)
+            if not demand_profile_table.empty:
+                st.dataframe(demand_profile_table, use_container_width=True, hide_index=True)
 
         wd = build_demand_weekday_hourly_profile(selected_hourly)
         if not wd.empty:
-            wd_chart = alt.Chart(wd).mark_line(point=True, strokeWidth=3).encode(
-                x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
-                y=alt.Y("avg_gw:Q", title="Average demand (GW)", scale=alt.Scale(zero=False)),
-                color=alt.Color(
-                    "day_type:N",
-                    title="Day type",
-                    legend=alt.Legend(orient="top", direction="horizontal"),
-                ),
-                tooltip=[
-                    alt.Tooltip("day_type:N", title="Day type"),
-                    alt.Tooltip("hour:O", title="Hour"),
-                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
-                    alt.Tooltip("obs:Q", title="Obs", format=",d"),
-                ],
-            ).properties(height=330)
-            st.altair_chart(wd_chart, use_container_width=True)
+            st.markdown("**Weekday vs weekend hourly demand | H1-H24**")
+            st.altair_chart(
+                plot_demand_weekday_profile_altair(wd, "Weekday vs weekend hourly demand | H1-H24"),
+                use_container_width=False,
+            )
+            st.caption("Static chart mode: exact values are shown in the table below.")
+            wd_table = build_demand_weekday_profile_table(wd)
+            if not wd_table.empty:
+                st.dataframe(wd_table, use_container_width=True, hide_index=True)
 
         daily = build_demand_daily_avg_profile(selected_hourly)
         if not daily.empty:
-            daily_chart = alt.Chart(daily).mark_bar().encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("avg_gw:Q", title="Daily average demand (GW)", scale=alt.Scale(zero=False)),
-                tooltip=[
-                    alt.Tooltip("date:T", title="Date", format="%d-%b-%Y"),
-                    alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
-                    alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
-                    alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
-                ],
-            ).properties(height=300)
-            st.altair_chart(daily_chart, use_container_width=True)
+            st.markdown("**Daily average demand during the selected month**")
+            st.altair_chart(
+                plot_demand_daily_avg_altair(daily, "Daily average demand"),
+                use_container_width=False,
+            )
+            daily_table = build_demand_daily_avg_table(daily)
+            if not daily_table.empty:
+                st.dataframe(daily_table, use_container_width=True, hide_index=True)
 
         with st.expander("REE demand diagnostics", expanded=False):
             st.json({"selected": sel_info, "previous": prev_info})
