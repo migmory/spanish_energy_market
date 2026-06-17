@@ -6301,27 +6301,6 @@ if weekly_demand_profile is not None:
     st.altair_chart(weekly_demand_profile, use_container_width=True)
     st.caption("Demand profile uses a week-only REE demanda/evolucion hourly pull, matching the test page methodology; fallback uses weekly averages only if REE returns no hourly rows.")
 
-weekly_hydro_chart = weekly_hydro_generation_chart(
-    historical_mix_daily,
-    live_mix_daily if not live_mix_daily.empty else live_mix_monthly,
-    selected_week,
-    report_end,
-    prev_week,
-    week_end(prev_week),
-    week_label(selected_week, is_current_wtd),
-    week_label(prev_week, False),
-)
-if weekly_hydro_chart is not None:
-    subsection("Weekly hydro generation profile | selected week vs previous week")
-    st.markdown(
-        f'<div class="comparison-note">Hydro generation comparison — selected week: <b>{fmt_gwh(selected_generation_metrics.get("hydro_gwh"))}</b> vs previous week: <b>{fmt_gwh(previous_generation_metrics.get("hydro_gwh"))}</b></div>',
-        unsafe_allow_html=True,
-    )
-    st.altair_chart(weekly_hydro_chart, use_container_width=True)
-    st.caption("Hydro includes Hydro, Hydro UGH, Hydro non-UGH and pumped-hydro rows where present in the REE generation-mix data.")
-
-
-
 # =========================================================
 # RESERVOIR LEVELS — before Forward Market
 # =========================================================
