@@ -1267,19 +1267,27 @@ def demand_peak_month_metrics(
     demand_monthly: pd.DataFrame | None = None,
 ) -> dict[str, float | None]:
     """
-    Monthly peak demand in GW.
+    Monthly average daily peak demand in GW.
 
-    Primary source: REE demanda/evolucion hourly pull.
-    Fallback: if REE does not return hourly demand for the month, use the official
-    monthly average demand so the report does not show a blank peak-demand row.
+    Method:
+    1) For each day in the target month/MTD period, take the maximum hourly demand.
+    2) Average those daily peak values across the selected month/MTD period.
+
+    Fallback:
+    If hourly demand is unavailable, use official monthly average demand.
     """
     if demand_hourly is not None and not demand_hourly.empty:
         tmp = demand_hourly.copy()
         tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+        tmp["demand_gw"] = pd.to_numeric(tmp["demand_gw"], errors="coerce")
+        tmp = tmp.dropna(subset=["datetime", "demand_gw"])
         mask = (tmp["datetime"].dt.year == target_month.year) & (tmp["datetime"].dt.month == target_month.month)
-        vals = pd.to_numeric(tmp.loc[mask, "demand_gw"], errors="coerce").dropna()
-        if not vals.empty:
-            return {"peak_demand_gw": float(vals.max()), "peak_demand_is_fallback": False}
+        tmp = tmp.loc[mask].copy()
+        if not tmp.empty:
+            tmp["date"] = tmp["datetime"].dt.normalize()
+            daily_peaks = tmp.groupby("date", as_index=False)["demand_gw"].max()
+            if not daily_peaks.empty:
+                return {"peak_demand_gw": float(daily_peaks["demand_gw"].mean()), "peak_demand_is_fallback": False}
 
     monthly = demand_month_metrics(demand_monthly, target_month) if demand_monthly is not None else {"avg_demand_gw": None}
     return {"peak_demand_gw": monthly.get("avg_demand_gw"), "peak_demand_is_fallback": True}
@@ -1641,6 +1649,7 @@ def build_generation_month_comparison_table(current: dict[str, float | None], pr
         ("⚛️ Nuclear injected", "nuclear_gwh", "gwh"),
         ("📈 Demand total", "demand_gwh", "gwh"),
         ("📊 Average demand", "avg_demand_gw", "gw"),
+        ("📈 Avg. daily peak demand", "peak_demand_gw", "gw"),
     ]
     rows = []
     for label, key, kind in specs:
@@ -5693,6 +5702,8 @@ kpi_generation_prev = build_generation_month_metrics(
 )
 kpi_demand_current = demand_month_metrics(official_demand_monthly, selected_month)
 kpi_demand_prev = demand_month_metrics(official_demand_monthly, prev_month)
+kpi_peak_current = demand_peak_month_metrics(official_demand_hourly, selected_month, official_demand_monthly)
+kpi_peak_prev = demand_peak_month_metrics(official_demand_hourly, prev_month, official_demand_monthly)
 
 k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5, gap="small")
 with k2_1:
@@ -5742,11 +5753,11 @@ with k2_5:
         help="Official REE demanda/evolucion monthly demand, converted to GWh.",
     )
     st.markdown(
-        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. month")}<br>Prev. month: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand current: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b> | Avg demand prev.: <b>{fmt_gw(kpi_demand_prev.get("avg_demand_gw"))}</b></div>',
+        f'<div class="metric-footnote">{delta_arrow_html(kpi_demand_current.get("demand_gwh"), kpi_demand_prev.get("demand_gwh"), "prev. month")}<br>Prev. month: <b>{fmt_gwh(kpi_demand_prev.get("demand_gwh"))}</b><br>Avg demand current: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b> | Avg demand prev.: <b>{fmt_gw(kpi_demand_prev.get("avg_demand_gw"))}</b><br>Avg daily peak current: <b>{fmt_gw(kpi_peak_current.get("peak_demand_gw"))}</b> | Prev. month: <b>{fmt_gw(kpi_peak_prev.get("peak_demand_gw"))}</b></div>',
         unsafe_allow_html=True,
     )
 st.markdown('<div style="height: 10px;"></div>', unsafe_allow_html=True)
-other_col1, other_col2, other_spacer = st.columns([1.0, 1.0, 3.0], gap="small")
+other_col1, other_col2, other_col3, other_spacer = st.columns([1.0, 1.0, 1.25, 2.75], gap="small")
 with other_col1:
     st.markdown(
         f'''
@@ -5765,6 +5776,24 @@ with other_col2:
             <div style="font-weight:800; margin-bottom:0.25rem;">💧 Hydro injected</div>
             <div><b>{fmt_gwh(kpi_generation_current.get("hydro_gwh"))}</b></div>
             <div>{delta_arrow_html(kpi_generation_current.get("hydro_gwh"), kpi_generation_prev.get("hydro_gwh"), "prev. month")}</div>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+with other_col3:
+    peak_curr = kpi_peak_current.get("peak_demand_gw")
+    peak_prev = kpi_peak_prev.get("peak_demand_gw")
+    approx_prefix = "≈ " if kpi_peak_current.get("peak_demand_is_fallback") else ""
+    st.markdown(
+        f'''
+        <div style="font-size:0.88rem; color:#0F172A; margin-top:0.1rem;">
+            <div style="font-weight:800; margin-bottom:0.25rem;">📈 Avg. daily peak demand</div>
+            <div><b>{approx_prefix}{fmt_gw(peak_curr)}</b></div>
+            <div>{delta_arrow_html(peak_curr, peak_prev, "prev. month")}</div>
+            <div style="font-size:0.74rem; color:#64748B; margin-top:0.15rem;">
+                Prev. month: <b>{fmt_gw(peak_prev)}</b>
+            </div>
         </div>
         ''',
         unsafe_allow_html=True,
@@ -5993,13 +6022,34 @@ generation_comparison = build_generation_month_comparison_table(
     previous_generation_metrics,
     month_label(selected_month, is_current_mtd),
     month_label(prev_month, False),
-    kpi_demand_current,
-    kpi_demand_prev,
+    {**kpi_demand_current, **kpi_peak_current},
+    {**kpi_demand_prev, **kpi_peak_prev},
 )
 st.dataframe(style_generation_comparison_table(generation_comparison), use_container_width=True, hide_index=True)
 st.caption("Solar = Solar PV + Solar thermal. Demand = REE demanda/evolucion official monthly GWh; average GW is GWh divided by month hours. For 2026, the renewable-share metric now uses the REE daily generation-mix pull aggregated to the selected month, with a monthly-widget fallback only if the daily pull is unavailable.")
 
-# Average 24h demand profile section removed by request.
+monthly_demand_profile = monthly_average_demand_profile_chart(
+    official_demand_hourly,
+    selected_month,
+    prev_month,
+    month_label(selected_month, is_current_mtd),
+    month_label(prev_month, False),
+)
+if monthly_demand_profile is None:
+    monthly_demand_profile = monthly_average_demand_profile_fallback_chart(
+        {**kpi_demand_current, **kpi_peak_current},
+        {**kpi_demand_prev, **kpi_peak_prev},
+        month_label(selected_month, is_current_mtd),
+        month_label(prev_month, False),
+    )
+if monthly_demand_profile is not None:
+    subsection("Monthly average 24h demand profile | selected month vs previous month")
+    st.markdown(
+        f'<div class="comparison-note">Average demand comparison — selected month: <b>{fmt_gw(kpi_demand_current.get("avg_demand_gw"))}</b> vs previous month: <b>{fmt_gw(kpi_demand_prev.get("avg_demand_gw"))}</b></div>',
+        unsafe_allow_html=True,
+    )
+    st.altair_chart(monthly_demand_profile, use_container_width=True)
+    st.caption("Demand profile uses official REE demanda/evolucion hourly data where available; fallback uses the official monthly average demand.")
 
 
 # =========================================================
