@@ -470,6 +470,9 @@ LIVE_START_DATE = date(2026, 1, 1)
 
 REE_API_BASE = "https://apidatos.ree.es/es/datos"
 REE_PENINSULAR_PARAMS = {"geo_trunc": "electric_system", "geo_limit": "peninsular", "geo_ids": "8741"}
+EMBALSES_HOME = "https://www.embalses.net/"
+EMBALSES_BOLETIN = "https://www.embalses.net/suscripciones/boletin-web.php"
+EMBALSES_GRAPH_BASE = "https://www.embalses.net/cache/home.png"
 
 LOCAL_MIX_TECH_MAP = {
     "Hidráulica": "Hydro",
@@ -1567,6 +1570,87 @@ def weekly_average_demand_profile_fallback_chart(
     ).properties(height=380, title="Weekly average 24h demand profile | selected week vs previous week")
     return apply_chart_style(chart, height=380)
 
+
+def _embalses_to_float(value):
+    if value is None or pd.isna(value):
+        return None
+    s = str(value).replace("\xa0", " ").strip()
+    s = re.sub(r"[^\d,\.\-]", "", s)
+    if not s:
+        return None
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _embalses_clean_text(html: str) -> str:
+    text_ = re.sub(r"<script[\s\S]*?</script>", " ", html or "", flags=re.I)
+    text_ = re.sub(r"<style[\s\S]*?</style>", " ", text_, flags=re.I)
+    text_ = re.sub(r"<[^>]+>", " ", text_)
+    repl = {"&nbsp;": " ", "&sup3;": "3", "&#179;": "3", "&aacute;": "á", "&eacute;": "é", "&iacute;": "í", "&oacute;": "ó", "&uacute;": "ú", "&ntilde;": "ñ"}
+    for a, b in repl.items():
+        text_ = text_.replace(a, b)
+    return re.sub(r"\s+", " ", text_).strip()
+
+
+def _parse_embalses_summary(html: str, source_url: str) -> dict:
+    txt = _embalses_clean_text(html)
+    out = {"date": None, "stored_hm3": None, "stored_pct": None, "capacity_hm3": None, "same_week_10y_avg_hm3": None, "source_url": source_url}
+    m = re.search(r"Agua embalsada(?: en España)?\s+a\s+(\d{2}-\d{2}-\d{4})", txt, flags=re.I)
+    if m:
+        out["date"] = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
+    m = re.search(r"Agua embalsada(?: en España)?(?:\s+a\s+\d{2}-\d{2}-\d{4})?\s*[:\-]?\s*([0-9\.,]+)\s*hm\s*\^?\s*3?\s*([0-9\.,]+)\s*%", txt, flags=re.I)
+    if m:
+        out["stored_hm3"] = _embalses_to_float(m.group(1))
+        out["stored_pct"] = _embalses_to_float(m.group(2))
+    m = re.search(r"Capacidad(?:\s+embalses)?\s*[:\-]?\s*([0-9\.,]+)\s*hm", txt, flags=re.I)
+    if m:
+        out["capacity_hm3"] = _embalses_to_float(m.group(1))
+    m = re.search(r"(?:Media\s+10\s+años|Med\.?\s*10\s*Años).*?([0-9\.,]+)\s*hm", txt, flags=re.I)
+    if m:
+        out["same_week_10y_avg_hm3"] = _embalses_to_float(m.group(1))
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_embalses_current_for_report() -> tuple[dict, dict]:
+    diagnostics = {"attempts": []}
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,image/*,*/*", "Referer": EMBALSES_HOME}
+    for url in [EMBALSES_BOLETIN, EMBALSES_HOME]:
+        try:
+            resp = requests.get(url, headers=headers, timeout=35)
+            parsed = _parse_embalses_summary(resp.text or "", resp.url)
+            diagnostics["attempts"].append({"url": resp.url, "http": resp.status_code, "stored_hm3": parsed.get("stored_hm3")})
+            if parsed.get("stored_hm3") is not None:
+                return parsed, diagnostics
+        except Exception as exc:
+            diagnostics["attempts"].append({"url": url, "error": str(exc)[:250]})
+    return {}, diagnostics
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def download_embalses_png_for_report(current_date_text: str | None = None) -> tuple[bytes | None, str | None]:
+    urls = []
+    if current_date_text:
+        dt = pd.to_datetime(current_date_text, errors="coerce")
+        if pd.notna(dt):
+            urls.append(f"{EMBALSES_GRAPH_BASE}?a={dt:%d-%m-%Y}")
+    urls.extend([EMBALSES_GRAPH_BASE, f"{EMBALSES_GRAPH_BASE}?_ts={int(pd.Timestamp.now().timestamp())}"])
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/png,image/*,*/*", "Referer": EMBALSES_HOME}
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=35)
+            content = resp.content or b""
+            if resp.ok and content.startswith(b"\x89PNG") and len(content) > 5000:
+                return content, url
+        except Exception:
+            continue
+    return None, None
 
 def fmt_gw(value: float | int | None, decimals: int = 2) -> str:
     if value is None or pd.isna(value):
@@ -6236,6 +6320,30 @@ if weekly_hydro_chart is not None:
     st.altair_chart(weekly_hydro_chart, use_container_width=True)
     st.caption("Hydro includes Hydro, Hydro UGH, Hydro non-UGH and pumped-hydro rows where present in the REE generation-mix data.")
 
+
+
+# =========================================================
+# RESERVOIR LEVELS — before Forward Market
+# =========================================================
+subsection("Reservoir weekly levels | Embalses.net")
+embalses_current, embalses_diag = fetch_embalses_current_for_report()
+emb_date = embalses_current.get("date") if embalses_current else None
+png_bytes, png_url = download_embalses_png_for_report(str(emb_date) if emb_date is not None else None)
+
+r1, r2, r3, r4 = st.columns(4)
+with r1:
+    st.metric("Stored water", f"{embalses_current.get('stored_hm3', float('nan')):,.0f} hm³" if embalses_current.get("stored_hm3") is not None else "—")
+with r2:
+    st.metric("Reservoir level", f"{embalses_current.get('stored_pct', float('nan')):,.2f}%" if embalses_current.get("stored_pct") is not None else "—")
+with r3:
+    st.metric("Capacity", f"{embalses_current.get('capacity_hm3', float('nan')):,.0f} hm³" if embalses_current.get("capacity_hm3") is not None else "—")
+with r4:
+    st.metric("Same week 10Y avg", f"{embalses_current.get('same_week_10y_avg_hm3', float('nan')):,.0f} hm³" if embalses_current.get("same_week_10y_avg_hm3") is not None else "—")
+
+if png_bytes:
+    st.image(png_bytes, caption=f"Embalses.net weekly reservoir chart | source: {png_url}")
+else:
+    st.info("Reservoir PNG could not be downloaded from Embalses.net at this time.")
 
 
 # =========================================================
