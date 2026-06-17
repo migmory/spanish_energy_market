@@ -1481,37 +1481,45 @@ def weekly_average_demand_profile_chart(
 ):
     """Weekly average hourly demand profile, selected week/WTD vs previous week.
 
-    This mirrors the working test-page demand profile chart: one line per period,
-    hour-of-day on x, average GW on y, with min/max/obs in the tooltip.
+    Defensive implementation: returns None when the public REE hourly demand pull
+    has no valid rows, so the Streamlit page can use the fallback chart instead
+    of failing with pandas "No objects to concatenate".
     """
-    profiles = [
+    profile_rows = []
+    for profile in [
         _week_hourly_demand_profile(demand_hourly, selected_week_start, selected_week_end, selected_label),
         _week_hourly_demand_profile(demand_hourly, previous_week_start, previous_week_end, previous_label),
-    ]
-    profile_df = pd.concat([p for p in profiles if p is not None and not p.empty], ignore_index=True)
-    if profile_df.empty:
+    ]:
+        if profile is not None and not profile.empty:
+            profile_rows.extend(profile.to_dict("records"))
+
+    if not profile_rows:
         return None
 
-    chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("hour:O", title="Hour of day", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+    profile_df = pd.DataFrame(profile_rows)
+    required = {"hour", "avg_gw", "label"}
+    if profile_df.empty or not required.issubset(profile_df.columns):
+        return None
+
+    chart = alt.Chart(profile_df).mark_line(point=alt.OverlayMarkDef(filled=True, size=55), strokeWidth=3).encode(
+        x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
         y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
         color=alt.Color(
             "label:N",
             title="Week",
-            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=420, titleLimit=420, symbolLimit=420),
         ),
-        strokeDash=alt.StrokeDash("label:N", legend=None),
+        strokeDash=alt.StrokeDash("label:N", title="Week", legend=None),
         tooltip=[
             alt.Tooltip("label:N", title="Week"),
             alt.Tooltip("hour:O", title="Hour"),
-            alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
-            alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
-            alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
+            alt.Tooltip("avg_gw:Q", title="Avg GW", format=",.2f"),
+            alt.Tooltip("min_gw:Q", title="Min GW", format=",.2f"),
+            alt.Tooltip("max_gw:Q", title="Max GW", format=",.2f"),
             alt.Tooltip("obs:Q", title="Obs", format=",d"),
         ],
-    ).properties(height=380, title="Weekly average 24h demand profile | selected week vs previous week")
+    ).properties(title="Weekly average 24h demand profile | selected week vs previous week")
     return apply_chart_style(chart, height=380)
-
 
 def weekly_average_demand_profile_fallback_chart(
     current_metrics: dict,
@@ -2802,6 +2810,111 @@ def ytd_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, f
         )
     )
     chart = alt.layer(*layers).resolve_scale(y="independent").properties(title=f"YTD 24h profile | {year}")
+    return apply_chart_style(chart, height=360)
+
+
+def _quarter_bounds_from_month(month_ts: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
+    q_start_month = ((int(month_ts.month) - 1) // 3) * 3 + 1
+    start = pd.Timestamp(month_ts.year, q_start_month, 1)
+    end = (start + pd.offsets.QuarterEnd(0)).normalize()
+    return start, end
+
+
+def quarterly_hourly_overlay(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, selected_period_end: pd.Timestamp):
+    """24h profile by quarter: current quarter, Q-1 and Q-2, aligned with Monthly Report formatting."""
+    if price_hourly is None or price_hourly.empty:
+        return None
+
+    selected_period_end = pd.Timestamp(selected_period_end).normalize()
+    q0_start, q0_end_calendar = _quarter_bounds_from_month(selected_period_end)
+    q0_end = min(selected_period_end, q0_end_calendar)
+    q1_start = q0_start - pd.offsets.QuarterBegin(startingMonth=q0_start.month)
+    q2_start = q1_start - pd.offsets.QuarterBegin(startingMonth=q1_start.month)
+    quarter_specs = [
+        (f"Q{((q0_start.month - 1)//3)+1}-{str(q0_start.year)[-2:]}", q0_start, q0_end),
+        (f"Q{((q1_start.month - 1)//3)+1}-{str(q1_start.year)[-2:]}", q1_start, q0_start - pd.Timedelta(hours=1)),
+        (f"Q{((q2_start.month - 1)//3)+1}-{str(q2_start.year)[-2:]}", q2_start, q1_start - pd.Timedelta(hours=1)),
+    ]
+
+    prices = price_hourly.copy()
+    prices["datetime"] = pd.to_datetime(prices["datetime"], errors="coerce")
+    prices["price"] = pd.to_numeric(prices["price"], errors="coerce")
+    prices = prices.dropna(subset=["datetime", "price"])
+
+    solar = solar_hourly.copy() if solar_hourly is not None and not solar_hourly.empty else pd.DataFrame()
+    if not solar.empty:
+        solar["datetime"] = pd.to_datetime(solar["datetime"], errors="coerce")
+        solar["solar_best_mw"] = pd.to_numeric(solar.get("solar_best_mw"), errors="coerce")
+        solar = solar.dropna(subset=["datetime", "solar_best_mw"])
+
+    price_rows = []
+    solar_rows = []
+    for label, start_ts, end_ts in quarter_specs:
+        p = prices[(prices["datetime"] >= start_ts) & (prices["datetime"] <= end_ts)].copy()
+        if not p.empty:
+            p["hour"] = p["datetime"].dt.hour
+            avg = p.groupby("hour", as_index=False)["price"].mean()
+            avg["series"] = label
+            avg["value"] = avg["price"]
+            price_rows.extend(avg[["hour", "series", "value"]].to_dict("records"))
+
+        if not solar.empty:
+            s = solar[(solar["datetime"] >= start_ts) & (solar["datetime"] <= end_ts)].copy()
+            if not s.empty:
+                s["hour"] = s["datetime"].dt.hour
+                sp = s.groupby("hour", as_index=False)["solar_best_mw"].mean()
+                sp["series"] = label
+                solar_rows.extend(sp[["hour", "series", "solar_best_mw"]].to_dict("records"))
+
+    if not price_rows:
+        return None
+
+    price_plot = pd.DataFrame(price_rows)
+    solar_plot = pd.DataFrame(solar_rows) if solar_rows else pd.DataFrame(columns=["hour", "series", "solar_best_mw"])
+    series_order = [label for label, _, _ in quarter_specs if label in price_plot["series"].unique().tolist()]
+    price_colors = [BLUE_DARK, BLUE, "#93C5FD"][:len(series_order)]
+    layers = []
+
+    if not solar_plot.empty:
+        cur_label = quarter_specs[0][0]
+        solar_current = solar_plot[solar_plot["series"] == cur_label].copy()
+        if not solar_current.empty:
+            layers.append(
+                alt.Chart(solar_current).mark_area(opacity=0.30, color=YELLOW).encode(
+                    x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("solar_best_mw:Q", title="Solar generation (MW)"),
+                    tooltip=[
+                        alt.Tooltip("hour:O", title="Hour"),
+                        alt.Tooltip("solar_best_mw:Q", title="Avg. solar generation", format=",.0f"),
+                    ],
+                )
+            )
+
+    layers.append(
+        alt.Chart(price_plot).mark_line(point=alt.OverlayMarkDef(filled=True, size=56), strokeWidth=3).encode(
+            x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("value:Q", title="Average price (€/MWh)"),
+            color=alt.Color(
+                "series:N",
+                title="Quarter price curve",
+                scale=alt.Scale(domain=series_order, range=price_colors),
+                legend=alt.Legend(orient="top", direction="horizontal", columns=3, labelLimit=260, titleLimit=260, symbolLimit=260),
+            ),
+            strokeDash=alt.StrokeDash(
+                "series:N",
+                title="Quarter price curve",
+                scale=alt.Scale(domain=series_order, range=[[1, 0], [5, 3], [2, 3]]),
+                legend=None,
+            ),
+            detail="series:N",
+            tooltip=[
+                alt.Tooltip("series:N", title="Quarter"),
+                alt.Tooltip("hour:O", title="Hour"),
+                alt.Tooltip("value:Q", title="Average price", format=",.2f"),
+            ],
+        )
+    )
+    chart = alt.layer(*layers).resolve_scale(y="independent").properties(title=f"Quarterly 24h profile | {series_order[0]} vs previous two quarters")
     return apply_chart_style(chart, height=360)
 
 def monthly_economic_curtailment(price_hourly: pd.DataFrame, solar_hourly: pd.DataFrame, year: int, end_ts: pd.Timestamp) -> pd.DataFrame:
@@ -5876,6 +5989,34 @@ if hourly_overlay is not None:
         unsafe_allow_html=True,
     )
     st.altair_chart(hourly_overlay, use_container_width=True)
+
+
+subsection("Quarterly 24h average market profile vs solar generation")
+hourly_overlay = quarterly_hourly_overlay(price_hourly, solar_hourly, report_end)
+if hourly_overlay is not None:
+    q0_start, _q0_end = _quarter_bounds_from_month(report_end)
+    q1_start = q0_start - pd.offsets.QuarterBegin(startingMonth=q0_start.month)
+    q2_start = q1_start - pd.offsets.QuarterBegin(startingMonth=q1_start.month)
+    q_labels = [
+        f"Q{((q0_start.month - 1)//3)+1}-{str(q0_start.year)[-2:]}",
+        f"Q{((q1_start.month - 1)//3)+1}-{str(q1_start.year)[-2:]}",
+        f"Q{((q2_start.month - 1)//3)+1}-{str(q2_start.year)[-2:]}",
+    ]
+    st.markdown(
+        f"""
+        <div style="display:flex; flex-wrap:wrap; gap:22px; align-items:center; margin:0.1rem 0 0.45rem 0; font-size:0.86rem;">
+            <span style="font-weight:800;color:#334155;">Quarter price curves</span>
+            <span><span style="display:inline-block;width:28px;border-top:3px solid {BLUE_DARK};vertical-align:middle;margin-right:6px;"></span>{q_labels[0]}</span>
+            <span><span style="display:inline-block;width:28px;border-top:3px dashed {BLUE};vertical-align:middle;margin-right:6px;"></span>{q_labels[1]}</span>
+            <span><span style="display:inline-block;width:28px;border-top:3px dotted #93C5FD;vertical-align:middle;margin-right:6px;"></span>{q_labels[2]}</span>
+            <span><span style="display:inline-block;width:24px;height:10px;background:#FDE68A;opacity:0.65;margin-right:6px;"></span>Current-quarter solar profile</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.altair_chart(hourly_overlay, use_container_width=True)
+else:
+    st.info("Quarterly 24h market profile could not be built with the available hourly price data.")
 
 subsection("Actual economic curtailment using PBF Solar PV (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26")
 st.info("This section uses PBF Solar PV from ESIOS indicator 14 as the generation basis, not P48 Spain. 2025 actual is included again through December.")
