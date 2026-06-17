@@ -1235,30 +1235,56 @@ def demand_month_metrics(demand_monthly: pd.DataFrame, target_month: pd.Timestam
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_ree_official_demand_hourly_for_report(start_day: date, end_day: date) -> pd.DataFrame:
-    """Official REE hourly demand, used for monthly peak-demand KPIs."""
+    """Official REE hourly demand, used for monthly peak-demand KPIs and 24h profiles.
+
+    Important:
+    We pull the REE widget in short chunks because longer hourly ranges can return
+    no usable rows. This chunked approach makes the monthly 24h profile and the
+    avg-daily-peak KPI behave consistently with the weekly/test implementation.
+    """
     cols = ["datetime", "demand_gw", "source"]
     if start_day > end_day:
         return pd.DataFrame(columns=cols)
-    try:
-        payload = fetch_ree_widget_for_report("demanda", "evolucion", start_day, end_day, time_trunc="hour")
-        df = parse_ree_included_series_for_report(payload)
-    except Exception:
+
+    frames: list[pd.DataFrame] = []
+    chunk_start = pd.Timestamp(start_day).date()
+
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=6))
+        try:
+            payload = fetch_ree_widget_for_report("demanda", "evolucion", chunk_start, chunk_end, time_trunc="hour")
+            df = parse_ree_included_series_for_report(payload)
+        except Exception:
+            df = pd.DataFrame()
+
+        if df is not None and not df.empty:
+            if df["title"].nunique() > 1:
+                demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
+                if not demand_like.empty:
+                    df = demand_like
+
+            part = df.dropna(subset=["datetime", "value"]).copy()
+            part["datetime"] = pd.to_datetime(part["datetime"], errors="coerce")
+            part["value"] = pd.to_numeric(part["value"], errors="coerce")
+            part = part.dropna(subset=["datetime", "value"])
+
+            if not part.empty:
+                part["demand_gw"] = part["value"] / 1000.0
+                part["source"] = "REE demanda/evolucion hourly"
+                frames.append(part[["datetime", "demand_gw", "source"]])
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
         return pd.DataFrame(columns=cols)
-    if df.empty:
-        return pd.DataFrame(columns=cols)
-    if df["title"].nunique() > 1:
-        demand_like = df[df["title"].astype(str).str.contains("demanda", case=False, na=False)].copy()
-        if not demand_like.empty:
-            df = demand_like
-    out = df.dropna(subset=["datetime", "value"]).copy()
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out["value"] = pd.to_numeric(out["value"], errors="coerce")
-    out = out.dropna(subset=["datetime", "value"])
-    if out.empty:
-        return pd.DataFrame(columns=cols)
-    out["demand_gw"] = out["value"] / 1000.0
-    out["source"] = "REE demanda/evolucion hourly"
-    return out[["datetime", "demand_gw", "source"]].sort_values("datetime").reset_index(drop=True)
+
+    out = pd.concat(frames, ignore_index=True)
+    out = (
+        out.drop_duplicates(subset=["datetime"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    return out[["datetime", "demand_gw", "source"]]
 
 
 def demand_peak_month_metrics(
@@ -1269,9 +1295,10 @@ def demand_peak_month_metrics(
     """
     Monthly average daily peak demand in GW.
 
-    Method:
-    1) For each day in the target month/MTD period, take the maximum hourly demand.
-    2) Average those daily peak values across the selected month/MTD period.
+    Definition used here:
+    1) For each day in the selected month / MTD period, take the single highest
+       hourly demand value of that day.
+    2) Compute the arithmetic mean of those daily 1-hour maxima.
 
     Fallback:
     If hourly demand is unavailable, use official monthly average demand.
