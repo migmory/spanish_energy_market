@@ -1479,57 +1479,58 @@ def weekly_average_demand_profile_chart(
     selected_label: str,
     previous_label: str,
 ):
-    """Weekly average hourly demand profile, selected week/WTD vs previous week.
+    """Weekly average 24h demand profile, styled like the working test page.
 
-    Fully defensive implementation: builds a list of non-empty frames first and
-    returns None when the REE hourly demand pull has no usable rows, so Streamlit
-    can use the fallback chart instead of raising pandas "No objects to concatenate".
+    Uses actual REE demanda/evolucion hourly rows for the selected week and
+    previous week. It returns None when no usable hourly rows are available so the
+    page can avoid pandas concat errors.
     """
-    frames: list[pd.DataFrame] = []
-    for profile in [
-        _week_hourly_demand_profile(demand_hourly, selected_week_start, selected_week_end, selected_label),
-        _week_hourly_demand_profile(demand_hourly, previous_week_start, previous_week_end, previous_label),
-    ]:
-        if profile is not None and isinstance(profile, pd.DataFrame) and not profile.empty:
-            frames.append(profile.copy())
+    profiles = []
+    selected_profile = _week_hourly_demand_profile(
+        demand_hourly,
+        selected_week_start,
+        selected_week_end,
+        selected_label,
+    )
+    if selected_profile is not None and not selected_profile.empty:
+        profiles.append(selected_profile)
 
-    if not frames:
+    previous_profile = _week_hourly_demand_profile(
+        demand_hourly,
+        previous_week_start,
+        previous_week_end,
+        previous_label,
+    )
+    if previous_profile is not None and not previous_profile.empty:
+        profiles.append(previous_profile)
+
+    if not profiles:
         return None
 
-    profile_df = pd.concat(frames, ignore_index=True)
-    required = {"hour", "avg_gw", "label"}
-    if profile_df.empty or not required.issubset(set(profile_df.columns)):
+    profile_df = pd.concat(profiles, ignore_index=True)
+    if profile_df.empty:
         return None
 
-    order = [s for s in [selected_label, previous_label] if s in profile_df["label"].unique().tolist()]
-    colors = [BLUE, GREY_DARK][: len(order)]
-    dashes = [[1, 0], [5, 3]][: len(order)]
-
-    chart = alt.Chart(profile_df).mark_line(point=alt.OverlayMarkDef(filled=True, size=55), strokeWidth=3).encode(
-        x=alt.X("hour:O", title="Hour", sort=list(range(24)), axis=alt.Axis(labelAngle=0)),
+    chart = alt.Chart(profile_df).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("hour:O", title="Hour of day", sort=list(range(24))),
         y=alt.Y("avg_gw:Q", title="Average hourly demand (GW)", scale=alt.Scale(zero=False)),
         color=alt.Color(
             "label:N",
             title="Week",
-            scale=alt.Scale(domain=order, range=colors) if order else None,
-            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=420, titleLimit=420, symbolLimit=420),
+            legend=alt.Legend(orient="top", direction="horizontal", labelLimit=360, titleLimit=360),
         ),
-        strokeDash=alt.StrokeDash(
-            "label:N",
-            title="Week",
-            scale=alt.Scale(domain=order, range=dashes) if order else None,
-            legend=None,
-        ),
+        strokeDash=alt.StrokeDash("label:N", legend=None),
         tooltip=[
             alt.Tooltip("label:N", title="Week"),
             alt.Tooltip("hour:O", title="Hour"),
-            alt.Tooltip("avg_gw:Q", title="Avg GW", format=",.2f"),
-            alt.Tooltip("min_gw:Q", title="Min GW", format=",.2f"),
-            alt.Tooltip("max_gw:Q", title="Max GW", format=",.2f"),
+            alt.Tooltip("avg_gw:Q", title="Avg GW", format=".2f"),
+            alt.Tooltip("min_gw:Q", title="Min GW", format=".2f"),
+            alt.Tooltip("max_gw:Q", title="Max GW", format=".2f"),
             alt.Tooltip("obs:Q", title="Obs", format=",d"),
         ],
-    ).properties(title="Weekly average 24h demand profile | selected week vs previous week")
-    return apply_chart_style(chart, height=380)
+    ).properties(height=380, title="Weekly average 24h demand profile | selected week vs previous week")
+    return chart
+
 
 def weekly_average_demand_profile_fallback_chart(
     current_metrics: dict,
@@ -5726,7 +5727,7 @@ historical_mix_daily = load_historical_generation_mix_daily_for_report()
 live_mix_monthly = load_live_2026_mix_monthly_for_report(date(2026, 1, 1), today)
 live_mix_daily = load_live_2026_mix_daily_for_report(date(2026, 1, 1), today)
 official_demand_daily = load_ree_official_demand_weekly_for_report(date(2026, 1, 1), today)
-official_demand_hourly = load_ree_official_demand_hourly_for_report(date(2026, 1, 1), today)
+official_demand_hourly = pd.DataFrame(columns=["datetime", "demand_gw", "source"])
 
 # =========================================================
 # SECTION 1 — DAY AHEAD
@@ -5737,6 +5738,12 @@ subsection("Quick read | selected week KPI panel")
 selected_metrics = period_metrics(price_hourly, solar_hourly, selected_week, report_end)
 prev_week = previous_week(selected_week)
 prev_metrics = period_metrics(price_hourly, solar_hourly, prev_week, week_end(prev_week))
+# Fetch hourly demand only for the selected week + previous week. Pulling a full-year
+# hourly REE demanda/evolucion range can return no usable rows, causing the profile
+# to fall back to flat weekly averages. This mirrors the working test page approach.
+demand_hourly_start = min(pd.Timestamp(prev_week).date(), pd.Timestamp(selected_week).date())
+demand_hourly_end = pd.Timestamp(report_end).date()
+official_demand_hourly = load_ree_official_demand_hourly_for_report(demand_hourly_start, demand_hourly_end)
 yoy = yoy_week(selected_week)
 yoy_metrics = period_metrics(price_hourly, solar_hourly, yoy, week_end(yoy))
 mibgas_selected = mibgas_weekly_selected_value_exact(
@@ -6116,7 +6123,7 @@ if weekly_demand_profile is not None:
         unsafe_allow_html=True,
     )
     st.altair_chart(weekly_demand_profile, use_container_width=True)
-    st.caption("Demand profile uses official REE demanda/evolucion hourly data where available; fallback uses the official weekly average demand.")
+    st.caption("Demand profile uses a week-only REE demanda/evolucion hourly pull, matching the test page methodology; fallback uses weekly averages only if REE returns no hourly rows.")
 
 
 
