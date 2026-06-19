@@ -392,7 +392,20 @@ def load_degradation_profile(path: Path) -> pd.DataFrame:
     return out.sort_values("year").reset_index(drop=True)
 
 
-def normalize_generation_upload(uploaded_file, target_years: list[int], scale_factor: float = 1.0) -> pd.DataFrame:
+def normalize_generation_upload(
+    uploaded_file,
+    target_years: list[int],
+    scale_factor: float = 1.0,
+    profile_mode: str = "repeat_single_year",
+) -> pd.DataFrame:
+    """Normalise uploaded solar generation profiles.
+
+    profile_mode="repeat_single_year" keeps the previous behaviour: one hourly
+    profile is repeated across all selected years.
+
+    profile_mode="profile_by_year" expects Date + Hour + generation columns and
+    uses the specific hourly profile supplied for each selected year.
+    """
     df = pd.read_excel(uploaded_file)
     if df.empty:
         raise ValueError("Uploaded generation file is empty.")
@@ -408,8 +421,40 @@ def normalize_generation_upload(uploaded_file, target_years: list[int], scale_fa
     if gen_col is None:
         raise ValueError("Generation file must contain a column named generation, generacion, or gen.")
 
-    date_col = col_map.get("date")
-    hour_col = col_map.get("hour")
+    date_col = col_map.get("date") or col_map.get("dia")
+    hour_col = col_map.get("hour") or col_map.get("hora")
+
+    if profile_mode == "profile_by_year":
+        if not (date_col and hour_col):
+            raise ValueError("Year-by-year generation upload must contain Date/dia, Hour/hora and generation/generacion columns.")
+
+        tmp = df[[date_col, hour_col, gen_col]].copy()
+        tmp.columns = ["Date", "Hour", "generation"]
+        tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+        tmp["Hour"] = pd.to_numeric(tmp["Hour"], errors="coerce")
+        tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0) * scale_factor
+        tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
+        tmp["Hour"] = tmp["Hour"].astype(int)
+        tmp = tmp[(tmp["Hour"] >= 1) & (tmp["Hour"] <= 24)].copy()
+        tmp["year"] = tmp["Date"].dt.year
+        tmp["timestamp"] = tmp["Date"].dt.floor("D") + pd.to_timedelta(tmp["Hour"] - 1, unit="h")
+        tmp = tmp.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+
+        uploaded_years = set(tmp["year"].dropna().astype(int).unique().tolist())
+        missing_years = [year for year in target_years if year not in uploaded_years]
+        if missing_years:
+            raise ValueError("Generation upload is missing selected year(s): " + ", ".join(str(y) for y in missing_years))
+
+        rows = []
+        for year in target_years:
+            expected_h = hours_in_year(year)
+            year_df = tmp[tmp["year"] == year].copy().sort_values("timestamp")
+            if len(year_df) < expected_h:
+                raise ValueError(f"Generation profile for year {year} has {len(year_df)} rows; expected at least {expected_h}.")
+            year_df = year_df.head(expected_h).copy()
+            rows.append(year_df[["timestamp", "Date", "Hour", "year", "generation"]])
+
+        return pd.concat(rows, ignore_index=True)
 
     if date_col and hour_col:
         tmp = df[[date_col, hour_col, gen_col]].copy()
@@ -419,6 +464,7 @@ def normalize_generation_upload(uploaded_file, target_years: list[int], scale_fa
         tmp["generation"] = pd.to_numeric(tmp["generation"], errors="coerce").fillna(0.0) * scale_factor
         tmp = tmp.dropna(subset=["Date", "Hour"]).copy()
         tmp["year"] = tmp["Date"].dt.year
+        tmp = tmp.sort_values(["Date", "Hour"]).reset_index(drop=True)
         tmp["hour_of_year"] = tmp.groupby("year").cumcount() + 1
         source_year = sorted(tmp["year"].dropna().unique().tolist())[0]
         base = tmp[tmp["year"] == source_year][["hour_of_year", "generation"]].copy()
@@ -457,6 +503,22 @@ def build_template_generation_excel(example_path: Path) -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="generation_template")
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def build_template_generation_by_year_excel(years: list[int]) -> bytes:
+    rows = []
+    for year in years:
+        idx = make_year_hour_index(year)
+        tmp = idx[["Date", "Hour"]].copy()
+        tmp["generacion"] = ""
+        rows.append(tmp)
+
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["Date", "Hour", "generacion"])
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="generation_by_year_template")
     bio.seek(0)
     return bio.getvalue()
 
@@ -703,6 +765,7 @@ def build_dataset(
     default_solar_profile: pd.DataFrame,
     bess_mw: float,
     uploaded_generation_file=None,
+    generation_profile_mode: str = "repeat_single_year",
     forward_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     prices = build_price_dataset_for_years(
@@ -715,7 +778,12 @@ def build_dataset(
 
     if mode in ["BESS with demand", "BESS without demand"]:
         if uploaded_generation_file is not None:
-            generation_df = normalize_generation_upload(uploaded_generation_file, years, scale_factor=bess_mw)
+            generation_df = normalize_generation_upload(
+                uploaded_generation_file,
+                years,
+                scale_factor=bess_mw,
+                profile_mode=generation_profile_mode,
+            )
         else:
             generation_df = build_default_solar_generation(years, bess_mw, default_solar_profile)
     else:
@@ -1638,23 +1706,50 @@ with left:
     optimization_method = "rolling_24h" if optimization_method_label.startswith("Rolling") else "fixed_24h"
 
     st.markdown("### Generation profile")
-    use_uploaded_generation = st.checkbox("Upload a custom yearly generation profile", value=False)
+    generation_source = st.radio(
+        "Solar generation source",
+        [
+            "Default 1-year profile repeated",
+            "Upload 1-year profile and repeat",
+            "Upload different hourly profile by year",
+        ],
+        index=0,
+        help=(
+            "Use the default 1-year solar profile, upload one profile to repeat across all selected years, "
+            "or upload Date/Hour/generation rows for each selected year."
+        ),
+    )
+
+    use_uploaded_generation = generation_source != "Default 1-year profile repeated"
+    generation_profile_mode = "profile_by_year" if generation_source == "Upload different hourly profile by year" else "repeat_single_year"
     uploaded_generation = None
+
     if use_uploaded_generation:
         uploaded_generation = st.file_uploader(
             "Upload generation Excel",
             type=["xlsx"],
-            help="Use the downloaded example structure. Values are assumed to be for a 1 MW solar plant and are automatically scaled to the equivalent BESS MW.",
+            help=(
+                "Values are assumed to be for a 1 MW solar plant and are automatically scaled to the equivalent BESS MW. "
+                "For 'different hourly profile by year', include Date/dia, Hour/hora and generation/generacion for every selected year."
+            ),
             key="generation_upload",
         )
 
-    template_bytes = build_template_generation_excel(DEFAULT_SOLAR_PROFILE_XLSX)
-    st.download_button(
-        "Download generation template",
-        data=template_bytes,
-        file_name="profile_production_1y_hourly_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if generation_profile_mode == "profile_by_year":
+        st.download_button(
+            "Download generation-by-year template",
+            data=build_template_generation_by_year_excel(years),
+            file_name=f"profile_generation_by_year_{year_start}_{year_end}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        template_bytes = build_template_generation_excel(DEFAULT_SOLAR_PROFILE_XLSX)
+        st.download_button(
+            "Download 1-year generation template",
+            data=template_bytes,
+            file_name="profile_production_1y_hourly_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     run_button = st.button("Run optimisation", type="primary")
 
@@ -1722,6 +1817,7 @@ if run_button:
                 default_solar_profile=default_solar_profile,
                 bess_mw=bess_mw,
                 uploaded_generation_file=uploaded_generation,
+                generation_profile_mode=generation_profile_mode,
                 forward_prices=forward_prices,
             )
 
@@ -1774,6 +1870,8 @@ if run_button:
                     "assume_degradation",
                     "degradation_status_output",
                     "uploaded_generation",
+                    "generation_source",
+                    "generation_profile_mode",
                     "default_generation_profile",
                     "degradation_file",
                 ],
@@ -1796,6 +1894,8 @@ if run_button:
                     "yes" if use_degradation else "no",
                     "degraded for forward years only" if use_degradation else "undegraded",
                     "yes" if uploaded_generation is not None else "no",
+                    generation_source,
+                    generation_profile_mode,
                     DEFAULT_SOLAR_PROFILE_XLSX.name if DEFAULT_SOLAR_PROFILE_XLSX.exists() else "not found",
                     DEFAULT_DEGRADATION_XLSX.name if DEFAULT_DEGRADATION_XLSX.exists() else "not found",
                 ],
