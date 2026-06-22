@@ -200,29 +200,32 @@ DEFAULT_DEGRADATION_XLSX = resolve_existing(
     BASE_DIR / "BESS degradation_SOH(%).xlsx",
 )
 
-FORWARD_PROVIDER_FILES = {
-    "Aurora": resolve_existing(
-        DATA_DIR / "Aurora Q1-26 central.xlsx",
-        BASE_DIR / "Aurora Q1-26 central.xlsx",
-        FORWARD_DIR / "Aurora Q1-26 central.xlsx",
-    ),
-    "Baringa": resolve_existing(
-        FORWARD_DIR / "Bringa_Q1.26.xlsx",
-        FORWARD_DIR / "Baringa_Q1.26.xlsx",
-        FORWARD_DIR / "Baringa Q1.26.xlsx",
-        DATA_DIR / "Bringa_Q1.26.xlsx",
-        DATA_DIR / "Baringa_Q1.26.xlsx",
-        DATA_DIR / "Baringa Q1.26.xlsx",
-        DATA_DIR / "Baringa nominal.xlsx",
-        FORWARD_DIR / "Baringa nominal.xlsx",
-    ),
-}
+FORWARD_EXTENSIONS = {".xlsx", ".xls", ".csv"}
 
-FORWARD_PROVIDER_LABELS = {
-    "Aurora": "Aurora Dec-25",
-    "Baringa": "Baringa Apr-26",
-}
-FORWARD_LABEL_TO_PROVIDER = {v: k for k, v in FORWARD_PROVIDER_LABELS.items()}
+
+def discover_forward_curve_files() -> dict[str, Path]:
+    """Return every Excel/CSV curve available in the forward_curves folder.
+
+    Labels are created from the file names so new curves dropped into the folder
+    automatically appear in the Streamlit selector without changing the code.
+    """
+    discovered: dict[str, Path] = {}
+    search_dirs = [FORWARD_DIR]
+
+    for folder in search_dirs:
+        if not folder.exists():
+            continue
+        for path in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+            if path.is_file() and path.suffix.lower() in FORWARD_EXTENSIONS and not path.name.startswith("~$"):
+                label = path.stem.replace("_", " ")
+                if label in discovered:
+                    label = path.name
+                discovered[label] = path
+
+    return discovered
+
+
+FORWARD_CURVE_FILES = discover_forward_curve_files()
 CUSTOM_FORWARD_LABEL = "Upload custom price curve"
 
 
@@ -620,7 +623,10 @@ def normalize_forward_price_dataframe(df: pd.DataFrame, source_name: str = "forw
 def normalize_provider_forward_price_file(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Forward price file not found: {path}")
-    df = pd.read_excel(path)
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path)
     return normalize_forward_price_dataframe(df, source_name=path.name)
 
 
@@ -650,11 +656,25 @@ def build_template_forward_price_excel(start_year: int = 2027) -> bytes:
     return bio.getvalue()
 
 
-def choose_historical_price_profile_for_year(price_hourly: pd.DataFrame, target_year: int) -> pd.DataFrame:
+def choose_historical_price_profile_for_year(
+    price_hourly: pd.DataFrame,
+    target_year: int,
+    actuals_only: bool = False,
+) -> pd.DataFrame:
     if price_hourly.empty:
         raise ValueError("No hourly electricity price history found from Day Ahead.")
 
     available_years = sorted(price_hourly["year"].unique().tolist())
+
+    if actuals_only:
+        if target_year not in available_years:
+            raise ValueError(f"Year {target_year} must use actual prices only, but no actual prices were found for that year.")
+        src = price_hourly[price_hourly["year"] == target_year].copy()
+        src = src.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+        src["omie_venta"] = src["price"]
+        src["omie_compra"] = src["price"]
+        return src[["timestamp", "Date", "Hour", "year", "omie_venta", "omie_compra"]]
+
     src_year = target_year if target_year in available_years else max(available_years)
 
     src = price_hourly[price_hourly["year"] == src_year].copy()
@@ -740,7 +760,11 @@ def build_price_dataset_for_years(
 
     rows = []
     for year in years:
-        if max_hist_year is not None and year <= max_hist_year:
+        if year == 2026:
+            # 2026 is never completed with forward curves. Use only actual
+            # prices already available from the Day Ahead/history file.
+            rows.append(choose_historical_price_profile_for_year(historical_prices, year, actuals_only=True))
+        elif max_hist_year is not None and year <= max_hist_year:
             rows.append(choose_historical_price_profile_for_year(historical_prices, year))
         else:
             if forward_prices is None or forward_prices.empty:
@@ -1604,15 +1628,20 @@ with left:
     uploaded_forward_curve = None
 
     if use_forward_prices:
-        available_repo_providers = [name for name, path in FORWARD_PROVIDER_FILES.items() if path.exists()]
-        repo_provider_labels = [FORWARD_PROVIDER_LABELS.get(name, name) for name in available_repo_providers]
+        # Automatically show every Excel/CSV file in /forward_curves.
+        # 2026 prices are not taken from these files; 2026 uses actuals only.
+        available_forward_files = {label: path for label, path in FORWARD_CURVE_FILES.items() if path.exists()}
+        repo_provider_labels = list(available_forward_files.keys())
         forward_source_options = repo_provider_labels + [CUSTOM_FORWARD_LABEL]
+
+        if not repo_provider_labels:
+            st.info("No repo forward curves found in the forward_curves folder. You can still upload a custom curve.")
 
         forward_price_source_label = st.selectbox(
             "Forward price source",
             forward_source_options,
             index=0 if forward_source_options else None,
-            help="Aurora means Aurora Dec-25; Baringa means Baringa Apr-26. You can also upload a custom hourly curve for 2027 onwards.",
+            help="Every Excel/CSV file found in the forward_curves folder appears here. 2026 uses actual prices only; forward curves are used from 2027 onwards.",
         )
 
         if forward_price_source_label == CUSTOM_FORWARD_LABEL:
@@ -1650,15 +1679,19 @@ with left:
             valid_forward_pwd = ("forward_prices_password" in st.secrets and provider_pwd == st.secrets["forward_prices_password"])
 
             if valid_forward_pwd:
-                forward_provider = FORWARD_LABEL_TO_PROVIDER.get(forward_price_source_label, forward_price_source_label)
-                provider_path = FORWARD_PROVIDER_FILES[forward_provider]
+                forward_provider = forward_price_source_label
+                provider_path = available_forward_files[forward_price_source_label]
                 forward_prices = normalize_provider_forward_price_file(provider_path)
-                provider_available_years = sorted(forward_prices["year"].unique().tolist())
-                st.caption(f"Loaded repo curve: {FORWARD_PROVIDER_LABELS.get(forward_provider, forward_provider)}")
+                provider_available_years = sorted(y for y in forward_prices["year"].unique().tolist() if int(y) >= 2027)
+                ignored_years = sorted(y for y in forward_prices["year"].unique().tolist() if int(y) < 2027)
+                st.caption(f"Loaded repo curve: {provider_path.name}")
+                if ignored_years:
+                    st.caption("Ignored forward year(s) before 2027: " + ", ".join(str(y) for y in ignored_years) + ". 2026 uses actual prices only.")
             else:
                 st.warning("Enter the correct password to unlock repo forward nominal prices.")
 
-    all_available_years = sorted(set(available_hist_years + provider_available_years))
+    forward_years_for_selection = [int(y) for y in provider_available_years if int(y) >= 2027]
+    all_available_years = sorted(set(available_hist_years + forward_years_for_selection))
     if not all_available_years:
         all_available_years = available_hist_years
 
@@ -1798,9 +1831,9 @@ if run_button:
                 st.error("No repo forward provider data is available.")
                 st.stop()
 
-    forward_years_selected = [y for y in years if max_hist_year is not None and y > max_hist_year]
+    forward_years_selected = [y for y in years if y >= 2027 and (max_hist_year is None or y > max_hist_year)]
     if forward_years_selected and forward_prices is None:
-        st.error("Your selected year range includes forward years, but no forward price curve is loaded. Select Aurora Dec-25, Baringa Apr-26, or upload a custom curve.")
+        st.error("Your selected year range includes forward years from 2027 onwards, but no forward price curve is loaded. Select a file from the forward_curves folder or upload a custom curve.")
         st.stop()
 
     if use_uploaded_generation and uploaded_generation is None:
