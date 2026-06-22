@@ -1563,6 +1563,32 @@ def make_results_excel(
     return bio.getvalue()
 
 
+def dataframe_sheets_to_xlsx_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """Create an Excel workbook from one or more DataFrames for chart-data downloads."""
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        used_names = set()
+        for raw_name, df in sheets.items():
+            # Excel sheet names are limited to 31 chars and cannot contain these characters.
+            sheet_name = str(raw_name).replace("/", "_").replace("\\", "_").replace("?", "_").replace("*", "_").replace("[", "_").replace("]", "_").replace(":", "_")[:31]
+            if not sheet_name:
+                sheet_name = "sheet"
+            base_name = sheet_name
+            counter = 1
+            while sheet_name in used_names:
+                suffix = f"_{counter}"
+                sheet_name = f"{base_name[:31-len(suffix)]}{suffix}"
+                counter += 1
+            used_names.add(sheet_name)
+            out = df.copy() if df is not None else pd.DataFrame()
+            for col in out.columns:
+                if pd.api.types.is_datetime64_any_dtype(out[col]):
+                    out[col] = pd.to_datetime(out[col], errors="coerce").dt.tz_localize(None)
+            out.to_excel(writer, index=False, sheet_name=sheet_name)
+    bio.seek(0)
+    return bio.getvalue()
+
+
 def add_derived_dispatch_columns(dispatch: pd.DataFrame, bess_mw: float) -> pd.DataFrame:
     out = dispatch.copy()
     out["timestamp"] = pd.to_datetime(out["Date"]) + pd.to_timedelta(out["Hour"] - 1, unit="h")
@@ -2242,6 +2268,18 @@ if st.session_state.dispatch is not None:
         ).properties(height=280)
         st.altair_chart(yearly_bar, use_container_width=True)
 
+    monthly_chart_download_sheets = {
+        "monthly_revenue_chart": monthly_chart_df,
+        "yearly_total_chart": yearly_total_df,
+    }
+    st.download_button(
+        "Download monthly revenue chart data XLSX",
+        data=dataframe_sheets_to_xlsx_bytes(monthly_chart_download_sheets),
+        file_name=f"bess_monthly_revenue_chart_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_monthly_revenue_chart_xlsx",
+    )
+
     hero_header("Average 24h charge / discharge profile")
     min_date = pd.to_datetime(dispatch["Date"]).min().date()
     max_date = pd.to_datetime(dispatch["Date"]).max().date()
@@ -2310,6 +2348,27 @@ if st.session_state.dispatch is not None:
                     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                     st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
                     st.metric("Hybrid capture (€/MWh)", metric_value_or_blank(hybrid_cap))
+                avg_metadata = pd.DataFrame([
+                    {
+                        "period_start": period_start,
+                        "period_end": period_end,
+                        "mode": mode_result,
+                        "bess_mw": bess_mw_result,
+                        "cycle_setting": cycle_limit_label,
+                        "optimization_method": optimization_method_label,
+                    }
+                ])
+                st.download_button(
+                    "Download average 24h chart data XLSX",
+                    data=dataframe_sheets_to_xlsx_bytes({
+                        "chart_data_avg_24h": avg_profile,
+                        "source_dispatch_period": period_df,
+                        "metadata": avg_metadata,
+                    }),
+                    file_name=f"bess_average_24h_chart_data_{period_start}_{period_end}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_average_24h_chart_xlsx",
+                )
 
     hero_header("Selected day dispatch")
     available_days = sorted(pd.to_datetime(dispatch["Date"]).dt.date.unique().tolist())
@@ -2356,6 +2415,25 @@ if st.session_state.dispatch is not None:
             if mode_result != "Standalone BESS":
                 legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
             draw_side_legend(legend_items)
+            day_metadata = pd.DataFrame([
+                {
+                    "selected_day": selected_day,
+                    "mode": mode_result,
+                    "bess_mw": bess_mw_result,
+                    "cycle_setting": cycle_limit_label,
+                    "optimization_method": optimization_method_label,
+                }
+            ])
+            st.download_button(
+                "Download selected day chart data XLSX",
+                data=dataframe_sheets_to_xlsx_bytes({
+                    "selected_day_chart_data": day_df,
+                    "metadata": day_metadata,
+                }),
+                file_name=f"bess_selected_day_dispatch_{selected_day}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_selected_day_chart_xlsx",
+            )
         if float(day_df["charge_mwh"].sum() + day_df["discharge_mwh"].sum()) <= 1e-9:
             if mode_result == "BESS without demand":
                 solar_day = float(day_df["generacion"].sum()) if "generacion" in day_df.columns else 0.0
