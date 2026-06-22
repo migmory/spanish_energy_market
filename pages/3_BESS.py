@@ -1,16 +1,21 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date, time, timedelta
 from io import BytesIO
 from pathlib import Path
+from time import sleep
+from zoneinfo import ZoneInfo
 import calendar
+import os
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import pulp
+import requests
 import streamlit as st
+from dotenv import load_dotenv
 
 
 st.set_page_config(page_title="BESS", layout="wide")
@@ -171,8 +176,16 @@ if "bess_admin_password" in st.secrets:
         st.stop()
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+
 DATA_DIR = BASE_DIR / "data"
 FORWARD_DIR = BASE_DIR / "forward_curves"
+
+# Same actual-price extraction path as the Day Ahead page.
+LIVE_START_DATE = date(2026, 1, 1)
+MADRID_TZ = ZoneInfo("Europe/Madrid")
+PRICE_INDICATOR_ID = 600
 
 def resolve_existing(*paths: Path) -> Path:
     for path in paths:
@@ -187,6 +200,7 @@ PRICE_RAW_CSV_PATH = resolve_existing(
     BASE_DIR / "historical_prices.xlsx",
     BASE_DIR / "historical_data" / "day_ahead_spain_spot_600_raw.csv",
 )
+HIST_PRICES_FILE = DATA_DIR / "hourly_avg_price_since2021.xlsx"
 DEFAULT_DATA_XLSX = resolve_existing(
     DATA_DIR / "data.xlsx",
     BASE_DIR / "data.xlsx",
@@ -301,6 +315,201 @@ def standardize_price_history_from_day_ahead(raw_csv_path: Path) -> pd.DataFrame
     hourly["hour_of_year"] = hourly.groupby("year").cumcount() + 1
     return hourly
 
+
+
+
+def now_madrid() -> datetime:
+    return datetime.now(MADRID_TZ)
+
+
+def allow_next_day_refresh() -> bool:
+    return now_madrid().time() >= time(15, 0)
+
+
+def max_refresh_day() -> date:
+    return date.today() + timedelta(days=1) if allow_next_day_refresh() else date.today()
+
+
+def require_esios_token() -> str:
+    token = (os.getenv("ESIOS_TOKEN") or os.getenv("ESIOS_API_TOKEN") or "").strip()
+    if not token:
+        raise ValueError(f"No ESIOS token found in {ENV_PATH}. Add ESIOS_TOKEN or ESIOS_API_TOKEN to use 2026 actual prices like the Day Ahead page.")
+    return token
+
+
+def build_headers(token: str) -> dict:
+    return {
+        "Accept": "application/json; application/vnd.esios-api-v1+json",
+        "Content-Type": "application/json",
+        "x-api-key": token,
+    }
+
+
+def parse_datetime_label(df: pd.DataFrame) -> pd.Series:
+    if "datetime_utc" in df.columns:
+        dt = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        return dt.dt.tz_convert("Europe/Madrid").dt.tz_localize(None)
+    raise ValueError("No datetime column found")
+
+
+def parse_esios_indicator(raw_json: dict, source_name: str) -> pd.DataFrame:
+    values = raw_json.get("indicator", {}).get("values", [])
+    if not values:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    df = pd.DataFrame(values)
+    if "geo_name" not in df.columns:
+        df["geo_name"] = None
+    if "geo_id" not in df.columns:
+        df["geo_id"] = None
+
+    if (df["geo_id"] == 3).any():
+        df = df[df["geo_id"] == 3].copy()
+    else:
+        geo_series = df["geo_name"].astype(str).str.strip().str.lower()
+        if (geo_series == "españa").any():
+            df = df[geo_series == "españa"].copy()
+        elif (geo_series == "espana").any():
+            df = df[geo_series == "espana"].copy()
+
+    df["datetime"] = parse_datetime_label(df)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"]).copy()
+    df["source"] = source_name
+    return df[["datetime", "value", "source", "geo_name", "geo_id"]].sort_values("datetime")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_esios_range(
+    indicator_id: int,
+    start_day: date,
+    end_day: date,
+    token: str,
+    time_trunc: str | None = None,
+) -> pd.DataFrame:
+    """Same chunked ESIOS extraction style used in the Day Ahead page."""
+    if start_day > end_day:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    if time_trunc is None:
+        time_trunc = "quarter_hour" if start_day >= date(2025, 10, 1) else "hour"
+
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    frames = []
+    chunk_start = start_day
+    chunk_days = 14 if time_trunc == "quarter_hour" else 31
+
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=chunk_days - 1))
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        start_utc = start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_utc = end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=build_headers(token),
+                    params={
+                        "start_date": start_utc,
+                        "end_date": end_utc,
+                        "time_trunc": time_trunc,
+                    },
+                    timeout=(15, 120),
+                )
+                resp.raise_for_status()
+                parsed = parse_esios_indicator(resp.json(), source_name=f"esios_{indicator_id}")
+                if not parsed.empty:
+                    frames.append(parsed)
+                last_error = None
+                break
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                sleep(1.5 * (attempt + 1))
+
+        if last_error is not None:
+            pass
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["datetime", "geo_id", "source"], keep="last")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_historical_prices_like_day_ahead() -> pd.DataFrame:
+    """Historical prices exactly like the Day Ahead page: /data workbook until 2025."""
+    if not HIST_PRICES_FILE.exists():
+        return pd.DataFrame(columns=["datetime", "price"])
+    try:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name="prices_hourly_avg")
+    except Exception:
+        df = pd.read_excel(HIST_PRICES_FILE, sheet_name=0)
+        if "price" not in df.columns and "value" in df.columns:
+            df = df.rename(columns={"value": "price"})
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["datetime", "price"])
+    df = df[df["datetime"].dt.year <= 2025].copy()
+    return df[["datetime", "price"]].sort_values("datetime").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_live_2026_prices(token: str, start_day: date, end_day: date) -> pd.DataFrame:
+    """Live 2026 prices from ESIOS indicator 600, same source as Day Ahead."""
+    raw = fetch_esios_range(PRICE_INDICATOR_ID, start_day, end_day, token)
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "price"])
+    out = raw[["datetime", "value"]].rename(columns={"value": "price"})
+    out["datetime"] = out["datetime"].dt.floor("h")
+    return out.groupby("datetime", as_index=False)["price"].mean().sort_values("datetime")
+
+
+def combine_hist_and_live(hist_df: pd.DataFrame, live_df: pd.DataFrame, subset_cols: list[str]) -> pd.DataFrame:
+    combined = pd.concat([hist_df, live_df], ignore_index=True)
+    if combined.empty:
+        return combined
+    return combined.sort_values(subset_cols).drop_duplicates(subset=subset_cols, keep="last").reset_index(drop=True)
+
+
+def format_prices_for_bess(price_df: pd.DataFrame) -> pd.DataFrame:
+    if price_df is None or price_df.empty:
+        return pd.DataFrame(columns=["timestamp", "Date", "Hour", "year", "hour_of_year", "price"])
+    out = price_df.copy()
+    out["timestamp"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.dropna(subset=["timestamp", "price"]).copy()
+    out = out.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+    out["Date"] = out["timestamp"].dt.date
+    out["Hour"] = out["timestamp"].dt.hour + 1
+    out["year"] = out["timestamp"].dt.year
+    out["hour_of_year"] = out.groupby("year").cumcount() + 1
+    return out[["timestamp", "Date", "Hour", "year", "hour_of_year", "price"]]
+
+
+def load_actual_prices_like_day_ahead() -> pd.DataFrame:
+    """Historical <=2025 from the Day Ahead workbook + live 2026 from ESIOS."""
+    hist_prices = load_historical_prices_like_day_ahead()
+    live_start = LIVE_START_DATE
+    live_end = max_refresh_day()
+    live_prices = pd.DataFrame(columns=["datetime", "price"])
+    if live_start <= live_end:
+        token = require_esios_token()
+        live_prices = load_live_2026_prices(token, live_start, live_end)
+    price_hourly = combine_hist_and_live(hist_prices, live_prices, ["datetime"])
+    return format_prices_for_bess(price_hourly)
 
 def load_default_data_xlsx(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -1573,7 +1782,7 @@ def build_capacity_chart(capacity_table: pd.DataFrame) -> alt.Chart:
 # LOAD BASE DATA
 # =========================================================
 try:
-    historical_prices = standardize_price_history_from_day_ahead(PRICE_RAW_CSV_PATH)
+    historical_prices = load_actual_prices_like_day_ahead()
     default_data = load_default_data_xlsx(DEFAULT_DATA_XLSX)
     default_solar_profile = load_default_solar_profile(DEFAULT_SOLAR_PROFILE_XLSX)
     degradation_profile = load_degradation_profile(DEFAULT_DEGRADATION_XLSX)
@@ -1583,10 +1792,14 @@ except Exception as e:
 
 available_hist_years = sorted(historical_prices["year"].unique().tolist()) if not historical_prices.empty else []
 max_hist_year = max(available_hist_years) if available_hist_years else None
+latest_actual_timestamp = historical_prices["timestamp"].max() if not historical_prices.empty else None
 
 if not available_hist_years:
-    st.error("No historical prices found. Please run the Day Ahead module first so that historical_data/day_ahead_spain_spot_600_raw.csv is created.")
+    st.error("No actual price data found. Check /data/hourly_avg_price_since2021.xlsx and the ESIOS token used by the Day Ahead page.")
     st.stop()
+
+if latest_actual_timestamp is not None:
+    st.caption(f"Actual price source: Day Ahead method (/data until 2025 + ESIOS live 2026). Latest actual hour: {latest_actual_timestamp:%Y-%m-%d %H:%M}")
 
 for key, default in {
     "dispatch": None,
