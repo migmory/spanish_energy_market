@@ -2343,9 +2343,11 @@ if st.session_state.dispatch is not None:
                 if mode_result != "Standalone BESS":
                     legend_items = [("Solar generation", "#f59e0b", "dashed"), ("Hybrid profile", "#facc15", "area")] + legend_items
                 draw_side_legend(legend_items)
+                baseload_price = pd.to_numeric(period_df["omie_venta"], errors="coerce").mean()
+                st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+                st.metric("Baseload price (€/MWh)", metric_value_or_blank(baseload_price))
                 if mode_result != "Standalone BESS":
                     solar_cap, hybrid_cap = compute_period_capture_metrics(period_df)
-                    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                     st.metric("Solar capture (€/MWh)", metric_value_or_blank(solar_cap))
                     st.metric("Hybrid capture (€/MWh)", metric_value_or_blank(hybrid_cap))
                 avg_metadata = pd.DataFrame([
