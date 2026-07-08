@@ -32,7 +32,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Page config & styling (kept consistent with the rest of the app)
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="PPA & DASS Settlement Lab", layout="wide")
+st.set_page_config(page_title="PPA & DASS Settlement", layout="wide")
 
 st.markdown(
     """
