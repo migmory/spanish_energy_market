@@ -33,6 +33,9 @@ pg = st.navigation(
         "Operational Parks": [
             st.Page("pages/6_IS2.py", title="IS2", icon="☀️"),
         ],
+        "Hedging & Settlements": [
+            st.Page("pages/7_PPA_DASS_Settlements.py", title="PPA & DASS Settlement Lab", icon="🤝"),
+        ],
     }
 )
 
