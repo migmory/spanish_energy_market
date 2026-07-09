@@ -195,6 +195,87 @@ st.markdown(
     }}
 
 
+
+    .nx-price-grid {{
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        margin: 14px 0 10px 0;
+    }}
+    .nx-price-card {{
+        background: rgba(255,255,255,.92);
+        border: 1px solid rgba(15,107,71,.16);
+        border-radius: 18px;
+        padding: 18px 20px;
+        box-shadow: 0 5px 16px rgba(18,51,42,.055);
+    }}
+    .nx-price-card.solar {{
+        border-color: #ead28a;
+        background: linear-gradient(180deg, #fffdf5 0%, #fff7db 100%);
+    }}
+    .nx-price-card.dass {{
+        border-color: #bfe0cb;
+        background: linear-gradient(180deg, #fbfffc 0%, #e9f8ee 100%);
+    }}
+    .nx-price-label {{
+        font-size: .76rem;
+        color: #6b7f78;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        font-weight: 850;
+    }}
+    .nx-price-value {{
+        margin-top: 5px;
+        font-size: 2.75rem;
+        line-height: .98;
+        font-weight: 950;
+        letter-spacing: -.04em;
+        color: #12332a;
+    }}
+    .nx-price-value .unit {{
+        font-size: 1.0rem;
+        letter-spacing: 0;
+        color: #6b7f78;
+        margin-left: 4px;
+        font-weight: 850;
+    }}
+    .nx-price-foot {{
+        margin-top: 8px;
+        color: #6b7f78;
+        font-size: .83rem;
+        line-height: 1.3;
+    }}
+    .nx-stepbar {{
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin: 10px 0 16px 0;
+    }}
+    .nx-step {{
+        border: 1px solid #e5eeea;
+        border-radius: 14px;
+        background: rgba(255,255,255,.72);
+        padding: 10px 12px;
+        color: #12332a;
+        font-size: .86rem;
+        font-weight: 700;
+    }}
+    .nx-step span {{
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        width:22px;
+        height:22px;
+        border-radius:999px;
+        background:#0f6b47;
+        color:#fff;
+        font-size:.72rem;
+        margin-right:7px;
+    }}
+    @media (max-width: 900px) {{
+        .nx-price-grid, .nx-stepbar {{ grid-template-columns: 1fr; }}
+    }}
+
     @media print {{
         @page {{ size: A4 landscape; margin: 8mm; }}
         .stApp {{ background: white !important; }}
@@ -226,7 +307,7 @@ st.markdown(
 st.markdown(
     """
     <div class="nx-hero">
-      <span class="nx-pill">Offtaker view · settlements payable to the buyer · FINAL v2024-2030 PDF · WIDE VISUAL</span>
+      <span class="nx-pill">Offtaker view · settlements payable to the buyer · FINAL v2024-2030 PDF · FAST CORPORATE UI</span>
       <h1>🛡️ PPA &amp; DASS Settlements</h1>
       <p>What the hedge would have paid you — and what it is expected to pay.
       Historical settlements 2021 – Jun 2026 on OMIE outturn, forward 2027 – 2040 on the
@@ -301,6 +382,27 @@ def start_module_wrap(kind: str = "solar"):
 
 def end_module_wrap():
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def price_card(label: str, value: str, unit: str, foot: str, kind: str = "solar"):
+    cls = "nx-price-card dass" if kind == "dass" else "nx-price-card solar"
+    return f"""<div class="{cls}">
+        <div class="nx-price-label">{label}</div>
+        <div class="nx-price-value">{value}<span class="unit">{unit}</span></div>
+        <div class="nx-price-foot">{foot}</div>
+    </div>"""
+
+
+def price_grid(cards: list[str]):
+    st.markdown("<div class='nx-price-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def stepbar(items: list[str]):
+    html = "<div class='nx-stepbar'>"
+    for i, item in enumerate(items, start=1):
+        html += f"<div class='nx-step'><span>{i}</span>{item}</div>"
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def chart_heading(title: str, subtitle: str = "", kind: str = ""):
@@ -677,8 +779,10 @@ if use_uploaded_curve:
             "recomputed from the uploaded prices.")
 else:
     hourly = hourly_base
-    st.caption("Using workbook summary figures for captured prices, BESS revenues and TB4. "
+    st.caption("Using workbook summary figures for captured prices, BESS revenues and TB4. Fast mode: charts are rendered from pre-aggregated monthly/annual tables. "
                "The app only recomputes those values when a user uploads an hourly curve.")
+
+stepbar(["Choose annual or monthly view", "Set tenor and settlement convention", "Review KPIs, charts and export to PDF"])
 
 hourly = hourly[(hourly.year >= year_range[0]) & (hourly.year <= year_range[1])]
 if hourly.empty:
@@ -740,6 +844,19 @@ with st.container(border=True):
             floor = st.slider("Floor (€/MWh)", 0.0, 150.0, 30.0, 0.5)
             discount = st.slider("Discount to market (€/MWh)", 0.0, 80.0, 5.0, 0.5,
                                  help="Contract price = max(floor, captured price − discount).")
+
+if ppa_type == "Fixed for floating":
+    price_grid([
+        price_card("PPA reference price", f"{strike:.1f}", "€/MWh", "Fixed strike used as the orange line in the chart."),
+        price_card("Settlement logic", "Capture − Strike", "", "Positive means payment to the offtaker."),
+        price_card("Contracted volume", f"{ppa_volume_gwh:,.0f}", "GWh/yr", "Annual PPA volume shaped by the solar profile."),
+    ])
+else:
+    price_grid([
+        price_card("PPA floor / strike", f"{floor:.1f}", "€/MWh", "This is the fixed orange line. It does not move with captured price."),
+        price_card("Discount to market", f"{discount:.1f}", "€/MWh", "Effective price = max(floor, captured price − discount)."),
+        price_card("Contracted volume", f"{ppa_volume_gwh:,.0f}", "GWh/yr", "Annual PPA volume shaped by the solar profile."),
+    ])
 
 ppa = cap_m.copy()
 ppa["yr_solar"] = ppa.groupby("year")["solar_mwh"].transform("sum")
@@ -884,6 +1001,12 @@ st.markdown(
     charges {E_CHARGE_GRID:.2f} MWh / discharges {E_DISCHARGE:.2f} MWh per cycle
     &nbsp;·&nbsp; undegraded &nbsp;·&nbsp; forward prices nominal</div>""",
     unsafe_allow_html=True)
+
+price_grid([
+    price_card("DASS strike", f"{dass_strike:.1f}", "k€/MW·yr", "Annual fixed strike. Orange line in the BESS chart.", "dass"),
+    price_card("TB4 equivalent", f"{eq_spread:.1f}", "€/MWh", "Approximate spread equivalent using 4h, 1 cycle/day and 0.856 RTE.", "dass"),
+    price_card("Contracted capacity", f"{dass_mw:,.1f}", "MW", "Used to convert €/MW settlement into total cash settlement.", "dass"),
+])
 
 bess = bess_m.copy().merge(ndays_m, on=["year", "month"], how="left")
 bess["strike_eur_mw"] = dass_strike * 1000.0 * bess["ndays"] / 365.0
