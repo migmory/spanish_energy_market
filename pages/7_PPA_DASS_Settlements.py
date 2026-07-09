@@ -164,34 +164,6 @@ st.markdown(
     }}
 
 
-    .nx-section-card-note {
-        margin: 0 0 16px 0;
-        padding: 12px 16px;
-        border-radius: 14px;
-        background: rgba(230,244,238,.65);
-        border: 1px solid #cfe8dc;
-        color: #12332a;
-        font-weight: 750;
-    }
-    .nx-section-card-note.dass {
-        background: rgba(227,246,236,.72);
-        border-color: #c8ecd7;
-    }
-    .nx-chart-title {
-        margin-top: 26px !important;
-    }
-    .nx-print-card {
-        margin-top: 34px;
-        padding: 18px 22px;
-        border: 1px solid #cfe8dc;
-        border-radius: 18px;
-        background: linear-gradient(120deg, #f7fcfa 0%, #e6f4ee 100%);
-        display:flex; justify-content:space-between; align-items:center; gap:18px;
-        box-shadow: 0 3px 14px rgba(18,51,42,.06);
-    }
-    .nx-print-title { font-size: 1.25rem; font-weight: 850; color:#12332a; }
-    .nx-print-subtitle { font-size:.9rem; color:#6b7f78; margin-top:4px; }
-    .nx-print-seal { border:2px solid #0f6b47; color:#0f6b47; border-radius:999px; padding:10px 18px; font-size:.82rem; font-weight:900; letter-spacing:.08em; white-space:nowrap; }
 
     @media print {{
         @page {{ size: A4 landscape; margin: 8mm; }}
