@@ -3,15 +3,12 @@
 PPA & DASS Settlements — offtaker-facing settlement dashboard.
 
 Data lineage (single source of truth = data/PV___BESS_settlement_app.xlsx):
-- Captured price = solar-weighted hourly day-ahead price. Monthly figures match the
-  workbook's monthly capture columns exactly; annual figures match the workbook's
-  annual "Uncurtailed/Curtailed capture price" columns exactly because monthly PPA
-  volumes follow each year's ACTUAL solar profile.
-- BESS revenue & TB4 are computed here from the hourly prices (the workbook's own
-  BESS/TB4 summary columns are empty). One cycle/day: buy 4/0.925 MWh in the cheapest
-  hours, sell 4*0.925 MWh in the priciest (RTE ~0.856, undegraded).
-- Performance: the xlsx is converted once to a parquet cache next to it; subsequent
-  loads are near-instant. The BESS dispatch is fully vectorised.
+- When the Aurora/workbook curve is selected, monthly and annual captured solar prices,
+  BESS revenues and TB4 spreads are read directly from the workbook summary tables.
+- Only when the user uploads an hourly forward curve does the app recompute solar capture
+  and BESS dispatch from the uploaded prices.
+- Performance: the hourly xlsx is converted once to a parquet cache next to it; subsequent
+  loads are near-instant.
 """
 
 from __future__ import annotations
@@ -27,6 +24,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 # ---------------------------------------------------------------------------
 # Page setup & corporate styling
@@ -36,8 +34,8 @@ st.set_page_config(page_title="PPA & DASS Settlements", layout="wide")
 GREEN = "#1f8a5f"
 GREEN_DARK = "#0f6b47"
 GREEN_SOFT = "#e6f4ee"
-PURPLE = "#5b4bc4"
-PURPLE_SOFT = "#eceafb"
+DASS_GREEN = "#198754"
+DASS_GREEN_SOFT = "#e3f6ec"
 ORANGE = "#e8862e"
 RED = "#cf4d4d"
 INK = "#12332a"
@@ -70,20 +68,21 @@ st.markdown(
 
     .kpi {{
         background:#fff; border:1px solid #e5eeea; border-radius:18px;
-        padding:20px 24px 18px 24px; box-shadow: 0 3px 12px rgba(18,51,42,.06); height:100%;
+        padding:22px 24px 20px 24px; box-shadow: 0 3px 12px rgba(18,51,42,.06); height:100%;
+        text-align:center; display:flex; flex-direction:column; justify-content:center; min-height:138px;
     }}
     .kpi .label {{ color:{MUTED}; font-size:.8rem; font-weight:700; text-transform:uppercase; letter-spacing:.07em; }}
     .kpi .value {{ font-size:3.1rem; font-weight:800; letter-spacing:-.035em; line-height:1.05; margin-top:4px; }}
     .kpi .unit  {{ font-size:1.15rem; font-weight:700; color:{MUTED}; margin-left:5px; }}
     .kpi .foot  {{ color:{MUTED}; font-size:.8rem; margin-top:8px; }}
-    .pos {{ color:{GREEN_DARK}; }} .neg {{ color:{RED}; }} .neu {{ color:{INK}; }} .pur {{ color:{PURPLE}; }}
+    .pos {{ color:{GREEN_DARK}; }} .neg {{ color:{RED}; }} .neu {{ color:{INK}; }} .pur {{ color:{DASS_GREEN}; }}
 
     .offtaker-badge {{
         display:inline-block; background:{GREEN_SOFT}; color:{GREEN_DARK};
         border:1px solid #cfe8dc; font-weight:700; font-size:.8rem;
         padding:5px 14px; border-radius:999px; letter-spacing:.03em;
     }}
-    .offtaker-badge.dass {{ background:{PURPLE_SOFT}; color:{PURPLE}; border-color:#ddd8f5; }}
+    .offtaker-badge.dass {{ background:{DASS_GREEN_SOFT}; color:{DASS_GREEN}; border-color:#c8ecd7; }}
 
     /* segmented-control look for horizontal radios */
     div[role="radiogroup"] {{ gap: 6px; }}
@@ -174,36 +173,92 @@ def style_chart(ch):
 # Fast data loading: xlsx -> parquet disk cache
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner="Loading dataset…")
-def load_dataset(path_str: str, mtime: float) -> tuple[pd.DataFrame, pd.Series]:
+def load_dataset(path_str: str, mtime: float) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame]:
     path = Path(path_str)
     pq = path.with_suffix(".parquet")
     sh = path.with_name(path.stem + "_shares.parquet")
-    if pq.exists() and sh.exists() and pq.stat().st_mtime >= mtime:
+
+    hourly_from_cache = pq.exists() and sh.exists() and pq.stat().st_mtime >= mtime
+    if hourly_from_cache:
         hourly = pd.read_parquet(pq)
         shares = pd.read_parquet(sh)["share"]
         shares.index = range(1, 13)
-        return hourly, shares
+    else:
+        hourly_recs = []
+        shares = None
 
-    df = pd.read_excel(path, sheet_name=0, usecols="A:F")
-    df.columns = ["date", "year", "month", "hour", "price", "solar"]
-    df = df.dropna(subset=["year", "price"]).copy()
-    df["year"] = df["year"].astype(int)
-    df["month"] = df["month"].astype(int)
-    df["day"] = pd.to_datetime(df["date"]).dt.day
-    df["solar"] = df["solar"].fillna(0.0).astype(float)
-    df["price"] = df["price"].astype(float)
-    hourly = df[["year", "month", "day", "hour", "price", "solar"]].reset_index(drop=True)
+    monthly_recs: list[dict] = []
+    annual_recs: list[dict] = []
+    share_vals: list[float] = []
 
-    raw = pd.read_excel(path, sheet_name=0, usecols="Z", nrows=14)
-    s = raw.iloc[:, 0].dropna().astype(float).to_numpy()[:12]
-    shares = pd.Series(s / s.sum(), index=range(1, 13), name="share")
+    # One fast read-only pass over the workbook. This avoids expensive repeated
+    # read_excel calls on a large hourly file.
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    for row in ws.iter_rows(min_row=2, max_col=26, values_only=True):
+        if not hourly_from_cache:
+            # A:F = Date, Year, Month, Hour, Price, Solar
+            if row[1] is not None and row[4] is not None:
+                dt = pd.to_datetime(row[0], errors="coerce")
+                if pd.notna(dt):
+                    hourly_recs.append({
+                        "year": int(row[1]),
+                        "month": int(row[2]),
+                        "day": int(dt.day),
+                        "hour": int(row[3]),
+                        "price": float(row[4]),
+                        "solar": 0.0 if row[5] is None else float(row[5]),
+                    })
 
-    try:  # persist for next cold start (works locally & on Streamlit Cloud runtime)
-        hourly.to_parquet(pq, index=False)
-        shares.rename("share").to_frame().to_parquet(sh)
-    except Exception:  # noqa: BLE001 - read-only FS: just skip disk cache
-        pass
-    return hourly, shares
+        # N:S = Year, Month, Uncurtailed capture, Curtailed capture, BESS revenue, TB4
+        if row[13] is not None and row[14] is not None:
+            monthly_recs.append({
+                "year": int(row[13]),
+                "month": int(row[14]),
+                "capture_uncurtailed": pd.to_numeric(row[15], errors="coerce"),
+                "capture_curtailed": pd.to_numeric(row[16], errors="coerce"),
+                "rev_eur_mw": pd.to_numeric(row[17], errors="coerce"),
+                "tb4": pd.to_numeric(row[18], errors="coerce"),
+            })
+
+        # U:Y = Year, Uncurtailed capture, Curtailed capture, BESS revenue, TB4
+        if row[20] is not None:
+            annual_recs.append({
+                "year": int(row[20]),
+                "capture_uncurtailed": pd.to_numeric(row[21], errors="coerce"),
+                "capture_curtailed": pd.to_numeric(row[22], errors="coerce"),
+                "rev_eur_mw": pd.to_numeric(row[23], errors="coerce"),
+                "tb4": pd.to_numeric(row[24], errors="coerce"),
+            })
+
+        # Z = Monthly share distribution (%)
+        if row[25] is not None and len(share_vals) < 12:
+            try:
+                share_vals.append(float(row[25]))
+            except Exception:
+                pass
+    wb.close()
+
+    if not hourly_from_cache:
+        hourly = pd.DataFrame(hourly_recs)
+        if not hourly.empty:
+            hourly[["year", "month", "day", "hour"]] = hourly[["year", "month", "day", "hour"]].astype(int)
+            hourly[["price", "solar"]] = hourly[["price", "solar"]].astype(float)
+        if share_vals:
+            shares = pd.Series(np.array(share_vals[:12]) / np.sum(share_vals[:12]),
+                               index=range(1, 13), name="share")
+        else:
+            shares = hourly.groupby("month")["solar"].sum()
+            shares = shares / shares.sum()
+        try:
+            hourly.to_parquet(pq, index=False)
+            shares.rename("share").to_frame().to_parquet(sh)
+        except Exception:
+            pass
+
+    monthly = pd.DataFrame(monthly_recs).dropna(subset=["year", "month"])
+    annual = pd.DataFrame(annual_recs).dropna(subset=["year"])
+    return hourly, shares, monthly, annual
 
 
 @st.cache_data(show_spinner=False)
@@ -331,69 +386,75 @@ def curve_template_bytes() -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Chart builders (annual layered / monthly faceted by year)
+# Chart builders — responsive, no faceting, labels centred inside bars
 # ---------------------------------------------------------------------------
-def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str, label_col: str | None,
+def _x_encoding(granularity: str):
+    if granularity == "Annual":
+        return alt.X("period:N", title=None, sort=None, axis=alt.Axis(labelAngle=0))
+    return alt.X("date:T", title=None, axis=alt.Axis(format="%b %y", labelAngle=-45, tickCount="month"))
+
+
+def _bar_label(v: float, suffix: str = "") -> str:
+    if pd.isna(v):
+        return ""
+    av = abs(v)
+    if av >= 1_000_000:
+        return f"{v/1_000_000:+.1f}M{suffix}"
+    if av >= 1_000:
+        return f"{v/1_000:+.0f}k{suffix}"
+    return f"{v:+.1f}{suffix}"
+
+
+def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
                      pos_lbl: str, neg_lbl: str, pos_c: str, neg_c: str,
-                     granularity: str, title: str, tb4_line: bool = False,
-                     tooltips: list | None = None, height: int = 300):
+                     granularity: str, title: str, tooltips: list | None = None,
+                     height: int = 320, label_suffix: str = ""):
     df = df.copy()
     df["sign"] = np.where(df[ycol] >= 0, pos_lbl, neg_lbl)
-    color = alt.Color("sign:N", scale=alt.Scale(domain=[pos_lbl, neg_lbl],
-                                                range=[pos_c, neg_c]),
+    df["label_y"] = df[ycol] / 2
+    df["bar_lbl"] = df[ycol].map(lambda v: _bar_label(v, label_suffix))
+    color = alt.Color("sign:N", scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
                       legend=alt.Legend(title=None, orient="top"))
     tt = tooltips or []
-
-    if granularity == "Annual":
-        base = alt.Chart(df)
-        zero = base.mark_rule(color="#c9d7d1").encode(y=alt.datum(0))
-        bars = base.mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5).encode(
-            x=alt.X("period:N", title=None, sort=None,
-                    scale=alt.Scale(paddingInner=0.45), axis=alt.Axis(labelAngle=0)),
-            y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
-        layers = [bars, zero]
-        if label_col:
-            layers.append(base.mark_text(dy=-9, fontSize=11, fontWeight="bold",
-                                         color=MUTED).encode(
-                x=alt.X("period:N", sort=None), y=alt.Y(f"{ycol}:Q"),
-                text=alt.Text(f"{label_col}:N")))
-        chart = alt.layer(*layers)
-        if tb4_line:
-            line = alt.Chart(df).mark_line(point={"filled": True, "size": 110},
-                                           color=ORANGE, strokeWidth=3, strokeDash=[6, 3]).encode(
-                x=alt.X("period:N", sort=None),
-                y=alt.Y("tb4:Q", title="Market TB4 spread (€/MWh)"),
-                tooltip=[alt.Tooltip("period:N"),
-                         alt.Tooltip("tb4:Q", title="TB4 €/MWh", format=".1f")])
-            chart = alt.layer(chart, line).resolve_scale(y="independent")
-        return chart.properties(height=height, title=alt.TitleParams(
-            title, anchor="start", fontSize=15, color=INK))
-
-    # Monthly → facet by year for a clear visual separation between years
-    df["mon"] = df["month"].map(MONTH_LBL)
+    xenc = _x_encoding(granularity)
     base = alt.Chart(df)
     zero = base.mark_rule(color="#c9d7d1").encode(y=alt.datum(0))
-    bars = base.mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
-        x=alt.X("mon:N", title=None, sort=list(MONTH_LBL.values()),
-                axis=alt.Axis(labelAngle=-90, labelFontSize=9)),
-        y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
-    layers = [bars, zero]
-    if label_col:
-        lbl_kw = dict(dy=-8, fontSize=11, fontWeight="bold", color=ORANGE, angle=270,
-                      align="left") if label_col == "tb4_lbl" else \
-                 dict(dy=-7, fontSize=9, color=MUTED, angle=270, align="left")
-        layers.append(base.mark_text(**lbl_kw).encode(
-            x=alt.X("mon:N", sort=list(MONTH_LBL.values())),
-            y=alt.Y(f"{ycol}:Q"), text=alt.Text(f"{label_col}:N")))
-    return (alt.layer(*layers)
-            .properties(height=height, width=alt.Step(16))
-            .facet(column=alt.Column("year:N", title=None,
-                                     header=alt.Header(labelFontSize=13,
-                                                       labelFontWeight="bold")),
-                   spacing=6)
-            .resolve_scale(x="independent")
-            .properties(title=alt.TitleParams(title, anchor="start",
-                                              fontSize=15, color=INK)))
+    bars = base.mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5,
+                         cornerRadiusBottomLeft=5, cornerRadiusBottomRight=5).encode(
+        x=xenc, y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
+    labels = base.mark_text(baseline="middle", align="center", fontSize=12,
+                            fontWeight="bold", color="white").encode(
+        x=xenc, y=alt.Y("label_y:Q"), text="bar_lbl:N")
+    return alt.layer(bars, zero, labels).properties(
+        height=height, title=alt.TitleParams(title, anchor="start", fontSize=15, color=INK))
+
+
+def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: str,
+                             ytitle: str, title: str, market_name: str,
+                             contract_name: str, granularity: str,
+                             tooltips: list | None = None, height: int = 340):
+    df = df.copy()
+    df["market_lbl"] = df[market_col].map(lambda v: "" if pd.isna(v) else f"{v:.0f}")
+    xenc = _x_encoding(granularity)
+    tt = tooltips or []
+    base = alt.Chart(df)
+    bars = base.mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5, opacity=0.88).encode(
+        x=xenc,
+        y=alt.Y(f"{market_col}:Q", title=ytitle),
+        color=alt.value(GREEN),
+        tooltip=tt,
+    )
+    bar_labels = base.mark_text(dy=-8, fontSize=12, fontWeight="bold", color=INK).encode(
+        x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
+    line = base.mark_line(point={"filled": True, "size": 70}, strokeWidth=3, color=ORANGE).encode(
+        x=xenc,
+        y=alt.Y(f"{contract_col}:Q", title=ytitle),
+        tooltip=tt,
+    )
+    return alt.layer(bars, bar_labels, line).properties(
+        height=height,
+        title=alt.TitleParams(f"{title} · bars = {market_name}, line = {contract_name}",
+                              anchor="start", fontSize=15, color=INK))
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +465,8 @@ if data_path is None:
     st.error("Data file `PV___BESS_settlement_app.xlsx` not found in `data/`.")
     st.stop()
 
-hourly_base, monthly_shares = load_dataset(str(data_path), data_path.stat().st_mtime)
+hourly_base, monthly_shares, monthly_summary_base, annual_summary_base = load_dataset(
+    str(data_path), data_path.stat().st_mtime)
 solar_shape = typical_solar_shape(hourly_base)
 HIST_MAX_YEAR = 2026
 
@@ -420,9 +482,8 @@ with st.container(border=True):
     with top3:
         settle_nonpos = st.toggle(
             "Settle at 0 / negative prices", value=True,
-            help="ON → every generated MWh settles (workbook 'Uncurtailed' capture). "
-                 "OFF → hours priced ≤ 0 €/MWh neither settle nor count as volume "
-                 "(workbook 'Curtailed' capture).")
+            help="ON → use the workbook 'Uncurtailed' capture. OFF → use the workbook "
+                 "'Curtailed' capture, excluding hours priced ≤ 0 €/MWh from settlement.")
     with top4:
         curve_source = st.radio("Forward curve (≥ 2027)",
                                 ["Aurora (workbook)", "Upload my own curve"],
@@ -442,7 +503,9 @@ if curve_source.startswith("Upload"):
             file_name="forward_curve_template.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-if uploaded_curve is not None and not uploaded_curve.empty:
+use_uploaded_curve = uploaded_curve is not None and not uploaded_curve.empty
+
+if use_uploaded_curve:
     fwd_years = sorted(uploaded_curve["year"].unique())
     hist_part = hourly_base[hourly_base["year"] <= HIST_MAX_YEAR].copy()
     fwd = uploaded_curve.merge(solar_shape, on=["month", "hour"], how="left")
@@ -450,28 +513,53 @@ if uploaded_curve is not None and not uploaded_curve.empty:
     fwd = fwd[["year", "month", "day", "hour", "price", "solar"]]
     hourly = pd.concat([hist_part, fwd], ignore_index=True)
     st.info(f"Using **your uploaded curve** for {fwd_years[0]}–{fwd_years[-1]} "
-            f"({len(uploaded_curve):,} hours). BESS dispatch is re-optimised on these "
-            "prices; solar capture uses the historical month-hour solar shape.")
+            f"({len(uploaded_curve):,} hours). Solar capture and BESS dispatch are "
+            "recomputed from the uploaded prices.")
 else:
     hourly = hourly_base
+    st.caption("Using workbook summary figures for captured prices, BESS revenues and TB4. "
+               "The app only recomputes those values when a user uploads an hourly curve.")
 
 hourly = hourly[(hourly.year >= year_range[0]) & (hourly.year <= year_range[1])]
 if hourly.empty:
     st.warning("No data in the selected period.")
     st.stop()
 
-cap_m = monthly_capture(hourly, settle_nonpos)
-bess_day = bess_daily_results(hourly)
-bess_m = (bess_day.groupby(["year", "month"])
-          .agg(rev_eur_mw=("rev_eur_mw", "sum"), tb4=("tb4", "mean")).reset_index())
+capture_col = "capture_uncurtailed" if settle_nonpos else "capture_curtailed"
+helper_m = monthly_capture(hourly, settle_nonpos)[["year", "month", "settled_share",
+                                                   "neg_hours_gen_share", "solar_mwh"]]
+if use_uploaded_curve:
+    cap_m = monthly_capture(hourly, settle_nonpos)
+    bess_day = bess_daily_results(hourly)
+    bess_m = (bess_day.groupby(["year", "month"])
+              .agg(rev_eur_mw=("rev_eur_mw", "sum"), tb4=("tb4", "mean")).reset_index())
+    annual_summary = None
+else:
+    ms = monthly_summary_base[(monthly_summary_base.year >= year_range[0]) &
+                              (monthly_summary_base.year <= year_range[1])].copy()
+    cap_m = (ms[["year", "month", capture_col]]
+             .rename(columns={capture_col: "capture"})
+             .merge(helper_m, on=["year", "month"], how="left"))
+    bess_m = ms[["year", "month", "rev_eur_mw", "tb4"]].copy()
+    annual_summary = annual_summary_base[(annual_summary_base.year >= year_range[0]) &
+                                         (annual_summary_base.year <= year_range[1])].copy()
+
+ndays_m = hourly.groupby(["year", "month"])["day"].nunique().reset_index(name="ndays")
+ndays_y = hourly.groupby("year")[["month", "day"]].apply(
+    lambda x: x.drop_duplicates().shape[0]).reset_index(name="ndays")
+
+# A real date axis makes Monthly charts responsive and avoids squeezing mini-facets.
+for _df in [cap_m, bess_m]:
+    if _df is not None and not _df.empty:
+        _df["date"] = pd.to_datetime(dict(year=_df["year"], month=_df["month"], day=1))
+        _df["period"] = _df["year"].astype(str) + "-" + _df["month"].map(lambda m: f"{m:02d}")
 
 # ======================================================================
 # 1) SOLAR PV PPA
 # ======================================================================
 section("Solar PV PPA", GREEN,
-        "Settlement to the offtaker = captured market price − contract price. "
-        "Green bars: the market paid above your contract — cash flows to you. "
-        "The small figures on the bars are the captured prices (€/MWh).",
+        "First chart: captured solar price in the market vs the contract price. "
+        "Second chart: settlement to the offtaker under the selected convention.",
         "☀️ Offtaker receives when green")
 
 with st.container(border=True):
@@ -487,40 +575,56 @@ with st.container(border=True):
         else:
             strike = 0.0
             floor = st.slider("Floor (€/MWh)", 0.0, 150.0, 30.0, 0.5)
-            discount = st.slider("Discount to market (%)", 0.0, 60.0, 15.0, 0.5)
+            discount = st.slider("Discount to market (€/MWh)", 0.0, 80.0, 5.0, 0.5,
+                                 help="Contract price = max(floor, captured price − discount).")
 
 ppa = cap_m.copy()
-# Monthly volumes follow each year's ACTUAL solar profile → annual capture
-# reproduces the workbook's annual capture column exactly.
 ppa["yr_solar"] = ppa.groupby("year")["solar_mwh"].transform("sum")
-ppa["volume_mwh"] = ppa_volume_gwh * 1000.0 * ppa["solar_mwh"] / ppa["yr_solar"]
-ppa["settled_mwh"] = ppa["volume_mwh"] * ppa["settled_share"].fillna(0)
+ppa["volume_mwh"] = ppa_volume_gwh * 1000.0 * ppa["solar_mwh"] / ppa["yr_solar"].clip(lower=1e-9)
+ppa["settled_mwh"] = ppa["volume_mwh"] * ppa["settled_share"].fillna(1.0)
 if ppa_type == "Fixed for floating":
     ppa["contract_price"] = strike
 else:
-    ppa["contract_price"] = np.maximum(floor, ppa["capture"] * (1 - discount / 100.0))
+    ppa["contract_price"] = np.maximum(floor, ppa["capture"] - discount)
 ppa["settle_eur_mwh"] = ppa["capture"] - ppa["contract_price"]
 ppa["settle_eur"] = ppa["settle_eur_mwh"] * ppa["settled_mwh"]
-ppa["period"] = ppa["year"].astype(str) + "-" + ppa["month"].map(lambda m: f"{m:02d}")
 
 if granularity == "Annual":
-    g = ppa.groupby("year")
-    ppa_view = pd.DataFrame({
-        "settle_eur": g["settle_eur"].sum(),
-        "settled_mwh": g["settled_mwh"].sum(),
-        "capture": g.apply(lambda x: (x["capture"] * x["settled_mwh"]).sum()
-                           / max(x["settled_mwh"].sum(), 1e-9), include_groups=False),
-        "neg_hours_gen_share": g["neg_hours_gen_share"].mean(),
-    }).reset_index()
-    ppa_view["settle_eur_mwh"] = ppa_view["settle_eur"] / ppa_view["settled_mwh"].clip(lower=1e-9)
+    if (not use_uploaded_curve) and annual_summary is not None:
+        ppa_view = annual_summary[["year", capture_col]].rename(columns={capture_col: "capture"}).copy()
+        vol_y = ppa.groupby("year").agg(settled_mwh=("settled_mwh", "sum"),
+                                        volume_mwh=("volume_mwh", "sum"),
+                                        neg_hours_gen_share=("neg_hours_gen_share", "mean")).reset_index()
+        ppa_view = ppa_view.merge(vol_y, on="year", how="left")
+        if ppa_type == "Fixed for floating":
+            ppa_view["contract_price"] = strike
+        else:
+            ppa_view["contract_price"] = np.maximum(floor, ppa_view["capture"] - discount)
+        ppa_view["settle_eur_mwh"] = ppa_view["capture"] - ppa_view["contract_price"]
+        ppa_view["settle_eur"] = ppa_view["settle_eur_mwh"] * ppa_view["settled_mwh"].fillna(0)
+    else:
+        g = ppa.groupby("year")
+        ppa_view = pd.DataFrame({
+            "settle_eur": g["settle_eur"].sum(),
+            "settled_mwh": g["settled_mwh"].sum(),
+            "volume_mwh": g["volume_mwh"].sum(),
+            "capture": g.apply(lambda x: (x["capture"] * x["settled_mwh"]).sum()
+                               / max(x["settled_mwh"].sum(), 1e-9)),
+            "contract_price": g.apply(lambda x: (x["contract_price"] * x["settled_mwh"]).sum()
+                                      / max(x["settled_mwh"].sum(), 1e-9)),
+            "neg_hours_gen_share": g["neg_hours_gen_share"].mean(),
+        }).reset_index()
+        ppa_view["settle_eur_mwh"] = ppa_view["settle_eur"] / ppa_view["settled_mwh"].clip(lower=1e-9)
     ppa_view["period"] = ppa_view["year"].astype(str)
     ppa_view["month"] = 1
 else:
     ppa_view = ppa.copy()
-ppa_view["cap_lbl"] = ppa_view["capture"].map(lambda v: f"{v:.0f}€" if pd.notna(v) else "")
 
-avg_settle_mwh = ppa_view["settle_eur"].sum() / max(ppa["settled_mwh"].sum(), 1e-9)
-avg_capture = (ppa["capture"] * ppa["settled_mwh"]).sum() / max(ppa["settled_mwh"].sum(), 1e-9)
+if "date" not in ppa_view.columns:
+    ppa_view["date"] = pd.to_datetime(dict(year=ppa_view["year"], month=ppa_view["month"], day=1))
+
+avg_settle_mwh = ppa_view["settle_eur"].sum() / max(ppa_view["settled_mwh"].sum(), 1e-9)
+avg_capture = (ppa_view["capture"] * ppa_view["settled_mwh"].fillna(0)).sum() / max(ppa_view["settled_mwh"].sum(), 1e-9)
 tone_ppa = "pos" if avg_settle_mwh >= 0 else "neg"
 
 k1, k2, k3, k4 = st.columns(4)
@@ -537,28 +641,33 @@ kpi(k4, "Generation in ≤0 € hours", f"{100*ppa['neg_hours_gen_share'].mean()
 st.markdown("")
 tt_ppa = [alt.Tooltip("period:N", title="Period"),
           alt.Tooltip("capture:Q", title="Captured €/MWh", format=".1f"),
+          alt.Tooltip("contract_price:Q", title="Contract €/MWh", format=".1f"),
           alt.Tooltip("settle_eur_mwh:Q", title="Settlement €/MWh", format="+.1f"),
           alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")]
+st.altair_chart(style_chart(market_vs_contract_chart(
+    ppa_view, "capture", "contract_price", "€/MWh",
+    "Solar market captured price vs PPA contract price",
+    "captured price", "contract price", granularity, tooltips=tt_ppa)),
+    use_container_width=True)
+
 st.altair_chart(style_chart(settlement_chart(
-    ppa_view, "settle_eur_mwh", "Settlement to offtaker (€/MWh)", "cap_lbl",
+    ppa_view, "settle_eur_mwh", "Settlement to offtaker (€/MWh)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
-    "PPA settlement per MWh — captured price shown on each bar",
+    "PPA settlement per MWh — positive means payment to offtaker",
     tooltips=tt_ppa)), use_container_width=True)
 
 st.altair_chart(style_chart(settlement_chart(
-    ppa_view, "settle_eur", "Settlement to offtaker (€)", None,
+    ppa_view, "settle_eur", "Settlement to offtaker (€)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
-    f"PPA settlement in € — {ppa_volume_gwh:,.0f} GWh/yr shaped on actual solar profile",
+    f"PPA settlement in € — {ppa_volume_gwh:,.0f} GWh/yr shaped on solar profile",
     tooltips=[alt.Tooltip("period:N"),
               alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")],
-    height=240)), use_container_width=True)
+    height=260)), use_container_width=True)
 
 with st.expander("PPA settlement table"):
     tbl = (ppa if granularity == "Monthly" else ppa_view)
-    cols = (["period", "capture", "contract_price", "settle_eur_mwh",
-             "volume_mwh", "settled_mwh", "settle_eur", "neg_hours_gen_share"]
-            if granularity == "Monthly" else
-            ["period", "capture", "settle_eur_mwh", "settle_eur", "neg_hours_gen_share"])
+    cols = ["period", "capture", "contract_price", "settle_eur_mwh",
+            "volume_mwh", "settled_mwh", "settle_eur", "neg_hours_gen_share"]
     st.dataframe(tbl[cols].rename(columns={
         "capture": "Captured €/MWh", "contract_price": "Contract €/MWh",
         "settle_eur_mwh": "Settlement €/MWh", "volume_mwh": "Volume MWh",
@@ -569,11 +678,9 @@ with st.expander("PPA settlement table"):
 # ======================================================================
 # 2) BESS DASS
 # ======================================================================
-section("BESS Day-Ahead Spread Swap (DASS)", PURPLE,
-        "Settled as a CfD on BESS market revenues: monthly settlement = realised "
-        "day-ahead revenue per MW − strike prorated by the days of the month over 365; "
-        "annual settlement = realised annual revenue − full strike (e.g. 70 k€/MW·yr). "
-        "Orange figures = the market TB4 spread (€/MWh) behind those revenues.",
+section("BESS Day-Ahead Spread Swap (DASS)", DASS_GREEN,
+        "First chart: realised / forecast BESS market revenue vs the DASS strike. "
+        "Second chart: the settlement after netting market revenue against the strike.",
         "🔋 Buyer receives when green", "dass")
 
 with st.container(border=True):
@@ -586,41 +693,50 @@ with st.container(border=True):
         eq_spread = dass_strike * 1000 / (365 * BESS_CAPACITY_MWH * RTE)
         st.markdown(
             f"<div style='color:{MUTED};font-size:.87rem;padding-top:26px;'>"
-            f"Strike ≈ <b>{eq_spread:.1f} €/MWh</b> OMIE TB4 spread equivalent "
-            f"(strike ÷ 365 d × 4 h × 1 c/d × 0.856 RTE — approximation, as RTE "
-            f"allocation between charge and discharge is not defined).</div>",
+            f"Strike ≈ <b>{eq_spread:.1f} €/MWh</b> TB4 spread equivalent "
+            f"(strike ÷ 365 d × 4 h × 1 c/d × 0.856 RTE).</div>",
             unsafe_allow_html=True)
 
 st.markdown(
-    f"""<div style="background:{PURPLE_SOFT};border:1px solid #ddd8f5;border-radius:12px;
-    padding:10px 16px;margin:6px 0 4px 0;color:{PURPLE};font-size:.85rem;font-weight:600;">
+    f"""<div style="background:{DASS_GREEN_SOFT};border:1px solid #c8ecd7;border-radius:12px;
+    padding:10px 16px;margin:6px 0 4px 0;color:{DASS_GREEN};font-size:.85rem;font-weight:600;">
     ⚙️ BESS assumptions &nbsp;·&nbsp; 1 MW / 4 MWh &nbsp;·&nbsp; max 1 cycle/day
     &nbsp;·&nbsp; η<sub>ch</sub> = η<sub>dis</sub> = 0.925 → RTE ≈ 0.856 &nbsp;·&nbsp;
     charges {E_CHARGE_GRID:.2f} MWh / discharges {E_DISCHARGE:.2f} MWh per cycle
     &nbsp;·&nbsp; undegraded &nbsp;·&nbsp; forward prices nominal</div>""",
     unsafe_allow_html=True)
 
-bess = bess_m.copy()
-ndays = bess_day.groupby(["year", "month"])["day"].nunique().reset_index(name="ndays")
-bess = bess.merge(ndays, on=["year", "month"])
+bess = bess_m.copy().merge(ndays_m, on=["year", "month"], how="left")
 bess["strike_eur_mw"] = dass_strike * 1000.0 * bess["ndays"] / 365.0
 bess["settle_eur_mw"] = bess["rev_eur_mw"] - bess["strike_eur_mw"]
 bess["settle_eur"] = bess["settle_eur_mw"] * dass_mw
-bess["period"] = bess["year"].astype(str) + "-" + bess["month"].map(lambda m: f"{m:02d}")
+bess["rev_keur_mw"] = bess["rev_eur_mw"] / 1000.0
+bess["strike_keur_mw"] = bess["strike_eur_mw"] / 1000.0
 
 if granularity == "Annual":
-    bess_view = (bess.groupby("year")
-                 .agg(rev_eur_mw=("rev_eur_mw", "sum"),
-                      strike_eur_mw=("strike_eur_mw", "sum"),
-                      settle_eur_mw=("settle_eur_mw", "sum"),
-                      settle_eur=("settle_eur", "sum"),
-                      tb4=("tb4", "mean")).reset_index())
+    if (not use_uploaded_curve) and annual_summary is not None:
+        bess_view = annual_summary[["year", "rev_eur_mw", "tb4"]].copy()
+        bess_view = bess_view.merge(ndays_y, on="year", how="left")
+        bess_view["strike_eur_mw"] = dass_strike * 1000.0 * bess_view["ndays"] / 365.0
+        bess_view["settle_eur_mw"] = bess_view["rev_eur_mw"] - bess_view["strike_eur_mw"]
+        bess_view["settle_eur"] = bess_view["settle_eur_mw"] * dass_mw
+    else:
+        bess_view = (bess.groupby("year")
+                     .agg(rev_eur_mw=("rev_eur_mw", "sum"),
+                          strike_eur_mw=("strike_eur_mw", "sum"),
+                          settle_eur_mw=("settle_eur_mw", "sum"),
+                          settle_eur=("settle_eur", "sum"),
+                          tb4=("tb4", "mean"), ndays=("ndays", "sum")).reset_index())
     bess_view["period"] = bess_view["year"].astype(str)
     bess_view["month"] = 1
 else:
     bess_view = bess.copy()
+
+if "date" not in bess_view.columns:
+    bess_view["date"] = pd.to_datetime(dict(year=bess_view["year"], month=bess_view["month"], day=1))
 bess_view["settle_keur_mw"] = bess_view["settle_eur_mw"] / 1000.0
-bess_view["tb4_lbl"] = bess_view["tb4"].map(lambda v: f"{v:.0f}")
+bess_view["rev_keur_mw"] = bess_view["rev_eur_mw"] / 1000.0
+bess_view["strike_keur_mw"] = bess_view["strike_eur_mw"] / 1000.0
 
 avg_settle = bess_view["settle_eur_mw"].mean() / 1000
 tone_dass = "pos" if avg_settle >= 0 else "neg"
@@ -639,29 +755,30 @@ kpi(k4, "Avg market TB4 spread", f"{bess_view['tb4'].mean():.1f}", "€/MWh",
 st.markdown("")
 tt_dass = [alt.Tooltip("period:N", title="Period"),
            alt.Tooltip("rev_eur_mw:Q", title="BESS revenue €/MW", format=",.0f"),
+           alt.Tooltip("strike_eur_mw:Q", title="DASS strike €/MW", format=",.0f"),
            alt.Tooltip("settle_keur_mw:Q", title="Settlement k€/MW", format="+.1f"),
            alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f"),
            alt.Tooltip("tb4:Q", title="TB4 spread €/MWh", format=".1f")]
 
-if granularity == "Annual":
-    ch = settlement_chart(bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
-                          None, "Buyer receives", "Buyer pays", GREEN, RED,
-                          "Annual", "DASS settlement vs market TB4 spread (dashed)",
-                          tb4_line=True, tooltips=tt_dass)
-else:
-    ch = settlement_chart(bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
-                          "tb4_lbl", "Buyer receives", "Buyer pays", GREEN, RED,
-                          "Monthly", "DASS settlement — market TB4 spread (€/MWh) on each bar",
-                          tooltips=tt_dass)
-st.altair_chart(style_chart(ch), use_container_width=True)
+st.altair_chart(style_chart(market_vs_contract_chart(
+    bess_view, "rev_keur_mw", "strike_keur_mw", "k€/MW",
+    "BESS market revenue vs DASS strike",
+    "BESS revenue", "DASS strike", granularity, tooltips=tt_dass)),
+    use_container_width=True)
 
 st.altair_chart(style_chart(settlement_chart(
-    bess_view, "settle_eur", "Settlement to buyer (€)", None,
+    bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
+    "Buyer receives", "Buyer pays", GREEN, RED, granularity,
+    "DASS settlement — positive means payment to swap buyer",
+    tooltips=tt_dass)), use_container_width=True)
+
+st.altair_chart(style_chart(settlement_chart(
+    bess_view, "settle_eur", "Settlement to buyer (€)",
     "Buyer receives", "Buyer pays", GREEN, RED, granularity,
     f"DASS settlement in € — {dass_mw:.0f} MW contracted",
     tooltips=[alt.Tooltip("period:N"),
               alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")],
-    height=240)), use_container_width=True)
+    height=260)), use_container_width=True)
 
 with st.expander("DASS settlement table"):
     st.dataframe(
@@ -681,25 +798,22 @@ with st.expander("ℹ️ Where every number comes from (data lineage & reconcili
     st.markdown(
         f"""
 - **Single data source**: `data/PV___BESS_settlement_app.xlsx` — hourly day-ahead price
-  (2021 – Jun 2026 OMIE outturn; 2027 – 2040 Aurora **nominal**) and hourly solar profile.
-  On first run the workbook is converted to a parquet cache next to it, so subsequent
-  loads are near-instant.
-- **Captured price** = solar-weighted average of hourly prices, computed from the hourly
-  columns. **Monthly** figures match the workbook's monthly capture columns exactly.
-  **Annual** figures match the workbook's annual capture columns exactly, because monthly
-  PPA volumes follow each year's **actual solar profile** (not a fixed average
-  distribution). With *Settle at 0/negative* **ON** you reproduce the *Uncurtailed*
-  columns; **OFF** the *Curtailed* ones (hours ≤ 0 €/MWh are removed from price and
-  settled volume) — comparing against the other column will always show a gap.
-- **BESS revenue & TB4** are computed here from the hourly prices (the workbook's own
-  BESS/TB4 summary columns are empty). Revenue = one optimal cycle/day buying
+  (2021 – Jun 2026 OMIE outturn; 2027 – 2040 Aurora **nominal**), hourly solar profile,
+  and workbook summary tables.
+- **Aurora/workbook curve selected**: the app reads the workbook's monthly / annual
+  summary figures directly: uncurtailed or curtailed solar captured price, BESS revenue
+  and TB4. The settlement is then calculated from those figures and from the contract
+  inputs selected in the app.
+- **User-uploaded curve selected**: the app recomputes captured price and BESS revenue
+  from the uploaded hourly prices. BESS revenue = one optimal cycle/day buying
   {E_CHARGE_GRID:.2f} MWh in the cheapest hours and selling {E_DISCHARGE:.2f} MWh in the
-  most expensive (η = 0.925/0.925 → RTE ≈ 0.856, undegraded).
-  **TB4** = daily *(mean of 4 highest − mean of 4 lowest)* prices, averaged per period.
-  The strike-to-spread conversion is an approximation: strike ÷ (365 × 4 h × 1 c/d ×
-  0.856 RTE), since the RTE split between charge and discharge is not defined.
+  most expensive (η = 0.925/0.925 → RTE ≈ 0.856, undegraded). **TB4** = daily mean of
+  4 highest prices − mean of 4 lowest prices, averaged per period.
+- **PPA Floor + Discount**: discount is in **€/MWh**. Contract price = max(floor,
+  captured price − discount).
 - **Sign convention**: positive = payment **to the offtaker / swap buyer**.
-  2026 figures are year-to-date (data through June). Values indicative, pre-fees.
+  2026 figures are year-to-date where the workbook only contains data through June.
+  Values indicative, pre-fees.
 """
     )
 
