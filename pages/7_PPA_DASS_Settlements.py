@@ -162,7 +162,37 @@ st.markdown(
         letter-spacing: .08em;
         white-space: nowrap;
     }}
+    }}
 
+    .nx-module-wrap {
+        padding: 18px 20px 22px 20px;
+        border-radius: 24px;
+        margin: 28px 0 34px 0;
+        box-shadow: 0 10px 24px rgba(18,51,42,.06);
+    }
+    .nx-module-wrap.solar {
+        background: linear-gradient(180deg, #fff8df 0%, #fffdf5 100%);
+        border: 1px solid #efd98f;
+    }
+    .nx-module-wrap.dass {
+        background: linear-gradient(180deg, #eef9f2 0%, #fbfffc 100%);
+        border: 1px solid #bfe0cb;
+    }
+    .nx-section-card-note {
+        margin: 0 0 8px 0;
+        padding: 10px 14px;
+        border-radius: 12px;
+        font-size: .87rem;
+        font-weight: 650;
+        color: #7d6415;
+        background: rgba(255, 238, 174, .45);
+        border: 1px solid #edd489;
+    }
+    .nx-section-card-note.dass {
+        color: #16653f;
+        background: rgba(183, 235, 199, .38);
+        border-color: #bfe0cb;
+    }
 
 
     @media print {{
@@ -262,6 +292,15 @@ def module_banner(title: str, subtitle: str, tag: str, kind: str = ""):
         <div class="nx-module-tag">{tag}</div></div>""",
         unsafe_allow_html=True,
     )
+
+
+def start_module_wrap(kind: str = "solar"):
+    cls = "nx-module-wrap dass" if kind == "dass" else "nx-module-wrap solar"
+    st.markdown(f"<div class='{cls}'>", unsafe_allow_html=True)
+
+
+def end_module_wrap():
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def chart_heading(title: str, subtitle: str = "", kind: str = ""):
@@ -678,6 +717,7 @@ for _df in [cap_m, bess_m]:
 # ======================================================================
 # 1) SOLAR PV PPA
 # ======================================================================
+start_module_wrap("solar")
 module_banner("Solar hedge module", "Solar PPA settlement view — captured price, strike / floor and cash settlement.", "Solar PV PPA")
 st.markdown("<div class='nx-section-card-note'>Solar section · all charts and KPIs below refer to the selected Solar PPA configuration.</div>", unsafe_allow_html=True)
 section("Solar PV PPA", GREEN,
@@ -809,9 +849,12 @@ with st.expander("PPA settlement table"):
         "neg_hours_gen_share": "% gen in ≤0€ h"}).round(2),
         use_container_width=True, hide_index=True)
 
+end_module_wrap()
+
 # ======================================================================
 # 2) BESS DASS
 # ======================================================================
+start_module_wrap("dass")
 module_banner("Battery spread swap module", "Day-ahead BESS revenue versus DASS strike and resulting settlement.", "BESS DASS", "dass")
 st.markdown("<div class='nx-section-card-note dass'>BESS section · all charts and KPIs below refer to the selected DASS configuration.</div>", unsafe_allow_html=True)
 section("BESS Day-Ahead Spread Swap (DASS)", DASS_GREEN,
@@ -929,6 +972,8 @@ with st.expander("DASS settlement table"):
                          "settle_eur": "Settlement €",
                          "tb4": "TB4 spread €/MWh"}).round(1),
         use_container_width=True, hide_index=True)
+
+end_module_wrap()
 
 # ---------------------------------------------------------------------------
 # Methodology / data lineage
