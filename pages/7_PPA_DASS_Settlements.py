@@ -16,6 +16,10 @@ Data lineage (single source of truth = data/PV___BESS_settlement_app.xlsx):
 
 from __future__ import annotations
 
+import os
+import smtplib
+import urllib.parse
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 
@@ -319,8 +323,10 @@ def parse_uploaded_curve(uploaded) -> pd.DataFrame | None:
 
 def curve_template_bytes() -> bytes:
     idx = pd.date_range("2027-01-01 00:00", "2027-12-31 23:00", freq="h")
+    tmpl = pd.DataFrame({"Datetime (hourly)": idx, "Price (€/MWh)": np.nan})
     buf = BytesIO()
-    pd.DataFrame({"datetime": idx, "price_eur_mwh": 60.0}).to_csv(buf, index=False)
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        tmpl.to_excel(xw, index=False, sheet_name="forward_curve")
     return buf.getvalue()
 
 
@@ -353,8 +359,8 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str, label_col: str | 
                 text=alt.Text(f"{label_col}:N")))
         chart = alt.layer(*layers)
         if tb4_line:
-            line = alt.Chart(df).mark_line(point={"filled": True, "size": 50},
-                                           color=ORANGE, strokeDash=[5, 3]).encode(
+            line = alt.Chart(df).mark_line(point={"filled": True, "size": 110},
+                                           color=ORANGE, strokeWidth=3, strokeDash=[6, 3]).encode(
                 x=alt.X("period:N", sort=None),
                 y=alt.Y("tb4:Q", title="Market TB4 spread (€/MWh)"),
                 tooltip=[alt.Tooltip("period:N"),
@@ -373,8 +379,10 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str, label_col: str | 
         y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
     layers = [bars, zero]
     if label_col:
-        layers.append(base.mark_text(dy=-7, fontSize=8.5, color=MUTED, angle=270,
-                                     align="left").encode(
+        lbl_kw = dict(dy=-8, fontSize=11, fontWeight="bold", color=ORANGE, angle=270,
+                      align="left") if label_col == "tb4_lbl" else \
+                 dict(dy=-7, fontSize=9, color=MUTED, angle=270, align="left")
+        layers.append(base.mark_text(**lbl_kw).encode(
             x=alt.X("mon:N", sort=list(MONTH_LBL.values())),
             y=alt.Y(f"{ycol}:Q"), text=alt.Text(f"{label_col}:N")))
     return (alt.layer(*layers)
@@ -429,8 +437,10 @@ if curve_source.startswith("Upload"):
         if up is not None:
             uploaded_curve = parse_uploaded_curve(up)
     with up_col2:
-        st.download_button("⬇️ Template (CSV)", data=curve_template_bytes(),
-                           file_name="forward_curve_template.csv", mime="text/csv")
+        st.download_button(
+            "⬇️ Template (XLSX)", data=curve_template_bytes(),
+            file_name="forward_curve_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if uploaded_curve is not None and not uploaded_curve.empty:
     fwd_years = sorted(uploaded_curve["year"].unique())
@@ -472,7 +482,7 @@ with st.container(border=True):
         ppa_volume_gwh = st.number_input("PPA volume (GWh/yr)", 1.0, 5000.0, 100.0, 10.0)
     with c2:
         if ppa_type == "Fixed for floating":
-            strike = st.slider("PPA strike price (€/MWh)", 0.0, 150.0, 45.0, 0.5)
+            strike = st.slider("PPA strike price (€/MWh)", 0.0, 150.0, 30.0, 0.5)
             floor, discount = 0.0, 0.0
         else:
             strike = 0.0
@@ -560,17 +570,18 @@ with st.expander("PPA settlement table"):
 # 2) BESS DASS
 # ======================================================================
 section("BESS Day-Ahead Spread Swap (DASS)", PURPLE,
-        "Settlement to the buyer = realised TB4 arbitrage revenue − fixed strike. "
-        "The orange figures show the market TB4 spread (€/MWh) OMIE must print for the "
-        "BESS to earn that revenue.",
-        "🔋 Buyer receives when purple", "dass")
+        "Settled as a CfD on BESS market revenues: monthly settlement = realised "
+        "day-ahead revenue per MW − strike prorated by the days of the month over 365; "
+        "annual settlement = realised annual revenue − full strike (e.g. 70 k€/MW·yr). "
+        "Orange figures = the market TB4 spread (€/MWh) behind those revenues.",
+        "🔋 Buyer receives when green", "dass")
 
 with st.container(border=True):
     d1, d2, d3 = st.columns([1.4, 1.0, 1.4])
     with d1:
         dass_strike = st.slider("DASS strike (k€/MW·yr)", 0.0, 200.0, 70.0, 0.5)
     with d2:
-        dass_mw = st.number_input("Contracted BESS capacity (MW)", 0.5, 1000.0, 10.0, 0.5)
+        dass_mw = st.number_input("Contracted BESS capacity (MW)", 0.5, 1000.0, 1.0, 0.5)
     with d3:
         eq_spread = dass_strike * 1000 / (365 * BESS_CAPACITY_MWH * RTE)
         st.markdown(
@@ -579,6 +590,15 @@ with st.container(border=True):
             f"(strike ÷ 365 d × 4 h × 1 c/d × 0.856 RTE — approximation, as RTE "
             f"allocation between charge and discharge is not defined).</div>",
             unsafe_allow_html=True)
+
+st.markdown(
+    f"""<div style="background:{PURPLE_SOFT};border:1px solid #ddd8f5;border-radius:12px;
+    padding:10px 16px;margin:6px 0 4px 0;color:{PURPLE};font-size:.85rem;font-weight:600;">
+    ⚙️ BESS assumptions &nbsp;·&nbsp; 1 MW / 4 MWh &nbsp;·&nbsp; max 1 cycle/day
+    &nbsp;·&nbsp; η<sub>ch</sub> = η<sub>dis</sub> = 0.925 → RTE ≈ 0.856 &nbsp;·&nbsp;
+    charges {E_CHARGE_GRID:.2f} MWh / discharges {E_DISCHARGE:.2f} MWh per cycle
+    &nbsp;·&nbsp; undegraded &nbsp;·&nbsp; forward prices nominal</div>""",
+    unsafe_allow_html=True)
 
 bess = bess_m.copy()
 ndays = bess_day.groupby(["year", "month"])["day"].nunique().reset_index(name="ndays")
@@ -625,19 +645,19 @@ tt_dass = [alt.Tooltip("period:N", title="Period"),
 
 if granularity == "Annual":
     ch = settlement_chart(bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
-                          None, "Buyer receives", "Buyer pays", PURPLE, RED,
+                          None, "Buyer receives", "Buyer pays", GREEN, RED,
                           "Annual", "DASS settlement vs market TB4 spread (dashed)",
                           tb4_line=True, tooltips=tt_dass)
 else:
     ch = settlement_chart(bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
-                          "tb4_lbl", "Buyer receives", "Buyer pays", PURPLE, RED,
+                          "tb4_lbl", "Buyer receives", "Buyer pays", GREEN, RED,
                           "Monthly", "DASS settlement — market TB4 spread (€/MWh) on each bar",
                           tooltips=tt_dass)
 st.altair_chart(style_chart(ch), use_container_width=True)
 
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_eur", "Settlement to buyer (€)", None,
-    "Buyer receives", "Buyer pays", PURPLE, RED, granularity,
+    "Buyer receives", "Buyer pays", GREEN, RED, granularity,
     f"DASS settlement in € — {dass_mw:.0f} MW contracted",
     tooltips=[alt.Tooltip("period:N"),
               alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")],
@@ -682,3 +702,95 @@ with st.expander("ℹ️ Where every number comes from (data lineage & reconcili
   2026 figures are year-to-date (data through June). Values indicative, pre-fees.
 """
     )
+
+# ---------------------------------------------------------------------------
+# Contact — questions about the settlements go to Nexwell Power
+# ---------------------------------------------------------------------------
+CONTACT_TO = "mmoreno@nexwellpower.com"
+
+
+def _smtp_config() -> dict | None:
+    """SMTP credentials from st.secrets['smtp'] or environment variables
+    (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD). Returns None if absent."""
+    cfg = {}
+    try:
+        cfg = dict(st.secrets.get("smtp", {}))
+    except Exception:  # noqa: BLE001 - no secrets file
+        cfg = {}
+    host = cfg.get("host") or os.getenv("SMTP_HOST")
+    if not host:
+        return None
+    return {
+        "host": host,
+        "port": int(cfg.get("port") or os.getenv("SMTP_PORT", 587)),
+        "user": cfg.get("user") or os.getenv("SMTP_USER"),
+        "password": cfg.get("password") or os.getenv("SMTP_PASSWORD"),
+    }
+
+
+def send_contact_email(sender: str, message: str) -> bool:
+    cfg = _smtp_config()
+    if cfg is None:
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = f"[PPA & DASS Settlements] Question from {sender}"
+    msg["From"] = cfg["user"] or sender
+    msg["To"] = CONTACT_TO
+    msg["Reply-To"] = sender
+    msg.set_content(
+        f"Question submitted from the PPA & DASS Settlements app\n"
+        f"From: {sender}\n\n{message}"
+    )
+    with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as server:
+        server.starttls()
+        if cfg["user"] and cfg["password"]:
+            server.login(cfg["user"], cfg["password"])
+        server.send_message(msg)
+    return True
+
+
+section("Questions about these settlements?", ORANGE,
+        "Leave your e-mail and your question — it goes straight to the Nexwell Power "
+        "origination desk.", "✉️ We reply within 1 business day")
+
+with st.container(border=True):
+    with st.form("contact_form", clear_on_submit=False):
+        f1, f2 = st.columns([1, 2])
+        with f1:
+            user_email = st.text_input("Your e-mail", placeholder="name@company.com")
+        with f2:
+            user_msg = st.text_area(
+                "Your question",
+                placeholder="e.g. Could you price a 10-year DASS on 20 MW starting 2027?",
+                height=90)
+        sent = st.form_submit_button("Send to Nexwell Power ➜", type="primary",
+                                     use_container_width=True)
+
+    if sent:
+        if "@" not in user_email or "." not in user_email.split("@")[-1]:
+            st.error("Please enter a valid e-mail address.")
+        elif not user_msg.strip():
+            st.error("Please write your question.")
+        else:
+            ok = False
+            try:
+                ok = send_contact_email(user_email.strip(), user_msg.strip())
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"Direct send failed ({exc}).")
+            if ok:
+                st.success(f"✅ Sent! Your question is on its way to {CONTACT_TO}. "
+                           "We will reply to your e-mail shortly.")
+            else:
+                # No SMTP configured on the server → hand off to the user's mail client
+                subject = urllib.parse.quote(
+                    f"[PPA & DASS Settlements] Question from {user_email.strip()}")
+                body = urllib.parse.quote(
+                    f"From: {user_email.strip()}\n\n{user_msg.strip()}")
+                st.info("Direct sending is not configured on this server — click below "
+                        "to send it from your own mail client (message pre-filled).")
+                st.markdown(
+                    f"<a href='mailto:{CONTACT_TO}?subject={subject}&body={body}' "
+                    f"target='_blank' style='display:inline-block;background:{GREEN_DARK};"
+                    f"color:#fff;font-weight:700;padding:10px 22px;border-radius:10px;"
+                    f"text-decoration:none;'>📨 Open e-mail to {CONTACT_TO}</a>",
+                    unsafe_allow_html=True)
