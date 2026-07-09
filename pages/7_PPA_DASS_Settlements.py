@@ -643,8 +643,30 @@ def _x_encoding(granularity: str):
     if granularity == "Annual":
         return alt.X("period:N", title=None, sort=None, axis=alt.Axis(labelAngle=0))
     return alt.X("date:T", title=None,
-                 axis=alt.Axis(format="%b %y", labelAngle=-45, tickCount=28,
-                               labelOverlap=True, labelFontSize=10))
+                 axis=alt.Axis(format="%b", labelAngle=0, tickCount=alt.TimeInterval(month="month", step=1),
+                               labelOverlap=True, labelFontSize=10, labelPadding=8))
+
+
+def _monthly_year_guides(df: pd.DataFrame):
+    years = (df[["year"]].drop_duplicates().sort_values("year").reset_index(drop=True))
+    if years.empty:
+        return None, None, None
+    years["x1"] = pd.to_datetime(dict(year=years["year"], month=1, day=1))
+    years["x2"] = pd.to_datetime(dict(year=years["year"] + 1, month=1, day=1))
+    years["mid"] = years["x1"] + (years["x2"] - years["x1"]) / 2
+    years["shade"] = np.where(years.index % 2 == 0, "A", "B")
+
+    bands = alt.Chart(years).mark_rect(opacity=0.06).encode(
+        x="x1:T", x2="x2:T",
+        color=alt.Color("shade:N", scale=alt.Scale(domain=["A", "B"], range=["#f4f7f6", "#ffffff"]), legend=None)
+    )
+    rules = alt.Chart(years).mark_rule(color="#d5ddd9", strokeDash=[3, 3]).encode(x="x1:T")
+    labels = alt.Chart(years).mark_text(
+        baseline="top", align="center", dy=0, fontSize=10, color=MUTED, fontWeight="bold"
+    ).encode(
+        x="mid:T", y=alt.value(6), text="year:O"
+    )
+    return bands, rules, labels
 
 
 def _bar_label(v: float, suffix: str = "") -> str:
@@ -675,7 +697,11 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
     bars = base.mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5,
                          cornerRadiusBottomLeft=5, cornerRadiusBottomRight=5).encode(
         x=xenc, y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
-    layers = [bars, zero]
+    layers = []
+    if granularity == "Monthly":
+        bands, rules, year_labels = _monthly_year_guides(df)
+        layers.extend([bands, rules, year_labels])
+    layers.extend([bars, zero])
     if show_labels:
         pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
             .mark_text(dy=-8, fontSize=10, fontWeight="bold", color=INK)
@@ -708,7 +734,11 @@ def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: st
         y=alt.Y(f"{contract_col}:Q", title=ytitle),
         tooltip=tt,
     )
-    layers = [bars, line]
+    layers = []
+    if granularity == "Monthly":
+        bands, rules, year_labels = _monthly_year_guides(df)
+        layers.extend([bands, rules, year_labels])
+    layers.extend([bars, line])
     if show_labels:
         bar_labels = base.mark_text(dy=-8, fontSize=10, fontWeight="bold", color=INK).encode(
             x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
@@ -736,16 +766,11 @@ HIST_MAX_YEAR = 2026
 # Global controls
 # ---------------------------------------------------------------------------
 with st.container(border=True):
-    top1, top2, top3, top4 = st.columns([1.0, 1.4, 1.2, 1.6])
+    top1, top2, top4 = st.columns([1.0, 1.4, 1.6])
     with top1:
         granularity = st.radio("View", ["Annual", "Monthly"], horizontal=True)
     with top2:
         year_range = st.slider("Period", 2021, 2040, (2024, 2030))
-    with top3:
-        settle_nonpos = st.toggle(
-            "Settle at 0 / negative prices", value=True,
-            help="ON → use the workbook 'Uncurtailed' capture. OFF → use the workbook "
-                 "'Curtailed' capture, excluding hours priced ≤ 0 €/MWh from settlement.")
     with top4:
         curve_source = st.radio("Forward curve (≥ 2027)",
                                 ["Aurora (workbook)", "Upload my own curve"],
@@ -782,38 +807,32 @@ else:
     st.caption("Using workbook summary figures for captured prices, BESS revenues and TB4. Fast mode: charts are rendered from pre-aggregated monthly/annual tables. "
                "The app only recomputes those values when a user uploads an hourly curve.")
 
-stepbar(["Choose annual or monthly view", "Set tenor and settlement convention", "Review KPIs, charts and export to PDF"])
+stepbar(["Choose annual or monthly view", "Set tenor and forward curve", "Review Solar / DASS charts and export to PDF"])
 
 hourly = hourly[(hourly.year >= year_range[0]) & (hourly.year <= year_range[1])]
 if hourly.empty:
     st.warning("No data in the selected period.")
     st.stop()
 
-capture_col = "capture_uncurtailed" if settle_nonpos else "capture_curtailed"
-helper_m = monthly_capture(hourly, settle_nonpos)[["year", "month", "settled_share",
-                                                   "neg_hours_gen_share", "solar_mwh"]]
+ms = None
 if use_uploaded_curve:
-    cap_m = monthly_capture(hourly, settle_nonpos)
     bess_day = bess_daily_results(hourly)
     bess_m = (bess_day.groupby(["year", "month"])
               .agg(rev_eur_mw=("rev_eur_mw", "sum"), tb4=("tb4", "mean")).reset_index())
-    annual_summary = None
+    annual_summary_bess = None
 else:
     ms = monthly_summary_base[(monthly_summary_base.year >= year_range[0]) &
                               (monthly_summary_base.year <= year_range[1])].copy()
-    cap_m = (ms[["year", "month", capture_col]]
-             .rename(columns={capture_col: "capture"})
-             .merge(helper_m, on=["year", "month"], how="left"))
     bess_m = ms[["year", "month", "rev_eur_mw", "tb4"]].copy()
-    annual_summary = annual_summary_base[(annual_summary_base.year >= year_range[0]) &
-                                         (annual_summary_base.year <= year_range[1])].copy()
+    annual_summary_bess = annual_summary_base[(annual_summary_base.year >= year_range[0]) &
+                                              (annual_summary_base.year <= year_range[1])].copy()
 
 ndays_m = hourly.groupby(["year", "month"])["day"].nunique().reset_index(name="ndays")
 ndays_y = hourly.groupby("year")[["month", "day"]].apply(
     lambda x: x.drop_duplicates().shape[0]).reset_index(name="ndays")
 
 # A real date axis makes Monthly charts responsive and avoids squeezing mini-facets.
-for _df in [cap_m, bess_m]:
+for _df in [bess_m]:
     if _df is not None and not _df.empty:
         _df["date"] = pd.to_datetime(dict(year=_df["year"], month=_df["month"], day=1))
         _df["period"] = _df["year"].astype(str) + "-" + _df["month"].map(lambda m: f"{m:02d}")
@@ -822,7 +841,7 @@ for _df in [cap_m, bess_m]:
 # 1) SOLAR PV PPA
 # ======================================================================
 start_module_wrap("solar")
-module_banner("Solar hedge module", "Solar PPA settlement view — captured price, strike / floor and cash settlement.", "Solar PV PPA")
+module_banner("Solar PPA simulation", "Solar PPA settlement view — captured price, strike / floor and cash settlement.", "Solar PV PPA")
 st.markdown("<div class='nx-section-card-note'>Solar section · all charts and KPIs below refer to the selected Solar PPA configuration.</div>", unsafe_allow_html=True)
 section("Solar PV PPA", GREEN,
         "First chart: captured solar price in the market vs the contract price. "
@@ -858,6 +877,23 @@ else:
         price_card("Contracted volume", f"{ppa_volume_gwh:,.0f}", "GWh/yr", "Annual PPA volume shaped by the solar profile."),
     ])
 
+capture_col = "capture_uncurtailed" if settle_nonpos else "capture_curtailed"
+helper_m = monthly_capture(hourly, settle_nonpos)[["year", "month", "settled_share",
+                                                   "neg_hours_gen_share", "solar_mwh"]]
+if use_uploaded_curve:
+    cap_m = monthly_capture(hourly, settle_nonpos)
+    annual_summary_solar = None
+else:
+    cap_m = (ms[["year", "month", capture_col]]
+             .rename(columns={capture_col: "capture"})
+             .merge(helper_m, on=["year", "month"], how="left"))
+    annual_summary_solar = annual_summary_base[(annual_summary_base.year >= year_range[0]) &
+                                               (annual_summary_base.year <= year_range[1])].copy()
+
+if cap_m is not None and not cap_m.empty:
+    cap_m["date"] = pd.to_datetime(dict(year=cap_m["year"], month=cap_m["month"], day=1))
+    cap_m["period"] = cap_m["year"].astype(str) + "-" + cap_m["month"].map(lambda m: f"{m:02d}")
+
 ppa = cap_m.copy()
 ppa["yr_solar"] = ppa.groupby("year")["solar_mwh"].transform("sum")
 ppa["volume_mwh"] = ppa_volume_gwh * 1000.0 * ppa["solar_mwh"] / ppa["yr_solar"].clip(lower=1e-9)
@@ -872,8 +908,8 @@ ppa["settle_eur_mwh"] = ppa["capture"] - ppa["contract_price"]
 ppa["settle_eur"] = ppa["settle_eur_mwh"] * ppa["settled_mwh"]
 
 if granularity == "Annual":
-    if (not use_uploaded_curve) and annual_summary is not None:
-        ppa_view = annual_summary[["year", capture_col]].rename(columns={capture_col: "capture"}).copy()
+    if (not use_uploaded_curve) and annual_summary_solar is not None:
+        ppa_view = annual_summary_solar[["year", capture_col]].rename(columns={capture_col: "capture"}).copy()
         vol_y = ppa.groupby("year").agg(settled_mwh=("settled_mwh", "sum"),
                                         volume_mwh=("volume_mwh", "sum"),
                                         neg_hours_gen_share=("neg_hours_gen_share", "mean")).reset_index()
@@ -926,7 +962,7 @@ kpi(k4, "Generation in ≤0 € hours", f"{100*ppa['neg_hours_gen_share'].mean()
     "Share of solar volume at non-positive prices", "neu")
 
 st.markdown("")
-chart_heading("Strike / floor price vs solar captured price", "Orange line = fixed strike / floor. Green bars = solar captured market price.")
+chart_heading("Strike / floor price vs solar captured price", "Orange line = fixed strike / floor. Green bars = solar captured market price. Monthly charts include year banding so each month is easier to place within its year.")
 tt_ppa = [alt.Tooltip("period:N", title="Period"),
           alt.Tooltip("capture:Q", title="Captured €/MWh", format=".1f"),
           alt.Tooltip("strike_floor_price:Q", title="Strike / floor €/MWh", format=".1f"),
@@ -946,7 +982,7 @@ st.altair_chart(style_chart(settlement_chart(
     "PPA settlement per MWh — positive means payment to offtaker",
     tooltips=tt_ppa)), use_container_width=True)
 
-chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume.")
+chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume. Monthly charts include year banding for readability.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur", "Settlement to offtaker (€)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
@@ -1016,8 +1052,8 @@ bess["rev_keur_mw"] = bess["rev_eur_mw"] / 1000.0
 bess["strike_keur_mw"] = bess["strike_eur_mw"] / 1000.0
 
 if granularity == "Annual":
-    if (not use_uploaded_curve) and annual_summary is not None:
-        bess_view = annual_summary[["year", "rev_eur_mw", "tb4"]].copy()
+    if (not use_uploaded_curve) and annual_summary_solar is not None:
+        bess_view = annual_summary_bess[["year", "rev_eur_mw", "tb4"]].copy()
         bess_view = bess_view.merge(ndays_y, on="year", how="left")
         bess_view["strike_eur_mw"] = dass_strike * 1000.0 * bess_view["ndays"] / 365.0
         bess_view["settle_eur_mw"] = bess_view["rev_eur_mw"] - bess_view["strike_eur_mw"]
