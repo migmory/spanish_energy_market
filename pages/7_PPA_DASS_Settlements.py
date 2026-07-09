@@ -46,7 +46,7 @@ RTE = 0.925 * 0.925  # ~0.856
 st.markdown(
     f"""
     <style>
-    .block-container {{ padding-top: 1.1rem; max-width: 1550px; }}
+    .block-container {{ padding-top: 1.1rem; max-width: 1850px; padding-left: 2.2rem; padding-right: 2.2rem; }}
     html, body, [class*="css"] {{ font-family: "Inter","Segoe UI",system-ui,sans-serif; }}
 
     .nx-hero {{
@@ -162,6 +162,37 @@ st.markdown(
         letter-spacing: .08em;
         white-space: nowrap;
     }}
+
+
+    .nx-section-card-note {
+        margin: 0 0 16px 0;
+        padding: 12px 16px;
+        border-radius: 14px;
+        background: rgba(230,244,238,.65);
+        border: 1px solid #cfe8dc;
+        color: #12332a;
+        font-weight: 750;
+    }
+    .nx-section-card-note.dass {
+        background: rgba(227,246,236,.72);
+        border-color: #c8ecd7;
+    }
+    .nx-chart-title {
+        margin-top: 26px !important;
+    }
+    .nx-print-card {
+        margin-top: 34px;
+        padding: 18px 22px;
+        border: 1px solid #cfe8dc;
+        border-radius: 18px;
+        background: linear-gradient(120deg, #f7fcfa 0%, #e6f4ee 100%);
+        display:flex; justify-content:space-between; align-items:center; gap:18px;
+        box-shadow: 0 3px 14px rgba(18,51,42,.06);
+    }
+    .nx-print-title { font-size: 1.25rem; font-weight: 850; color:#12332a; }
+    .nx-print-subtitle { font-size:.9rem; color:#6b7f78; margin-top:4px; }
+    .nx-print-seal { border:2px solid #0f6b47; color:#0f6b47; border-radius:999px; padding:10px 18px; font-size:.82rem; font-weight:900; letter-spacing:.08em; white-space:nowrap; }
+
     @media print {{
         @page {{ size: A4 landscape; margin: 8mm; }}
         .stApp {{ background: white !important; }}
@@ -193,7 +224,7 @@ st.markdown(
 st.markdown(
     """
     <div class="nx-hero">
-      <span class="nx-pill">Offtaker view · settlements payable to the buyer · FINAL v2024-2030 PDF</span>
+      <span class="nx-pill">Offtaker view · settlements payable to the buyer · FINAL v2024-2030 PDF · WIDE VISUAL</span>
       <h1>🛡️ PPA &amp; DASS Settlements</h1>
       <p>What the hedge would have paid you — and what it is expected to pay.
       Historical settlements 2021 – Jun 2026 on OMIE outturn, forward 2027 – 2040 on the
@@ -498,7 +529,9 @@ def curve_template_bytes() -> bytes:
 def _x_encoding(granularity: str):
     if granularity == "Annual":
         return alt.X("period:N", title=None, sort=None, axis=alt.Axis(labelAngle=0))
-    return alt.X("date:T", title=None, axis=alt.Axis(format="%b %y", labelAngle=-45, tickCount="month"))
+    return alt.X("date:T", title=None,
+                 axis=alt.Axis(format="%b %y", labelAngle=-45, tickCount=28,
+                               labelOverlap=True, labelFontSize=10))
 
 
 def _bar_label(v: float, suffix: str = "") -> str:
@@ -515,11 +548,11 @@ def _bar_label(v: float, suffix: str = "") -> str:
 def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
                      pos_lbl: str, neg_lbl: str, pos_c: str, neg_c: str,
                      granularity: str, title: str, tooltips: list | None = None,
-                     height: int = 320, label_suffix: str = ""):
+                     height: int = 370, label_suffix: str = ""):
     df = df.copy()
     df["sign"] = np.where(df[ycol] >= 0, pos_lbl, neg_lbl)
     df["bar_lbl"] = df[ycol].map(lambda v: _bar_label(v, label_suffix))
-    show_labels = (granularity == "Annual") or (len(df) <= 48)
+    show_labels = (granularity == "Annual") or (len(df) <= 96)
     color = alt.Color("sign:N", scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
                       legend=alt.Legend(title=None, orient="top"))
     tt = tooltips or []
@@ -532,10 +565,10 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
     layers = [bars, zero]
     if show_labels:
         pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
-            .mark_text(dy=-8, fontSize=12, fontWeight="bold", color=INK)
+            .mark_text(dy=-8, fontSize=10, fontWeight="bold", color=INK)
             .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
         neg_labels = (base.transform_filter(f"datum.{ycol} < 0")
-            .mark_text(dy=12, fontSize=12, fontWeight="bold", color=INK)
+            .mark_text(dy=12, fontSize=10, fontWeight="bold", color=INK)
             .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
         layers.extend([pos_labels, neg_labels])
     return alt.layer(*layers).properties(
@@ -544,10 +577,10 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
 def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: str,
                              ytitle: str, title: str, market_name: str,
                              contract_name: str, granularity: str,
-                             tooltips: list | None = None, height: int = 340):
+                             tooltips: list | None = None, height: int = 390):
     df = df.copy()
     df["market_lbl"] = df[market_col].map(lambda v: "" if pd.isna(v) else f"{v:.0f}")
-    show_labels = (granularity == "Annual") or (len(df) <= 72)
+    show_labels = (granularity == "Annual") or (len(df) <= 96)
     xenc = _x_encoding(granularity)
     tt = tooltips or []
     base = alt.Chart(df)
@@ -564,7 +597,7 @@ def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: st
     )
     layers = [bars, line]
     if show_labels:
-        bar_labels = base.mark_text(dy=-8, fontSize=12, fontWeight="bold", color=INK).encode(
+        bar_labels = base.mark_text(dy=-8, fontSize=10, fontWeight="bold", color=INK).encode(
             x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
         layers.append(bar_labels)
     return alt.layer(*layers).properties(
@@ -674,6 +707,7 @@ for _df in [cap_m, bess_m]:
 # 1) SOLAR PV PPA
 # ======================================================================
 module_banner("Solar hedge module", "Solar PPA settlement view — captured price, strike / floor and cash settlement.", "Solar PV PPA")
+st.markdown("<div class='nx-section-card-note'>Solar section · all charts and KPIs below refer to the selected Solar PPA configuration.</div>", unsafe_allow_html=True)
 section("Solar PV PPA", GREEN,
         "First chart: captured solar price in the market vs the contract price. "
         "Second chart: settlement to the offtaker under the selected convention.",
@@ -776,7 +810,7 @@ st.altair_chart(style_chart(market_vs_contract_chart(
     "solar captured price", "strike / floor", granularity, tooltips=tt_ppa)),
     use_container_width=True)
 
-chart_heading("Settlement in €/MWh", "Positive values = payment to the offtaker; negative values = payment by the offtaker.")
+chart_heading("Settlement in €/MWh", "Positive values = payment to the offtaker; negative values = payment by the offtaker. Labels remain visible in black for the default monthly tenor.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur_mwh", "Settlement to offtaker (€/MWh)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
@@ -790,7 +824,7 @@ st.altair_chart(style_chart(settlement_chart(
     f"PPA settlement in € — {ppa_volume_gwh:,.0f} GWh/yr shaped on solar profile",
     tooltips=[alt.Tooltip("period:N"),
               alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")],
-    height=260)), use_container_width=True)
+    height=320)), use_container_width=True)
 
 with st.expander("PPA settlement table"):
     tbl = (ppa if granularity == "Monthly" else ppa_view)
@@ -807,6 +841,7 @@ with st.expander("PPA settlement table"):
 # 2) BESS DASS
 # ======================================================================
 module_banner("Battery spread swap module", "Day-ahead BESS revenue versus DASS strike and resulting settlement.", "BESS DASS", "dass")
+st.markdown("<div class='nx-section-card-note dass'>BESS section · all charts and KPIs below refer to the selected DASS configuration.</div>", unsafe_allow_html=True)
 section("BESS Day-Ahead Spread Swap (DASS)", DASS_GREEN,
         "First chart: realised / forecast BESS market revenue vs the DASS strike. "
         "Second chart: the settlement after netting market revenue against the strike.",
@@ -910,7 +945,7 @@ st.altair_chart(style_chart(settlement_chart(
     f"DASS settlement in € — {dass_mw:.0f} MW contracted",
     tooltips=[alt.Tooltip("period:N"),
               alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")],
-    height=260)), use_container_width=True)
+    height=320)), use_container_width=True)
 
 with st.expander("DASS settlement table"):
     st.dataframe(
