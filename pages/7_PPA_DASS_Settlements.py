@@ -423,44 +423,22 @@ def style_chart(ch):
 # ---------------------------------------------------------------------------
 # Fast data loading: xlsx -> parquet disk cache
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Loading dataset…")
-def load_dataset(path_str: str, mtime: float) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame]:
+@st.cache_data(show_spinner="Loading workbook summary…")
+def load_summary_dataset(path_str: str, mtime: float) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    """Fast path: read only workbook summary columns.
+
+    This intentionally does NOT parse the hourly price/generation block. The normal
+    Aurora workbook view only needs the already summarised monthly/annual values.
+    Hourly data is loaded lazily only when a user uploads a custom forward curve.
+    """
     path = Path(path_str)
-    pq = path.with_suffix(".parquet")
-    sh = path.with_name(path.stem + "_shares.parquet")
-
-    hourly_from_cache = pq.exists() and sh.exists() and pq.stat().st_mtime >= mtime
-    if hourly_from_cache:
-        hourly = pd.read_parquet(pq)
-        shares = pd.read_parquet(sh)["share"]
-        shares.index = range(1, 13)
-    else:
-        hourly_recs = []
-        shares = None
-
     monthly_recs: list[dict] = []
     annual_recs: list[dict] = []
     share_vals: list[float] = []
 
-    # One fast read-only pass over the workbook. This avoids expensive repeated
-    # read_excel calls on a large hourly file.
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
     for row in ws.iter_rows(min_row=2, max_col=26, values_only=True):
-        if not hourly_from_cache:
-            # A:F = Date, Year, Month, Hour, Price, Solar
-            if row[1] is not None and row[4] is not None:
-                dt = pd.to_datetime(row[0], errors="coerce")
-                if pd.notna(dt):
-                    hourly_recs.append({
-                        "year": int(row[1]),
-                        "month": int(row[2]),
-                        "day": int(dt.day),
-                        "hour": int(row[3]),
-                        "price": float(row[4]),
-                        "solar": 0.0 if row[5] is None else float(row[5]),
-                    })
-
         # N:S = Year, Month, Uncurtailed capture, Curtailed capture, BESS revenue, TB4
         if row[13] is not None and row[14] is not None:
             monthly_recs.append({
@@ -482,7 +460,7 @@ def load_dataset(path_str: str, mtime: float) -> tuple[pd.DataFrame, pd.Series, 
                 "tb4": pd.to_numeric(row[24], errors="coerce"),
             })
 
-        # Z = Monthly share distribution (%)
+        # Z = monthly solar shape / volume distribution. If absent, equal months.
         if row[25] is not None and len(share_vals) < 12:
             try:
                 share_vals.append(float(row[25]))
@@ -490,26 +468,78 @@ def load_dataset(path_str: str, mtime: float) -> tuple[pd.DataFrame, pd.Series, 
                 pass
     wb.close()
 
-    if not hourly_from_cache:
-        hourly = pd.DataFrame(hourly_recs)
-        if not hourly.empty:
-            hourly[["year", "month", "day", "hour"]] = hourly[["year", "month", "day", "hour"]].astype(int)
-            hourly[["price", "solar"]] = hourly[["price", "solar"]].astype(float)
-        if share_vals:
-            shares = pd.Series(np.array(share_vals[:12]) / np.sum(share_vals[:12]),
-                               index=range(1, 13), name="share")
-        else:
-            shares = hourly.groupby("month")["solar"].sum()
-            shares = shares / shares.sum()
-        try:
-            hourly.to_parquet(pq, index=False)
-            shares.rename("share").to_frame().to_parquet(sh)
-        except Exception:
-            pass
-
     monthly = pd.DataFrame(monthly_recs).dropna(subset=["year", "month"])
     annual = pd.DataFrame(annual_recs).dropna(subset=["year"])
-    return hourly, shares, monthly, annual
+    if not monthly.empty:
+        monthly[["year", "month"]] = monthly[["year", "month"]].astype(int)
+    if not annual.empty:
+        annual["year"] = annual["year"].astype(int)
+
+    if share_vals and sum(share_vals[:12]) != 0:
+        shares = pd.Series(np.array(share_vals[:12]) / np.sum(share_vals[:12]),
+                           index=range(1, 13), name="share")
+    else:
+        shares = pd.Series(np.ones(12) / 12, index=range(1, 13), name="share")
+    return monthly, annual, shares
+
+
+@st.cache_data(show_spinner="Loading hourly data for custom curve…")
+def load_hourly_dataset(path_str: str, mtime: float) -> pd.DataFrame:
+    """Slow path, used only when a user uploads a custom curve."""
+    path = Path(path_str)
+    pq = path.with_suffix(".parquet")
+    if pq.exists() and pq.stat().st_mtime >= mtime:
+        return pd.read_parquet(pq)
+
+    hourly_recs: list[dict] = []
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
+        if row[1] is not None and row[4] is not None:
+            dt = pd.to_datetime(row[0], errors="coerce")
+            if pd.notna(dt):
+                hourly_recs.append({
+                    "year": int(row[1]),
+                    "month": int(row[2]),
+                    "day": int(dt.day),
+                    "hour": int(row[3]),
+                    "price": float(row[4]),
+                    "solar": 0.0 if row[5] is None else float(row[5]),
+                })
+    wb.close()
+    hourly = pd.DataFrame(hourly_recs)
+    if not hourly.empty:
+        hourly[["year", "month", "day", "hour"]] = hourly[["year", "month", "day", "hour"]].astype(int)
+        hourly[["price", "solar"]] = hourly[["price", "solar"]].astype(float)
+        try:
+            hourly.to_parquet(pq, index=False)
+        except Exception:
+            pass
+    return hourly
+
+
+def add_summary_helpers(df: pd.DataFrame, monthly_shares: pd.Series) -> pd.DataFrame:
+    """Add columns previously rebuilt from hourly data, using summary-table inputs only."""
+    out = df.copy()
+    out["settled_share"] = 1.0
+    out["neg_hours_gen_share"] = np.nan
+    out["solar_mwh"] = out["month"].map(monthly_shares).fillna(1 / 12).astype(float)
+    return out
+
+
+def calendar_days_monthly(year_range: tuple[int, int]) -> pd.DataFrame:
+    dates = pd.date_range(f"{year_range[0]}-01-01", f"{year_range[1]}-12-01", freq="MS")
+    return pd.DataFrame({
+        "year": dates.year.astype(int),
+        "month": dates.month.astype(int),
+        "ndays": dates.days_in_month.astype(int),
+    })
+
+
+def calendar_days_annual(year_range: tuple[int, int]) -> pd.DataFrame:
+    years = np.arange(year_range[0], year_range[1] + 1)
+    return pd.DataFrame({"year": years.astype(int),
+                         "ndays": [366 if pd.Timestamp(int(y), 12, 31).is_leap_year else 365 for y in years]})
 
 
 @st.cache_data(show_spinner=False)
@@ -757,9 +787,8 @@ if data_path is None:
     st.error("Data file `PV___BESS_settlement_app.xlsx` not found in `data/`.")
     st.stop()
 
-hourly_base, monthly_shares, monthly_summary_base, annual_summary_base = load_dataset(
+monthly_summary_base, annual_summary_base, monthly_shares = load_summary_dataset(
     str(data_path), data_path.stat().st_mtime)
-solar_shape = typical_solar_shape(hourly_base)
 HIST_MAX_YEAR = 2026
 
 # ---------------------------------------------------------------------------
@@ -793,43 +822,47 @@ if curve_source.startswith("Upload"):
 use_uploaded_curve = uploaded_curve is not None and not uploaded_curve.empty
 
 if use_uploaded_curve:
+    hourly_base = load_hourly_dataset(str(data_path), data_path.stat().st_mtime)
+    solar_shape = typical_solar_shape(hourly_base)
     fwd_years = sorted(uploaded_curve["year"].unique())
     hist_part = hourly_base[hourly_base["year"] <= HIST_MAX_YEAR].copy()
     fwd = uploaded_curve.merge(solar_shape, on=["month", "hour"], how="left")
     fwd["solar"] = fwd["solar_shape"].fillna(0.0)
     fwd = fwd[["year", "month", "day", "hour", "price", "solar"]]
     hourly = pd.concat([hist_part, fwd], ignore_index=True)
+    hourly = hourly[(hourly.year >= year_range[0]) & (hourly.year <= year_range[1])]
     st.info(f"Using **your uploaded curve** for {fwd_years[0]}–{fwd_years[-1]} "
             f"({len(uploaded_curve):,} hours). Solar capture and BESS dispatch are "
             "recomputed from the uploaded prices.")
 else:
-    hourly = hourly_base
-    st.caption("Using workbook summary figures for captured prices, BESS revenues and TB4. Fast mode: charts are rendered from pre-aggregated monthly/annual tables. "
-               "The app only recomputes those values when a user uploads an hourly curve.")
+    hourly = None
+    st.caption("Fast mode: using only workbook summary tables for captured prices, BESS revenues and TB4. The hourly sheet is not loaded unless a user uploads a curve.")
 
 stepbar(["Choose annual or monthly view", "Set tenor and forward curve", "Review Solar / DASS charts and export to PDF"])
 
-hourly = hourly[(hourly.year >= year_range[0]) & (hourly.year <= year_range[1])]
-if hourly.empty:
-    st.warning("No data in the selected period.")
-    st.stop()
-
 ms = None
 if use_uploaded_curve:
+    if hourly is None or hourly.empty:
+        st.warning("No data in the selected period.")
+        st.stop()
     bess_day = bess_daily_results(hourly)
     bess_m = (bess_day.groupby(["year", "month"])
               .agg(rev_eur_mw=("rev_eur_mw", "sum"), tb4=("tb4", "mean")).reset_index())
     annual_summary_bess = None
+    ndays_m = hourly.groupby(["year", "month"])["day"].nunique().reset_index(name="ndays")
+    ndays_y = hourly.groupby("year")[["month", "day"]].apply(
+        lambda x: x.drop_duplicates().shape[0]).reset_index(name="ndays")
 else:
     ms = monthly_summary_base[(monthly_summary_base.year >= year_range[0]) &
                               (monthly_summary_base.year <= year_range[1])].copy()
+    if ms.empty:
+        st.warning("No summary data in the selected period.")
+        st.stop()
     bess_m = ms[["year", "month", "rev_eur_mw", "tb4"]].copy()
     annual_summary_bess = annual_summary_base[(annual_summary_base.year >= year_range[0]) &
                                               (annual_summary_base.year <= year_range[1])].copy()
-
-ndays_m = hourly.groupby(["year", "month"])["day"].nunique().reset_index(name="ndays")
-ndays_y = hourly.groupby("year")[["month", "day"]].apply(
-    lambda x: x.drop_duplicates().shape[0]).reset_index(name="ndays")
+    ndays_m = calendar_days_monthly(year_range)
+    ndays_y = calendar_days_annual(year_range)
 
 # A real date axis makes Monthly charts responsive and avoids squeezing mini-facets.
 for _df in [bess_m]:
@@ -863,6 +896,9 @@ with st.container(border=True):
             floor = st.slider("Floor (€/MWh)", 0.0, 150.0, 30.0, 0.5)
             discount = st.slider("Discount to market (€/MWh)", 0.0, 80.0, 5.0, 0.5,
                                  help="Contract price = max(floor, captured price − discount).")
+        settle_nonpos = st.toggle(
+            "Settle at 0 / negative prices", value=True,
+            help="ON → use uncurtailed workbook capture. OFF → use curtailed workbook capture and exclude ≤0 €/MWh hours from settlement when hourly data is available.")
 
 if ppa_type == "Fixed for floating":
     price_grid([
@@ -878,15 +914,12 @@ else:
     ])
 
 capture_col = "capture_uncurtailed" if settle_nonpos else "capture_curtailed"
-helper_m = monthly_capture(hourly, settle_nonpos)[["year", "month", "settled_share",
-                                                   "neg_hours_gen_share", "solar_mwh"]]
 if use_uploaded_curve:
     cap_m = monthly_capture(hourly, settle_nonpos)
     annual_summary_solar = None
 else:
-    cap_m = (ms[["year", "month", capture_col]]
-             .rename(columns={capture_col: "capture"})
-             .merge(helper_m, on=["year", "month"], how="left"))
+    cap_m = ms[["year", "month", capture_col]].rename(columns={capture_col: "capture"}).copy()
+    cap_m = add_summary_helpers(cap_m, monthly_shares)
     annual_summary_solar = annual_summary_base[(annual_summary_base.year >= year_range[0]) &
                                                (annual_summary_base.year <= year_range[1])].copy()
 
@@ -958,7 +991,9 @@ kpi(k2, "Cumulative settlement", f"{ppa_view['settle_eur'].sum()/1e6:+.2f}", "M�
     tone_ppa)
 kpi(k3, "Avg captured price", f"{avg_capture:.1f}", "€/MWh",
     "Solar-weighted market price", "neu")
-kpi(k4, "Generation in ≤0 € hours", f"{100*ppa['neg_hours_gen_share'].mean():.1f}", "%",
+neg_share = ppa["neg_hours_gen_share"].dropna()
+neg_share_txt = "n/a" if neg_share.empty else f"{100*neg_share.mean():.1f}"
+kpi(k4, "Generation in ≤0 € hours", neg_share_txt, "%",
     "Share of solar volume at non-positive prices", "neu")
 
 st.markdown("")
@@ -1052,7 +1087,7 @@ bess["rev_keur_mw"] = bess["rev_eur_mw"] / 1000.0
 bess["strike_keur_mw"] = bess["strike_eur_mw"] / 1000.0
 
 if granularity == "Annual":
-    if (not use_uploaded_curve) and annual_summary_solar is not None:
+    if (not use_uploaded_curve) and annual_summary_bess is not None:
         bess_view = annual_summary_bess[["year", "rev_eur_mw", "tb4"]].copy()
         bess_view = bess_view.merge(ndays_y, on="year", how="left")
         bess_view["strike_eur_mw"] = dass_strike * 1000.0 * bess_view["ndays"] / 365.0
