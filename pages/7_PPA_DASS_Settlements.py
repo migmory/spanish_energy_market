@@ -24,6 +24,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import load_workbook
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,94 @@ st.markdown(
     /* slider accent */
     div[data-baseweb="slider"] div[role="slider"] {{ background:{GREEN_DARK}; }}
     div[data-testid="stExpander"] {{ border-radius: 14px; border:1px solid #e5eeea; }}
+
+
+    .nx-module-banner {{
+        margin: 26px 0 14px 0;
+        padding: 18px 22px;
+        border-radius: 18px;
+        border: 1px solid #cfe8dc;
+        background: linear-gradient(120deg, #f7fcfa 0%, #e6f4ee 100%);
+        box-shadow: 0 6px 18px rgba(18,51,42,.07);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+    }}
+    .nx-module-banner.dass {{
+        background: linear-gradient(120deg, #f7fcfa 0%, #e3f6ec 100%);
+        border-color: #c8ecd7;
+    }}
+    .nx-module-title {{ font-size: 1.28rem; font-weight: 900; color: #12332a; letter-spacing: -.01em; }}
+    .nx-module-subtitle {{ margin-top: 3px; color: #6b7f78; font-size: .9rem; }}
+    .nx-module-tag {{
+        padding: 8px 14px;
+        border-radius: 999px;
+        border: 1.5px solid #0f6b47;
+        color: #0f6b47;
+        font-size: .76rem;
+        font-weight: 900;
+        letter-spacing: .07em;
+        white-space: nowrap;
+        text-transform: uppercase;
+    }}
+    .nx-chart-title {{
+        margin: 20px 0 6px 0;
+        padding-left: 10px;
+        border-left: 5px solid #0f6b47;
+        color: #12332a;
+        font-size: 1.02rem;
+        font-weight: 900;
+    }}
+    .nx-chart-title.dass {{ border-left-color: #198754; }}
+    .nx-chart-note {{ color:#6b7f78; font-size:.82rem; margin: -2px 0 8px 15px; }}
+    .nx-print-card {{
+        margin-top: 34px;
+        padding: 18px 22px;
+        border: 1px solid #cfe8dc;
+        border-radius: 18px;
+        background: linear-gradient(120deg, #f7fcfa 0%, #e6f4ee 100%);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 18px;
+        box-shadow: 0 3px 14px rgba(18,51,42,.06);
+    }}
+    .nx-print-title {{ font-size: 1.25rem; font-weight: 850; color: #12332a; }}
+    .nx-print-subtitle {{ font-size: .9rem; color: #6b7f78; margin-top: 4px; }}
+    .nx-print-seal {{
+        border: 2px solid #0f6b47;
+        color: #0f6b47;
+        border-radius: 999px;
+        padding: 10px 18px;
+        font-size: .82rem;
+        font-weight: 900;
+        letter-spacing: .08em;
+        white-space: nowrap;
+    }}
+    @media print {{
+        @page {{ size: A4 landscape; margin: 8mm; }}
+        .stApp {{ background: white !important; }}
+        header, footer, [data-testid="stToolbar"], [data-testid="stSidebar"],
+        [data-testid="stDecoration"], .stDeployButton {{ display: none !important; }}
+        .block-container {{ max-width: 100% !important; padding: 0.3rem 0.5rem !important; }}
+        .nx-hero, .nx-module-banner, .kpi, .nx-print-card {{ break-inside: avoid; box-shadow: none !important; }}
+        button {{ display: none !important; }}
+        .nx-print-card::after {{
+            content: "NEXWELL POWER";
+            position: fixed;
+            right: 12mm;
+            bottom: 8mm;
+            color: rgba(15,107,71,.35);
+            border: 1.5px solid rgba(15,107,71,.35);
+            border-radius: 999px;
+            padding: 6px 14px;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: .1em;
+        }}
+    }}
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -104,7 +193,7 @@ st.markdown(
 st.markdown(
     """
     <div class="nx-hero">
-      <span class="nx-pill">Offtaker view · settlements payable to the buyer</span>
+      <span class="nx-pill">Offtaker view · settlements payable to the buyer · FINAL v2024-2030 PDF</span>
       <h1>🛡️ PPA &amp; DASS Settlements</h1>
       <p>What the hedge would have paid you — and what it is expected to pay.
       Historical settlements 2021 – Jun 2026 on OMIE outturn, forward 2027 – 2040 on the
@@ -159,6 +248,24 @@ def section(title: str, color: str, subtitle: str, badge: str, badge_cls: str = 
         <p class="nx-sub">{subtitle}</p>""",
         unsafe_allow_html=True,
     )
+
+
+def module_banner(title: str, subtitle: str, tag: str, kind: str = ""):
+    cls = "nx-module-banner dass" if kind == "dass" else "nx-module-banner"
+    st.markdown(
+        f"""<div class="{cls}">
+        <div><div class="nx-module-title">{title}</div>
+        <div class="nx-module-subtitle">{subtitle}</div></div>
+        <div class="nx-module-tag">{tag}</div></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def chart_heading(title: str, subtitle: str = "", kind: str = ""):
+    cls = "nx-chart-title dass" if kind == "dass" else "nx-chart-title"
+    st.markdown(f"<div class='{cls}'>{title}</div>", unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f"<div class='nx-chart-note'>{subtitle}</div>", unsafe_allow_html=True)
 
 
 def style_chart(ch):
@@ -411,8 +518,8 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
                      height: int = 320, label_suffix: str = ""):
     df = df.copy()
     df["sign"] = np.where(df[ycol] >= 0, pos_lbl, neg_lbl)
-    df["label_y"] = df[ycol] / 2
     df["bar_lbl"] = df[ycol].map(lambda v: _bar_label(v, label_suffix))
+    show_labels = (granularity == "Annual") or (len(df) <= 48)
     color = alt.Color("sign:N", scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
                       legend=alt.Legend(title=None, orient="top"))
     tt = tooltips or []
@@ -422,12 +529,17 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
     bars = base.mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5,
                          cornerRadiusBottomLeft=5, cornerRadiusBottomRight=5).encode(
         x=xenc, y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
-    labels = base.mark_text(baseline="middle", align="center", fontSize=12,
-                            fontWeight="bold", color="white").encode(
-        x=xenc, y=alt.Y("label_y:Q"), text="bar_lbl:N")
-    return alt.layer(bars, zero, labels).properties(
+    layers = [bars, zero]
+    if show_labels:
+        pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
+            .mark_text(dy=-8, fontSize=12, fontWeight="bold", color=INK)
+            .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
+        neg_labels = (base.transform_filter(f"datum.{ycol} < 0")
+            .mark_text(dy=12, fontSize=12, fontWeight="bold", color=INK)
+            .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
+        layers.extend([pos_labels, neg_labels])
+    return alt.layer(*layers).properties(
         height=height, title=alt.TitleParams(title, anchor="start", fontSize=15, color=INK))
-
 
 def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: str,
                              ytitle: str, title: str, market_name: str,
@@ -435,6 +547,7 @@ def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: st
                              tooltips: list | None = None, height: int = 340):
     df = df.copy()
     df["market_lbl"] = df[market_col].map(lambda v: "" if pd.isna(v) else f"{v:.0f}")
+    show_labels = (granularity == "Annual") or (len(df) <= 72)
     xenc = _x_encoding(granularity)
     tt = tooltips or []
     base = alt.Chart(df)
@@ -444,14 +557,17 @@ def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: st
         color=alt.value(GREEN),
         tooltip=tt,
     )
-    bar_labels = base.mark_text(dy=-8, fontSize=12, fontWeight="bold", color=INK).encode(
-        x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
     line = base.mark_line(point={"filled": True, "size": 70}, strokeWidth=3, color=ORANGE).encode(
         x=xenc,
         y=alt.Y(f"{contract_col}:Q", title=ytitle),
         tooltip=tt,
     )
-    return alt.layer(bars, bar_labels, line).properties(
+    layers = [bars, line]
+    if show_labels:
+        bar_labels = base.mark_text(dy=-8, fontSize=12, fontWeight="bold", color=INK).encode(
+            x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
+        layers.append(bar_labels)
+    return alt.layer(*layers).properties(
         height=height,
         title=alt.TitleParams(f"{title} · bars = {market_name}, line = {contract_name}",
                               anchor="start", fontSize=15, color=INK))
@@ -478,7 +594,7 @@ with st.container(border=True):
     with top1:
         granularity = st.radio("View", ["Annual", "Monthly"], horizontal=True)
     with top2:
-        year_range = st.slider("Period", 2021, 2040, (2021, 2035))
+        year_range = st.slider("Period", 2021, 2040, (2024, 2030))
     with top3:
         settle_nonpos = st.toggle(
             "Settle at 0 / negative prices", value=True,
@@ -557,6 +673,7 @@ for _df in [cap_m, bess_m]:
 # ======================================================================
 # 1) SOLAR PV PPA
 # ======================================================================
+module_banner("Solar hedge module", "Solar PPA settlement view — captured price, strike / floor and cash settlement.", "Solar PV PPA")
 section("Solar PV PPA", GREEN,
         "First chart: captured solar price in the market vs the contract price. "
         "Second chart: settlement to the offtaker under the selected convention.",
@@ -584,8 +701,10 @@ ppa["volume_mwh"] = ppa_volume_gwh * 1000.0 * ppa["solar_mwh"] / ppa["yr_solar"]
 ppa["settled_mwh"] = ppa["volume_mwh"] * ppa["settled_share"].fillna(1.0)
 if ppa_type == "Fixed for floating":
     ppa["contract_price"] = strike
+    ppa["strike_floor_price"] = strike
 else:
     ppa["contract_price"] = np.maximum(floor, ppa["capture"] - discount)
+    ppa["strike_floor_price"] = floor
 ppa["settle_eur_mwh"] = ppa["capture"] - ppa["contract_price"]
 ppa["settle_eur"] = ppa["settle_eur_mwh"] * ppa["settled_mwh"]
 
@@ -598,8 +717,10 @@ if granularity == "Annual":
         ppa_view = ppa_view.merge(vol_y, on="year", how="left")
         if ppa_type == "Fixed for floating":
             ppa_view["contract_price"] = strike
+            ppa_view["strike_floor_price"] = strike
         else:
             ppa_view["contract_price"] = np.maximum(floor, ppa_view["capture"] - discount)
+            ppa_view["strike_floor_price"] = floor
         ppa_view["settle_eur_mwh"] = ppa_view["capture"] - ppa_view["contract_price"]
         ppa_view["settle_eur"] = ppa_view["settle_eur_mwh"] * ppa_view["settled_mwh"].fillna(0)
     else:
@@ -615,11 +736,14 @@ if granularity == "Annual":
             "neg_hours_gen_share": g["neg_hours_gen_share"].mean(),
         }).reset_index()
         ppa_view["settle_eur_mwh"] = ppa_view["settle_eur"] / ppa_view["settled_mwh"].clip(lower=1e-9)
+        ppa_view["strike_floor_price"] = strike if ppa_type == "Fixed for floating" else floor
     ppa_view["period"] = ppa_view["year"].astype(str)
     ppa_view["month"] = 1
 else:
     ppa_view = ppa.copy()
 
+if "strike_floor_price" not in ppa_view.columns:
+    ppa_view["strike_floor_price"] = strike if ppa_type == "Fixed for floating" else floor
 if "date" not in ppa_view.columns:
     ppa_view["date"] = pd.to_datetime(dict(year=ppa_view["year"], month=ppa_view["month"], day=1))
 
@@ -639,23 +763,27 @@ kpi(k4, "Generation in ≤0 € hours", f"{100*ppa['neg_hours_gen_share'].mean()
     "Share of solar volume at non-positive prices", "neu")
 
 st.markdown("")
+chart_heading("Strike / floor price vs solar captured price", "Orange line = fixed strike / floor. Green bars = solar captured market price.")
 tt_ppa = [alt.Tooltip("period:N", title="Period"),
           alt.Tooltip("capture:Q", title="Captured €/MWh", format=".1f"),
-          alt.Tooltip("contract_price:Q", title="Contract €/MWh", format=".1f"),
+          alt.Tooltip("strike_floor_price:Q", title="Strike / floor €/MWh", format=".1f"),
+          alt.Tooltip("contract_price:Q", title="Effective contract €/MWh", format=".1f"),
           alt.Tooltip("settle_eur_mwh:Q", title="Settlement €/MWh", format="+.1f"),
           alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")]
 st.altair_chart(style_chart(market_vs_contract_chart(
-    ppa_view, "capture", "contract_price", "€/MWh",
-    "Solar market captured price vs PPA contract price",
-    "captured price", "contract price", granularity, tooltips=tt_ppa)),
+    ppa_view, "capture", "strike_floor_price", "€/MWh",
+    "Strike / floor price vs solar captured price",
+    "solar captured price", "strike / floor", granularity, tooltips=tt_ppa)),
     use_container_width=True)
 
+chart_heading("Settlement in €/MWh", "Positive values = payment to the offtaker; negative values = payment by the offtaker.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur_mwh", "Settlement to offtaker (€/MWh)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
     "PPA settlement per MWh — positive means payment to offtaker",
     tooltips=tt_ppa)), use_container_width=True)
 
+chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur", "Settlement to offtaker (€)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
@@ -666,10 +794,10 @@ st.altair_chart(style_chart(settlement_chart(
 
 with st.expander("PPA settlement table"):
     tbl = (ppa if granularity == "Monthly" else ppa_view)
-    cols = ["period", "capture", "contract_price", "settle_eur_mwh",
+    cols = ["period", "capture", "strike_floor_price", "contract_price", "settle_eur_mwh",
             "volume_mwh", "settled_mwh", "settle_eur", "neg_hours_gen_share"]
     st.dataframe(tbl[cols].rename(columns={
-        "capture": "Captured €/MWh", "contract_price": "Contract €/MWh",
+        "capture": "Captured €/MWh", "strike_floor_price": "Strike / Floor €/MWh", "contract_price": "Effective Contract €/MWh",
         "settle_eur_mwh": "Settlement €/MWh", "volume_mwh": "Volume MWh",
         "settled_mwh": "Settled MWh", "settle_eur": "Settlement €",
         "neg_hours_gen_share": "% gen in ≤0€ h"}).round(2),
@@ -678,6 +806,7 @@ with st.expander("PPA settlement table"):
 # ======================================================================
 # 2) BESS DASS
 # ======================================================================
+module_banner("Battery spread swap module", "Day-ahead BESS revenue versus DASS strike and resulting settlement.", "BESS DASS", "dass")
 section("BESS Day-Ahead Spread Swap (DASS)", DASS_GREEN,
         "First chart: realised / forecast BESS market revenue vs the DASS strike. "
         "Second chart: the settlement after netting market revenue against the strike.",
@@ -753,6 +882,7 @@ kpi(k4, "Avg market TB4 spread", f"{bess_view['tb4'].mean():.1f}", "€/MWh",
     "Mean of daily top-4 − bottom-4 prices", "neu")
 
 st.markdown("")
+chart_heading("DASS strike vs BESS market revenue", "Green bars = BESS market revenue; orange line = DASS strike.", "dass")
 tt_dass = [alt.Tooltip("period:N", title="Period"),
            alt.Tooltip("rev_eur_mw:Q", title="BESS revenue €/MW", format=",.0f"),
            alt.Tooltip("strike_eur_mw:Q", title="DASS strike €/MW", format=",.0f"),
@@ -766,12 +896,14 @@ st.altair_chart(style_chart(market_vs_contract_chart(
     "BESS revenue", "DASS strike", granularity, tooltips=tt_dass)),
     use_container_width=True)
 
+chart_heading("Settlement in k€/MW", "Positive values = payment to the swap buyer; negative values = payment by the swap buyer.", "dass")
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
     "Buyer receives", "Buyer pays", GREEN, RED, granularity,
     "DASS settlement — positive means payment to swap buyer",
     tooltips=tt_dass)), use_container_width=True)
 
+chart_heading("Settlement in €", "Total cash settlement using the selected contracted BESS MW.", "dass")
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_eur", "Settlement to buyer (€)",
     "Buyer receives", "Buyer pays", GREEN, RED, granularity,
@@ -809,7 +941,7 @@ with st.expander("ℹ️ Where every number comes from (data lineage & reconcili
   {E_CHARGE_GRID:.2f} MWh in the cheapest hours and selling {E_DISCHARGE:.2f} MWh in the
   most expensive (η = 0.925/0.925 → RTE ≈ 0.856, undegraded). **TB4** = daily mean of
   4 highest prices − mean of 4 lowest prices, averaged per period.
-- **PPA Floor + Discount**: discount is in **€/MWh**. Contract price = max(floor,
+- **PPA Floor + Discount**: discount is in **€/MWh**. Orange line = floor. Effective settlement price = max(floor,
   captured price − discount).
 - **Sign convention**: positive = payment **to the offtaker / swap buyer**.
   2026 figures are year-to-date where the workbook only contains data through June.
@@ -820,7 +952,7 @@ with st.expander("ℹ️ Where every number comes from (data lineage & reconcili
 # ---------------------------------------------------------------------------
 # Contact — questions about the settlements go to Nexwell Power
 # ---------------------------------------------------------------------------
-CONTACT_TO = "mmoreno@nexwellpower.com"
+CONTACT_TO = os.getenv("CONTACT_TO", "mmoreno@nexwellpower.com")
 
 
 def _smtp_config() -> dict | None:
@@ -908,3 +1040,43 @@ with st.container(border=True):
                     f"color:#fff;font-weight:700;padding:10px 22px;border-radius:10px;"
                     f"text-decoration:none;'>📨 Open e-mail to {CONTACT_TO}</a>",
                     unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Export / PDF
+# ---------------------------------------------------------------------------
+st.markdown("---")
+st.markdown(
+    """
+    <div class="nx-print-card">
+        <div>
+            <div class="nx-print-title">Export page to PDF</div>
+            <div class="nx-print-subtitle">
+                Print or save the current settlement view as PDF. Recommended format:
+                <b>A4 landscape</b>, margins set to <b>minimum</b>, background graphics enabled.
+            </div>
+        </div>
+        <div class="nx-print-seal">NEXWELL POWER · SETTLEMENT VIEW</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+components.html(
+    """
+    <button onclick="window.parent.print()" style="
+        width: 100%;
+        padding: 14px 18px;
+        border: 0;
+        border-radius: 12px;
+        background: #0f6b47;
+        color: white;
+        font-weight: 800;
+        font-size: 15px;
+        cursor: pointer;
+        margin-top: 10px;
+    ">
+        🖨️ Print / Save current page as PDF
+    </button>
+    """,
+    height=70,
+)
