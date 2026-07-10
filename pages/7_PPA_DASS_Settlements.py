@@ -724,12 +724,12 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
 
     zero = base.mark_rule(color="#adc5bc").encode(y=alt.datum(0))
 
-    # Use the standard sign field + explicit scale. This is Altair-safe and makes
-    # positive bars green and negative bars orange.
-    color = alt.Color(
-        "sign:N",
-        scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
-        legend=alt.Legend(title=None, orient="top", labelFontSize=12),
+    # Explicit conditional colour. This avoids Altair/Streamlit categorical-scale
+    # quirks and guarantees monthly bars are green when positive and orange when negative.
+    bar_colour = alt.condition(
+        f"datum.{ycol} >= 0",
+        alt.value(pos_c),
+        alt.value(neg_c),
     )
 
     if granularity == "Monthly":
@@ -738,12 +738,12 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
             cornerRadiusTopRight=4,
             cornerRadiusBottomLeft=4,
             cornerRadiusBottomRight=4,
-            opacity=0.98,
-            size=9,
+            opacity=1.0,
+            size=10,
         ).encode(
             x=xenc,
             y=alt.Y(f"{ycol}:Q", title=ytitle),
-            color=color,
+            color=bar_colour,
             tooltip=tt,
         )
     else:
@@ -752,16 +752,16 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
             cornerRadiusTopRight=4,
             cornerRadiusBottomLeft=4,
             cornerRadiusBottomRight=4,
-            opacity=0.98,
+            opacity=1.0,
         ).encode(
             x=xenc,
             y=alt.Y(f"{ycol}:Q", title=ytitle),
-            color=color,
+            color=bar_colour,
             tooltip=tt,
         )
 
     # Black labels outside the bars. No stroke params here, to avoid Altair schema issues.
-    label_size = 10 if granularity == "Monthly" else 12
+    label_size = 11 if granularity == "Monthly" else 12
     pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
         .mark_text(dy=-8, fontSize=label_size, fontWeight="bold", color="#000000")
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
@@ -1019,23 +1019,19 @@ if "date" not in ppa_view.columns:
 
 avg_settle_mwh = ppa_view["settle_eur"].sum() / max(ppa_view["settled_mwh"].sum(), 1e-9)
 avg_capture = (ppa_view["capture"] * ppa_view["settled_mwh"].fillna(0)).sum() / max(ppa_view["settled_mwh"].sum(), 1e-9)
+avg_contract = (ppa_view["contract_price"] * ppa_view["settled_mwh"].fillna(0)).sum() / max(ppa_view["settled_mwh"].sum(), 1e-9)
 tone_ppa = "pos" if avg_settle_mwh >= 0 else "neg"
 
 k1, k2, k3, k4 = st.columns(4)
 kpi(k1, "Avg settlement to offtaker", f"{avg_settle_mwh:+.1f}", "€/MWh",
     "Per settled MWh, selected period", tone_ppa)
 kpi(k2, "Cumulative settlement", f"{ppa_view['settle_eur'].sum()/1e6:+.2f}", "M€",
-    f"{ppa_volume_gwh:,.0f} GWh/yr · {'settles ≤0€' if settle_nonpos else 'no settle ≤0€'}",
+    f"{ppa_volume_gwh:,.0f} GWh/yr · selected tenor",
     tone_ppa)
 kpi(k3, "Avg captured price", f"{avg_capture:.1f}", "€/MWh",
     "Solar-weighted market price", "neu")
-neg_share = ppa["neg_hours_gen_share"].dropna()
-if neg_share.empty:
-    kpi(k4, "≤0€ hours settlement", "Included" if settle_nonpos else "Excluded", "",
-        "Whether non-positive price hours are included in settlement.", "neu")
-else:
-    kpi(k4, "Generation in ≤0 € hours", f"{100*neg_share.mean():.1f}", "%",
-        "Share of solar volume at non-positive prices", "neu")
+kpi(k4, "Avg contract price", f"{avg_contract:.1f}", "€/MWh",
+    "Effective PPA price used for settlement", "neu")
 
 st.markdown("")
 chart_heading("Strike / floor price vs solar captured price", "Orange line = fixed strike / floor. Green bars = solar captured market price. Monthly charts include year banding so each month is easier to place within its year.")
