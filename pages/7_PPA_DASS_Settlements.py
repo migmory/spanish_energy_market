@@ -753,23 +753,23 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
     pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
         .mark_text(
             dy=-7,
-            fontSize=label_size,
+            fontSize=label_size + 1,
             fontWeight="bold",
-            color=INK,
+            color="#000000",
             stroke="white",
-            strokeWidth=2,
-            strokeOpacity=0.85,
+            strokeWidth=1.5,
+            strokeOpacity=0.95,
         )
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
     neg_labels = (base.transform_filter(f"datum.{ycol} < 0")
         .mark_text(
             dy=12,
-            fontSize=label_size,
+            fontSize=label_size + 1,
             fontWeight="bold",
-            color=INK,
+            color="#000000",
             stroke="white",
-            strokeWidth=2,
-            strokeOpacity=0.85,
+            strokeWidth=1.5,
+            strokeOpacity=0.95,
         )
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
 
@@ -812,7 +812,7 @@ def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: st
         layers.extend([bands, rules, year_labels])
     layers.extend([bars, line])
     if show_labels:
-        bar_labels = base.mark_text(dy=-8, fontSize=10, fontWeight="bold", color=INK).encode(
+        bar_labels = base.mark_text(dy=-8, fontSize=11, fontWeight="bold", color="#000000", stroke="white", strokeWidth=1.2, strokeOpacity=0.9).encode(
             x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
         layers.append(bar_labels)
     return alt.layer(*layers).properties(
@@ -945,12 +945,12 @@ with st.container(border=True):
 if ppa_type == "Fixed for floating":
     price_grid([
         price_card("PPA strike price", f"{strike:.1f}", "€/MWh", "Fixed strike used as the orange line in the chart."),
-        price_card("Settlement logic", "Capture − Strike", "", "Positive means payment to the offtaker."),
+        price_card("Settlement at ≤0€ hours", "Yes" if settle_nonpos else "No", "", "Whether non-positive price hours are included in the settlement calculation."),
         price_card("Contracted volume", f"{ppa_volume_gwh:,.0f}", "GWh/yr", "Annual PPA volume shaped by the solar profile."),
     ])
 else:
     price_grid([
-        price_card("PPA floor / strike", f"{floor:.1f}", "€/MWh", "This is the fixed orange line. It does not move with captured price."),
+        price_card("PPA strike price", f"{floor:.1f}", "€/MWh", "This is the fixed orange line. It does not move with captured price."),
         price_card("Discount to market", f"{discount:.1f}", "€/MWh", "Effective price = max(floor, captured price − discount)."),
         price_card("Contracted volume", f"{ppa_volume_gwh:,.0f}", "GWh/yr", "Annual PPA volume shaped by the solar profile."),
     ])
@@ -1034,9 +1034,12 @@ kpi(k2, "Cumulative settlement", f"{ppa_view['settle_eur'].sum()/1e6:+.2f}", "M�
 kpi(k3, "Avg captured price", f"{avg_capture:.1f}", "€/MWh",
     "Solar-weighted market price", "neu")
 neg_share = ppa["neg_hours_gen_share"].dropna()
-neg_share_txt = "n/a" if neg_share.empty else f"{100*neg_share.mean():.1f}"
-kpi(k4, "Generation in ≤0 € hours", neg_share_txt, "%",
-    "Share of solar volume at non-positive prices", "neu")
+if neg_share.empty:
+    kpi(k4, "≤0€ hours settlement", "Included" if settle_nonpos else "Excluded", "",
+        "Whether non-positive price hours are included in settlement.", "neu")
+else:
+    kpi(k4, "Generation in ≤0 € hours", f"{100*neg_share.mean():.1f}", "%",
+        "Share of solar volume at non-positive prices", "neu")
 
 st.markdown("")
 chart_heading("Strike / floor price vs solar captured price", "Orange line = fixed strike / floor. Green bars = solar captured market price. Monthly charts include year banding so each month is easier to place within its year.")
