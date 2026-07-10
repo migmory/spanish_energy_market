@@ -716,15 +716,16 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
                      height: int = 430, label_suffix: str = ""):
     df = df.copy()
     df["sign"] = np.where(df[ycol] >= 0, pos_lbl, neg_lbl)
+    df["fill_color"] = np.where(df[ycol] >= 0, pos_c, neg_c)
     df["bar_lbl"] = df[ycol].map(lambda v: _bar_label(v, label_suffix))
     tt = tooltips or []
 
     # Back to bars for Monthly, but with year banding and black labels outside bars.
-    # This keeps the price/settlement values visible without the heatmap/matrix feel.
+    # Use explicit per-row hex colours so positive bars are clearly green and negative bars clearly orange.
     color = alt.Color(
-        "sign:N",
-        scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
-        legend=alt.Legend(title=None, orient="top", labelFontSize=12),
+        "fill_color:N",
+        scale=None,
+        legend=None,
     )
     xenc = _x_encoding(granularity)
     base = alt.Chart(df)
@@ -737,6 +738,8 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
         cornerRadiusBottomRight=4,
         opacity=0.95,
         size=8 if granularity == "Monthly" else None,
+        stroke="#ffffff",
+        strokeWidth=0.6,
     ).encode(
         x=xenc,
         y=alt.Y(f"{ycol}:Q", title=ytitle),
@@ -941,7 +944,7 @@ with st.container(border=True):
 
 if ppa_type == "Fixed for floating":
     price_grid([
-        price_card("PPA reference price", f"{strike:.1f}", "€/MWh", "Fixed strike used as the orange line in the chart."),
+        price_card("PPA strike price", f"{strike:.1f}", "€/MWh", "Fixed strike used as the orange line in the chart."),
         price_card("Settlement logic", "Capture − Strike", "", "Positive means payment to the offtaker."),
         price_card("Contracted volume", f"{ppa_volume_gwh:,.0f}", "GWh/yr", "Annual PPA volume shaped by the solar profile."),
     ])
@@ -1049,14 +1052,14 @@ st.altair_chart(style_chart(market_vs_contract_chart(
     "solar captured price", "strike / floor", granularity, tooltips=tt_ppa)),
     use_container_width=True)
 
-chart_heading("Settlement in €/MWh", "Positive values = payment to the offtaker; negative values = payment by the offtaker. Labels remain visible in black for the default monthly tenor.")
+chart_heading("Settlement in €/MWh", "Positive values = payment to the offtaker; negative values = payment by the offtaker. Bars are green when positive and orange when negative.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur_mwh", "Settlement to offtaker (€/MWh)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
     "PPA settlement per MWh — positive means payment to offtaker",
     tooltips=tt_ppa)), use_container_width=True)
 
-chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume. Monthly view uses bars with year banding and black labels for readability.")
+chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume. Bars are green when positive and orange when negative.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur", "Settlement to offtaker (€)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
@@ -1179,17 +1182,17 @@ st.altair_chart(style_chart(market_vs_contract_chart(
     "BESS revenue", "DASS strike", granularity, tooltips=tt_dass)),
     use_container_width=True)
 
-chart_heading("Settlement in k€/MW", "Positive values = payment to the swap buyer; negative values = payment by the swap buyer. Monthly view uses bars with year banding and black labels for readability.", "dass")
+chart_heading("Settlement in k€/MW", "Positive values = payment to the swap buyer; negative values = payment by the swap buyer. Bars are green when positive and orange when negative.", "dass")
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
-    "Buyer receives", "Buyer pays", GREEN, RED, granularity,
+    "Buyer receives", "Buyer pays", GREEN, ORANGE, granularity,
     "DASS settlement — positive means payment to swap buyer",
     tooltips=tt_dass)), use_container_width=True)
 
-chart_heading("Settlement in €", "Total cash settlement using the selected contracted BESS MW. Monthly view uses bars with year banding and black labels for readability.", "dass")
+chart_heading("Settlement in €", "Total cash settlement using the selected contracted BESS MW. Bars are green when positive and orange when negative.", "dass")
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_eur", "Settlement to buyer (€)",
-    "Buyer receives", "Buyer pays", GREEN, RED, granularity,
+    "Buyer receives", "Buyer pays", GREEN, ORANGE, granularity,
     f"DASS settlement in € — {dass_mw:.0f} MW contracted",
     tooltips=[alt.Tooltip("period:N"),
               alt.Tooltip("settle_eur:Q", title="Settlement €", format=",.0f")],
