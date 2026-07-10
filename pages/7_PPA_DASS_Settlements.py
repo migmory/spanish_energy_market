@@ -730,7 +730,7 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
     xenc = _x_encoding(granularity)
     base = alt.Chart(df)
 
-    zero = base.mark_rule(color="#adc5bc", strokeWidth=1.2).encode(y=alt.datum(0))
+    zero = base.mark_rule(color="#adc5bc").encode(y=alt.datum(0))
     bars = base.mark_bar(
         cornerRadiusTopLeft=4,
         cornerRadiusTopRight=4,
@@ -756,9 +756,6 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
             fontSize=label_size + 1,
             fontWeight="bold",
             color="#000000",
-            stroke="white",
-            strokeWidth=1.5,
-            strokeOpacity=0.95,
         )
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
     neg_labels = (base.transform_filter(f"datum.{ycol} < 0")
@@ -767,9 +764,6 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
             fontSize=label_size + 1,
             fontWeight="bold",
             color="#000000",
-            stroke="white",
-            strokeWidth=1.5,
-            strokeOpacity=0.95,
         )
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
 
@@ -812,7 +806,7 @@ def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: st
         layers.extend([bands, rules, year_labels])
     layers.extend([bars, line])
     if show_labels:
-        bar_labels = base.mark_text(dy=-8, fontSize=11, fontWeight="bold", color="#000000", stroke="white", strokeWidth=1.2, strokeOpacity=0.9).encode(
+        bar_labels = base.mark_text(dy=-8, fontSize=11, fontWeight="bold", color="#000000").encode(
             x=xenc, y=alt.Y(f"{market_col}:Q"), text="market_lbl:N")
         layers.append(bar_labels)
     return alt.layer(*layers).properties(
