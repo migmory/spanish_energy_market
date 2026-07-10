@@ -673,7 +673,7 @@ def _x_encoding(granularity: str):
     if granularity == "Annual":
         return alt.X("period:N", title=None, sort=None, axis=alt.Axis(labelAngle=0))
     return alt.X("date:T", title=None,
-                 axis=alt.Axis(format="%b", labelAngle=0, tickCount=alt.TimeInterval(month="month", step=1),
+                 axis=alt.Axis(format="%b", labelAngle=0, tickCount=24,
                                labelOverlap=True, labelFontSize=10, labelPadding=8))
 
 
