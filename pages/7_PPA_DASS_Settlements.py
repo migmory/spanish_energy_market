@@ -716,55 +716,57 @@ def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
                      height: int = 430, label_suffix: str = ""):
     df = df.copy()
     df["sign"] = np.where(df[ycol] >= 0, pos_lbl, neg_lbl)
-    df["fill_color"] = np.where(df[ycol] >= 0, pos_c, neg_c)
     df["bar_lbl"] = df[ycol].map(lambda v: _bar_label(v, label_suffix))
     tt = tooltips or []
 
-    # Back to bars for Monthly, but with year banding and black labels outside bars.
-    # Use explicit per-row hex colours so positive bars are clearly green and negative bars clearly orange.
-    color = alt.Color(
-        "fill_color:N",
-        scale=None,
-        legend=None,
-    )
     xenc = _x_encoding(granularity)
     base = alt.Chart(df)
 
     zero = base.mark_rule(color="#adc5bc").encode(y=alt.datum(0))
-    bars = base.mark_bar(
-        cornerRadiusTopLeft=4,
-        cornerRadiusTopRight=4,
-        cornerRadiusBottomLeft=4,
-        cornerRadiusBottomRight=4,
-        opacity=0.95,
-        size=8 if granularity == "Monthly" else None,
-        stroke="#ffffff",
-        strokeWidth=0.6,
-    ).encode(
-        x=xenc,
-        y=alt.Y(f"{ycol}:Q", title=ytitle),
-        color=color,
-        tooltip=tt,
+
+    # Use the standard sign field + explicit scale. This is Altair-safe and makes
+    # positive bars green and negative bars orange.
+    color = alt.Color(
+        "sign:N",
+        scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
+        legend=alt.Legend(title=None, orient="top", labelFontSize=12),
     )
 
-    # Black labels, outside the bar, with a small white outline so they remain readable
-    # even when they sit close to the coloured bar or gridline.
-    label_size = 9 if granularity == "Monthly" else 11
-    pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
-        .mark_text(
-            dy=-7,
-            fontSize=label_size + 1,
-            fontWeight="bold",
-            color="#000000",
+    if granularity == "Monthly":
+        bars = base.mark_bar(
+            cornerRadiusTopLeft=4,
+            cornerRadiusTopRight=4,
+            cornerRadiusBottomLeft=4,
+            cornerRadiusBottomRight=4,
+            opacity=0.98,
+            size=9,
+        ).encode(
+            x=xenc,
+            y=alt.Y(f"{ycol}:Q", title=ytitle),
+            color=color,
+            tooltip=tt,
         )
+    else:
+        bars = base.mark_bar(
+            cornerRadiusTopLeft=4,
+            cornerRadiusTopRight=4,
+            cornerRadiusBottomLeft=4,
+            cornerRadiusBottomRight=4,
+            opacity=0.98,
+        ).encode(
+            x=xenc,
+            y=alt.Y(f"{ycol}:Q", title=ytitle),
+            color=color,
+            tooltip=tt,
+        )
+
+    # Black labels outside the bars. No stroke params here, to avoid Altair schema issues.
+    label_size = 10 if granularity == "Monthly" else 12
+    pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
+        .mark_text(dy=-8, fontSize=label_size, fontWeight="bold", color="#000000")
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
     neg_labels = (base.transform_filter(f"datum.{ycol} < 0")
-        .mark_text(
-            dy=12,
-            fontSize=label_size + 1,
-            fontWeight="bold",
-            color="#000000",
-        )
+        .mark_text(dy=13, fontSize=label_size, fontWeight="bold", color="#000000")
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
 
     layers = []
