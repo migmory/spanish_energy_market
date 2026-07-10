@@ -713,64 +713,74 @@ def _bar_label(v: float, suffix: str = "") -> str:
 def settlement_chart(df: pd.DataFrame, ycol: str, ytitle: str,
                      pos_lbl: str, neg_lbl: str, pos_c: str, neg_c: str,
                      granularity: str, title: str, tooltips: list | None = None,
-                     height: int = 370, label_suffix: str = ""):
+                     height: int = 430, label_suffix: str = ""):
     df = df.copy()
     df["sign"] = np.where(df[ycol] >= 0, pos_lbl, neg_lbl)
     df["bar_lbl"] = df[ycol].map(lambda v: _bar_label(v, label_suffix))
     tt = tooltips or []
 
-    # Monthly settlement charts are much easier to read as a year/month matrix:
-    # one row per year, one column per month, colour = payment direction, label = amount.
-    # This avoids 84+ thin bars and overlapping labels when the tenor is 2024-2030.
-    if granularity == "Monthly":
-        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        df["month_name"] = pd.Categorical(
-            df["month"].map(lambda m: month_names[int(m) - 1]),
-            categories=month_names,
-            ordered=True,
-        )
-        years = sorted(df["year"].dropna().unique())
-        matrix_height = max(230, 44 * len(years))
-        color = alt.Color(
-            "sign:N",
-            scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
-            legend=alt.Legend(title=None, orient="top", labelFontSize=12),
-        )
-        base = alt.Chart(df)
-        cells = base.mark_rect(cornerRadius=5, opacity=0.88).encode(
-            x=alt.X("month_name:N", title=None, sort=month_names,
-                    axis=alt.Axis(labelAngle=0, labelFontSize=11, labelPadding=8)),
-            y=alt.Y("year:O", title=None,
-                    axis=alt.Axis(labelFontSize=12, labelPadding=8)),
-            color=color,
-            tooltip=tt,
-        )
-        labels = base.mark_text(fontSize=10, fontWeight="bold", color=INK).encode(
-            x=alt.X("month_name:N", sort=month_names),
-            y=alt.Y("year:O"),
-            text="bar_lbl:N",
-        )
-        return alt.layer(cells, labels).properties(
-            height=matrix_height,
-            title=alt.TitleParams(title + " · monthly matrix", anchor="start", fontSize=15, color=INK),
-        )
-
-    color = alt.Color("sign:N", scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
-                      legend=alt.Legend(title=None, orient="top"))
+    # Back to bars for Monthly, but with year banding and black labels outside bars.
+    # This keeps the price/settlement values visible without the heatmap/matrix feel.
+    color = alt.Color(
+        "sign:N",
+        scale=alt.Scale(domain=[pos_lbl, neg_lbl], range=[pos_c, neg_c]),
+        legend=alt.Legend(title=None, orient="top", labelFontSize=12),
+    )
     xenc = _x_encoding(granularity)
     base = alt.Chart(df)
-    zero = base.mark_rule(color="#c9d7d1").encode(y=alt.datum(0))
-    bars = base.mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5,
-                         cornerRadiusBottomLeft=5, cornerRadiusBottomRight=5).encode(
-        x=xenc, y=alt.Y(f"{ycol}:Q", title=ytitle), color=color, tooltip=tt)
+
+    zero = base.mark_rule(color="#adc5bc", strokeWidth=1.2).encode(y=alt.datum(0))
+    bars = base.mark_bar(
+        cornerRadiusTopLeft=4,
+        cornerRadiusTopRight=4,
+        cornerRadiusBottomLeft=4,
+        cornerRadiusBottomRight=4,
+        opacity=0.95,
+        size=8 if granularity == "Monthly" else None,
+    ).encode(
+        x=xenc,
+        y=alt.Y(f"{ycol}:Q", title=ytitle),
+        color=color,
+        tooltip=tt,
+    )
+
+    # Black labels, outside the bar, with a small white outline so they remain readable
+    # even when they sit close to the coloured bar or gridline.
+    label_size = 9 if granularity == "Monthly" else 11
     pos_labels = (base.transform_filter(f"datum.{ycol} >= 0")
-        .mark_text(dy=-8, fontSize=10, fontWeight="bold", color=INK)
+        .mark_text(
+            dy=-7,
+            fontSize=label_size,
+            fontWeight="bold",
+            color=INK,
+            stroke="white",
+            strokeWidth=2,
+            strokeOpacity=0.85,
+        )
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
     neg_labels = (base.transform_filter(f"datum.{ycol} < 0")
-        .mark_text(dy=12, fontSize=10, fontWeight="bold", color=INK)
+        .mark_text(
+            dy=12,
+            fontSize=label_size,
+            fontWeight="bold",
+            color=INK,
+            stroke="white",
+            strokeWidth=2,
+            strokeOpacity=0.85,
+        )
         .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N"))
-    return alt.layer(bars, zero, pos_labels, neg_labels).properties(
-        height=height, title=alt.TitleParams(title, anchor="start", fontSize=15, color=INK))
+
+    layers = []
+    if granularity == "Monthly":
+        bands, rules, year_labels = _monthly_year_guides(df)
+        layers.extend([bands, rules, year_labels])
+    layers.extend([bars, zero, pos_labels, neg_labels])
+
+    chart_height = max(height, 450) if granularity == "Monthly" else height
+    return alt.layer(*layers).properties(
+        height=chart_height,
+        title=alt.TitleParams(title, anchor="start", fontSize=15, color=INK),
+    )
 
 def market_vs_contract_chart(df: pd.DataFrame, market_col: str, contract_col: str,
                              ytitle: str, title: str, market_name: str,
@@ -1046,7 +1056,7 @@ st.altair_chart(style_chart(settlement_chart(
     "PPA settlement per MWh — positive means payment to offtaker",
     tooltips=tt_ppa)), use_container_width=True)
 
-chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume. Monthly view is shown as a year/month matrix for readability.")
+chart_heading("Settlement in €", "Total cash settlement using the selected PPA volume. Monthly view uses bars with year banding and black labels for readability.")
 st.altair_chart(style_chart(settlement_chart(
     ppa_view, "settle_eur", "Settlement to offtaker (€)",
     "Offtaker receives", "Offtaker pays", GREEN, ORANGE, granularity,
@@ -1169,14 +1179,14 @@ st.altair_chart(style_chart(market_vs_contract_chart(
     "BESS revenue", "DASS strike", granularity, tooltips=tt_dass)),
     use_container_width=True)
 
-chart_heading("Settlement in k€/MW", "Positive values = payment to the swap buyer; negative values = payment by the swap buyer. Monthly view is shown as a year/month matrix for readability.", "dass")
+chart_heading("Settlement in k€/MW", "Positive values = payment to the swap buyer; negative values = payment by the swap buyer. Monthly view uses bars with year banding and black labels for readability.", "dass")
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_keur_mw", "Settlement to buyer (k€/MW)",
     "Buyer receives", "Buyer pays", GREEN, RED, granularity,
     "DASS settlement — positive means payment to swap buyer",
     tooltips=tt_dass)), use_container_width=True)
 
-chart_heading("Settlement in €", "Total cash settlement using the selected contracted BESS MW. Monthly view is shown as a year/month matrix for readability.", "dass")
+chart_heading("Settlement in €", "Total cash settlement using the selected contracted BESS MW. Monthly view uses bars with year banding and black labels for readability.", "dass")
 st.altair_chart(style_chart(settlement_chart(
     bess_view, "settle_eur", "Settlement to buyer (€)",
     "Buyer receives", "Buyer pays", GREEN, RED, granularity,
