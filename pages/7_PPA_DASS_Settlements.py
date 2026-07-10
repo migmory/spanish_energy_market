@@ -1117,26 +1117,43 @@ price_grid([
 ])
 
 bess = bess_m.copy().merge(ndays_m, on=["year", "month"], how="left")
-bess["strike_eur_mw"] = dass_strike * 1000.0 * bess["ndays"] / 365.0
-bess["settle_eur_mw"] = bess["rev_eur_mw"] - bess["strike_eur_mw"]
+
+# Only settle DASS periods where the workbook actually contains a BESS revenue value.
+# Some forecast tables may leave future months as blank/zero placeholders. Without this
+# guard, the app would subtract the DASS strike from an absent revenue and show an
+# artificial negative settlement. Uploaded curves are recomputed from hourly prices,
+# so zero revenue there is kept as a valid model result.
+bess["has_bess_revenue"] = bess["rev_eur_mw"].notna()
+if not use_uploaded_curve:
+    bess["has_bess_revenue"] &= bess["rev_eur_mw"].abs() > 1e-9
+
+bess["strike_eur_mw"] = np.where(
+    bess["has_bess_revenue"],
+    dass_strike * 1000.0 * bess["ndays"] / 365.0,
+    np.nan,
+)
+bess["settle_eur_mw"] = np.where(
+    bess["has_bess_revenue"],
+    bess["rev_eur_mw"] - bess["strike_eur_mw"],
+    np.nan,
+)
 bess["settle_eur"] = bess["settle_eur_mw"] * dass_mw
 bess["rev_keur_mw"] = bess["rev_eur_mw"] / 1000.0
 bess["strike_keur_mw"] = bess["strike_eur_mw"] / 1000.0
 
 if granularity == "Annual":
-    if (not use_uploaded_curve) and annual_summary_bess is not None:
-        bess_view = annual_summary_bess[["year", "rev_eur_mw", "tb4"]].copy()
-        bess_view = bess_view.merge(ndays_y, on="year", how="left")
-        bess_view["strike_eur_mw"] = dass_strike * 1000.0 * bess_view["ndays"] / 365.0
-        bess_view["settle_eur_mw"] = bess_view["rev_eur_mw"] - bess_view["strike_eur_mw"]
-        bess_view["settle_eur"] = bess_view["settle_eur_mw"] * dass_mw
-    else:
-        bess_view = (bess.groupby("year")
-                     .agg(rev_eur_mw=("rev_eur_mw", "sum"),
-                          strike_eur_mw=("strike_eur_mw", "sum"),
-                          settle_eur_mw=("settle_eur_mw", "sum"),
-                          settle_eur=("settle_eur", "sum"),
-                          tb4=("tb4", "mean"), ndays=("ndays", "sum")).reset_index())
+    # Aggregate from the monthly table so years with partial BESS revenue coverage
+    # only settle the months that actually exist in the source table.
+    bess_view = (bess.groupby("year")
+                 .agg(rev_eur_mw=("rev_eur_mw", lambda s: s[bess.loc[s.index, "has_bess_revenue"]].sum(min_count=1)),
+                      strike_eur_mw=("strike_eur_mw", "sum"),
+                      settle_eur_mw=("settle_eur_mw", "sum"),
+                      settle_eur=("settle_eur", "sum"),
+                      tb4=("tb4", "mean"),
+                      ndays=("ndays", lambda s: s[bess.loc[s.index, "has_bess_revenue"]].sum(min_count=1)),
+                      valid_months=("has_bess_revenue", "sum"))
+                 .reset_index())
+    bess_view.loc[bess_view["valid_months"] == 0, ["rev_eur_mw", "strike_eur_mw", "settle_eur_mw", "settle_eur", "ndays"]] = np.nan
     bess_view["period"] = bess_view["year"].astype(str)
     bess_view["month"] = 1
 else:
