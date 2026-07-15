@@ -126,16 +126,21 @@ ENERGY_MIX_INDICATORS_FORECAST = {
     "Other renewables": None,
 }
 
-# PBF programme indicators by technology. These series are used only in the
-# comparison displayed below the P48 energy-mix chart. Technologies are limited
-# to those for which a direct and reconcilable PBF series is available.
+# Total PBF generation-programme indicators by technology.
+# IMPORTANT: indicators 421/422/424/429/... are the *bilateral* component of PBF,
+# not the complete PBF generation programme. The comparison below must use the
+# total PBF indicators (1-24 family), so that it is comparable with P48.
 PBF_TECH_INDICATORS = {
-    "CCGT": [429],
-    "Nuclear": [424],
-    "Wind": [432, 433],              # onshore + offshore wind
-    "Hydro": [421, 422],             # UGH + non-UGH hydro
-    "Coal": [426, 427],               # sub-bituminous + anthracite coal
-    "Other renewables": [10234],
+    "CCGT": [9],
+    "Nuclear": [4],
+    "Wind": [12, 13],                # onshore + offshore wind
+    "Solar PV": [14],
+    "Solar thermal": [15],
+    "Hydro": [1, 2],                 # UGH + non-UGH hydro
+    "Pumped hydro": [3],
+    "Coal": [7, 8],                  # anthracite + sub-bituminous coal
+    "Biomass": [21],
+    "Biogas": [22],
 }
 
 LOCAL_MIX_TECH_MAP = {
@@ -4263,7 +4268,7 @@ try:
         year_sel = available_years[-1]
         day_range = None
         if granularity == "Monthly":
-            year_sel = st.selectbox("Year", available_years, index=len(available_years) - 1)
+            year_sel = st.selectbox("Year", available_years, index=len(available_years) - 1, key="energy_mix_year")
         elif granularity == "Daily":
             daily_min = mix_daily["datetime"].dt.date.min()
             daily_max = mix_daily["datetime"].dt.date.max()
@@ -4326,9 +4331,13 @@ try:
                 "CCGT",
                 "Nuclear",
                 "Wind",
+                "Solar PV",
+                "Solar thermal",
                 "Hydro",
+                "Pumped hydro",
                 "Coal",
-                "Other renewables",
+                "Biomass",
+                "Biogas",
             ]
             if tech in PBF_TECH_INDICATORS
         ]
@@ -4437,8 +4446,8 @@ try:
                 )
 
         st.caption(
-            "P48 is the energy-mix series shown above. PBF is downloaded from "
-            "the corresponding ESIOS programme indicator for the selected technology."
+            "P48 is the operating programme shown above. PBF uses the total generation "
+            "programme indicator for the selected technology (not only its bilateral component)."
         )
 
         subtle_subsection("Monthly renewables summary")
