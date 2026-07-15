@@ -126,6 +126,22 @@ ENERGY_MIX_INDICATORS_FORECAST = {
     "Other renewables": None,
 }
 
+# Total P48 generation-programme indicators by technology.
+# These are used in the lower comparison so P48 and PBF come from the same
+# ESIOS source, use the same technology perimeter and are aggregated identically.
+P48_TECH_INDICATORS = {
+    "CCGT": [79],
+    "Nuclear": [74],
+    "Wind": [82, 83],                # onshore + offshore wind
+    "Solar PV": [84],
+    "Solar thermal": [85],
+    "Hydro": [71, 72],               # UGH + non-UGH hydro
+    "Pumped hydro": [73],
+    "Coal": [77, 78],                 # anthracite + sub-bituminous coal
+    "Biomass": [91],
+    "Biogas": [92],
+}
+
 # Total PBF generation-programme indicators by technology.
 # IMPORTANT: indicators 421/422/424/429/... are the *bilateral* component of PBF,
 # not the complete PBF generation programme. The comparison below must use the
@@ -2041,37 +2057,143 @@ def get_mix_selection_bounds(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_pbf_technology_series(
+def fetch_esios_program_aggregated(
+    indicator_id: int,
+    start_day: date,
+    end_day: date,
     token: str,
+    granularity: str,
+) -> pd.DataFrame:
+    """Fetch an ESIOS programme-energy indicator with SUM aggregation.
+
+    Programme indicators are energy (MWh) per scheduling period. Since recent
+    programme series can be quarter-hourly, aggregating them with the API default
+    average materially understates energy. This helper explicitly requests
+    ``time_agg=sum`` and aligns requests to full calendar periods.
+    """
+    cols = ["datetime", "value", "source", "geo_name", "geo_id"]
+    if start_day is None or end_day is None or start_day > end_day:
+        return pd.DataFrame(columns=cols)
+
+    if granularity == "Annual":
+        time_trunc = "year"
+        chunks = [
+            (max(start_day, date(y, 1, 1)), min(end_day, date(y, 12, 31)))
+            for y in range(start_day.year, end_day.year + 1)
+        ]
+    elif granularity == "Monthly":
+        time_trunc = "month"
+        chunks = [
+            (max(start_day, date(y, 1, 1)), min(end_day, date(y, 12, 31)))
+            for y in range(start_day.year, end_day.year + 1)
+        ]
+    else:
+        time_trunc = "day"
+        chunks = []
+        cursor = pd.Timestamp(start_day).to_period("M").to_timestamp()
+        last_month = pd.Timestamp(end_day).to_period("M").to_timestamp()
+        while cursor <= last_month:
+            month_start = cursor.date()
+            month_end = (cursor + pd.offsets.MonthEnd(1)).date()
+            chunks.append((max(start_day, month_start), min(end_day, month_end)))
+            cursor = cursor + pd.offsets.MonthBegin(1)
+
+    url = f"https://api.esios.ree.es/indicators/{indicator_id}"
+    frames: list[pd.DataFrame] = []
+
+    for chunk_start, chunk_end in chunks:
+        if chunk_start > chunk_end:
+            continue
+
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        params = {
+            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_trunc": time_trunc,
+            "time_agg": "sum",
+        }
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=build_headers(token),
+                    params=params,
+                    timeout=(15, 120),
+                )
+                resp.raise_for_status()
+                parsed = parse_esios_indicator(
+                    resp.json(),
+                    source_name=f"esios_{indicator_id}_{time_trunc}_sum",
+                )
+                if not parsed.empty:
+                    frames.append(parsed)
+                last_error = None
+                break
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                sleep(1.5 * (attempt + 1))
+
+        if last_error is not None:
+            continue
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["datetime", "value"]).copy()
+    return (
+        out.groupby(["datetime", "geo_name", "geo_id"], dropna=False, as_index=False)["value"]
+        .sum()
+        .assign(source=f"esios_{indicator_id}_{time_trunc}_sum")
+        [["datetime", "value", "source", "geo_name", "geo_id"]]
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_program_technology_series(
+    token: str,
+    programme: str,
     technology: str,
     start_day: date,
     end_day: date,
+    granularity: str,
 ) -> pd.DataFrame:
-    """Download and combine the PBF programme series for one technology."""
+    """Download P48 or PBF for one technology with identical SUM aggregation."""
     cols = ["datetime", "technology", "energy_mwh", "data_source"]
-    indicator_ids = PBF_TECH_INDICATORS.get(technology, [])
+    programme = str(programme).upper().strip()
+    mappings = {
+        "P48": P48_TECH_INDICATORS,
+        "PBF": PBF_TECH_INDICATORS,
+    }
+    indicator_ids = mappings.get(programme, {}).get(technology, [])
 
     if not indicator_ids or start_day is None or end_day is None or start_day > end_day:
         return pd.DataFrame(columns=cols)
 
     frames: list[pd.DataFrame] = []
     for indicator_id in indicator_ids:
-        try:
-            raw = fetch_esios_range(indicator_id, start_day, end_day, token)
-        except Exception:
-            raw = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
-
+        raw = fetch_esios_program_aggregated(
+            indicator_id=indicator_id,
+            start_day=start_day,
+            end_day=end_day,
+            token=token,
+            granularity=granularity,
+        )
         if raw.empty:
             continue
 
-        energy = to_programmed_generation_energy(raw)
-        if energy.empty:
-            continue
-
+        energy = raw[["datetime", "value"]].rename(columns={"value": "energy_mwh"})
         energy["datetime"] = pd.to_datetime(energy["datetime"], errors="coerce")
         energy["energy_mwh"] = pd.to_numeric(energy["energy_mwh"], errors="coerce")
         energy = energy.dropna(subset=["datetime", "energy_mwh"]).copy()
-        frames.append(energy[["datetime", "energy_mwh"]])
+        frames.append(energy)
 
     if not frames:
         return pd.DataFrame(columns=cols)
@@ -2079,12 +2201,12 @@ def load_pbf_technology_series(
     out = pd.concat(frames, ignore_index=True)
     out = out.groupby("datetime", as_index=False)["energy_mwh"].sum()
     out["technology"] = technology
-    out["data_source"] = "PBF - ESIOS"
+    out["data_source"] = f"{programme} - ESIOS (sum)"
     return out[cols].sort_values("datetime").reset_index(drop=True)
 
 
 def build_p48_vs_pbf_comparison(
-    mix_source_df: pd.DataFrame,
+    p48_df: pd.DataFrame,
     pbf_df: pd.DataFrame,
     technology: str,
     granularity: str,
@@ -2104,8 +2226,8 @@ def build_p48_vs_pbf_comparison(
     ]
 
     p48 = pd.DataFrame()
-    if mix_source_df is not None and not mix_source_df.empty:
-        p48 = mix_source_df[mix_source_df["technology"] == technology].copy()
+    if p48_df is not None and not p48_df.empty:
+        p48 = p48_df[p48_df["technology"] == technology].copy()
         p48 = add_mix_period_columns(
             p48,
             granularity,
@@ -4356,6 +4478,9 @@ try:
             day_range=day_range,
         )
 
+        p48_selected_df = pd.DataFrame(
+            columns=["datetime", "technology", "energy_mwh", "data_source"]
+        )
         pbf_selected_df = pd.DataFrame(
             columns=["datetime", "technology", "energy_mwh", "data_source"]
         )
@@ -4364,16 +4489,28 @@ try:
             and comparison_end is not None
             and comparison_start <= comparison_end
         ):
-            with st.spinner(f"Loading {selected_pbf_tech} PBF programme..."):
-                pbf_selected_df = load_pbf_technology_series(
+            with st.spinner(
+                f"Loading {selected_pbf_tech} P48 and PBF programmes with SUM aggregation..."
+            ):
+                p48_selected_df = load_program_technology_series(
                     token=token,
+                    programme="P48",
                     technology=selected_pbf_tech,
                     start_day=comparison_start,
                     end_day=comparison_end,
+                    granularity=granularity,
+                )
+                pbf_selected_df = load_program_technology_series(
+                    token=token,
+                    programme="PBF",
+                    technology=selected_pbf_tech,
+                    start_day=comparison_start,
+                    end_day=comparison_end,
+                    granularity=granularity,
                 )
 
         p48_pbf_comparison = build_p48_vs_pbf_comparison(
-            mix_source_df=mix_source_df,
+            p48_df=p48_selected_df,
             pbf_df=pbf_selected_df,
             technology=selected_pbf_tech,
             granularity=granularity,
