@@ -126,6 +126,18 @@ ENERGY_MIX_INDICATORS_FORECAST = {
     "Other renewables": None,
 }
 
+# PBF programme indicators by technology. These series are used only in the
+# comparison displayed below the P48 energy-mix chart. Technologies are limited
+# to those for which a direct and reconcilable PBF series is available.
+PBF_TECH_INDICATORS = {
+    "CCGT": [429],
+    "Nuclear": [424],
+    "Wind": [432, 433],              # onshore + offshore wind
+    "Hydro": [421, 422],             # UGH + non-UGH hydro
+    "Coal": [426, 427],               # sub-bituminous + anthracite coal
+    "Other renewables": [10234],
+}
+
 LOCAL_MIX_TECH_MAP = {
     "Hidráulica": "Hydro",
     "Hidroeólica": "Other renewables",
@@ -1957,6 +1969,262 @@ def build_energy_mix_period_chart(mix_period: pd.DataFrame, demand_period: pd.Da
 
     chart = alt.layer(left_chart, re_line).resolve_scale(y="independent").properties(height=430)
     return apply_common_chart_style(chart, height=430)
+
+
+def add_mix_period_columns(
+    df: pd.DataFrame,
+    granularity: str,
+    year_sel: int | None = None,
+    day_range: tuple[date, date] | None = None,
+) -> pd.DataFrame:
+    """Apply the same period selection used by the energy-mix chart."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"], errors="coerce")
+    tmp = tmp.dropna(subset=["datetime"]).copy()
+
+    if granularity == "Annual":
+        tmp["period_label"] = tmp["datetime"].dt.year.astype(str)
+        tmp["sort_key"] = tmp["datetime"].dt.year
+    elif granularity == "Monthly":
+        if year_sel is not None:
+            tmp = tmp[tmp["datetime"].dt.year == year_sel].copy()
+        tmp["period_label"] = tmp["datetime"].dt.to_period("M").dt.strftime("%b - %Y")
+        tmp["sort_key"] = tmp["datetime"].dt.to_period("M").dt.to_timestamp()
+    else:
+        if day_range is not None:
+            d0, d1 = day_range
+            tmp = tmp[
+                (tmp["datetime"].dt.date >= d0)
+                & (tmp["datetime"].dt.date <= d1)
+            ].copy()
+        tmp["period_label"] = tmp["datetime"].dt.strftime("%a %d-%b")
+        tmp["sort_key"] = tmp["datetime"].dt.normalize()
+
+    return tmp
+
+
+def get_mix_selection_bounds(
+    granularity: str,
+    mix_source_df: pd.DataFrame,
+    year_sel: int | None = None,
+    day_range: tuple[date, date] | None = None,
+) -> tuple[date | None, date | None]:
+    """Return the exact date bounds represented by the current mix selection."""
+    if mix_source_df is None or mix_source_df.empty:
+        return None, None
+
+    mix_dates = pd.to_datetime(mix_source_df["datetime"], errors="coerce").dropna()
+    if mix_dates.empty:
+        return None, None
+
+    available_start = mix_dates.min().date()
+    available_end = min(mix_dates.max().date(), max_refresh_day())
+
+    if granularity == "Monthly" and year_sel is not None:
+        return (
+            max(available_start, date(year_sel, 1, 1)),
+            min(available_end, date(year_sel, 12, 31)),
+        )
+
+    if granularity == "Daily" and day_range is not None:
+        return max(available_start, day_range[0]), min(available_end, day_range[1])
+
+    return available_start, available_end
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_pbf_technology_series(
+    token: str,
+    technology: str,
+    start_day: date,
+    end_day: date,
+) -> pd.DataFrame:
+    """Download and combine the PBF programme series for one technology."""
+    cols = ["datetime", "technology", "energy_mwh", "data_source"]
+    indicator_ids = PBF_TECH_INDICATORS.get(technology, [])
+
+    if not indicator_ids or start_day is None or end_day is None or start_day > end_day:
+        return pd.DataFrame(columns=cols)
+
+    frames: list[pd.DataFrame] = []
+    for indicator_id in indicator_ids:
+        try:
+            raw = fetch_esios_range(indicator_id, start_day, end_day, token)
+        except Exception:
+            raw = pd.DataFrame(columns=["datetime", "value", "source", "geo_name", "geo_id"])
+
+        if raw.empty:
+            continue
+
+        energy = to_programmed_generation_energy(raw)
+        if energy.empty:
+            continue
+
+        energy["datetime"] = pd.to_datetime(energy["datetime"], errors="coerce")
+        energy["energy_mwh"] = pd.to_numeric(energy["energy_mwh"], errors="coerce")
+        energy = energy.dropna(subset=["datetime", "energy_mwh"]).copy()
+        frames.append(energy[["datetime", "energy_mwh"]])
+
+    if not frames:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.groupby("datetime", as_index=False)["energy_mwh"].sum()
+    out["technology"] = technology
+    out["data_source"] = "PBF - ESIOS"
+    return out[cols].sort_values("datetime").reset_index(drop=True)
+
+
+def build_p48_vs_pbf_comparison(
+    mix_source_df: pd.DataFrame,
+    pbf_df: pd.DataFrame,
+    technology: str,
+    granularity: str,
+    year_sel: int | None = None,
+    day_range: tuple[date, date] | None = None,
+) -> pd.DataFrame:
+    """Aggregate P48 and PBF energy using identical period labels."""
+    result_cols = [
+        "period_label",
+        "sort_key",
+        "p48_mwh",
+        "pbf_mwh",
+        "p48_gwh",
+        "pbf_gwh",
+        "delta_gwh",
+        "delta_pct_vs_pbf",
+    ]
+
+    p48 = pd.DataFrame()
+    if mix_source_df is not None and not mix_source_df.empty:
+        p48 = mix_source_df[mix_source_df["technology"] == technology].copy()
+        p48 = add_mix_period_columns(
+            p48,
+            granularity,
+            year_sel=year_sel,
+            day_range=day_range,
+        )
+
+    if p48.empty:
+        p48_period = pd.DataFrame(columns=["period_label", "sort_key", "p48_mwh"])
+    else:
+        p48_period = (
+            p48.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"]
+            .sum()
+            .rename(columns={"energy_mwh": "p48_mwh"})
+        )
+
+    pbf = add_mix_period_columns(
+        pbf_df,
+        granularity,
+        year_sel=year_sel,
+        day_range=day_range,
+    ) if pbf_df is not None and not pbf_df.empty else pd.DataFrame()
+
+    if pbf.empty:
+        pbf_period = pd.DataFrame(columns=["period_label", "sort_key", "pbf_mwh"])
+    else:
+        pbf_period = (
+            pbf.groupby(["period_label", "sort_key"], as_index=False)["energy_mwh"]
+            .sum()
+            .rename(columns={"energy_mwh": "pbf_mwh"})
+        )
+
+    out = p48_period.merge(
+        pbf_period,
+        on=["period_label", "sort_key"],
+        how="outer",
+    )
+    if out.empty:
+        return pd.DataFrame(columns=result_cols)
+
+    out["p48_mwh"] = pd.to_numeric(out["p48_mwh"], errors="coerce")
+    out["pbf_mwh"] = pd.to_numeric(out["pbf_mwh"], errors="coerce")
+    out["p48_gwh"] = out["p48_mwh"] / 1000.0
+    out["pbf_gwh"] = out["pbf_mwh"] / 1000.0
+    out["delta_gwh"] = out["p48_gwh"] - out["pbf_gwh"]
+    out["delta_pct_vs_pbf"] = out["delta_gwh"] / out["pbf_gwh"].replace(0, pd.NA)
+
+    return out[result_cols].sort_values("sort_key").reset_index(drop=True)
+
+
+def build_p48_vs_pbf_chart(comparison_df: pd.DataFrame, technology: str):
+    """Grouped P48/PBF columns with the percentage gap on the right axis."""
+    if comparison_df is None or comparison_df.empty:
+        return None
+
+    plot = comparison_df.copy()
+    order_list = plot.sort_values("sort_key")["period_label"].tolist()
+
+    bars_df = plot.melt(
+        id_vars=["period_label", "sort_key"],
+        value_vars=["p48_gwh", "pbf_gwh"],
+        var_name="programme",
+        value_name="energy_gwh",
+    )
+    bars_df["programme"] = bars_df["programme"].map(
+        {"p48_gwh": "P48", "pbf_gwh": "PBF"}
+    )
+
+    bars = alt.Chart(bars_df.dropna(subset=["energy_gwh"])).mark_bar(size=24).encode(
+        x=alt.X(
+            "period_label:N",
+            sort=order_list,
+            axis=alt.Axis(title=None, labelAngle=0),
+        ),
+        xOffset=alt.XOffset("programme:N", sort=["P48", "PBF"]),
+        y=alt.Y(
+            "energy_gwh:Q",
+            title=f"{technology} energy (GWh)",
+            axis=alt.Axis(orient="left"),
+        ),
+        color=alt.Color(
+            "programme:N",
+            title="Programme",
+            scale=alt.Scale(
+                domain=["P48", "PBF"],
+                range=[BLUE_PRICE, AURORA_COLOR],
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("period_label:N", title="Period"),
+            alt.Tooltip("programme:N", title="Programme"),
+            alt.Tooltip("energy_gwh:Q", title="Energy (GWh)", format=",.2f"),
+        ],
+    )
+
+    delta_df = plot.dropna(subset=["delta_pct_vs_pbf"]).copy()
+    if delta_df.empty:
+        return apply_common_chart_style(bars.properties(height=350), height=350)
+
+    delta_line = alt.Chart(delta_df).mark_line(
+        point=True,
+        color="#111827",
+        strokeWidth=2.6,
+    ).encode(
+        x=alt.X(
+            "period_label:N",
+            sort=order_list,
+            axis=alt.Axis(title=None, labelAngle=0),
+        ),
+        y=alt.Y(
+            "delta_pct_vs_pbf:Q",
+            title="P48 vs PBF",
+            axis=alt.Axis(format=".0%", orient="right"),
+        ),
+        tooltip=[
+            alt.Tooltip("period_label:N", title="Period"),
+            alt.Tooltip("delta_pct_vs_pbf:Q", title="P48 vs PBF", format=".1%"),
+            alt.Tooltip("delta_gwh:Q", title="Difference (GWh)", format=",.2f"),
+        ],
+    )
+
+    chart = alt.layer(bars, delta_line).resolve_scale(y="independent").properties(height=350)
+    return apply_common_chart_style(chart, height=350)
+
 
 def build_monthly_renewables_table(mix_df: pd.DataFrame) -> pd.DataFrame:
     cols = [
@@ -4051,6 +4319,127 @@ try:
         if mix_chart is not None:
             st.altair_chart(mix_chart, use_container_width=True)
             st.caption("Línea verde = % RE (eje derecho 0%-100%). Para 2026 mensual, la serie prioriza el mix diario agregado a mes y usa el widget mensual solo como fallback.")
+
+        subtle_subsection("P48 vs PBF comparison by technology")
+        pbf_technology_options = [
+            tech for tech in [
+                "CCGT",
+                "Nuclear",
+                "Wind",
+                "Hydro",
+                "Coal",
+                "Other renewables",
+            ]
+            if tech in PBF_TECH_INDICATORS
+        ]
+        default_pbf_tech = "CCGT" if "CCGT" in pbf_technology_options else pbf_technology_options[0]
+        selected_pbf_tech = st.selectbox(
+            "Technology for P48 vs PBF comparison",
+            pbf_technology_options,
+            index=pbf_technology_options.index(default_pbf_tech),
+            key="mix_p48_pbf_technology",
+        )
+
+        comparison_start, comparison_end = get_mix_selection_bounds(
+            granularity,
+            mix_source_df,
+            year_sel=year_sel,
+            day_range=day_range,
+        )
+
+        pbf_selected_df = pd.DataFrame(
+            columns=["datetime", "technology", "energy_mwh", "data_source"]
+        )
+        if (
+            comparison_start is not None
+            and comparison_end is not None
+            and comparison_start <= comparison_end
+        ):
+            with st.spinner(f"Loading {selected_pbf_tech} PBF programme..."):
+                pbf_selected_df = load_pbf_technology_series(
+                    token=token,
+                    technology=selected_pbf_tech,
+                    start_day=comparison_start,
+                    end_day=comparison_end,
+                )
+
+        p48_pbf_comparison = build_p48_vs_pbf_comparison(
+            mix_source_df=mix_source_df,
+            pbf_df=pbf_selected_df,
+            technology=selected_pbf_tech,
+            granularity=granularity,
+            year_sel=year_sel,
+            day_range=day_range,
+        )
+
+        has_p48 = (
+            not p48_pbf_comparison.empty
+            and p48_pbf_comparison["p48_gwh"].notna().any()
+        )
+        has_pbf = (
+            not p48_pbf_comparison.empty
+            and p48_pbf_comparison["pbf_gwh"].notna().any()
+        )
+
+        if not has_p48 or not has_pbf:
+            st.info(
+                "No complete P48/PBF comparison is available for the selected "
+                "technology and period."
+            )
+        else:
+            total_p48_gwh = p48_pbf_comparison["p48_gwh"].sum(min_count=1)
+            total_pbf_gwh = p48_pbf_comparison["pbf_gwh"].sum(min_count=1)
+            total_delta_gwh = total_p48_gwh - total_pbf_gwh
+            total_delta_pct = (
+                total_delta_gwh / total_pbf_gwh
+                if pd.notna(total_pbf_gwh) and total_pbf_gwh != 0
+                else None
+            )
+
+            metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+            metric_1.metric("P48 total", format_metric(total_p48_gwh, " GWh", 1))
+            metric_2.metric("PBF total", format_metric(total_pbf_gwh, " GWh", 1))
+            metric_3.metric("P48 - PBF", format_metric(total_delta_gwh, " GWh", 1))
+            metric_4.metric(
+                "P48 vs PBF",
+                "-" if total_delta_pct is None else f"{total_delta_pct:.1%}",
+            )
+
+            p48_pbf_chart = build_p48_vs_pbf_chart(
+                p48_pbf_comparison,
+                selected_pbf_tech,
+            )
+            if p48_pbf_chart is not None:
+                st.altair_chart(p48_pbf_chart, use_container_width=True)
+
+            with st.expander("Show P48 vs PBF data table"):
+                comparison_table = p48_pbf_comparison.rename(
+                    columns={
+                        "period_label": "Period",
+                        "p48_gwh": "P48 (GWh)",
+                        "pbf_gwh": "PBF (GWh)",
+                        "delta_gwh": "P48 - PBF (GWh)",
+                        "delta_pct_vs_pbf": "P48 vs PBF (%)",
+                    }
+                )
+                st.dataframe(
+                    styled_df(
+                        comparison_table[[
+                            "Period",
+                            "P48 (GWh)",
+                            "PBF (GWh)",
+                            "P48 - PBF (GWh)",
+                            "P48 vs PBF (%)",
+                        ]],
+                        pct_cols=["P48 vs PBF (%)"],
+                    ),
+                    use_container_width=True,
+                )
+
+        st.caption(
+            "P48 is the energy-mix series shown above. PBF is downloaded from "
+            "the corresponding ESIOS programme indicator for the selected technology."
+        )
 
         subtle_subsection("Monthly renewables summary")
         # Use the same preferred source as the monthly chart so the table and
