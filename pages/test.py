@@ -677,179 +677,198 @@ def load_pbf_daily_mix(
 def build_demand_temperature_chart(
     combined: pd.DataFrame,
     temperature_label: str,
+    selected_series: list[str],
+    rolling_days: int,
 ):
-    if combined.empty:
+    if combined.empty or not selected_series:
         return None
 
     plot = combined.copy().sort_values("date")
     plot["avg_demand_gw"] = plot["demand_gwh"] / 24.0
-    plot["avg_demand_7d_gw"] = (
+    plot["avg_demand_rolling_gw"] = (
         plot["avg_demand_gw"]
-        .rolling(7, min_periods=1)
+        .rolling(rolling_days, min_periods=1)
         .mean()
     )
-    plot["temperature_7d_c"] = (
+    plot["temperature_rolling_c"] = (
         plot["temperature_c"]
-        .rolling(7, min_periods=1)
+        .rolling(rolling_days, min_periods=1)
         .mean()
     )
 
-    demand_long = pd.concat(
-        [
+    demand_frames = []
+    temperature_frames = []
+    legend_order = []
+    legend_colors = []
+    legend_dashes = []
+
+    if "Demand daily" in selected_series:
+        demand_frames.append(
             pd.DataFrame(
                 {
                     "date": plot["date"],
                     "value": plot["avg_demand_gw"],
                     "series": "Demand daily",
                 }
-            ),
+            )
+        )
+        legend_order.append("Demand daily")
+        legend_colors.append("#A5B4FC")
+        legend_dashes.append([4, 2])
+
+    if "Demand rolling average" in selected_series:
+        demand_rolling_label = f"Demand {rolling_days}d avg"
+        demand_frames.append(
             pd.DataFrame(
                 {
                     "date": plot["date"],
-                    "value": plot["avg_demand_7d_gw"],
-                    "series": "Demand 7d avg",
+                    "value": plot["avg_demand_rolling_gw"],
+                    "series": demand_rolling_label,
                 }
-            ),
-        ],
-        ignore_index=True,
-    )
+            )
+        )
+        legend_order.append(demand_rolling_label)
+        legend_colors.append(DEMAND_BLUE)
+        legend_dashes.append([1, 0])
 
-    temperature_long = pd.concat(
-        [
+    if "Temperature daily" in selected_series:
+        temperature_frames.append(
             pd.DataFrame(
                 {
                     "date": plot["date"],
                     "value": plot["temperature_c"],
                     "series": "Temperature daily",
                 }
-            ),
+            )
+        )
+        legend_order.append("Temperature daily")
+        legend_colors.append("#FDBA74")
+        legend_dashes.append([4, 2])
+
+    if "Temperature rolling average" in selected_series:
+        temperature_rolling_label = f"Temperature {rolling_days}d avg"
+        temperature_frames.append(
             pd.DataFrame(
                 {
                     "date": plot["date"],
-                    "value": plot["temperature_7d_c"],
-                    "series": "Temperature 7d avg",
+                    "value": plot["temperature_rolling_c"],
+                    "series": temperature_rolling_label,
                 }
-            ),
-        ],
-        ignore_index=True,
-    )
+            )
+        )
+        legend_order.append(temperature_rolling_label)
+        legend_colors.append(TEMPERATURE_ORANGE)
+        legend_dashes.append([1, 0])
 
     color_scale = alt.Scale(
-        domain=[
-            "Demand daily",
-            "Demand 7d avg",
-            "Temperature daily",
-            "Temperature 7d avg",
-        ],
-        range=[
-            "#A5B4FC",
-            DEMAND_BLUE,
-            "#FDBA74",
-            TEMPERATURE_ORANGE,
-        ],
+        domain=legend_order,
+        range=legend_colors,
     )
-
     dash_scale = alt.Scale(
-        domain=[
-            "Demand daily",
-            "Demand 7d avg",
-            "Temperature daily",
-            "Temperature 7d avg",
-        ],
-        range=[[4, 2], [1, 0], [4, 2], [1, 0]],
+        domain=legend_order,
+        range=legend_dashes,
     )
 
-    demand_chart = (
-        alt.Chart(demand_long)
-        .mark_line(strokeWidth=2.6)
-        .encode(
-            x=alt.X(
-                "date:T",
-                title=None,
-                axis=alt.Axis(format="%d-%b", labelAngle=0),
-            ),
-            y=alt.Y(
-                "value:Q",
-                title="Average daily demand (GW)",
-                axis=alt.Axis(
-                    orient="left",
-                    titlePadding=12,
-                    labelPadding=8,
+    layers = []
+
+    if demand_frames:
+        demand_long = pd.concat(demand_frames, ignore_index=True)
+        demand_chart = (
+            alt.Chart(demand_long)
+            .mark_line(strokeWidth=2.6)
+            .encode(
+                x=alt.X(
+                    "date:T",
+                    title=None,
+                    axis=alt.Axis(format="%d-%b", labelAngle=0),
                 ),
-                scale=alt.Scale(zero=False),
-            ),
-            color=alt.Color(
-                "series:N",
-                title="Series",
-                scale=color_scale,
-                sort=[
-                    "Demand daily",
-                    "Demand 7d avg",
-                    "Temperature daily",
-                    "Temperature 7d avg",
-                ],
-            ),
-            strokeDash=alt.StrokeDash(
-                "series:N",
-                scale=dash_scale,
-                legend=None,
-            ),
-            tooltip=[
-                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip(
+                y=alt.Y(
                     "value:Q",
                     title="Average daily demand (GW)",
-                    format=",.2f",
+                    axis=alt.Axis(
+                        orient="left",
+                        titlePadding=12,
+                        labelPadding=8,
+                    ),
+                    scale=alt.Scale(zero=False),
                 ),
-            ],
-        )
-    )
-
-    temperature_chart = (
-        alt.Chart(temperature_long)
-        .mark_line(strokeWidth=2.6)
-        .encode(
-            x=alt.X("date:T", title=None),
-            y=alt.Y(
-                "value:Q",
-                title=f"{temperature_label} (°C)",
-                axis=alt.Axis(
-                    orient="right",
-                    titlePadding=12,
-                    labelPadding=8,
+                color=alt.Color(
+                    "series:N",
+                    title="Series",
+                    scale=color_scale,
+                    sort=legend_order,
                 ),
-                scale=alt.Scale(zero=False),
-            ),
-            color=alt.Color(
-                "series:N",
-                title="Series",
-                scale=color_scale,
-                sort=[
-                    "Demand daily",
-                    "Demand 7d avg",
-                    "Temperature daily",
-                    "Temperature 7d avg",
+                strokeDash=alt.StrokeDash(
+                    "series:N",
+                    scale=dash_scale,
+                    legend=None,
+                ),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip(
+                        "value:Q",
+                        title="Average daily demand (GW)",
+                        format=",.2f",
+                    ),
                 ],
-            ),
-            strokeDash=alt.StrokeDash(
-                "series:N",
-                scale=dash_scale,
-                legend=None,
-            ),
-            tooltip=[
-                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip(
-                    "value:Q",
-                    title="Temperature (°C)",
-                    format=",.1f",
-                ),
-            ],
+            )
         )
-    )
+        layers.append(demand_chart)
 
-    chart = alt.layer(demand_chart, temperature_chart).resolve_scale(y="independent")
+    if temperature_frames:
+        temperature_long = pd.concat(temperature_frames, ignore_index=True)
+        temperature_chart = (
+            alt.Chart(temperature_long)
+            .mark_line(strokeWidth=2.6)
+            .encode(
+                x=alt.X(
+                    "date:T",
+                    title=None,
+                    axis=alt.Axis(format="%d-%b", labelAngle=0),
+                ),
+                y=alt.Y(
+                    "value:Q",
+                    title=f"{temperature_label} (°C)",
+                    axis=alt.Axis(
+                        orient="right",
+                        titlePadding=12,
+                        labelPadding=8,
+                    ),
+                    scale=alt.Scale(zero=False),
+                ),
+                color=alt.Color(
+                    "series:N",
+                    title="Series",
+                    scale=color_scale,
+                    sort=legend_order,
+                ),
+                strokeDash=alt.StrokeDash(
+                    "series:N",
+                    scale=dash_scale,
+                    legend=None,
+                ),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip(
+                        "value:Q",
+                        title="Temperature (°C)",
+                        format=",.1f",
+                    ),
+                ],
+            )
+        )
+        layers.append(temperature_chart)
+
+    if not layers:
+        return None
+
+    if len(layers) == 1:
+        chart = layers[0]
+    else:
+        chart = alt.layer(*layers).resolve_scale(y="independent")
+
     return configure_chart(chart, height=420)
 
 
@@ -1075,9 +1094,41 @@ else:
         else "Madrid daily mean temperature"
     )
 
+    series_options = [
+        "Demand daily",
+        "Demand rolling average",
+        "Temperature daily",
+        "Temperature rolling average",
+    ]
+
+    series_col, rolling_col = st.columns([2.4, 1])
+    with series_col:
+        selected_chart_series = st.multiselect(
+            "Variables shown in chart",
+            options=series_options,
+            default=series_options,
+            key="demand_temperature_chart_series",
+        )
+
+    rolling_is_selected = any(
+        "rolling" in series.lower()
+        for series in selected_chart_series
+    )
+
+    with rolling_col:
+        rolling_days = st.number_input(
+            "Rolling window (days)",
+            min_value=2,
+            max_value=30,
+            value=7,
+            step=1,
+            disabled=not rolling_is_selected,
+            key="demand_temperature_rolling_days",
+        )
+
     metric_1, metric_2, metric_3, metric_4 = st.columns(4)
 
-    combined['avg_demand_gw'] = combined['demand_gwh'] / 24.0
+    combined["avg_demand_gw"] = combined["demand_gwh"] / 24.0
 
     metric_1.metric(
         "Average daily demand",
@@ -1102,17 +1153,23 @@ else:
     demand_temperature_chart = build_demand_temperature_chart(
         combined,
         temperature_label=temperature_label,
-    )
-    st.altair_chart(
-        demand_temperature_chart,
-        use_container_width=True,
+        selected_series=selected_chart_series,
+        rolling_days=int(rolling_days),
     )
 
+    if demand_temperature_chart is None:
+        st.info("Select at least one variable to display in the chart.")
+    else:
+        st.altair_chart(
+            demand_temperature_chart,
+            use_container_width=True,
+        )
+
     st.caption(
-        "Dashed lines show daily observations and solid lines show the 7-day moving "
-        "average. Demand is displayed as average daily GW. The Spain series is a "
-        "population-weighted proxy based on representative peninsular cities, not an "
-        "official AEMET national index."
+        "Choose independently whether to show the daily demand, rolling demand, "
+        "daily temperature and rolling temperature. Dashed lines are daily observations; "
+        "solid lines are rolling averages. Demand is displayed as average daily GW. "
+        "The Spain series is a population-weighted proxy, not an official AEMET national index."
     )
 
 
