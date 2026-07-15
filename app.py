@@ -29,6 +29,7 @@ pg = st.navigation(
             st.Page("pages/4_Email_Report.py", title="Email Report", icon="📨"),
             st.Page("pages/5_MIBGAS.py", title="MIBGAS", icon="🔥"),
             st.Page("pages/test.py", title="test", icon="🧪"),
+            st.Page("pages/test.py", title="test2", icon="🧪"),
         ],
         "Operational Parks": [
             st.Page("pages/6_IS2.py", title="IS2", icon="☀️"),
