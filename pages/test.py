@@ -1776,9 +1776,43 @@ def load_generation_weather_forecast(
     )
     response.raise_for_status()
     forecast = _weighted_generation_weather(response.json())
-    return forecast[
+    forecast = forecast[
         forecast["datetime"].dt.date == target_day
-    ].reset_index(drop=True)
+    ].copy()
+
+    # Build a complete 24-hour local grid. Open-Meteo can occasionally omit a
+    # variable for one location/run, which previously caused all downstream
+    # Solar PV rows to be dropped by the strict dropna validation.
+    expected = pd.DataFrame(
+        {
+            "datetime": pd.date_range(
+                start=pd.Timestamp(target_day),
+                periods=24,
+                freq="h",
+            )
+        }
+    )
+    forecast = expected.merge(
+        forecast,
+        on="datetime",
+        how="left",
+    ).sort_values("datetime")
+
+    for variable in GENERATION_WEATHER_VARIABLES:
+        if variable not in forecast.columns:
+            forecast[variable] = np.nan
+        forecast[variable] = pd.to_numeric(
+            forecast[variable],
+            errors="coerce",
+        )
+        # Interpolate isolated missing forecast hours first. Any variable that
+        # is entirely unavailable is completed later from historical hourly
+        # climatology inside forecast_pbf_technology().
+        forecast[variable] = forecast[variable].interpolate(
+            limit_direction="both"
+        )
+
+    return forecast.reset_index(drop=True)
 
 
 def _market_calendar(frame: pd.DataFrame) -> pd.DataFrame:
@@ -2005,6 +2039,112 @@ def _generation_fallback(
     return np.maximum(prediction, 0)
 
 
+def _complete_generation_model_inputs(
+    model_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Complete model features without dropping target hours.
+
+    Priority for missing target values:
+    1. same-hour median from the training history;
+    2. global training median;
+    3. zero only when the feature is unavailable throughout history.
+
+    HistGradientBoosting can technically accept NaNs, but explicit imputation
+    keeps the fallback model and post-processing deterministic as well.
+    """
+    train = model_data.copy()
+    target = target_data.copy()
+    imputed_cells = 0
+
+    # Reconstruct the lag family before generic imputation. This preserves the
+    # most recent physical generation pattern whenever an isolated ESIOS hour
+    # is missing.
+    lag_columns = [
+        "gen_lag_2d", "gen_lag_3d", "gen_lag_7d",
+        "gen_lag_9d", "gen_lag_10d", "gen_lag_14d",
+        "gen_lag_21d", "gen_lag_28d",
+    ]
+    available_lags = [c for c in lag_columns if c in target.columns]
+    if available_lags:
+        target_lag_mean = target[available_lags].mean(axis=1)
+        for column in available_lags:
+            missing_before = int(target[column].isna().sum())
+            target[column] = target[column].fillna(target_lag_mean)
+            imputed_cells += missing_before - int(target[column].isna().sum())
+
+    if "gen_same_hour_4w" in target.columns:
+        recent_mean = target[
+            [
+                c for c in [
+                    "gen_lag_7d", "gen_lag_14d",
+                    "gen_lag_21d", "gen_lag_28d",
+                ]
+                if c in target.columns
+            ]
+        ].mean(axis=1)
+        missing_before = int(target["gen_same_hour_4w"].isna().sum())
+        target["gen_same_hour_4w"] = target[
+            "gen_same_hour_4w"
+        ].fillna(recent_mean)
+        imputed_cells += missing_before - int(
+            target["gen_same_hour_4w"].isna().sum()
+        )
+
+    for column in ["gen_change_d2_d9", "gen_change_d3_d10"]:
+        if column in target.columns:
+            missing_before = int(target[column].isna().sum())
+            target[column] = target[column].fillna(0.0)
+            imputed_cells += missing_before
+
+    if "gen_adjusted_d7" in target.columns:
+        reconstructed = (
+            target.get("gen_lag_7d", pd.Series(index=target.index, dtype=float))
+            + 0.65 * target.get(
+                "gen_change_d2_d9",
+                pd.Series(0.0, index=target.index),
+            )
+            + 0.35 * target.get(
+                "gen_change_d3_d10",
+                pd.Series(0.0, index=target.index),
+            )
+        )
+        missing_before = int(target["gen_adjusted_d7"].isna().sum())
+        target["gen_adjusted_d7"] = target[
+            "gen_adjusted_d7"
+        ].fillna(reconstructed)
+        imputed_cells += missing_before - int(
+            target["gen_adjusted_d7"].isna().sum()
+        )
+
+    for feature in GENERATION_FEATURES:
+        if feature not in train.columns:
+            train[feature] = np.nan
+        if feature not in target.columns:
+            target[feature] = np.nan
+
+        train[feature] = pd.to_numeric(train[feature], errors="coerce")
+        target[feature] = pd.to_numeric(target[feature], errors="coerce")
+
+        # Same-hour medians are especially important for radiation, wind and
+        # generation lags because a single daily median would flatten profiles.
+        hourly_median = train.groupby("hour")[feature].median()
+        hourly_fill = target["hour"].map(hourly_median)
+
+        missing_before = int(target[feature].isna().sum())
+        target[feature] = target[feature].fillna(hourly_fill)
+
+        global_median = train[feature].median()
+        if pd.isna(global_median):
+            global_median = 0.0
+
+        target[feature] = target[feature].fillna(float(global_median))
+        train[feature] = train[feature].fillna(float(global_median))
+        imputed_cells += missing_before
+
+    return train, target, imputed_cells
+
+
 def forecast_pbf_technology(
     technology: str,
     history: pd.DataFrame,
@@ -2033,16 +2173,26 @@ def forecast_pbf_technology(
     target = _generation_weather_features(target)
     target = _generation_lags(target, lookup)
 
+    # Keep every valid generation observation. Missing explanatory variables
+    # are completed below instead of discarding the entire hour.
     model_data = training.dropna(
-        subset=["energy_mwh"] + GENERATION_FEATURES
+        subset=["energy_mwh", "datetime", "hour"]
     ).copy()
     target_data = target.dropna(
-        subset=GENERATION_FEATURES
+        subset=["datetime", "hour"]
     ).copy()
+
+    model_data, target_data, imputed_cells = (
+        _complete_generation_model_inputs(
+            model_data,
+            target_data,
+        )
+    )
 
     if len(target_data) < 23:
         raise ValueError(
-            f"Incomplete target inputs for {technology}."
+            f"Only {len(target_data)} target hours are available for "
+            f"{technology}; expected at least 23."
         )
 
     stats = {"mae": np.nan, "mape": np.nan}
@@ -2151,6 +2301,7 @@ def forecast_pbf_technology(
     return output, {
         "Technology": technology,
         "Model": model_name,
+        "Target feature values imputed": int(imputed_cells),
         "Backtest MAE (MW)": stats.get("mae"),
         "Backtest MAPE (%)": stats.get("mape"),
     }
@@ -2198,6 +2349,7 @@ def generate_thermal_gap_forecast(
                 {
                     "Technology": technology,
                     "Model": "No ESIOS history",
+                    "Target feature values imputed": np.nan,
                     "Backtest MAE (MW)": np.nan,
                     "Backtest MAPE (%)": np.nan,
                 }
@@ -3245,7 +3397,7 @@ if st.button(
                 token,
             )
 
-        st.session_state["day_ahead_result"] = {
+        st.session_state["day_ahead_result_v5"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -3259,7 +3411,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result")
+forecast_result = st.session_state.get("day_ahead_result_v5")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
