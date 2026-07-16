@@ -13,3 +13,4 @@ reportlab
 scipy
 beautifulsoup4
 scikit-learn
+python-dateutil
