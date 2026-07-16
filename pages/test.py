@@ -597,7 +597,7 @@ def national_holidays(years: list[int]) -> set[date]:
     return result
 
 
-def build_forecast_features(frame: pd.DataFrame, demand_lookup: dict) -> pd.DataFrame:
+def build_forecast_features(frame: pd.DataFrame, demand_lookup: dict, trend_alpha: float = 1.0) -> pd.DataFrame:
     out = frame.copy()
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
     out["date"] = out["datetime"].dt.date
@@ -629,10 +629,47 @@ def build_forecast_features(frame: pd.DataFrame, demand_lookup: dict) -> pd.Data
     daily_temp = daily_temp.rename(columns={"mean": "daily_temp_mean", "min": "daily_temp_min", "max": "daily_temp_max"})
     out = out.merge(daily_temp, on="date", how="left")
 
-    for lag in [2, 3, 7, 14, 21, 28]:
-        out[f"lag_{lag}d"] = [demand_lookup.get((d - timedelta(days=lag), int(h)), np.nan) for d, h in zip(out["date"], out["hour"])]
-    out["same_hour_4w_mean"] = out[["lag_7d", "lag_14d", "lag_21d", "lag_28d"]].mean(axis=1)
-    out["recent_level_mean"] = out[["lag_2d", "lag_3d", "lag_7d"]].mean(axis=1)
+    # Historical demand lags available at a D-1 publication cut-off.
+    # D-2 and D-9 are the same weekday one week apart; likewise D-3 and D-10.
+    # Their differences provide an explicit measure of the most recent weekly
+    # level change, which is useful during heatwaves, cold spells or abrupt
+    # changes in economic/activity conditions.
+    for lag in [2, 3, 7, 9, 10, 14, 21, 28]:
+        out[f"lag_{lag}d"] = [
+            demand_lookup.get(
+                (d - timedelta(days=lag), int(h)),
+                np.nan,
+            )
+            for d, h in zip(out["date"], out["hour"])
+        ]
+
+    out["weekly_change_d2_vs_d9"] = out["lag_2d"] - out["lag_9d"]
+    out["weekly_change_d3_vs_d10"] = out["lag_3d"] - out["lag_10d"]
+
+    # Give slightly more relevance to D-2, while reducing the risk that a
+    # single anomalous day completely shifts the target curve.
+    out["recent_weekly_trend_raw_mw"] = (
+        0.65 * out["weekly_change_d2_vs_d9"]
+        + 0.35 * out["weekly_change_d3_vs_d10"]
+    )
+
+    # Cap extreme one-week movements before applying them to D-7. The raw
+    # differences remain available to the model as separate features.
+    out["recent_weekly_trend_mw"] = out[
+        "recent_weekly_trend_raw_mw"
+    ].clip(lower=-3500.0, upper=3500.0)
+
+    out["trend_adjusted_lag_7d"] = (
+        out["lag_7d"]
+        + float(trend_alpha) * out["recent_weekly_trend_mw"]
+    )
+
+    out["same_hour_4w_mean"] = out[
+        ["lag_7d", "lag_14d", "lag_21d", "lag_28d"]
+    ].mean(axis=1)
+    out["recent_level_mean"] = out[
+        ["lag_2d", "lag_3d", "lag_7d"]
+    ].mean(axis=1)
     return out
 
 
@@ -641,7 +678,11 @@ FORECAST_FEATURES = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos",
     "temperature_c", "daily_temp_mean", "daily_temp_min", "daily_temp_max",
     "heating_degree", "cooling_degree", "heating_degree_sq", "cooling_degree_sq",
-    "lag_2d", "lag_3d", "lag_7d", "lag_14d", "lag_21d", "lag_28d",
+    "lag_2d", "lag_3d", "lag_7d", "lag_9d", "lag_10d",
+    "lag_14d", "lag_21d", "lag_28d",
+    "weekly_change_d2_vs_d9", "weekly_change_d3_vs_d10",
+    "recent_weekly_trend_raw_mw", "recent_weekly_trend_mw",
+    "trend_adjusted_lag_7d",
     "same_hour_4w_mean", "recent_level_mean",
 ]
 
@@ -678,7 +719,7 @@ def similar_day_prediction(history: pd.DataFrame, target: pd.DataFrame) -> np.nd
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperature_mode: str) -> dict:
+def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperature_mode: str, trend_alpha: float = 1.0) -> dict:
     history_end = target_day - timedelta(days=2)
     history_start = history_end - timedelta(days=lookback_days)
 
@@ -699,14 +740,14 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
 
     history = demand_grid.merge(weather_grid, on=["date", "hour"], how="inner")
     history["datetime"] = pd.to_datetime(history["date"].astype(str)) + pd.to_timedelta(history["hour"], unit="h")
-    history = build_forecast_features(history, demand_lookup)
+    history = build_forecast_features(history, demand_lookup, trend_alpha=trend_alpha)
 
     target = target_weather.copy()
     target["date"] = target["datetime"].dt.date
     target["hour"] = target["datetime"].dt.hour
     target = target.groupby(["date", "hour"], as_index=False)["temperature_c"].mean()
     target["datetime"] = pd.to_datetime(target["date"].astype(str)) + pd.to_timedelta(target["hour"], unit="h")
-    target = build_forecast_features(target, demand_lookup)
+    target = build_forecast_features(target, demand_lookup, trend_alpha=trend_alpha)
 
     model_data = history.dropna(subset=["demand_mw"] + FORECAST_FEATURES).copy()
     target_data = target.dropna(subset=FORECAST_FEATURES).copy()
@@ -737,15 +778,39 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
         target_prediction = similar_day_prediction(model_data, target_data)
         model_name = "Weighted similar-day fallback"
 
-    model_stats = forecast_metrics(validation["demand_mw"], validation_prediction)
-    baseline_stats = forecast_metrics(validation["demand_mw"], validation["lag_7d"])
+    model_stats = forecast_metrics(
+        validation["demand_mw"],
+        validation_prediction,
+    )
+    baseline_stats = forecast_metrics(
+        validation["demand_mw"],
+        validation["lag_7d"],
+    )
+    trend_baseline_stats = forecast_metrics(
+        validation["demand_mw"],
+        validation["trend_adjusted_lag_7d"],
+    )
 
     residuals = validation[["hour"]].copy()
     residuals["residual"] = validation["demand_mw"].to_numpy() - validation_prediction
     quantiles = residuals.groupby("hour")["residual"].quantile([0.10, 0.90]).unstack()
     quantiles.columns = ["residual_p10", "residual_p90"]
 
-    forecast = target_data[["datetime", "date", "hour", "temperature_c", "lag_2d", "lag_7d"]].copy()
+    forecast = target_data[
+        [
+            "datetime",
+            "date",
+            "hour",
+            "temperature_c",
+            "lag_2d",
+            "lag_7d",
+            "lag_9d",
+            "weekly_change_d2_vs_d9",
+            "weekly_change_d3_vs_d10",
+            "recent_weekly_trend_mw",
+            "trend_adjusted_lag_7d",
+        ]
+    ].copy()
     forecast["forecast_mw"] = np.maximum(target_prediction, 0)
     forecast = forecast.merge(quantiles, left_on="hour", right_index=True, how="left")
     forecast["residual_p10"] = forecast["residual_p10"].fillna(residuals["residual"].quantile(0.10))
@@ -753,7 +818,17 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
     forecast["p10_mw"] = (forecast["forecast_mw"] + forecast["residual_p10"]).clip(lower=0)
     forecast["p90_mw"] = (forecast["forecast_mw"] + forecast["residual_p90"]).clip(lower=0)
 
-    backtest = validation[["datetime", "date", "hour", "demand_mw", "lag_7d"]].copy()
+    backtest = validation[
+        [
+            "datetime",
+            "date",
+            "hour",
+            "demand_mw",
+            "lag_7d",
+            "trend_adjusted_lag_7d",
+            "recent_weekly_trend_mw",
+        ]
+    ].copy()
     backtest["model_forecast_mw"] = validation_prediction
 
     return {
@@ -761,6 +836,8 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
         "backtest": backtest.sort_values("datetime").reset_index(drop=True),
         "model_stats": model_stats,
         "baseline_stats": baseline_stats,
+        "trend_baseline_stats": trend_baseline_stats,
+        "trend_alpha": float(trend_alpha),
         "model_name": model_name,
         "history_start": history_start,
         "history_end": history_end,
@@ -776,9 +853,21 @@ def build_day_ahead_chart(forecast: pd.DataFrame):
     )
 
     lines = pd.concat([
-        forecast[["datetime", "forecast_mw"]].rename(columns={"forecast_mw": "value"}).assign(series="Model forecast"),
-        forecast[["datetime", "lag_7d"]].rename(columns={"lag_7d": "value"}).assign(series="Same weekday previous week"),
-        forecast[["datetime", "lag_2d"]].rename(columns={"lag_2d": "value"}).assign(series="D-2 actual reference"),
+        forecast[["datetime", "forecast_mw"]]
+        .rename(columns={"forecast_mw": "value"})
+        .assign(series="Model forecast"),
+
+        forecast[["datetime", "trend_adjusted_lag_7d"]]
+        .rename(columns={"trend_adjusted_lag_7d": "value"})
+        .assign(series="Previous week + recent trend"),
+
+        forecast[["datetime", "lag_7d"]]
+        .rename(columns={"lag_7d": "value"})
+        .assign(series="Same weekday previous week"),
+
+        forecast[["datetime", "lag_2d"]]
+        .rename(columns={"lag_2d": "value"})
+        .assign(series="D-2 actual reference"),
     ], ignore_index=True)
 
     chart = alt.Chart(lines).mark_line(strokeWidth=3).encode(
@@ -788,13 +877,23 @@ def build_day_ahead_chart(forecast: pd.DataFrame):
             "series:N",
             title="Forecast series",
             scale=alt.Scale(
-                domain=["Model forecast", "Same weekday previous week", "D-2 actual reference"],
-                range=["#22C55E", "#64748B", "#93C5FD"],
+                domain=[
+                    "Model forecast",
+                    "Previous week + recent trend",
+                    "Same weekday previous week",
+                    "D-2 actual reference",
+                ],
+                range=[
+                    "#22C55E",
+                    "#F97316",
+                    "#64748B",
+                    "#93C5FD",
+                ],
             ),
             legend=alt.Legend(
                 orient="top",
                 direction="horizontal",
-                columns=3,
+                columns=4,
                 labelLimit=360,
                 titleLimit=240,
                 symbolLimit=360,
@@ -803,8 +902,18 @@ def build_day_ahead_chart(forecast: pd.DataFrame):
         strokeDash=alt.StrokeDash(
             "series:N", legend=None,
             scale=alt.Scale(
-                domain=["Model forecast", "Same weekday previous week", "D-2 actual reference"],
-                range=[[1, 0], [6, 3], [2, 2]],
+                domain=[
+                    "Model forecast",
+                    "Previous week + recent trend",
+                    "Same weekday previous week",
+                    "D-2 actual reference",
+                ],
+                range=[
+                    [1, 0],
+                    [8, 3],
+                    [5, 3],
+                    [2, 2],
+                ],
             ),
         ),
         tooltip=[
@@ -818,16 +927,72 @@ def build_day_ahead_chart(forecast: pd.DataFrame):
 
 def build_backtest_chart(backtest: pd.DataFrame):
     bt = backtest.copy()
-    bt["model_ape"] = (bt["demand_mw"] - bt["model_forecast_mw"]).abs() / bt["demand_mw"]
-    bt["baseline_ape"] = (bt["demand_mw"] - bt["lag_7d"]).abs() / bt["demand_mw"]
-    daily = bt.groupby("date", as_index=False).agg(model=("model_ape", "mean"), baseline=("baseline_ape", "mean"))
-    long = daily.melt(id_vars="date", var_name="series", value_name="mape")
-    long["series"] = long["series"].map({"model": "Model", "baseline": "Previous-week baseline"})
-    chart = alt.Chart(long).mark_line(point=True, strokeWidth=2.3).encode(
-        x=alt.X("date:T", title=None, axis=alt.Axis(format="%d-%b")),
-        y=alt.Y("mape:Q", title="Daily MAPE", axis=alt.Axis(format=".1%")),
-        color=alt.Color("series:N", title="Backtest", scale=alt.Scale(domain=["Model", "Previous-week baseline"], range=[CORP_GREEN, "#64748B"])),
-        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("series:N", title="Series"), alt.Tooltip("mape:Q", title="MAPE", format=".2%")],
+    safe_actual = bt["demand_mw"].replace(0, np.nan)
+
+    bt["model_ape"] = (
+        bt["demand_mw"] - bt["model_forecast_mw"]
+    ).abs() / safe_actual
+    bt["baseline_ape"] = (
+        bt["demand_mw"] - bt["lag_7d"]
+    ).abs() / safe_actual
+    bt["trend_baseline_ape"] = (
+        bt["demand_mw"] - bt["trend_adjusted_lag_7d"]
+    ).abs() / safe_actual
+
+    daily = bt.groupby("date", as_index=False).agg(
+        model=("model_ape", "mean"),
+        trend_baseline=("trend_baseline_ape", "mean"),
+        baseline=("baseline_ape", "mean"),
+    )
+
+    long = daily.melt(
+        id_vars="date",
+        var_name="series",
+        value_name="mape",
+    )
+    long["series"] = long["series"].map(
+        {
+            "model": "Model",
+            "trend_baseline": "Previous week + recent trend",
+            "baseline": "Previous-week baseline",
+        }
+    )
+
+    chart = alt.Chart(long).mark_line(
+        point=True,
+        strokeWidth=2.3,
+    ).encode(
+        x=alt.X(
+            "date:T",
+            title=None,
+            axis=alt.Axis(format="%d-%b"),
+        ),
+        y=alt.Y(
+            "mape:Q",
+            title="Daily MAPE",
+            axis=alt.Axis(format=".1%"),
+        ),
+        color=alt.Color(
+            "series:N",
+            title="Backtest",
+            scale=alt.Scale(
+                domain=[
+                    "Model",
+                    "Previous week + recent trend",
+                    "Previous-week baseline",
+                ],
+                range=[
+                    CORP_GREEN,
+                    "#F97316",
+                    "#64748B",
+                ],
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("date:T", title="Date"),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("mape:Q", title="MAPE", format=".2%"),
+        ],
     )
     return configure_chart(chart, height=290)
 
@@ -1607,7 +1772,7 @@ st.caption(
     "Demand is cut off at target D-2 so incomplete D-1 demand is never used."
 )
 
-fc1, fc2, fc3 = st.columns([1.05, 1.05, 1.4])
+fc1, fc2, fc3, fc4 = st.columns([1.0, 1.0, 1.1, 1.25])
 with fc1:
     forecast_target_day = st.date_input(
         "Forecast target day",
@@ -1625,10 +1790,25 @@ with fc2:
         key="forecast_training_days",
     )
 with fc3:
+    forecast_trend_alpha = st.slider(
+        "Recent weekly-trend weight",
+        min_value=0.0,
+        max_value=1.5,
+        value=1.0,
+        step=0.1,
+        help=(
+            "Adjusts the D-7 curve using the recent change between "
+            "D-2 and D-9, blended with D-3 versus D-10. "
+            "0 ignores the adjustment; 1 applies it fully."
+        ),
+        key="forecast_weekly_trend_alpha",
+    )
+with fc4:
     st.markdown(
-        "<div style='padding-top:1.8rem;color:#475569;font-size:0.92rem;'>"
-        "<b>Reference publication:</b> target D-1.<br>"
-        "<b>Latest complete demand used:</b> target D-2."
+        "<div style='padding-top:1.8rem;color:#475569;font-size:0.88rem;'>"
+        "<b>Publication:</b> target D-1.<br>"
+        "<b>Latest complete demand:</b> target D-2.<br>"
+        "<b>Trend pair:</b> D-2 vs D-9."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1640,6 +1820,7 @@ if st.button("Generate next-day demand curve", type="primary", use_container_wid
                 forecast_target_day,
                 int(forecast_lookback),
                 temperature_mode,
+                float(forecast_trend_alpha),
             )
     except Exception as exc:
         st.error(f"Demand forecast failed: {exc}")
@@ -1669,6 +1850,7 @@ if forecast_result:
             font-weight:650;
         ">
           <span><span style="display:inline-block;width:30px;border-top:3px solid #22C55E;margin-right:7px;vertical-align:middle;"></span>Model forecast</span>
+          <span><span style="display:inline-block;width:30px;border-top:3px dashed #F97316;margin-right:7px;vertical-align:middle;"></span>Previous week + recent trend</span>
           <span><span style="display:inline-block;width:30px;border-top:3px dashed #64748B;margin-right:7px;vertical-align:middle;"></span>Same weekday previous week</span>
           <span><span style="display:inline-block;width:30px;border-top:3px dotted #93C5FD;margin-right:7px;vertical-align:middle;"></span>D-2 actual reference</span>
           <span><span style="display:inline-block;width:30px;height:12px;background:rgba(16,185,129,0.18);border:1px solid rgba(16,185,129,0.35);margin-right:7px;vertical-align:middle;"></span>P10–P90 uncertainty band</span>
@@ -1678,13 +1860,49 @@ if forecast_result:
     )
     st.altair_chart(build_day_ahead_chart(forecast_df), use_container_width=True)
 
+    average_trend = forecast_df["recent_weekly_trend_mw"].mean()
+    evening_mask = forecast_df["hour"].between(18, 22)
+    evening_trend = (
+        forecast_df.loc[evening_mask, "recent_weekly_trend_mw"].mean()
+        if evening_mask.any()
+        else np.nan
+    )
+    st.caption(
+        "Recent weekly trend applied to the orange reference: "
+        f"{average_trend:+,.0f} MW on average across the day"
+        + (
+            f" and {evening_trend:+,.0f} MW during 18:00–22:00."
+            if pd.notna(evening_trend)
+            else "."
+        )
+        + f" Trend weight α = {forecast_result['trend_alpha']:.1f}."
+    )
+
     model_stats = forecast_result["model_stats"]
     baseline_stats = forecast_result["baseline_stats"]
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("Backtest model MAPE", f"{model_stats['mape']:,.2f}%")
-    q2.metric("Previous-week MAPE", f"{baseline_stats['mape']:,.2f}%")
-    q3.metric("Backtest MAE", f"{model_stats['mae']:,.0f} MW")
-    q4.metric("Training observations", f"{forecast_result['training_rows']:,}")
+    trend_baseline_stats = forecast_result["trend_baseline_stats"]
+
+    q1, q2, q3, q4, q5 = st.columns(5)
+    q1.metric(
+        "Backtest model MAPE",
+        f"{model_stats['mape']:,.2f}%",
+    )
+    q2.metric(
+        "Trend-adjusted D-7 MAPE",
+        f"{trend_baseline_stats['mape']:,.2f}%",
+    )
+    q3.metric(
+        "Plain D-7 MAPE",
+        f"{baseline_stats['mape']:,.2f}%",
+    )
+    q4.metric(
+        "Backtest model MAE",
+        f"{model_stats['mae']:,.0f} MW",
+    )
+    q5.metric(
+        "Training observations",
+        f"{forecast_result['training_rows']:,}",
+    )
 
     st.markdown(
         f"""
@@ -1700,8 +1918,9 @@ if forecast_result:
         ">
           <b>MAPE</b> (Mean Absolute Percentage Error): average hourly absolute error as a percentage of real demand.
           A model MAPE of <b>{model_stats['mape']:,.2f}%</b> means that the hourly forecast differs from realised
-          demand by approximately that percentage on average. <b>Previous-week MAPE</b> is the benchmark obtained
-          by copying the curve from the same weekday one week earlier.<br>
+          demand by approximately that percentage on average. <b>Plain D-7 MAPE</b> copies the curve from
+          the same weekday one week earlier. <b>Trend-adjusted D-7 MAPE</b> first shifts that D-7 curve by the
+          most recent same-weekday change observed between D-2 and D-9, blended with D-3 versus D-10.<br>
           <b>MAE</b> (Mean Absolute Error): average hourly absolute deviation in MW.
           A MAE of <b>{model_stats['mae']:,.0f} MW</b> means that the forecast was, on average,
           that many MW above or below realised demand. <b>Lower values are better</b>.
@@ -1710,11 +1929,30 @@ if forecast_result:
         unsafe_allow_html=True,
     )
 
-    improvement = baseline_stats["mape"] - model_stats["mape"]
-    if pd.notna(improvement) and improvement > 0:
-        st.success(f"The model improves MAPE by {improvement:,.2f} percentage points versus the previous-week curve.")
-    elif pd.notna(improvement):
-        st.warning(f"The model is {abs(improvement):,.2f} percentage points worse than the previous-week baseline in the latest validation window.")
+    model_vs_plain = baseline_stats["mape"] - model_stats["mape"]
+    trend_vs_plain = baseline_stats["mape"] - trend_baseline_stats["mape"]
+
+    message_parts = []
+    if pd.notna(model_vs_plain):
+        message_parts.append(
+            f"Model vs plain D-7: {model_vs_plain:+,.2f} pp"
+        )
+    if pd.notna(trend_vs_plain):
+        message_parts.append(
+            f"Trend-adjusted D-7 vs plain D-7: {trend_vs_plain:+,.2f} pp"
+        )
+
+    if message_parts:
+        if pd.notna(trend_vs_plain) and trend_vs_plain > 0:
+            st.success(
+                " | ".join(message_parts)
+                + ". Positive values indicate a MAPE improvement."
+            )
+        else:
+            st.info(
+                " | ".join(message_parts)
+                + ". Positive values indicate a MAPE improvement."
+            )
 
     with st.expander("Backtest and methodology"):
         st.altair_chart(build_backtest_chart(forecast_result["backtest"]), use_container_width=True)
@@ -1725,7 +1963,12 @@ if forecast_result:
             - Hour, weekday/weekend and annual seasonality.
             - National holidays and the adjacent days.
             - Forecast temperature, heating degrees and cooling degrees.
-            - Demand for the same hour on D-2, D-3, D-7, D-14, D-21 and D-28.
+            - Demand for the same hour on D-2, D-3, D-7, D-9, D-10, D-14, D-21 and D-28.
+            - Explicit recent weekly changes: D-2 minus D-9 and D-3 minus D-10.
+            - Trend-adjusted D-7 curve:
+
+              `D-7 adjusted = D-7 + alpha × [0.65 × (D-2 − D-9) + 0.35 × (D-3 − D-10)]`
+
             - Average same-hour demand over the previous four weeks.
 
             The validation is chronological over the latest 42 historical days.
@@ -1747,6 +1990,11 @@ if forecast_result:
         "temperature_c": "Forecast temperature °C",
         "lag_7d": "Same weekday previous week MW",
         "lag_2d": "D-2 actual MW",
+        "lag_9d": "D-9 actual MW",
+        "weekly_change_d2_vs_d9": "Weekly change D-2 minus D-9 MW",
+        "weekly_change_d3_vs_d10": "Weekly change D-3 minus D-10 MW",
+        "recent_weekly_trend_mw": "Blended recent weekly trend MW",
+        "trend_adjusted_lag_7d": "Previous week plus recent trend MW",
     })
     st.download_button(
         "Download forecast CSV",
