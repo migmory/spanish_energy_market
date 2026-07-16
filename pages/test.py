@@ -6,7 +6,17 @@ from time import sleep
 from zoneinfo import ZoneInfo
 
 import altair as alt
+import numpy as np
 import pandas as pd
+
+try:
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    SKLEARN_AVAILABLE = True
+except Exception:
+    HistGradientBoostingRegressor = None
+    SKLEARN_AVAILABLE = False
+
+from dateutil.easter import easter
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -37,6 +47,7 @@ MADRID_TZ = ZoneInfo("Europe/Madrid")
 ESIOS_API_BASE = "https://api.esios.ree.es/indicators"
 REDATA_DEMAND_URL = "https://apidatos.ree.es/es/datos/demanda/evolucion"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
@@ -44,6 +55,7 @@ DEMAND_BLUE = "#1D4ED8"
 TEMPERATURE_ORANGE = "#EA580C"
 
 MAX_RANGE_DAYS = 124
+FORECAST_VALIDATION_DAYS = 42
 
 
 # =========================================================
@@ -416,6 +428,399 @@ def load_spain_daily_temperature(
     )
 
     return national[["date", "temperature_c"]].sort_values("date")
+
+
+
+# =========================================================
+# DAY-AHEAD HOURLY DEMAND FORECAST
+# =========================================================
+def parse_redata_hourly(payload: dict) -> pd.DataFrame:
+    rows = []
+    for item in payload.get("included", []) or []:
+        attrs = item.get("attributes", {}) or {}
+        title = str(attrs.get("title") or item.get("id") or "").strip()
+        for value in attrs.get("values", []) or []:
+            dt = pd.to_datetime(value.get("datetime"), utc=True, errors="coerce")
+            val = pd.to_numeric(value.get("value"), errors="coerce")
+            if pd.isna(dt) or pd.isna(val):
+                continue
+            rows.append({
+                "datetime": dt.tz_convert("Europe/Madrid").tz_localize(None),
+                "title": title,
+                "value": float(val),
+            })
+    return pd.DataFrame(rows)
+
+
+def _fetch_hourly_demand_chunk(start_day: date, end_day: date) -> pd.DataFrame:
+    params = {
+        "start_date": f"{start_day.isoformat()}T00:00",
+        "end_date": f"{end_day.isoformat()}T23:59",
+        "time_trunc": "hour",
+        "geo_trunc": "electric_system",
+        "geo_limit": "peninsular",
+        "geo_ids": "8741",
+    }
+    response = requests.get(REDATA_DEMAND_URL, params=params, timeout=90)
+    response.raise_for_status()
+    raw = parse_redata_hourly(response.json())
+    if raw.empty:
+        return pd.DataFrame(columns=["datetime", "demand_mw"])
+
+    demand_like = raw[raw["title"].str.contains("demanda|demand", case=False, regex=True, na=False)]
+    if not demand_like.empty:
+        raw = demand_like
+
+    totals = raw.groupby("title", as_index=False)["value"].sum().sort_values("value", ascending=False)
+    if not totals.empty:
+        raw = raw[raw["title"] == totals.iloc[0]["title"]]
+
+    return (
+        raw.groupby("datetime", as_index=False)["value"]
+        .mean()
+        .rename(columns={"value": "demand_mw"})
+        .sort_values("datetime")
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFrame:
+    chunks = []
+    current = start_day
+    while current <= end_day:
+        chunk_end = min(end_day, current + timedelta(days=6))
+        chunks.append((current, chunk_end))
+        current = chunk_end + timedelta(days=1)
+
+    frames = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_fetch_hourly_demand_chunk, s, e): (s, e) for s, e in chunks}
+        for future in as_completed(futures):
+            try:
+                frame = future.result()
+            except Exception:
+                frame = pd.DataFrame()
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "demand_mw"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["demand_mw"] = pd.to_numeric(out["demand_mw"], errors="coerce")
+    return (
+        out.dropna(subset=["datetime", "demand_mw"])
+        .groupby("datetime", as_index=False)["demand_mw"].mean()
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+def _weighted_hourly_temperature(payload, points: list[dict]) -> pd.DataFrame:
+    if isinstance(payload, dict):
+        payload = [payload]
+    frames = []
+    for idx, item in enumerate(payload):
+        if idx >= len(points):
+            continue
+        hourly = item.get("hourly", {}) or {}
+        times = hourly.get("time", []) or []
+        values = hourly.get("temperature_2m", []) or []
+        if not times or not values:
+            continue
+        frame = pd.DataFrame({
+            "datetime": pd.to_datetime(times, errors="coerce"),
+            "temperature_c": pd.to_numeric(pd.Series(values), errors="coerce"),
+        })
+        frame["weight"] = float(points[idx]["weight"])
+        frames.append(frame.dropna(subset=["datetime", "temperature_c"]))
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "temperature_c"])
+
+    long = pd.concat(frames, ignore_index=True)
+    long["weighted"] = long["temperature_c"] * long["weight"]
+    out = long.groupby("datetime", as_index=False).agg(weighted=("weighted", "sum"), weight=("weight", "sum"))
+    out["temperature_c"] = out["weighted"] / out["weight"]
+    return out[["datetime", "temperature_c"]].sort_values("datetime")
+
+
+def _temperature_points(mode: str) -> list[dict]:
+    if mode == "Madrid":
+        return [{"city": "Madrid", "latitude": 40.4168, "longitude": -3.7038, "weight": 1.0}]
+    return SPAIN_TEMPERATURE_POINTS
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_hourly_temperature_history(start_day: date, end_day: date, mode: str) -> pd.DataFrame:
+    points = _temperature_points(mode)
+    safe_end = min(end_day, date.today() - timedelta(days=5))
+    if start_day > safe_end:
+        return pd.DataFrame(columns=["datetime", "temperature_c"])
+    params = {
+        "latitude": ",".join(str(p["latitude"]) for p in points),
+        "longitude": ",".join(str(p["longitude"]) for p in points),
+        "start_date": start_day.isoformat(),
+        "end_date": safe_end.isoformat(),
+        "hourly": "temperature_2m",
+        "timezone": "Europe/Madrid",
+        "models": "era5_land",
+    }
+    response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=180)
+    response.raise_for_status()
+    return _weighted_hourly_temperature(response.json(), points)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def load_hourly_temperature_forecast(target_day: date, mode: str) -> pd.DataFrame:
+    points = _temperature_points(mode)
+    params = {
+        "latitude": ",".join(str(p["latitude"]) for p in points),
+        "longitude": ",".join(str(p["longitude"]) for p in points),
+        "hourly": "temperature_2m",
+        "timezone": "Europe/Madrid",
+        "forecast_days": min(max((target_day - date.today()).days + 1, 1), 16),
+    }
+    response = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=120)
+    response.raise_for_status()
+    out = _weighted_hourly_temperature(response.json(), points)
+    return out[out["datetime"].dt.date == target_day].reset_index(drop=True)
+
+
+def national_holidays(years: list[int]) -> set[date]:
+    result = set()
+    for year in years:
+        for month, day in [(1, 1), (1, 6), (5, 1), (8, 15), (10, 12), (11, 1), (12, 6), (12, 8), (12, 25)]:
+            result.add(date(year, month, day))
+        result.add(easter(year) - timedelta(days=2))
+    return result
+
+
+def build_forecast_features(frame: pd.DataFrame, demand_lookup: dict) -> pd.DataFrame:
+    out = frame.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    out["date"] = out["datetime"].dt.date
+    out["hour"] = out["datetime"].dt.hour
+    out["date_ts"] = pd.to_datetime(out["date"].astype(str))
+    out["dow"] = out["date_ts"].dt.dayofweek
+    out["doy"] = out["date_ts"].dt.dayofyear
+    out["month"] = out["date_ts"].dt.month
+    out["is_weekend"] = (out["dow"] >= 5).astype(int)
+
+    holidays = national_holidays(sorted(out["date_ts"].dt.year.unique().tolist()))
+    out["is_holiday"] = out["date"].isin(holidays).astype(int)
+    out["is_pre_holiday"] = out["date"].map(lambda d: int(d + timedelta(days=1) in holidays))
+    out["is_post_holiday"] = out["date"].map(lambda d: int(d - timedelta(days=1) in holidays))
+
+    out["hour_sin"] = np.sin(2 * np.pi * out["hour"] / 24)
+    out["hour_cos"] = np.cos(2 * np.pi * out["hour"] / 24)
+    out["dow_sin"] = np.sin(2 * np.pi * out["dow"] / 7)
+    out["dow_cos"] = np.cos(2 * np.pi * out["dow"] / 7)
+    out["doy_sin"] = np.sin(2 * np.pi * out["doy"] / 365.25)
+    out["doy_cos"] = np.cos(2 * np.pi * out["doy"] / 365.25)
+
+    out["heating_degree"] = (16 - out["temperature_c"]).clip(lower=0)
+    out["cooling_degree"] = (out["temperature_c"] - 22).clip(lower=0)
+    out["heating_degree_sq"] = out["heating_degree"] ** 2
+    out["cooling_degree_sq"] = out["cooling_degree"] ** 2
+
+    daily_temp = out.groupby("date", as_index=False)["temperature_c"].agg(["mean", "min", "max"]).reset_index()
+    daily_temp = daily_temp.rename(columns={"mean": "daily_temp_mean", "min": "daily_temp_min", "max": "daily_temp_max"})
+    out = out.merge(daily_temp, on="date", how="left")
+
+    for lag in [2, 3, 7, 14, 21, 28]:
+        out[f"lag_{lag}d"] = [demand_lookup.get((d - timedelta(days=lag), int(h)), np.nan) for d, h in zip(out["date"], out["hour"])]
+    out["same_hour_4w_mean"] = out[["lag_7d", "lag_14d", "lag_21d", "lag_28d"]].mean(axis=1)
+    out["recent_level_mean"] = out[["lag_2d", "lag_3d", "lag_7d"]].mean(axis=1)
+    return out
+
+
+FORECAST_FEATURES = [
+    "hour", "month", "dow", "is_weekend", "is_holiday", "is_pre_holiday", "is_post_holiday",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos",
+    "temperature_c", "daily_temp_mean", "daily_temp_min", "daily_temp_max",
+    "heating_degree", "cooling_degree", "heating_degree_sq", "cooling_degree_sq",
+    "lag_2d", "lag_3d", "lag_7d", "lag_14d", "lag_21d", "lag_28d",
+    "same_hour_4w_mean", "recent_level_mean",
+]
+
+
+def forecast_metrics(actual, predicted) -> dict:
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    valid = np.isfinite(actual) & np.isfinite(predicted)
+    actual, predicted = actual[valid], predicted[valid]
+    if len(actual) == 0:
+        return {"mae": np.nan, "rmse": np.nan, "mape": np.nan}
+    error = actual - predicted
+    return {
+        "mae": float(np.mean(np.abs(error))),
+        "rmse": float(np.sqrt(np.mean(error ** 2))),
+        "mape": float(np.mean(np.abs(error / actual)) * 100),
+    }
+
+
+def similar_day_prediction(history: pd.DataFrame, target: pd.DataFrame) -> np.ndarray:
+    predictions = []
+    for row in target.itertuples(index=False):
+        candidates = history[(history["dow"] == row.dow) & (history["date"] < row.date)].copy()
+        candidates = candidates[candidates["hour"] == row.hour]
+        if candidates.empty:
+            predictions.append(float(row.same_hour_4w_mean))
+            continue
+        candidates["temp_distance"] = (candidates["daily_temp_mean"] - row.daily_temp_mean).abs()
+        candidates["days_ago"] = candidates["date"].map(lambda d: (row.date - d).days)
+        candidates = candidates.nsmallest(10, ["temp_distance", "days_ago"])
+        weights = np.exp(-candidates["temp_distance"] / 3) * np.exp(-candidates["days_ago"] / 240)
+        predictions.append(float(np.average(candidates["demand_mw"], weights=weights)))
+    return np.asarray(predictions)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperature_mode: str) -> dict:
+    history_end = target_day - timedelta(days=2)
+    history_start = history_end - timedelta(days=lookback_days)
+
+    demand = load_hourly_peninsular_demand(history_start, history_end)
+    weather = load_hourly_temperature_history(history_start, history_end, temperature_mode)
+    target_weather = load_hourly_temperature_forecast(target_day, temperature_mode)
+    if demand.empty or weather.empty or target_weather.empty:
+        raise ValueError("Hourly demand or weather data is unavailable.")
+
+    demand["date"] = demand["datetime"].dt.date
+    demand["hour"] = demand["datetime"].dt.hour
+    demand_grid = demand.groupby(["date", "hour"], as_index=False)["demand_mw"].mean()
+    demand_lookup = {(r.date, int(r.hour)): float(r.demand_mw) for r in demand_grid.itertuples(index=False)}
+
+    weather["date"] = weather["datetime"].dt.date
+    weather["hour"] = weather["datetime"].dt.hour
+    weather_grid = weather.groupby(["date", "hour"], as_index=False)["temperature_c"].mean()
+
+    history = demand_grid.merge(weather_grid, on=["date", "hour"], how="inner")
+    history["datetime"] = pd.to_datetime(history["date"].astype(str)) + pd.to_timedelta(history["hour"], unit="h")
+    history = build_forecast_features(history, demand_lookup)
+
+    target = target_weather.copy()
+    target["date"] = target["datetime"].dt.date
+    target["hour"] = target["datetime"].dt.hour
+    target = target.groupby(["date", "hour"], as_index=False)["temperature_c"].mean()
+    target["datetime"] = pd.to_datetime(target["date"].astype(str)) + pd.to_timedelta(target["hour"], unit="h")
+    target = build_forecast_features(target, demand_lookup)
+
+    model_data = history.dropna(subset=["demand_mw"] + FORECAST_FEATURES).copy()
+    target_data = target.dropna(subset=FORECAST_FEATURES).copy()
+    if len(model_data) < 24 * 180 or len(target_data) < 23:
+        raise ValueError("Insufficient complete observations after creating lag features.")
+
+    validation_start = model_data["date_ts"].max() - pd.Timedelta(days=FORECAST_VALIDATION_DAYS - 1)
+    train = model_data[model_data["date_ts"] < validation_start]
+    validation = model_data[model_data["date_ts"] >= validation_start]
+
+    if SKLEARN_AVAILABLE:
+        validation_model = HistGradientBoostingRegressor(
+            loss="absolute_error", learning_rate=0.055, max_iter=300,
+            max_leaf_nodes=31, min_samples_leaf=30, l2_regularization=8, random_state=42,
+        )
+        validation_model.fit(train[FORECAST_FEATURES], train["demand_mw"])
+        validation_prediction = validation_model.predict(validation[FORECAST_FEATURES])
+
+        final_model = HistGradientBoostingRegressor(
+            loss="absolute_error", learning_rate=0.055, max_iter=300,
+            max_leaf_nodes=31, min_samples_leaf=30, l2_regularization=8, random_state=42,
+        )
+        final_model.fit(model_data[FORECAST_FEATURES], model_data["demand_mw"])
+        target_prediction = final_model.predict(target_data[FORECAST_FEATURES])
+        model_name = "Histogram gradient boosting"
+    else:
+        validation_prediction = similar_day_prediction(train, validation)
+        target_prediction = similar_day_prediction(model_data, target_data)
+        model_name = "Weighted similar-day fallback"
+
+    model_stats = forecast_metrics(validation["demand_mw"], validation_prediction)
+    baseline_stats = forecast_metrics(validation["demand_mw"], validation["lag_7d"])
+
+    residuals = validation[["hour"]].copy()
+    residuals["residual"] = validation["demand_mw"].to_numpy() - validation_prediction
+    quantiles = residuals.groupby("hour")["residual"].quantile([0.10, 0.90]).unstack()
+    quantiles.columns = ["residual_p10", "residual_p90"]
+
+    forecast = target_data[["datetime", "date", "hour", "temperature_c", "lag_2d", "lag_7d"]].copy()
+    forecast["forecast_mw"] = np.maximum(target_prediction, 0)
+    forecast = forecast.merge(quantiles, left_on="hour", right_index=True, how="left")
+    forecast["residual_p10"] = forecast["residual_p10"].fillna(residuals["residual"].quantile(0.10))
+    forecast["residual_p90"] = forecast["residual_p90"].fillna(residuals["residual"].quantile(0.90))
+    forecast["p10_mw"] = (forecast["forecast_mw"] + forecast["residual_p10"]).clip(lower=0)
+    forecast["p90_mw"] = (forecast["forecast_mw"] + forecast["residual_p90"]).clip(lower=0)
+
+    backtest = validation[["datetime", "date", "hour", "demand_mw", "lag_7d"]].copy()
+    backtest["model_forecast_mw"] = validation_prediction
+
+    return {
+        "forecast": forecast.sort_values("datetime").reset_index(drop=True),
+        "backtest": backtest.sort_values("datetime").reset_index(drop=True),
+        "model_stats": model_stats,
+        "baseline_stats": baseline_stats,
+        "model_name": model_name,
+        "history_start": history_start,
+        "history_end": history_end,
+        "training_rows": len(model_data),
+    }
+
+
+def build_day_ahead_chart(forecast: pd.DataFrame):
+    band = alt.Chart(forecast).mark_area(opacity=0.16, color=CORP_GREEN).encode(
+        x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
+        y=alt.Y("p10_mw:Q", title="Demand (MW)", scale=alt.Scale(zero=False)),
+        y2="p90_mw:Q",
+    )
+
+    lines = pd.concat([
+        forecast[["datetime", "forecast_mw"]].rename(columns={"forecast_mw": "value"}).assign(series="Model forecast"),
+        forecast[["datetime", "lag_7d"]].rename(columns={"lag_7d": "value"}).assign(series="Same weekday previous week"),
+        forecast[["datetime", "lag_2d"]].rename(columns={"lag_2d": "value"}).assign(series="D-2 actual reference"),
+    ], ignore_index=True)
+
+    chart = alt.Chart(lines).mark_line(strokeWidth=3).encode(
+        x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
+        y=alt.Y("value:Q", title="Demand (MW)", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "series:N", title="Series",
+            scale=alt.Scale(
+                domain=["Model forecast", "Same weekday previous week", "D-2 actual reference"],
+                range=["#22C55E", "#64748B", "#93C5FD"],
+            ),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N", legend=None,
+            scale=alt.Scale(
+                domain=["Model forecast", "Same weekday previous week", "D-2 actual reference"],
+                range=[[1, 0], [6, 3], [2, 2]],
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("datetime:T", title="Hour", format="%d-%m-%Y %H:%M"),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("value:Q", title="Demand", format=",.0f"),
+        ],
+    )
+    return configure_chart(alt.layer(band, chart), height=430)
+
+
+def build_backtest_chart(backtest: pd.DataFrame):
+    bt = backtest.copy()
+    bt["model_ape"] = (bt["demand_mw"] - bt["model_forecast_mw"]).abs() / bt["demand_mw"]
+    bt["baseline_ape"] = (bt["demand_mw"] - bt["lag_7d"]).abs() / bt["demand_mw"]
+    daily = bt.groupby("date", as_index=False).agg(model=("model_ape", "mean"), baseline=("baseline_ape", "mean"))
+    long = daily.melt(id_vars="date", var_name="series", value_name="mape")
+    long["series"] = long["series"].map({"model": "Model", "baseline": "Previous-week baseline"})
+    chart = alt.Chart(long).mark_line(point=True, strokeWidth=2.3).encode(
+        x=alt.X("date:T", title=None, axis=alt.Axis(format="%d-%b")),
+        y=alt.Y("mape:Q", title="Daily MAPE", axis=alt.Axis(format=".1%")),
+        color=alt.Color("series:N", title="Backtest", scale=alt.Scale(domain=["Model", "Previous-week baseline"], range=[CORP_GREEN, "#64748B"])),
+        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("series:N", title="Series"), alt.Tooltip("mape:Q", title="MAPE", format=".2%")],
+    )
+    return configure_chart(chart, height=290)
 
 
 # =========================================================
@@ -1173,10 +1578,131 @@ else:
     )
 
 
+
+# =========================================================
+# NEXT-DAY DEMAND FORECAST
+# =========================================================
+section_header("Day-ahead peninsular demand forecast")
+
+st.caption(
+    "Prototype of a next-day hourly demand curve using calendar effects, "
+    "forecast temperature, national holidays and historical demand lags. "
+    "Demand is cut off at target D-2 so incomplete D-1 demand is never used."
+)
+
+fc1, fc2, fc3 = st.columns([1.05, 1.05, 1.4])
+with fc1:
+    forecast_target_day = st.date_input(
+        "Forecast target day",
+        value=date.today() + timedelta(days=1),
+        min_value=date.today(),
+        max_value=date.today() + timedelta(days=15),
+        key="forecast_target_day",
+    )
+with fc2:
+    forecast_lookback = st.select_slider(
+        "Training history",
+        options=[365, 450, 550, 650, 730],
+        value=550,
+        format_func=lambda value: f"{value} days",
+        key="forecast_training_days",
+    )
+with fc3:
+    st.markdown(
+        "<div style='padding-top:1.8rem;color:#475569;font-size:0.92rem;'>"
+        "<b>Reference publication:</b> target D-1.<br>"
+        "<b>Latest complete demand used:</b> target D-2."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+if st.button("Generate next-day demand curve", type="primary", use_container_width=True):
+    try:
+        with st.spinner("Downloading hourly history and training the forecast model..."):
+            st.session_state["day_ahead_result"] = generate_day_ahead_forecast(
+                forecast_target_day,
+                int(forecast_lookback),
+                temperature_mode,
+            )
+    except Exception as exc:
+        st.error(f"Demand forecast failed: {exc}")
+
+forecast_result = st.session_state.get("day_ahead_result")
+if forecast_result:
+    forecast_df = forecast_result["forecast"]
+    peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
+    minimum = forecast_df.loc[forecast_df["forecast_mw"].idxmin()]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Forecast average", f"{forecast_df['forecast_mw'].mean():,.0f} MW")
+    m2.metric("Forecast peak", f"{peak['forecast_mw']:,.0f} MW", delta=f"{int(peak['hour']):02d}:00", delta_color="off")
+    m3.metric("Forecast minimum", f"{minimum['forecast_mw']:,.0f} MW", delta=f"{int(minimum['hour']):02d}:00", delta_color="off")
+    m4.metric("Forecast temperature", f"{forecast_df['temperature_c'].mean():,.1f} °C")
+
+    st.altair_chart(build_day_ahead_chart(forecast_df), use_container_width=True)
+
+    model_stats = forecast_result["model_stats"]
+    baseline_stats = forecast_result["baseline_stats"]
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Backtest model MAPE", f"{model_stats['mape']:,.2f}%")
+    q2.metric("Previous-week MAPE", f"{baseline_stats['mape']:,.2f}%")
+    q3.metric("Backtest MAE", f"{model_stats['mae']:,.0f} MW")
+    q4.metric("Training observations", f"{forecast_result['training_rows']:,}")
+
+    improvement = baseline_stats["mape"] - model_stats["mape"]
+    if pd.notna(improvement) and improvement > 0:
+        st.success(f"The model improves MAPE by {improvement:,.2f} percentage points versus the previous-week curve.")
+    elif pd.notna(improvement):
+        st.warning(f"The model is {abs(improvement):,.2f} percentage points worse than the previous-week baseline in the latest validation window.")
+
+    with st.expander("Backtest and methodology"):
+        st.altair_chart(build_backtest_chart(forecast_result["backtest"]), use_container_width=True)
+        st.markdown(
+            """
+            **Inputs used by the prototype**
+
+            - Hour, weekday/weekend and annual seasonality.
+            - National holidays and the adjacent days.
+            - Forecast temperature, heating degrees and cooling degrees.
+            - Demand for the same hour on D-2, D-3, D-7, D-14, D-21 and D-28.
+            - Average same-hour demand over the previous four weeks.
+
+            The validation is chronological over the latest 42 historical days.
+            Historical realised weather is used in training, whereas the target day
+            uses forecast weather. Therefore, the backtest is slightly optimistic
+            because it does not include the full weather-forecast error.
+            """
+        )
+        st.caption(
+            f"Model: {forecast_result['model_name']}. Demand history used: "
+            f"{forecast_result['history_start']} to {forecast_result['history_end']}."
+        )
+
+    export = forecast_df.rename(columns={
+        "datetime": "Datetime",
+        "forecast_mw": "Forecast demand MW",
+        "p10_mw": "Forecast P10 MW",
+        "p90_mw": "Forecast P90 MW",
+        "temperature_c": "Forecast temperature °C",
+        "lag_7d": "Same weekday previous week MW",
+        "lag_2d": "D-2 actual MW",
+    })
+    st.download_button(
+        "Download forecast CSV",
+        data=export.to_csv(index=False).encode("utf-8"),
+        file_name=f"peninsular_demand_forecast_{forecast_df['date'].iloc[0]}.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("Press the button to generate the day-ahead curve. The first run is slower because the hourly history is downloaded and cached.")
+
+
 # =========================================================
 # PBF DAILY MIX
 # =========================================================
 section_header("PBF daily programmed-generation mix")
+
+summary = pd.DataFrame()
 
 if pbf_daily.empty:
     st.warning(
