@@ -785,10 +785,19 @@ def build_day_ahead_chart(forecast: pd.DataFrame):
         x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
         y=alt.Y("value:Q", title="Demand (MW)", scale=alt.Scale(zero=False)),
         color=alt.Color(
-            "series:N", title="Series",
+            "series:N",
+            title="Forecast series",
             scale=alt.Scale(
                 domain=["Model forecast", "Same weekday previous week", "D-2 actual reference"],
                 range=["#22C55E", "#64748B", "#93C5FD"],
+            ),
+            legend=alt.Legend(
+                orient="top",
+                direction="horizontal",
+                columns=3,
+                labelLimit=360,
+                titleLimit=240,
+                symbolLimit=360,
             ),
         ),
         strokeDash=alt.StrokeDash(
@@ -859,7 +868,7 @@ def parse_esios_values(payload: dict) -> pd.DataFrame:
     frame["datetime"] = (
         dt.dt.tz_convert("Europe/Madrid")
         .dt.tz_localize(None)
-        .dt.normalize()
+        .dt.floor("h")
     )
     frame["value"] = pd.to_numeric(
         frame.get("value"),
@@ -899,26 +908,25 @@ def parse_esios_values(payload: dict) -> pd.DataFrame:
     return frame[["datetime", "value", "geo_id", "geo_name"]]
 
 
-def fetch_one_pbf_indicator_daily(
+def fetch_one_pbf_indicator_hourly(
     indicator_id: int,
     start_day: date,
     end_day: date,
     token: str,
 ) -> pd.DataFrame:
+    """
+    Fetch one PBF indicator at hourly resolution.
+
+    time_agg=sum ensures that, after the quarter-hour market transition, the
+    four quarter-hour programmed-energy values are summed into the hourly MWh.
+    """
     frames = []
     chunk_start = start_day
 
-    # Monthly chunks keep ESIOS requests small and stable.
     while chunk_start <= end_day:
-        chunk_end = min(
-            end_day,
-            chunk_start + timedelta(days=30),
-        )
+        chunk_end = min(end_day, chunk_start + timedelta(days=13))
 
-        start_local = pd.Timestamp(
-            chunk_start,
-            tz="Europe/Madrid",
-        )
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
         end_local = pd.Timestamp(
             chunk_end + timedelta(days=1),
             tz="Europe/Madrid",
@@ -931,11 +939,9 @@ def fetch_one_pbf_indicator_daily(
             "end_date": end_local.tz_convert("UTC").strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
-            "time_trunc": "day",
+            "time_trunc": "hour",
             "time_agg": "sum",
         }
-
-        last_error = None
 
         for attempt in range(3):
             try:
@@ -950,41 +956,32 @@ def fetch_one_pbf_indicator_daily(
                 parsed = parse_esios_values(response.json())
                 if not parsed.empty:
                     frames.append(parsed)
-
-                last_error = None
                 break
 
-            except requests.RequestException as exc:
-                last_error = exc
+            except requests.RequestException:
                 sleep(1.5 * (attempt + 1))
-
-        if last_error is not None:
-            # Return the chunks that did work instead of breaking the whole page.
-            pass
 
         chunk_start = chunk_end + timedelta(days=1)
 
     if not frames:
-        return pd.DataFrame(columns=["date", "energy_mwh"])
+        return pd.DataFrame(columns=["datetime", "energy_mwh"])
 
     out = pd.concat(frames, ignore_index=True)
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["datetime", "value"])
 
     return (
         out.groupby("datetime", as_index=False)["value"]
         .sum()
-        .rename(
-            columns={
-                "datetime": "date",
-                "value": "energy_mwh",
-            }
-        )
-        .sort_values("date")
-        .drop_duplicates(subset=["date"], keep="last")
+        .rename(columns={"value": "energy_mwh"})
+        .sort_values("datetime")
+        .drop_duplicates(subset=["datetime"], keep="last")
         .reset_index(drop=True)
     )
 
 
-def load_one_pbf_technology(
+def load_one_pbf_technology_hourly(
     technology: str,
     indicator_ids: list[int],
     start_day: date,
@@ -994,7 +991,7 @@ def load_one_pbf_technology(
     frames = []
 
     for indicator_id in indicator_ids:
-        indicator_df = fetch_one_pbf_indicator_daily(
+        indicator_df = fetch_one_pbf_indicator_hourly(
             indicator_id=indicator_id,
             start_day=start_day,
             end_day=end_day,
@@ -1005,22 +1002,21 @@ def load_one_pbf_technology(
 
     if not frames:
         return pd.DataFrame(
-            columns=["date", "technology", "energy_mwh"]
+            columns=["datetime", "technology", "energy_mwh"]
         )
 
     combined = pd.concat(frames, ignore_index=True)
-
     combined = (
-        combined.groupby("date", as_index=False)["energy_mwh"]
+        combined.groupby("datetime", as_index=False)["energy_mwh"]
         .sum()
     )
     combined["technology"] = technology
 
-    return combined[["date", "technology", "energy_mwh"]]
+    return combined[["datetime", "technology", "energy_mwh"]]
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_pbf_daily_mix(
+def load_pbf_hourly_mix(
     start_day: date,
     end_day: date,
     _token: str,
@@ -1030,7 +1026,7 @@ def load_pbf_daily_mix(
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
             executor.submit(
-                load_one_pbf_technology,
+                load_one_pbf_technology_hourly,
                 technology,
                 indicator_ids,
                 start_day,
@@ -1041,13 +1037,11 @@ def load_pbf_daily_mix(
         }
 
         for future in as_completed(futures):
-            technology = futures[future]
-
             try:
                 frame = future.result()
             except Exception:
                 frame = pd.DataFrame(
-                    columns=["date", "technology", "energy_mwh"]
+                    columns=["datetime", "technology", "energy_mwh"]
                 )
 
             if not frame.empty:
@@ -1055,23 +1049,23 @@ def load_pbf_daily_mix(
 
     if not results:
         return pd.DataFrame(
-            columns=["date", "technology", "energy_mwh"]
+            columns=["datetime", "technology", "energy_mwh"]
         )
 
     out = pd.concat(results, ignore_index=True)
-    out["energy_mwh"] = pd.to_numeric(
-        out["energy_mwh"],
-        errors="coerce",
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
+    out["energy_mwh"] = pd.to_numeric(out["energy_mwh"], errors="coerce")
+    out = out.dropna(
+        subset=["datetime", "technology", "energy_mwh"]
     )
-    out = out.dropna(subset=["date", "technology", "energy_mwh"])
 
     return (
         out.groupby(
-            ["date", "technology"],
+            ["datetime", "technology"],
             as_index=False,
         )["energy_mwh"]
         .sum()
-        .sort_values(["date", "technology"])
+        .sort_values(["datetime", "technology"])
         .reset_index(drop=True)
     )
 
@@ -1277,12 +1271,13 @@ def build_demand_temperature_chart(
     return configure_chart(chart, height=420)
 
 
-def build_pbf_daily_area_chart(pbf_daily: pd.DataFrame):
-    if pbf_daily.empty:
+def build_pbf_hourly_area_chart(pbf_hourly: pd.DataFrame):
+    if pbf_hourly.empty:
         return None
 
-    plot = pbf_daily.copy()
-    plot["energy_gwh"] = plot["energy_mwh"] / 1_000.0
+    plot = pbf_hourly.copy()
+    # Hourly MWh divided by one hour is average MW; /1,000 displays GW.
+    plot["average_power_gw"] = plot["energy_mwh"] / 1_000.0
 
     order = [
         technology
@@ -1295,13 +1290,17 @@ def build_pbf_daily_area_chart(pbf_daily: pd.DataFrame):
         .mark_area()
         .encode(
             x=alt.X(
-                "date:T",
+                "datetime:T",
                 title=None,
-                axis=alt.Axis(format="%d-%b", labelAngle=0),
+                axis=alt.Axis(
+                    format="%d-%b %H:%M",
+                    labelAngle=-35,
+                    labelOverlap="greedy",
+                ),
             ),
             y=alt.Y(
-                "sum(energy_gwh):Q",
-                title="Daily PBF programmed generation (GWh)",
+                "sum(average_power_gw):Q",
+                title="Hourly PBF programmed generation (GW)",
                 stack="zero",
             ),
             color=alt.Color(
@@ -1312,24 +1311,40 @@ def build_pbf_daily_area_chart(pbf_daily: pd.DataFrame):
                     domain=PBF_COLOR_DOMAIN,
                     range=PBF_COLOR_RANGE,
                 ),
+                legend=alt.Legend(
+                    orient="top",
+                    direction="horizontal",
+                    columns=5,
+                    labelLimit=220,
+                    symbolLimit=220,
+                ),
             ),
             order=alt.Order(
                 "technology:N",
                 sort="ascending",
             ),
             tooltip=[
-                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip(
+                    "datetime:T",
+                    title="Hour",
+                    format="%Y-%m-%d %H:%M",
+                ),
                 alt.Tooltip("technology:N", title="Technology"),
                 alt.Tooltip(
-                    "sum(energy_gwh):Q",
-                    title="PBF energy (GWh)",
+                    "average_power_gw:Q",
+                    title="Programmed power (GW)",
                     format=",.2f",
+                ),
+                alt.Tooltip(
+                    "energy_mwh:Q",
+                    title="Programmed energy (MWh)",
+                    format=",.0f",
                 ),
             ],
         )
     )
 
-    return configure_chart(chart, height=390)
+    return configure_chart(chart, height=420)
 
 
 def build_pbf_average_chart(summary: pd.DataFrame):
@@ -1348,8 +1363,8 @@ def build_pbf_average_chart(summary: pd.DataFrame):
                 title=None,
             ),
             x=alt.X(
-                "average_daily_gwh:Q",
-                title="Average programmed energy (GWh/day)",
+                "average_programmed_gw:Q",
+                title="Average programmed power (GW)",
             ),
             color=alt.Color(
                 "technology:N",
@@ -1362,8 +1377,8 @@ def build_pbf_average_chart(summary: pd.DataFrame):
             tooltip=[
                 alt.Tooltip("technology:N", title="Technology"),
                 alt.Tooltip(
-                    "average_daily_gwh:Q",
-                    title="Average GWh/day",
+                    "average_programmed_gw:Q",
+                    title="Average programmed power (GW)",
                     format=",.2f",
                 ),
                 alt.Tooltip(
@@ -1373,7 +1388,7 @@ def build_pbf_average_chart(summary: pd.DataFrame):
                 ),
                 alt.Tooltip(
                     "share_pct:Q",
-                    title="Share",
+                    title="Energy share",
                     format=".1%",
                 ),
             ],
@@ -1390,17 +1405,18 @@ def build_pbf_average_chart(summary: pd.DataFrame):
         )
         .encode(
             y=alt.Y("technology:N", sort=order),
-            x=alt.X("average_daily_gwh:Q"),
+            x=alt.X("average_programmed_gw:Q"),
             text=alt.Text(
-                "average_daily_gwh:Q",
+                "average_programmed_gw:Q",
                 format=",.1f",
             ),
         )
     )
 
-    chart = alt.layer(bars, labels)
-
-    return configure_chart(chart, height=max(340, 31 * len(summary)))
+    return configure_chart(
+        alt.layer(bars, labels),
+        height=max(340, 31 * len(summary)),
+    )
 
 
 # =========================================================
@@ -1410,14 +1426,15 @@ st.title("Demand, temperature and PBF — test")
 
 st.caption(
     "Daily peninsular electricity demand from REData, historical temperature "
-    "from Open-Meteo ERA5-Land and programmed PBF generation from ESIOS."
+    "from Open-Meteo ERA5-Land and hourly programmed PBF generation from ESIOS."
 )
 
 token = require_esios_token()
 
 archive_safe_end = date.today() - timedelta(days=5)
 default_end = archive_safe_end
-default_start = default_end - timedelta(days=61)
+# Default view: the latest seven complete days available in the archive.
+default_start = default_end - timedelta(days=6)
 
 controls_1, controls_2, controls_3 = st.columns([1, 1, 1.2])
 
@@ -1469,7 +1486,7 @@ with st.spinner("Loading demand, temperature and PBF data..."):
         mode=temperature_mode,
     )
 
-    pbf_daily = load_pbf_daily_mix(
+    pbf_hourly = load_pbf_hourly_mix(
         start_day=start_day,
         end_day=end_day,
         _token=token,
@@ -1639,6 +1656,26 @@ if forecast_result:
     m3.metric("Forecast minimum", f"{minimum['forecast_mw']:,.0f} MW", delta=f"{int(minimum['hour']):02d}:00", delta_color="off")
     m4.metric("Forecast temperature", f"{forecast_df['temperature_c'].mean():,.1f} °C")
 
+    st.markdown(
+        """
+        <div style="
+            display:flex;
+            flex-wrap:wrap;
+            gap:18px;
+            align-items:center;
+            margin:4px 0 8px 0;
+            color:#334155;
+            font-size:0.88rem;
+            font-weight:650;
+        ">
+          <span><span style="display:inline-block;width:30px;border-top:3px solid #22C55E;margin-right:7px;vertical-align:middle;"></span>Model forecast</span>
+          <span><span style="display:inline-block;width:30px;border-top:3px dashed #64748B;margin-right:7px;vertical-align:middle;"></span>Same weekday previous week</span>
+          <span><span style="display:inline-block;width:30px;border-top:3px dotted #93C5FD;margin-right:7px;vertical-align:middle;"></span>D-2 actual reference</span>
+          <span><span style="display:inline-block;width:30px;height:12px;background:rgba(16,185,129,0.18);border:1px solid rgba(16,185,129,0.35);margin-right:7px;vertical-align:middle;"></span>P10–P90 uncertainty band</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.altair_chart(build_day_ahead_chart(forecast_df), use_container_width=True)
 
     model_stats = forecast_result["model_stats"]
@@ -1648,6 +1685,30 @@ if forecast_result:
     q2.metric("Previous-week MAPE", f"{baseline_stats['mape']:,.2f}%")
     q3.metric("Backtest MAE", f"{model_stats['mae']:,.0f} MW")
     q4.metric("Training observations", f"{forecast_result['training_rows']:,}")
+
+    st.markdown(
+        f"""
+        <div style="
+            background:#F8FAFC;
+            border:1px solid #E2E8F0;
+            border-radius:10px;
+            padding:10px 13px;
+            margin:8px 0 12px 0;
+            color:#475569;
+            font-size:0.88rem;
+            line-height:1.45;
+        ">
+          <b>MAPE</b> (Mean Absolute Percentage Error): average hourly absolute error as a percentage of real demand.
+          A model MAPE of <b>{model_stats['mape']:,.2f}%</b> means that the hourly forecast differs from realised
+          demand by approximately that percentage on average. <b>Previous-week MAPE</b> is the benchmark obtained
+          by copying the curve from the same weekday one week earlier.<br>
+          <b>MAE</b> (Mean Absolute Error): average hourly absolute deviation in MW.
+          A MAE of <b>{model_stats['mae']:,.0f} MW</b> means that the forecast was, on average,
+          that many MW above or below realised demand. <b>Lower values are better</b>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     improvement = baseline_stats["mape"] - model_stats["mape"]
     if pd.notna(improvement) and improvement > 0:
@@ -1698,43 +1759,50 @@ else:
 
 
 # =========================================================
-# PBF DAILY MIX
+# PBF HOURLY MIX
 # =========================================================
-section_header("PBF daily programmed-generation mix")
+section_header("PBF hourly programmed-generation mix")
 
 summary = pd.DataFrame()
 
-if pbf_daily.empty:
+if pbf_hourly.empty:
     st.warning(
-        "ESIOS did not return PBF technology data for the selected period. "
-        "Check the token and the selected dates."
+        "ESIOS did not return hourly PBF technology data for the selected "
+        "period. Check the token and selected dates."
     )
 else:
-    pbf_area_chart = build_pbf_daily_area_chart(pbf_daily)
+    pbf_area_chart = build_pbf_hourly_area_chart(pbf_hourly)
     st.altair_chart(
         pbf_area_chart,
         use_container_width=True,
     )
 
-    days_with_data = max(
-        int(pbf_daily["date"].nunique()),
+    hours_with_data = max(
+        int(pbf_hourly["datetime"].nunique()),
         1,
     )
 
     summary = (
-        pbf_daily.groupby("technology", as_index=False)["energy_mwh"]
+        pbf_hourly.groupby(
+            "technology",
+            as_index=False,
+        )["energy_mwh"]
         .sum()
         .rename(columns={"energy_mwh": "period_total_mwh"})
     )
-
     summary["period_total_gwh"] = (
         summary["period_total_mwh"] / 1_000.0
     )
-    summary["average_daily_gwh"] = (
-        summary["period_total_gwh"] / days_with_data
+    summary["average_programmed_gw"] = (
+        summary["period_total_mwh"]
+        / hours_with_data
+        / 1_000.0
     )
 
     total_period_gwh = summary["period_total_gwh"].sum()
+    total_average_gw = (
+        summary["average_programmed_gw"].sum()
+    )
     summary["share_pct"] = (
         summary["period_total_gwh"] / total_period_gwh
         if total_period_gwh != 0
@@ -1742,7 +1810,7 @@ else:
     )
 
     summary = summary.sort_values(
-        "average_daily_gwh",
+        "average_programmed_gw",
         ascending=False,
     ).reset_index(drop=True)
 
@@ -1753,15 +1821,17 @@ else:
         f"{total_period_gwh:,.1f} GWh",
     )
     pbf_m2.metric(
-        "Average PBF generation",
-        f"{total_period_gwh / days_with_data:,.1f} GWh/day",
+        "Average PBF programmed power",
+        f"{total_average_gw:,.1f} GW",
     )
     pbf_m3.metric(
-        "Days with PBF data",
-        f"{days_with_data:,}",
+        "Hourly timestamps with PBF data",
+        f"{hours_with_data:,}",
     )
 
-    st.subheader("Average PBF composition during selected period")
+    st.subheader(
+        "Average hourly PBF composition during selected period"
+    )
 
     average_chart = build_pbf_average_chart(summary)
     st.altair_chart(
@@ -1772,25 +1842,25 @@ else:
     table = summary[
         [
             "technology",
-            "average_daily_gwh",
+            "average_programmed_gw",
             "period_total_gwh",
             "share_pct",
         ]
     ].rename(
         columns={
             "technology": "Technology",
-            "average_daily_gwh": "Average GWh/day",
+            "average_programmed_gw": "Average programmed GW",
             "period_total_gwh": "Period total GWh",
-            "share_pct": "PBF share",
+            "share_pct": "PBF energy share",
         }
     )
 
     st.dataframe(
         table.style.format(
             {
-                "Average GWh/day": "{:,.2f}",
+                "Average programmed GW": "{:,.2f}",
                 "Period total GWh": "{:,.1f}",
-                "PBF share": "{:.1%}",
+                "PBF energy share": "{:.1%}",
             }
         ),
         use_container_width=True,
@@ -1798,10 +1868,12 @@ else:
     )
 
     st.caption(
-        "PBF averages are calculated as total programmed energy for each "
-        "technology divided by the number of dates returned by ESIOS. "
-        "Imports, exports, pumping consumption and demand-side programme "
-        "components are intentionally excluded from this generation mix."
+        "The stacked PBF chart is now hourly. Each ESIOS observation is "
+        "requested with time_trunc=hour and time_agg=sum; hourly MWh are "
+        "shown as average GW for that hour. The summary divides each "
+        "technology's total MWh by the number of hourly timestamps. Imports, "
+        "exports, pumping consumption and demand-side programme components "
+        "remain excluded."
     )
 
 
@@ -1812,7 +1884,7 @@ with st.expander("Show / download test data"):
     tab_1, tab_2, tab_3 = st.tabs(
         [
             "Demand and temperature",
-            "PBF daily mix",
+            "PBF hourly mix",
             "PBF average",
         ]
     )
@@ -1833,9 +1905,9 @@ with st.expander("Show / download test data"):
         )
 
     with tab_2:
-        pbf_export = pbf_daily.copy()
+        pbf_export = pbf_hourly.copy()
         if not pbf_export.empty:
-            pbf_export["energy_gwh"] = (
+            pbf_export["average_power_gw"] = (
                 pbf_export["energy_mwh"] / 1_000.0
             )
 
@@ -1845,9 +1917,9 @@ with st.expander("Show / download test data"):
             hide_index=True,
         )
         st.download_button(
-            "Download daily PBF CSV",
+            "Download hourly PBF CSV",
             data=pbf_export.to_csv(index=False).encode("utf-8"),
-            file_name=f"pbf_daily_{start_day}_{end_day}.csv",
+            file_name=f"pbf_hourly_{start_day}_{end_day}.csv",
             mime="text/csv",
         )
 
