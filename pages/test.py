@@ -1,4 +1,5 @@
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -56,7 +57,18 @@ DEMAND_BLUE = "#1D4ED8"
 TEMPERATURE_ORANGE = "#EA580C"
 
 MAX_RANGE_DAYS = 124
+
 FORECAST_VALIDATION_DAYS = 42
+
+# =========================================================
+# MIBGAS D-1 INPUT
+# =========================================================
+# This reads the same GDAES_D+1 Reference Price dataset used by the MIBGAS
+# Streamlit page. The feature used for electricity delivery day D is the gas
+# price for gas delivery day D-1, which is a conservative no-leakage input.
+MIBGAS_TARGET_SHEET = "Trading Data PVB&VTP"
+MIBGAS_LOCAL_FILE_PATTERN = "MIBGAS_Data_*.xlsx"
+MIBGAS_CACHE_FILENAME = "mibgas_2026_cache.csv"
 
 
 # =========================================================
@@ -3459,6 +3471,498 @@ def build_thermal_gap_forecast_chart(
     )
 
 
+
+# =========================================================
+# MIBGAS GDAES D+1 — DAILY GAS INPUT
+# =========================================================
+def _mibgas_normalize_column(column) -> str:
+    if pd.isna(column):
+        return ""
+    value = (
+        str(column)
+        .replace("\xa0", " ")
+        .replace("\n", " ")
+        .strip()
+        .lower()
+    )
+    replacements = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ñ": "n",
+        "[": "",
+        "]": "",
+        "(": "",
+        ")": "",
+        "%": "pct",
+        "/": "_",
+        "-": "_",
+        ".": "_",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    value = re.sub(r"\s+", "_", value)
+    return re.sub(r"_+", "_", value).strip("_")
+
+
+def _mibgas_to_number(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.replace("€", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace("\xa0", "", regex=False)
+    )
+    cleaned = (
+        cleaned.str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def _mibgas_first_column(
+    columns: list[str],
+    candidates: list[str],
+) -> str | None:
+    column_set = set(columns)
+    for candidate in candidates:
+        normalized = _mibgas_normalize_column(candidate)
+        if normalized in column_set:
+            return normalized
+    return None
+
+
+def _mibgas_data_directories() -> list[Path]:
+    candidates = [
+        CURRENT_FILE.parent / "data",
+        CURRENT_FILE.parent.parent / "data",
+    ]
+    output = []
+    for candidate in candidates:
+        if candidate not in output:
+            output.append(candidate)
+    return output
+
+
+def _standardize_mibgas_actuals(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return GDAES_D+1 reference prices indexed by gas delivery day.
+
+    This follows the MIBGAS page convention:
+      market_trading_day = original Trading day
+      gas_delivery_day   = First Day Delivery
+    """
+    if raw is None or raw.empty:
+        return pd.DataFrame(
+            columns=[
+                "gas_delivery_day",
+                "market_trading_day",
+                "gas_price_eur_mwh",
+                "gas_source",
+            ]
+        )
+
+    frame = raw.copy()
+    frame.columns = [
+        _mibgas_normalize_column(column)
+        for column in frame.columns
+    ]
+
+    trading_column = _mibgas_first_column(
+        frame.columns.tolist(),
+        ["Trading day", "trading_day"],
+    )
+    product_column = _mibgas_first_column(
+        frame.columns.tolist(),
+        ["Product", "product"],
+    )
+    area_column = _mibgas_first_column(
+        frame.columns.tolist(),
+        ["Area", "area"],
+    )
+    delivery_column = _mibgas_first_column(
+        frame.columns.tolist(),
+        ["First Day Delivery", "first_day_delivery", "delivery_start"],
+    )
+    price_column = _mibgas_first_column(
+        frame.columns.tolist(),
+        [
+            "Reference Price [EUR/MWh]",
+            "Daily Reference Price [EUR/MWh]",
+            "reference_price_eur_mwh",
+            "daily_reference_price_eur_mwh",
+        ],
+    )
+
+    if (
+        trading_column is None
+        or product_column is None
+        or price_column is None
+    ):
+        return pd.DataFrame(
+            columns=[
+                "gas_delivery_day",
+                "market_trading_day",
+                "gas_price_eur_mwh",
+                "gas_source",
+            ]
+        )
+
+    product = frame[product_column].astype(str).str.strip()
+    area = (
+        frame[area_column].astype(str).str.strip()
+        if area_column is not None
+        else pd.Series("ES", index=frame.index)
+    )
+
+    mask = (
+        product.eq("GDAES_D+1")
+        & area.fillna("ES").eq("ES")
+    )
+    selected = frame.loc[mask].copy()
+    if selected.empty:
+        return pd.DataFrame(
+            columns=[
+                "gas_delivery_day",
+                "market_trading_day",
+                "gas_price_eur_mwh",
+                "gas_source",
+            ]
+        )
+
+    output = pd.DataFrame(index=selected.index)
+    output["market_trading_day"] = pd.to_datetime(
+        selected[trading_column],
+        dayfirst=True,
+        errors="coerce",
+    )
+    output["gas_delivery_day"] = (
+        pd.to_datetime(
+            selected[delivery_column],
+            dayfirst=True,
+            errors="coerce",
+        )
+        if delivery_column is not None
+        else pd.NaT
+    )
+    output["gas_delivery_day"] = (
+        output["gas_delivery_day"]
+        .combine_first(output["market_trading_day"])
+        .dt.normalize()
+    )
+    output["gas_price_eur_mwh"] = _mibgas_to_number(
+        selected[price_column]
+    )
+    output["gas_source"] = (
+        selected["source_file"].astype(str)
+        if "source_file" in selected.columns
+        else "MIBGAS"
+    )
+
+    return (
+        output.dropna(
+            subset=[
+                "gas_delivery_day",
+                "gas_price_eur_mwh",
+            ]
+        )
+        .sort_values(
+            [
+                "gas_delivery_day",
+                "market_trading_day",
+            ]
+        )
+        .drop_duplicates(
+            subset=["gas_delivery_day"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def _read_mibgas_excel_actuals(path: Path) -> pd.DataFrame:
+    try:
+        workbook = pd.ExcelFile(path)
+    except Exception:
+        return pd.DataFrame()
+
+    sheet = None
+    if MIBGAS_TARGET_SHEET in workbook.sheet_names:
+        sheet = MIBGAS_TARGET_SHEET
+    else:
+        for candidate in workbook.sheet_names:
+            candidate_text = str(candidate).upper()
+            if "PVB" in candidate_text and "VTP" in candidate_text:
+                sheet = candidate
+                break
+
+    if sheet is None:
+        return pd.DataFrame()
+
+    try:
+        frame = pd.read_excel(path, sheet_name=sheet)
+    except Exception:
+        return pd.DataFrame()
+
+    frame["source_file"] = f"{path.name}/{sheet}"
+    return _standardize_mibgas_actuals(frame)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def load_mibgas_gdaes_actuals() -> tuple[pd.DataFrame, str]:
+    """
+    Load the same gas-price source used by the MIBGAS page.
+
+    Historical years come from data/MIBGAS_Data_*.xlsx. The current-year cache
+    comes from data/mibgas_2026_cache.csv, which is refreshed by the MIBGAS
+    Streamlit page. The forecast remains operational when the gas source is
+    unavailable; gas features then receive a zero availability flag.
+    """
+    frames = []
+    sources = []
+
+    for data_directory in _mibgas_data_directories():
+        if not data_directory.exists():
+            continue
+
+        for path in sorted(
+            data_directory.glob(MIBGAS_LOCAL_FILE_PATTERN)
+        ):
+            actuals = _read_mibgas_excel_actuals(path)
+            if not actuals.empty:
+                frames.append(actuals)
+                sources.append(path.name)
+
+        cache_path = data_directory / MIBGAS_CACHE_FILENAME
+        if cache_path.exists():
+            try:
+                cached = pd.read_csv(cache_path)
+                cached["source_file"] = cache_path.name
+                actuals = _standardize_mibgas_actuals(cached)
+                if not actuals.empty:
+                    frames.append(actuals)
+                    sources.append(cache_path.name)
+            except Exception:
+                pass
+
+    if not frames:
+        return (
+            pd.DataFrame(
+                columns=[
+                    "gas_delivery_day",
+                    "market_trading_day",
+                    "gas_price_eur_mwh",
+                    "gas_source",
+                ]
+            ),
+            (
+                "No MIBGAS GDAES_D+1 data found. Open the MIBGAS page and "
+                "refresh its SFTP cache, or add MIBGAS_Data_*.xlsx to /data."
+            ),
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["gas_delivery_day"] = pd.to_datetime(
+        combined["gas_delivery_day"],
+        errors="coerce",
+    ).dt.normalize()
+    combined["market_trading_day"] = pd.to_datetime(
+        combined["market_trading_day"],
+        errors="coerce",
+    )
+    combined["gas_price_eur_mwh"] = pd.to_numeric(
+        combined["gas_price_eur_mwh"],
+        errors="coerce",
+    )
+
+    combined = (
+        combined.dropna(
+            subset=[
+                "gas_delivery_day",
+                "gas_price_eur_mwh",
+            ]
+        )
+        .sort_values(
+            [
+                "gas_delivery_day",
+                "market_trading_day",
+            ]
+        )
+        .drop_duplicates(
+            subset=["gas_delivery_day"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    message = (
+        f"{len(combined):,} GDAES_D+1 delivery-day prices loaded from "
+        + ", ".join(sorted(set(sources)))
+    )
+    return combined, message
+
+
+def build_mibgas_daily_lookup(
+    gas_actuals: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+) -> tuple[dict, dict]:
+    """
+    Build a daily as-of lookup.
+
+    Short gaps such as weekends/holidays are forward-filled for at most four
+    days. Long gaps are left unavailable rather than carrying stale gas prices.
+    """
+    if gas_actuals is None or gas_actuals.empty:
+        return {}, {}
+
+    daily = gas_actuals[
+        [
+            "gas_delivery_day",
+            "gas_price_eur_mwh",
+            "gas_source",
+        ]
+    ].copy()
+    daily["gas_delivery_day"] = pd.to_datetime(
+        daily["gas_delivery_day"],
+        errors="coerce",
+    ).dt.normalize()
+    daily = daily.dropna(
+        subset=[
+            "gas_delivery_day",
+            "gas_price_eur_mwh",
+        ]
+    )
+
+    full_index = pd.date_range(
+        start=pd.Timestamp(start_day),
+        end=pd.Timestamp(end_day),
+        freq="D",
+    )
+    indexed = (
+        daily.set_index("gas_delivery_day")
+        .sort_index()
+        .reindex(full_index)
+    )
+    indexed["gas_price_eur_mwh"] = (
+        pd.to_numeric(
+            indexed["gas_price_eur_mwh"],
+            errors="coerce",
+        )
+        .ffill(limit=4)
+    )
+    indexed["gas_source"] = indexed["gas_source"].ffill(
+        limit=4
+    )
+
+    price_lookup = {
+        timestamp.date(): float(value)
+        for timestamp, value in indexed[
+            "gas_price_eur_mwh"
+        ].items()
+        if pd.notna(value)
+    }
+    source_lookup = {
+        timestamp.date(): str(value)
+        for timestamp, value in indexed[
+            "gas_source"
+        ].items()
+        if pd.notna(value)
+    }
+    return price_lookup, source_lookup
+
+
+def add_mibgas_features(
+    frame: pd.DataFrame,
+    gas_price_lookup: dict,
+) -> pd.DataFrame:
+    """
+    Add no-leakage gas features to every electricity delivery date D.
+
+    The primary variable is GDAES_D+1 for gas delivery D-1. We also add recent
+    changes and a gas × thermal-gap interaction for CCGT price-setting hours.
+    """
+    out = frame.copy()
+
+    def _gas(day_value, lag_days: int):
+        return gas_price_lookup.get(
+            day_value - timedelta(days=lag_days),
+            np.nan,
+        )
+
+    out["mibgas_d1_eur_mwh"] = [
+        _gas(day_value, 1)
+        for day_value in out["date"]
+    ]
+    out["mibgas_d2_eur_mwh"] = [
+        _gas(day_value, 2)
+        for day_value in out["date"]
+    ]
+    out["mibgas_d7_eur_mwh"] = [
+        _gas(day_value, 7)
+        for day_value in out["date"]
+    ]
+
+    seven_day_values = []
+    for day_value in out["date"]:
+        values = [
+            _gas(day_value, lag)
+            for lag in range(1, 8)
+        ]
+        valid = [
+            value
+            for value in values
+            if pd.notna(value)
+        ]
+        seven_day_values.append(
+            float(np.mean(valid))
+            if valid
+            else np.nan
+        )
+
+    out["mibgas_7d_avg_eur_mwh"] = seven_day_values
+    out["mibgas_change_d1_eur_mwh"] = (
+        out["mibgas_d1_eur_mwh"]
+        - out["mibgas_d2_eur_mwh"]
+    )
+    out["mibgas_change_vs_7d_eur_mwh"] = (
+        out["mibgas_d1_eur_mwh"]
+        - out["mibgas_7d_avg_eur_mwh"]
+    )
+    out["mibgas_data_available"] = (
+        out["mibgas_d1_eur_mwh"].notna().astype(int)
+    )
+
+    # Preserve functionality when the gas page/cache is unavailable. The
+    # availability flag lets the model distinguish an absent input from a true
+    # zero gas price.
+    gas_numeric_columns = [
+        "mibgas_d1_eur_mwh",
+        "mibgas_d2_eur_mwh",
+        "mibgas_d7_eur_mwh",
+        "mibgas_7d_avg_eur_mwh",
+        "mibgas_change_d1_eur_mwh",
+        "mibgas_change_vs_7d_eur_mwh",
+    ]
+    for column in gas_numeric_columns:
+        out[column] = pd.to_numeric(
+            out[column],
+            errors="coerce",
+        ).fillna(0.0)
+
+    out["mibgas_x_positive_gap"] = (
+        out["mibgas_d1_eur_mwh"]
+        * out["positive_gap"]
+        / 10_000.0
+    )
+    return out
+
+
 # =========================================================
 # STEP 3 — FORECAST DA SPOT PRICE
 # =========================================================
@@ -3542,6 +4046,7 @@ def _price_features(
     frame: pd.DataFrame,
     price_lookup: dict,
     gap_lookup: dict,
+    gas_price_lookup: dict,
 ) -> pd.DataFrame:
     out = _market_calendar(frame)
 
@@ -3601,6 +4106,11 @@ def _price_features(
     out["gap_change_d7"] = (
         out["thermal_gap_mwh"] - out["gap_lag_7d"]
     )
+
+    out = add_mibgas_features(
+        out,
+        gas_price_lookup,
+    )
     return out
 
 
@@ -3615,6 +4125,11 @@ PRICE_FEATURES = [
     "price_lag_1d", "price_lag_2d", "price_lag_7d",
     "price_lag_14d", "price_lag_21d", "price_lag_28d",
     "same_hour_price_4w", "price_anchor",
+    "mibgas_d1_eur_mwh", "mibgas_d2_eur_mwh",
+    "mibgas_d7_eur_mwh", "mibgas_7d_avg_eur_mwh",
+    "mibgas_change_d1_eur_mwh",
+    "mibgas_change_vs_7d_eur_mwh",
+    "mibgas_data_available", "mibgas_x_positive_gap",
 ]
 
 
@@ -3704,6 +4219,27 @@ def empirical_similar_gap_price_reference(
             candidates["gap_distance"] / gap_scale
             + candidates["hour_distance"] / 3.0
         )
+
+        # Where available, prefer historical observations with a similar D-1
+        # MIBGAS level. A 10 €/MWh gas difference has roughly the same distance
+        # weight as one unit of the thermal-gap scale.
+        if (
+            "mibgas_d1_eur_mwh" in candidates.columns
+            and hasattr(row, "mibgas_d1_eur_mwh")
+            and float(getattr(row, "mibgas_data_available", 0)) > 0
+        ):
+            target_gas = float(row.mibgas_d1_eur_mwh)
+            candidates["gas_distance"] = (
+                pd.to_numeric(
+                    candidates["mibgas_d1_eur_mwh"],
+                    errors="coerce",
+                )
+                - target_gas
+            ).abs()
+            candidates["distance_score"] = (
+                candidates["distance_score"]
+                + candidates["gas_distance"].fillna(0.0) / 10.0
+            )
         candidates = candidates.nsmallest(
             max_candidates,
             "distance_score",
@@ -3967,8 +4503,30 @@ def recent_price_guardrails(
         0.0,
         22.0,
     )
+
+    # A higher D-1 MIBGAS price can justify a higher CCGT-linked electricity
+    # price even when the thermal-gap shape is unchanged. The allowance uses a
+    # conservative 1.8x heat-rate proxy and is capped to avoid overreaction.
+    gas_change_vs_7d = pd.to_numeric(
+        target.get(
+            "mibgas_change_vs_7d_eur_mwh",
+            pd.Series(0.0, index=target.index),
+        ),
+        errors="coerce",
+    ).fillna(0.0).to_numpy(dtype=float)
+    gas_uplift_allowance = np.clip(
+        np.maximum(gas_change_vs_7d, 0.0) * 1.8,
+        0.0,
+        20.0,
+    )
+
     base_buffer = np.where(evening_or_night, 4.0, 6.0)
-    upper_guardrail = recent_upper + base_buffer + gap_uplift_allowance
+    upper_guardrail = (
+        recent_upper
+        + base_buffer
+        + gap_uplift_allowance
+        + gas_uplift_allowance
+    )
 
     # Do not over-constrain downward moves. The lower guardrail is deliberately
     # loose and exists only to avoid pathological model output.
@@ -3990,6 +4548,7 @@ def recent_price_guardrails(
             "residual_shrink_factor": residual_shrink,
             "gap_shock_vs_recent_mw": gap_shock,
             "gap_uplift_allowance_eur_mwh": gap_uplift_allowance,
+            "gas_uplift_allowance_eur_mwh": gas_uplift_allowance,
             "recent_reference_upper_eur_mwh": recent_upper,
             "recent_reference_lower_eur_mwh": recent_lower,
             "price_upper_guardrail_eur_mwh": upper_guardrail,
@@ -4027,6 +4586,13 @@ def generate_price_forecast(
     if prices.empty:
         raise ValueError("No spot-price history returned by ESIOS.")
 
+    gas_actuals, gas_data_message = load_mibgas_gdaes_actuals()
+    gas_price_lookup, gas_source_lookup = build_mibgas_daily_lookup(
+        gas_actuals,
+        historical["datetime"].min().date() - timedelta(days=35),
+        target_day - timedelta(days=1),
+    )
+
     training = historical.merge(
         prices,
         on="datetime",
@@ -4057,6 +4623,7 @@ def generate_price_forecast(
         training,
         price_lookup,
         gap_lookup,
+        gas_price_lookup,
     )
     training["price_residual"] = (
         training["price_eur_mwh"]
@@ -4074,6 +4641,7 @@ def generate_price_forecast(
         target,
         price_lookup,
         gap_lookup,
+        gas_price_lookup,
     )
 
     model_data = training.dropna(
@@ -4220,6 +4788,14 @@ def generate_price_forecast(
             "price_lag_1d",
             "price_lag_7d",
             "same_hour_price_4w",
+            "mibgas_d1_eur_mwh",
+            "mibgas_d2_eur_mwh",
+            "mibgas_d7_eur_mwh",
+            "mibgas_7d_avg_eur_mwh",
+            "mibgas_change_d1_eur_mwh",
+            "mibgas_change_vs_7d_eur_mwh",
+            "mibgas_data_available",
+            "mibgas_x_positive_gap",
         ]
     ].copy()
     output["forecast_price_eur_mwh"] = target_final
@@ -4248,8 +4824,34 @@ def generate_price_forecast(
             validation["price_eur_mwh"],
             validation["price_anchor"],
         ),
-        "model_name": model_name,
+        "model_name": (
+            model_name
+            + " + MIBGAS GDAES D-1"
+            if int(target_data["mibgas_data_available"].max()) > 0
+            else model_name + " (MIBGAS unavailable)"
+        ),
         "training_rows": len(model_data),
+        "gas_data_message": gas_data_message,
+        "gas_delivery_day_used": target_day - timedelta(days=1),
+        "gas_price_d1_eur_mwh": (
+            float(target_data["mibgas_d1_eur_mwh"].iloc[0])
+            if int(target_data["mibgas_data_available"].max()) > 0
+            else np.nan
+        ),
+        "gas_price_7d_avg_eur_mwh": (
+            float(target_data["mibgas_7d_avg_eur_mwh"].iloc[0])
+            if int(target_data["mibgas_data_available"].max()) > 0
+            else np.nan
+        ),
+        "gas_price_change_d1_eur_mwh": (
+            float(target_data["mibgas_change_d1_eur_mwh"].iloc[0])
+            if int(target_data["mibgas_data_available"].max()) > 0
+            else np.nan
+        ),
+        "gas_source": gas_source_lookup.get(
+            target_day - timedelta(days=1),
+            "Unavailable",
+        ),
     }
 
 
@@ -4934,7 +5536,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v9"] = {
+        st.session_state["day_ahead_result_v10"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -4952,7 +5554,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v9")
+forecast_result = st.session_state.get("day_ahead_result_v10")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -5170,6 +5772,51 @@ if forecast_result:
             f"{int(price_forecast['guardrail_applied'].sum())} h",
         )
 
+        gas_price_d1 = price_result.get(
+            "gas_price_d1_eur_mwh",
+            np.nan,
+        )
+        gas_price_7d = price_result.get(
+            "gas_price_7d_avg_eur_mwh",
+            np.nan,
+        )
+        gas_change_d1 = price_result.get(
+            "gas_price_change_d1_eur_mwh",
+            np.nan,
+        )
+
+        gas1, gas2, gas3 = st.columns(3)
+        gas1.metric(
+            "MIBGAS GDAES D-1",
+            (
+                f"{gas_price_d1:,.2f} €/MWh"
+                if pd.notna(gas_price_d1)
+                else "Unavailable"
+            ),
+            delta=(
+                f"Gas delivery {price_result.get('gas_delivery_day_used'):%d/%m/%Y}"
+                if pd.notna(gas_price_d1)
+                else None
+            ),
+            delta_color="off",
+        )
+        gas2.metric(
+            "MIBGAS previous 7D average",
+            (
+                f"{gas_price_7d:,.2f} €/MWh"
+                if pd.notna(gas_price_7d)
+                else "Unavailable"
+            ),
+        )
+        gas3.metric(
+            "MIBGAS change vs D-2",
+            (
+                f"{gas_change_d1:+,.2f} €/MWh"
+                if pd.notna(gas_change_d1)
+                else "Unavailable"
+            ),
+        )
+
         st.altair_chart(
             build_price_forecast_chart(
                 price_forecast
@@ -5188,7 +5835,17 @@ if forecast_result:
             "during evening and night hours—and cannot exceed all recent "
             "references by a material amount unless the forecast thermal gap "
             "is clearly higher than D-1 and D-7. The red dashed line shows the "
-            "dynamic upper guardrail."
+            "dynamic upper guardrail. The model also uses the MIBGAS "
+            "GDAES_D+1 Reference Price for gas delivery D-1, its recent "
+            "changes and a gas × thermal-gap interaction. "
+            f"Gas source: {price_result.get('gas_source', 'Unavailable')}."
+        )
+
+        st.caption(
+            price_result.get(
+                "gas_data_message",
+                "MIBGAS source status unavailable.",
+            )
         )
 
         # =================================================
@@ -5314,6 +5971,14 @@ if forecast_result:
                     "price_anchor",
                     "price_lag_1d",
                     "price_lag_7d",
+                    "mibgas_d1_eur_mwh",
+                    "mibgas_d2_eur_mwh",
+                    "mibgas_7d_eur_mwh",
+                    "mibgas_7d_avg_eur_mwh",
+                    "mibgas_change_d1_eur_mwh",
+                    "mibgas_change_vs_7d_eur_mwh",
+                    "mibgas_data_available",
+                    "mibgas_x_positive_gap",
                     "negative_thermal_gap_flag",
                     "conditional_price_median_eur_mwh",
                     "conditional_price_p25_eur_mwh",
@@ -5327,6 +5992,7 @@ if forecast_result:
                     "residual_shrink_factor",
                     "gap_shock_vs_recent_mw",
                     "gap_uplift_allowance_eur_mwh",
+                    "gas_uplift_allowance_eur_mwh",
                     "recent_reference_upper_eur_mwh",
                     "price_upper_guardrail_eur_mwh",
                     "guardrail_reduction_eur_mwh",
