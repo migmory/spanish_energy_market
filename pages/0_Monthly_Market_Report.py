@@ -238,6 +238,12 @@ def fmt_mw_revenue(value: float | int | None) -> str:
     return f"{float(value):,.0f} €/MW".replace(",", ".")
 
 
+def fmt_mw_revenue_annualized(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.0f} €/MW/yr".replace(",", ".")
+
+
 def fmt_gwh(value: float | int | None, decimals: int = 1) -> str:
     if value is None or pd.isna(value):
         return "—"
@@ -3784,20 +3790,94 @@ def live_omip_forward_snapshot(asof: date) -> pd.DataFrame:
 # =========================================================
 # BESS SECTION
 # =========================================================
+def _chronological_full_cycle_spread(
+    prices: list[float],
+    duration_h: int,
+) -> float | None:
+    """Maximum chronological spread for one full cycle of an h-hour battery.
+
+    The calculation is a pure market-price metric:
+      - 100% efficiency and no degradation;
+      - 1 MW power and ``duration_h`` MWh capacity;
+      - exactly ``duration_h`` full charging hours and ``duration_h`` full
+        discharging hours inside the calendar day;
+      - the state of charge starts and ends at zero;
+      - discharge is only possible after enough energy has previously been
+        charged;
+      - charging and discharging cannot occur in the same hour.
+
+    Charging and discharging may be interleaved (charge -> discharge -> charge
+    -> discharge), provided the cumulative state-of-charge constraint is met.
+    The returned value is gross arbitrage revenue divided by ``duration_h``,
+    expressed in EUR/MWh and therefore comparable with the former TB metric.
+    """
+    h = int(duration_h)
+    if h <= 0:
+        return None
+
+    clean_prices = [float(v) for v in prices if pd.notna(v)]
+    if len(clean_prices) < 2 * h:
+        return None
+
+    # Dynamic-programming state: (charged_hours, discharged_hours) ->
+    # maximum gross revenue accumulated up to the current hour.
+    # Because a discharge transition is allowed only when discharged < charged,
+    # the state of charge can never become negative.
+    states: dict[tuple[int, int], float] = {(0, 0): 0.0}
+
+    for price in clean_prices:
+        next_states = dict(states)  # idle action
+        for (charged, discharged), value in states.items():
+            if charged < h:
+                key = (charged + 1, discharged)
+                next_states[key] = max(next_states.get(key, -math.inf), value - price)
+
+            if discharged < charged and discharged < h:
+                key = (charged, discharged + 1)
+                next_states[key] = max(next_states.get(key, -math.inf), value + price)
+
+        states = next_states
+
+    gross_revenue = states.get((h, h))
+    if gross_revenue is None or not math.isfinite(gross_revenue):
+        return None
+    return float(gross_revenue / h)
+
+
 def top_bottom_spread_daily(price_hourly: pd.DataFrame, duration_h: int) -> pd.DataFrame:
+    """Daily chronological TB spread for one full cycle.
+
+    Unlike the previous implementation, this function preserves the hourly
+    order. A selected discharge hour must be backed by energy charged in an
+    earlier hour. The algorithm allows partial cycling sequences within the day,
+    but total daily throughput is exactly one full cycle.
+    """
     if price_hourly.empty:
         return pd.DataFrame(columns=["date", "spread"])
+
     p = price_hourly.copy()
+    p["datetime"] = pd.to_datetime(p["datetime"], errors="coerce")
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["datetime", "price"]).sort_values("datetime")
+    if p.empty:
+        return pd.DataFrame(columns=["date", "spread"])
+
+    # Defensive hourly aggregation in case the source contains quarter-hourly
+    # observations or duplicated timestamps.
+    p["datetime"] = p["datetime"].dt.floor("h")
+    p = p.groupby("datetime", as_index=False)["price"].mean().sort_values("datetime")
     p["date"] = p["datetime"].dt.normalize()
+
     rows = []
-    for d, g in p.groupby("date"):
-        prices = pd.to_numeric(g["price"], errors="coerce").dropna().sort_values()
-        if len(prices) < duration_h * 2:
-            continue
-        bottom = prices.head(duration_h).mean()
-        top = prices.tail(duration_h).mean()
-        rows.append({"date": d, "spread": float(top - bottom)})
-    return pd.DataFrame(rows)
+    for day, group in p.groupby("date", sort=True):
+        spread = _chronological_full_cycle_spread(
+            group.sort_values("datetime")["price"].tolist(),
+            duration_h,
+        )
+        if spread is not None:
+            rows.append({"date": day, "spread": spread})
+
+    return pd.DataFrame(rows, columns=["date", "spread"])
 
 def top_bottom_summary(price_hourly: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> dict[str, float | None]:
     p = price_hourly[(price_hourly["datetime"] >= start_ts) & (price_hourly["datetime"] < end_ts + pd.Timedelta(days=1))].copy()
@@ -4036,7 +4116,7 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
     if not normalized.empty:
         return normalized, "file"
 
-    # Top-bottom spreads are simple market-price metrics.
+    # Top-bottom spreads are chronological market-price metrics with one full cycle/day and 100% efficiency.
     spreads = bess_monthly_proxy(price_hourly, solar_hourly)[["period", "tb1", "tb2", "tb4"]].copy()
 
     # All BESS revenue rows come from the daily LP model so they are
@@ -4073,64 +4153,94 @@ def load_or_build_bess_monthly(price_hourly: pd.DataFrame, solar_hourly: pd.Data
     return out[wanted].dropna(subset=["period"]).sort_values("period").reset_index(drop=True), "daily_bess_model"
 
 def bess_summary_table(bess: pd.DataFrame, report_month: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
-    cols = ["Metric", "Selected month", "YTD", "Annualized", "Previous year"]
+    """
+    Build the BESS summary table.
+
+    'Annualized month' is a monthly run-rate:
+        selected-month revenue / elapsed calendar days in that month * 365
+
+    For a closed month, elapsed days are the full calendar month. For an open
+    MTD month, only days from day 1 to the report cut-off are used. Spread and
+    cycles/day metrics are already normalized metrics, so their Annualized
+    month value is kept equal to the selected-month value.
+    """
+    cols = ["Metric", "Selected month", "Annualized month", "YTD", "Annualized", "Previous year"]
     if bess.empty:
         return pd.DataFrame(columns=cols)
+
     b = bess.copy()
     b["period"] = pd.to_datetime(b["period"], errors="coerce")
     b = b.dropna(subset=["period"]).copy()
     b["year"] = b["period"].dt.year
     b["month"] = b["period"].dt.month
+
+    report_month = pd.Timestamp(report_month).to_period("M").to_timestamp()
+    report_end = pd.Timestamp(report_end).normalize()
     selected = b[(b["year"] == report_month.year) & (b["month"] == report_month.month)]
     ytd = b[(b["year"] == report_month.year) & (b["period"] <= report_month)]
     prev = b[b["year"] == report_month.year - 1]
+
     metrics = [
-        ("TB4", "tb4", "eur"),
-        ("TB2", "tb2", "eur"),
-        ("TB1", "tb1", "eur"),
+        ("TB4 chronological", "tb4", "eur"),
+        ("TB2 chronological", "tb2", "eur"),
+        ("TB1 chronological", "tb1", "eur"),
         ("Revenue w/o demand 1.0c", "revenue_wo_demand_eur_mw", "rev"),
         ("Revenue w. demand 1.0c", "revenue_w_demand_1c_eur_mw", "rev"),
         ("Revenue standalone | no cycle cap", "revenue_standalone_eur_mw", "rev"),
         ("Standalone cycles/day avg | no cycle cap", "standalone_cycles_day_avg", "cycles"),
         ("Captured spread standalone | no cycle cap", "captured_spread_standalone_eur_mwh", "spread"),
     ]
-    days_elapsed = max((report_end - pd.Timestamp(report_month.year, 1, 1)).days + 1, 1)
+
+    year_days_elapsed = max((report_end - pd.Timestamp(report_month.year, 1, 1)).days + 1, 1)
+    selected_calendar_end = report_month + pd.offsets.MonthEnd(0)
+    selected_period_end = min(selected_calendar_end, report_end)
+    selected_days_elapsed = max((selected_period_end - report_month).days + 1, 1)
+
     rows = []
     for label, col, kind in metrics:
         if col not in b.columns:
-            sel_val = ytd_val = annualized = prev_val = np.nan
+            sel_val = annualized_month = ytd_val = annualized = prev_val = np.nan
         else:
             sel_val = selected[col].mean() if not selected.empty else np.nan
             if kind == "rev":
+                annualized_month = float(sel_val) * 365.0 / selected_days_elapsed if pd.notna(sel_val) else np.nan
                 ytd_val = ytd[col].sum()
-                annualized = ytd_val * 365 / days_elapsed if pd.notna(ytd_val) else ytd_val
+                annualized = float(ytd_val) * 365.0 / year_days_elapsed if pd.notna(ytd_val) else ytd_val
                 prev_val = prev[col].sum()
             else:
+                annualized_month = sel_val
                 ytd_val = ytd[col].mean()
                 annualized = ytd_val
                 prev_val = prev[col].mean()
+
         rows.append({
             "Metric": label,
             "Selected month": sel_val,
+            "Annualized month": annualized_month,
             "YTD": ytd_val,
             "Annualized": annualized,
             "Previous year": prev_val,
         })
+
     return pd.DataFrame(rows, columns=cols)
 
 def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    def _fmt(metric: str, value):
+    def _fmt(metric: str, column: str, value):
         if pd.isna(value):
             return "—"
         if "cycles/day" in metric.lower():
             return f"{float(value):,.2f} c/day"
         if "Revenue" in metric:
+            if column in {"Annualized month", "Annualized"}:
+                return fmt_mw_revenue_annualized(value)
             return fmt_mw_revenue(value)
         return fmt_eur(value)
 
     display = df.copy()
-    for col in ["Selected month", "YTD", "Annualized", "Previous year"]:
-        display[col] = display.apply(lambda r: _fmt(r["Metric"], r[col]), axis=1)
+    value_columns = ["Selected month", "Annualized month", "YTD", "Annualized", "Previous year"]
+    for col in value_columns:
+        if col in display.columns:
+            display[col] = display.apply(lambda r: _fmt(r["Metric"], col, r[col]), axis=1)
 
     def _row_style(row: pd.Series) -> list[str]:
         metric = str(row.get("Metric", ""))
@@ -4151,6 +4261,127 @@ def format_bess_summary(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             {"selector": "td", "props": [("padding", "6px 8px")]},
         ])
     )
+
+
+def bess_monthly_annualized_revenue_chart(
+    bess: pd.DataFrame,
+    report_end: pd.Timestamp,
+):
+    """
+    Annualize each individual month's BESS revenue as a monthly run-rate.
+
+    Formula for each revenue series and month:
+        monthly revenue (EUR/MW) / elapsed days represented by that month * 365
+
+    Closed months use their full calendar-day count. The open MTD month uses
+    the report cut-off date, so the latest point is a true MTD run-rate.
+    """
+    if bess is None or bess.empty:
+        return None
+
+    revenue_columns = {
+        "revenue_wo_demand_eur_mw": "W/o demand 1.0c",
+        "revenue_w_demand_1c_eur_mw": "W. demand 1.0c",
+        "revenue_standalone_eur_mw": "Standalone | no cycle cap",
+    }
+
+    b = bess.copy()
+    b["period"] = pd.to_datetime(b["period"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    b = b.dropna(subset=["period"]).copy()
+    b = b[b["period"] >= pd.Timestamp(2025, 1, 1)].copy()
+    if b.empty:
+        return None
+
+    report_end = pd.Timestamp(report_end).normalize()
+    b = b[b["period"] <= report_end.to_period("M").to_timestamp()].copy()
+    if b.empty:
+        return None
+
+    def _days_represented(period: pd.Timestamp) -> int:
+        period = pd.Timestamp(period)
+        calendar_end = period + pd.offsets.MonthEnd(0)
+        is_report_month = period.year == report_end.year and period.month == report_end.month
+        effective_end = min(calendar_end, report_end) if is_report_month else calendar_end
+        return max((effective_end - period).days + 1, 1)
+
+    b["days_represented"] = b["period"].map(_days_represented)
+
+    available = [
+        c for c in revenue_columns
+        if c in b.columns and pd.to_numeric(b[c], errors="coerce").notna().any()
+    ]
+    if not available:
+        return None
+
+    long = b.melt(
+        id_vars=["period", "days_represented"],
+        value_vars=available,
+        var_name="revenue_type",
+        value_name="monthly_revenue_eur_mw",
+    )
+    long["monthly_revenue_eur_mw"] = pd.to_numeric(long["monthly_revenue_eur_mw"], errors="coerce")
+    long = long.dropna(subset=["monthly_revenue_eur_mw"]).copy()
+    if long.empty:
+        return None
+
+    long["annualized_revenue_eur_mw_yr"] = long["monthly_revenue_eur_mw"] * 365.0 / long["days_represented"]
+    long["series"] = long["revenue_type"].map(revenue_columns)
+    long["period_label"] = long["period"].dt.strftime("%b-%y")
+
+    period_order = (
+        b.sort_values("period")["period"]
+        .drop_duplicates()
+        .dt.strftime("%b-%y")
+        .tolist()
+    )
+    domain = [revenue_columns[c] for c in available]
+    color_map = {
+        "W/o demand 1.0c": YELLOW_DARK,
+        "W. demand 1.0c": CORP_GREEN,
+        "Standalone | no cycle cap": BLUE,
+    }
+    dash_map = {
+        "W/o demand 1.0c": [6, 3],
+        "W. demand 1.0c": [3, 2],
+        "Standalone | no cycle cap": [1, 0],
+    }
+
+    chart = alt.Chart(long).mark_line(point=True, strokeWidth=3.2).encode(
+        x=alt.X("period_label:N", title=None, sort=period_order, axis=alt.Axis(labelAngle=-35)),
+        y=alt.Y(
+            "annualized_revenue_eur_mw_yr:Q",
+            title="Annualized revenue (€/MW/yr)",
+            scale=alt.Scale(zero=False),
+        ),
+        color=alt.Color(
+            "series:N",
+            title="Revenue case",
+            scale=alt.Scale(domain=domain, range=[color_map[d] for d in domain]),
+            legend=alt.Legend(
+                orient="top",
+                direction="horizontal",
+                columns=3,
+                labelLimit=420,
+                titleLimit=420,
+                symbolLimit=420,
+            ),
+        ),
+        strokeDash=alt.StrokeDash(
+            "series:N",
+            title="Revenue case",
+            scale=alt.Scale(domain=domain, range=[dash_map[d] for d in domain]),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("period:T", title="Month", format="%b %Y"),
+            alt.Tooltip("series:N", title="Revenue case"),
+            alt.Tooltip("monthly_revenue_eur_mw:Q", title="Monthly revenue (€/MW)", format=",.0f"),
+            alt.Tooltip("days_represented:Q", title="Days represented", format=",d"),
+            alt.Tooltip("annualized_revenue_eur_mw_yr:Q", title="Annualized month (€/MW/yr)", format=",.0f"),
+        ],
+    ).properties(title="Monthly BESS revenue run-rate | each month annualized independently")
+
+    return apply_chart_style(chart, height=400)
 
 
 
@@ -5761,9 +5992,11 @@ kpi_peak_prev = demand_peak_month_metrics(official_demand_hourly, prev_month, of
 k2_1, k2_2, k2_3, k2_4, k2_5 = st.columns(5, gap="small")
 with k2_1:
     st.metric(
-        f"Market spread TB4 | {month_label(selected_month, is_current_mtd)}",
+        f"Market spread TB4 chronological | {month_label(selected_month, is_current_mtd)}",
         fmt_eur(tb4_selected),
-        help="Average daily Top-4 minus Bottom-4 spread of hourly day-ahead prices.",
+        help=("Average daily chronological TB4 spread. Exactly four 1 MW charging hours and four 1 MW "
+              "discharging hours are selected with 100% efficiency, SOC beginning and ending at zero, "
+              "and discharge allowed only after sufficient prior charging."),
     )
     st.markdown(
         f'<div class="metric-footnote">{delta_arrow_html(tb4_selected, tb4_prev, "prev. month")}<br>Prev. month: <b>{fmt_eur(tb4_prev)}</b><br>Same month LY: <b>{fmt_eur(tb4_yoy)}</b></div>',
@@ -6198,11 +6431,33 @@ else:
     )
     bess_summary_display = align_bess_summary_with_ytd_cards(bess_summary, bess_ytd_cards_summary)
     st.dataframe(format_bess_summary(bess_summary_display), use_container_width=True)
+    st.caption(
+        "TB1 / TB2 / TB4 chronological: one full cycle within each calendar day, "
+        "100% efficiency, full-hour 1 MW charge/discharge blocks, SOC starts and ends "
+        "at zero, and every discharge is backed by prior charging. Charge and discharge "
+        "sequences may be interleaved as long as the SOC constraint is respected."
+    )
     render_bess_ytd_annualized_cards(
         bess_ytd_cards_summary if not bess_ytd_cards_summary.empty else bess_summary_display,
         report_year=selected_month.year,
         report_end=report_end,
     )
+
+subsection("Monthly BESS revenue run-rate | each month annualized independently")
+bess_monthly_annualized_plot = bess_monthly_annualized_revenue_chart(
+    bess_monthly,
+    report_end,
+)
+if bess_monthly_annualized_plot is not None:
+    st.altair_chart(bess_monthly_annualized_plot, use_container_width=True)
+    st.caption(
+        "Each monthly revenue is converted into an annual run-rate as: "
+        "monthly revenue (€/MW) ÷ days represented in that month × 365. "
+        "Closed months use all calendar days; the open MTD month uses the report cut-off. "
+        "This is a monthly run-rate, not the YTD annualization shown in the table."
+    )
+else:
+    st.info("Monthly BESS revenue run-rates could not be generated from the available monthly model outputs.")
 
 subsection("Monthly BESS-model captured hybrid price vs monthly baseload")
 hybrid_capture_monthly, hybrid_source = load_or_build_hybrid_capture_monthly(price_hourly)
@@ -6266,6 +6521,7 @@ pdf_charts = pdf_spot_heatmaps + [
     ("Quarterly 24h average market profile vs solar generation", hourly_overlay),
     ("Actual economic curtailment (%) vs forecasts Aurora central Dec25 / Baringa reference Apr26", curt_chart),
     ("Forward market history / latest snapshot", forward_chart),
+    ("Monthly BESS revenue run-rate | each month annualized independently", bess_monthly_annualized_plot),
     ("BESS-model hybrid captured price", hybrid_plot),
 ]
 pdf_bytes = build_pdf_report_bytes(
@@ -6277,7 +6533,11 @@ pdf_bytes = build_pdf_report_bytes(
     capture_report=capture_report,
     negative_summary=negative_summary,
     forward_snapshot=forward_snapshot,
-    bess_summary=bess_summary,
+    bess_summary=(
+        bess_summary_display
+        if "bess_summary_display" in locals()
+        else bess_summary
+    ),
     charts=pdf_charts,
 )
 st.download_button(
