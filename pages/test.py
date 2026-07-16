@@ -3664,6 +3664,173 @@ def blend_model_with_empirical_low_gap_reference(
     return np.maximum(blended, 0.0), empirical
 
 
+
+def recent_price_guardrails(
+    raw_prediction,
+    target_data: pd.DataFrame,
+    empirical_reference: pd.DataFrame | None,
+    hourly_bias_correction: pd.Series | None = None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    Prevent the residual price model from moving too far away from all recent
+    hourly references without a sufficiently strong thermal-gap justification.
+
+    The model is still allowed to exceed D-1 / D-7 when tomorrow's thermal gap
+    is materially higher, but otherwise the positive residual is shrunk and
+    capped by a recent-price envelope.
+    """
+    target = target_data.copy()
+    raw = np.asarray(raw_prediction, dtype=float)
+
+    anchor = pd.to_numeric(
+        target["price_anchor"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    # Correct systematic recent hourly bias estimated out of sample.
+    if hourly_bias_correction is not None and len(hourly_bias_correction):
+        bias = (
+            target["hour"]
+            .map(hourly_bias_correction)
+            .fillna(0.0)
+            .clip(lower=-15.0, upper=15.0)
+            .to_numpy(dtype=float)
+        )
+        raw = raw - 0.65 * bias
+    else:
+        bias = np.zeros(len(target), dtype=float)
+
+    model_residual = raw - anchor
+
+    gap_reference = pd.concat(
+        [
+            pd.to_numeric(target["gap_lag_1d"], errors="coerce"),
+            pd.to_numeric(target["gap_lag_7d"], errors="coerce"),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    gap_shock = (
+        pd.to_numeric(target["thermal_gap_mwh"], errors="coerce")
+        - gap_reference
+    ).fillna(0.0).to_numpy(dtype=float)
+
+    # Only a clear positive thermal-gap shock should justify a material uplift
+    # above all recent price references.
+    shock_strength = np.clip(gap_shock / 4_000.0, 0.0, 1.0)
+
+    hours = target["hour"].to_numpy(dtype=int)
+    evening_or_night = (hours >= 18) | (hours <= 6)
+
+    # Positive residuals are shrunk more aggressively overnight/evening.
+    positive_shrink = np.where(
+        evening_or_night,
+        0.30 + 0.40 * shock_strength,
+        0.48 + 0.32 * shock_strength,
+    )
+    negative_shrink = np.where(
+        evening_or_night,
+        0.72,
+        0.82,
+    )
+
+    residual_shrink = np.where(
+        model_residual >= 0,
+        positive_shrink,
+        negative_shrink,
+    )
+
+    shrunk = anchor + residual_shrink * model_residual
+
+    reference_frame = pd.DataFrame(
+        {
+            "price_lag_1d": pd.to_numeric(
+                target["price_lag_1d"],
+                errors="coerce",
+            ),
+            "price_lag_7d": pd.to_numeric(
+                target["price_lag_7d"],
+                errors="coerce",
+            ),
+            "same_hour_price_4w": pd.to_numeric(
+                target["same_hour_price_4w"],
+                errors="coerce",
+            ),
+            "price_anchor": pd.to_numeric(
+                target["price_anchor"],
+                errors="coerce",
+            ),
+        },
+        index=target.index,
+    )
+
+    if (
+        empirical_reference is not None
+        and not empirical_reference.empty
+        and "conditional_price_p75_eur_mwh" in empirical_reference.columns
+    ):
+        reference_frame["similar_gap_p75"] = pd.to_numeric(
+            empirical_reference["conditional_price_p75_eur_mwh"],
+            errors="coerce",
+        ).to_numpy()
+
+    recent_upper = reference_frame.max(axis=1, skipna=True).to_numpy(
+        dtype=float
+    )
+    recent_lower = reference_frame.min(axis=1, skipna=True).to_numpy(
+        dtype=float
+    )
+
+    # Allow only a modest buffer above recent references unless tomorrow's
+    # thermal gap is genuinely higher. 3 EUR/MWh per additional GW, capped.
+    gap_uplift_allowance = np.clip(
+        np.maximum(gap_shock, 0.0) * 0.003,
+        0.0,
+        22.0,
+    )
+    base_buffer = np.where(evening_or_night, 4.0, 6.0)
+    upper_guardrail = recent_upper + base_buffer + gap_uplift_allowance
+
+    # Do not over-constrain downward moves. The lower guardrail is deliberately
+    # loose and exists only to avoid pathological model output.
+    lower_guardrail = np.maximum(
+        0.0,
+        recent_lower - np.where(evening_or_night, 20.0, 30.0),
+    )
+
+    guarded = np.clip(
+        shrunk,
+        lower_guardrail,
+        upper_guardrail,
+    )
+
+    diagnostics = pd.DataFrame(
+        {
+            "hourly_bias_correction_eur_mwh": bias,
+            "model_residual_before_guardrail_eur_mwh": model_residual,
+            "residual_shrink_factor": residual_shrink,
+            "gap_shock_vs_recent_mw": gap_shock,
+            "gap_uplift_allowance_eur_mwh": gap_uplift_allowance,
+            "recent_reference_upper_eur_mwh": recent_upper,
+            "recent_reference_lower_eur_mwh": recent_lower,
+            "price_upper_guardrail_eur_mwh": upper_guardrail,
+            "price_lower_guardrail_eur_mwh": lower_guardrail,
+            "guardrail_reduction_eur_mwh": np.maximum(
+                shrunk - guarded,
+                0.0,
+            ),
+            "guardrail_increase_eur_mwh": np.maximum(
+                guarded - shrunk,
+                0.0,
+            ),
+            "guardrail_applied": np.abs(guarded - shrunk) > 1e-6,
+        },
+        index=target.index,
+    )
+
+    return np.maximum(guarded, 0.0), diagnostics
+
+
 def generate_price_forecast(
     target_day: date,
     historical_gap: pd.DataFrame,
@@ -3809,22 +3976,52 @@ def generate_price_forecast(
         ].to_numpy()
         model_name = "D-1 / D-7 anchor fallback"
 
-    # A negative simplified thermal gap does not mechanically imply a zero
-    # market price. Calibrate low-gap hours against historically similar
-    # observations instead of applying a hard 0 EUR/MWh rule.
-    validation_final, validation_empirical = (
+    # Estimate systematic recent hourly model bias from the chronological
+    # validation period. Positive values mean the model overpredicted.
+    validation_error = pd.Series(
+        validation_raw - validation["price_eur_mwh"].to_numpy(dtype=float),
+        index=validation.index,
+    )
+    hourly_bias_correction = (
+        pd.DataFrame(
+            {
+                "hour": validation["hour"].to_numpy(),
+                "error": validation_error.to_numpy(),
+            }
+        )
+        .groupby("hour")["error"]
+        .median()
+    )
+
+    # First calibrate against historically similar thermal-gap observations.
+    validation_empirical_blend, validation_empirical = (
         blend_model_with_empirical_low_gap_reference(
             validation_raw,
             train if not train.empty else model_data,
             validation,
         )
     )
-    target_final, target_empirical = (
+    target_empirical_blend, target_empirical = (
         blend_model_with_empirical_low_gap_reference(
             target_raw,
             model_data,
             target_data,
         )
+    )
+
+    # Then constrain unjustified deviations from D-1, D-7 and the recent
+    # same-hour profile. This specifically controls evening/night overshoots.
+    validation_final, validation_guardrails = recent_price_guardrails(
+        validation_empirical_blend,
+        validation,
+        validation_empirical,
+        hourly_bias_correction=None,
+    )
+    target_final, target_guardrails = recent_price_guardrails(
+        target_empirical_blend,
+        target_data,
+        target_empirical,
+        hourly_bias_correction=hourly_bias_correction,
     )
 
     cap = model_data["price_eur_mwh"].quantile(0.997)
@@ -3855,6 +4052,10 @@ def generate_price_forecast(
     if target_empirical is not None and not target_empirical.empty:
         for column in target_empirical.columns:
             output[column] = target_empirical[column].to_numpy()
+
+    if target_guardrails is not None and not target_guardrails.empty:
+        for column in target_guardrails.columns:
+            output[column] = target_guardrails[column].to_numpy()
 
     return {
         "forecast": output.sort_values(
@@ -3911,6 +4112,15 @@ def build_price_forecast_chart(
                 }
             )
             .assign(series="Historical similar-gap median"),
+            price_forecast[
+                ["datetime", "price_upper_guardrail_eur_mwh"]
+            ]
+            .rename(
+                columns={
+                    "price_upper_guardrail_eur_mwh": "price"
+                }
+            )
+            .assign(series="Dynamic upper guardrail"),
         ],
         ignore_index=True,
     )
@@ -3921,6 +4131,7 @@ def build_price_forecast_chart(
         "Same weekday previous week",
         "Absolute-price anchor",
         "Historical similar-gap median",
+        "Dynamic upper guardrail",
     ]
 
     chart = (
@@ -3948,13 +4159,14 @@ def build_price_forecast_chart(
                         "#60A5FA",
                         "#64748B",
                         "#A855F7",
+                        "#DC2626",
                     ],
                 ),
                 legend=alt.Legend(
                     orient="top",
                     direction="horizontal",
-                    columns=5,
-                    labelLimit=300,
+                    columns=3,
+                    labelLimit=320,
                 ),
             ),
             strokeDash=alt.StrokeDash(
@@ -3968,6 +4180,7 @@ def build_price_forecast_chart(
                         [2, 2],
                         [8, 3],
                         [3, 2],
+                        [10, 4],
                     ],
                 ),
             ),
@@ -4303,7 +4516,7 @@ if st.button(
                 token,
             )
 
-        st.session_state["day_ahead_result_v7"] = {
+        st.session_state["day_ahead_result_v8"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -4317,7 +4530,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v7")
+forecast_result = st.session_state.get("day_ahead_result_v8")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -4502,7 +4715,7 @@ if forecast_result:
             "forecast_price_eur_mwh"
         ]
 
-        p1, p2, p3, p4, p5 = st.columns(5)
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
         p1.metric(
             "Forecast baseload",
             f"{forecast_prices.mean():,.2f} €/MWh",
@@ -4530,6 +4743,10 @@ if forecast_result:
             "Forecast TB4",
             f"{forecast_tb4(forecast_prices):,.2f} €/MWh",
         )
+        p6.metric(
+            "Guardrail-limited hours",
+            f"{int(price_forecast['guardrail_applied'].sum())} h",
+        )
 
         st.altair_chart(
             build_price_forecast_chart(
@@ -4544,9 +4761,12 @@ if forecast_result:
             f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
             "unadjusted price anchor. Absolute values are anchored in the "
             "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. Negative thermal gap no longer forces an "
-            "exact zero price: low-gap hours are calibrated against historical "
-            "hours with similar thermal gap and hour of day."
+            "same-hour profile. Negative thermal gap does not force zero. "
+            "In addition, positive model residuals are now shrunk—especially "
+            "during evening and night hours—and cannot exceed all recent "
+            "references by a material amount unless the forecast thermal gap "
+            "is clearly higher than D-1 and D-7. The red dashed line shows the "
+            "dynamic upper guardrail."
         )
 
         complete_output = thermal_forecast.merge(
@@ -4565,6 +4785,15 @@ if forecast_result:
                     "probability_price_below_5_pct",
                     "low_gap_blend_weight",
                     "similar_gap_observations",
+                    "hourly_bias_correction_eur_mwh",
+                    "model_residual_before_guardrail_eur_mwh",
+                    "residual_shrink_factor",
+                    "gap_shock_vs_recent_mw",
+                    "gap_uplift_allowance_eur_mwh",
+                    "recent_reference_upper_eur_mwh",
+                    "price_upper_guardrail_eur_mwh",
+                    "guardrail_reduction_eur_mwh",
+                    "guardrail_applied",
                 ]
             ],
             on="datetime",
