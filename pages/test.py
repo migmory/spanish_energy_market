@@ -126,8 +126,11 @@ PBF_COLOR_RANGE = [
 # DOWNSTREAM MARKET FORECAST
 # =========================================================
 PRICE_INDICATOR_ID = 600
+PBF_DEMAND_INDICATOR_ID = 10141
 
+# Gross PBF technology indicators.
 FORECAST_NON_THERMAL_INDICATORS = {
+    "Hydro UGH": [1],
     "Wind": [12, 13],
     "Solar PV": [14],
     "Solar thermal": [15],
@@ -136,7 +139,20 @@ FORECAST_NON_THERMAL_INDICATORS = {
     "Other renewables": [10074],
 }
 
+# Bilateral programmes must be deducted from gross PBF to obtain the net
+# programme that is comparable with the price-setting thermal-gap definition.
+FORECAST_BILATERAL_INDICATORS = {
+    "Hydro UGH": [421],
+    "Wind": [432, 433],
+    "Solar PV": [],
+    "Solar thermal": [],
+    "Run-of-river": [422],
+    "Nuclear": [424],
+    "Other renewables": [10234],
+}
+
 FORECAST_NON_THERMAL_DEFAULT = [
+    "Hydro UGH",
     "Wind",
     "Solar PV",
     "Solar thermal",
@@ -146,6 +162,7 @@ FORECAST_NON_THERMAL_DEFAULT = [
 ]
 
 FORECAST_TECH_COLORS = {
+    "Hydro UGH": "#0EA5E9",
     "Wind": "#2563EB",
     "Solar PV": "#FACC15",
     "Solar thermal": "#FB923C",
@@ -153,6 +170,282 @@ FORECAST_TECH_COLORS = {
     "Nuclear": "#A855F7",
     "Other renewables": "#10B981",
 }
+
+# Explicit D-1 calibration supplied by the user. It is used as a fallback for
+# the 17-Jul-2026 forecast and as a validation reference. On later dates the
+# app automatically downloads the corresponding D-1 PBF demand, gross
+# generation and bilateral programmes from ESIOS.
+EMBEDDED_D1_CALIBRATION_DATE = date(2026, 7, 16)
+EMBEDDED_D1_CALIBRATION_RECORDS = [{'hour': 0,
+  'pbf_demand_mwh': 29688.5,
+  'Hydro UGH': 3970.0,
+  'Run-of-river': 449.7,
+  'Nuclear': 2111.1,
+  'Wind': 4876.7,
+  'Solar PV': 0.4,
+  'Solar thermal': 452.8,
+  'Other renewables': 578.1,
+  'actual_thermal_gap_mwh': 17249.7,
+  'price_eur_mwh': 67.842},
+ {'hour': 1,
+  'pbf_demand_mwh': 27744.8,
+  'Hydro UGH': 3052.4,
+  'Run-of-river': 447.3,
+  'Nuclear': 2109.0,
+  'Wind': 4753.6,
+  'Solar PV': 5.8,
+  'Solar thermal': 430.2,
+  'Other renewables': 579.9,
+  'actual_thermal_gap_mwh': 16366.6,
+  'price_eur_mwh': 66.589},
+ {'hour': 2,
+  'pbf_demand_mwh': 26598.5,
+  'Hydro UGH': 2803.4,
+  'Run-of-river': 433.7,
+  'Nuclear': 2108.8,
+  'Wind': 4495.8,
+  'Solar PV': 5.8,
+  'Solar thermal': 386.6,
+  'Other renewables': 580.0,
+  'actual_thermal_gap_mwh': 15784.4,
+  'price_eur_mwh': 66.574},
+ {'hour': 3,
+  'pbf_demand_mwh': 25986.2,
+  'Hydro UGH': 2705.9,
+  'Run-of-river': 432.3,
+  'Nuclear': 2109.0,
+  'Wind': 4315.5,
+  'Solar PV': 0.0,
+  'Solar thermal': 338.9,
+  'Other renewables': 578.4,
+  'actual_thermal_gap_mwh': 15506.2,
+  'price_eur_mwh': 66.304},
+ {'hour': 4,
+  'pbf_demand_mwh': 25586.3,
+  'Hydro UGH': 2620.6,
+  'Run-of-river': 430.2,
+  'Nuclear': 2108.8,
+  'Wind': 4028.6,
+  'Solar PV': 0.0,
+  'Solar thermal': 256.1,
+  'Other renewables': 578.4,
+  'actual_thermal_gap_mwh': 15563.6,
+  'price_eur_mwh': 66.26},
+ {'hour': 5,
+  'pbf_demand_mwh': 25622.8,
+  'Hydro UGH': 2846.4,
+  'Run-of-river': 427.7,
+  'Nuclear': 2109.2,
+  'Wind': 3586.0,
+  'Solar PV': 0.2,
+  'Solar thermal': 239.6,
+  'Other renewables': 579.4,
+  'actual_thermal_gap_mwh': 15834.3,
+  'price_eur_mwh': 66.574},
+ {'hour': 6,
+  'pbf_demand_mwh': 26975.3,
+  'Hydro UGH': 3643.9,
+  'Run-of-river': 425.1,
+  'Nuclear': 2106.8,
+  'Wind': 3449.4,
+  'Solar PV': 134.8,
+  'Solar thermal': 149.3,
+  'Other renewables': 577.9,
+  'actual_thermal_gap_mwh': 16488.1,
+  'price_eur_mwh': 67.3},
+ {'hour': 7,
+  'pbf_demand_mwh': 29242.7,
+  'Hydro UGH': 3973.8,
+  'Run-of-river': 424.1,
+  'Nuclear': 2104.9,
+  'Wind': 3175.1,
+  'Solar PV': 2443.1,
+  'Solar thermal': 241.2,
+  'Other renewables': 573.8,
+  'actual_thermal_gap_mwh': 16306.7,
+  'price_eur_mwh': 68.218},
+ {'hour': 8,
+  'pbf_demand_mwh': 31194.3,
+  'Hydro UGH': 2707.3,
+  'Run-of-river': 422.6,
+  'Nuclear': 2101.2,
+  'Wind': 2741.5,
+  'Solar PV': 10609.8,
+  'Solar thermal': 383.3,
+  'Other renewables': 572.3,
+  'actual_thermal_gap_mwh': 11656.3,
+  'price_eur_mwh': 64.82},
+ {'hour': 9,
+  'pbf_demand_mwh': 33024.5,
+  'Hydro UGH': 1030.2,
+  'Run-of-river': 424.9,
+  'Nuclear': 2101.1,
+  'Wind': 1643.6,
+  'Solar PV': 20008.7,
+  'Solar thermal': 924.6,
+  'Other renewables': 572.8,
+  'actual_thermal_gap_mwh': 6318.6,
+  'price_eur_mwh': 54.556},
+ {'hour': 10,
+  'pbf_demand_mwh': 34430.6,
+  'Hydro UGH': 897.9,
+  'Run-of-river': 423.2,
+  'Nuclear': 2098.9,
+  'Wind': 939.8,
+  'Solar PV': 25910.6,
+  'Solar thermal': 1609.2,
+  'Other renewables': 483.9,
+  'actual_thermal_gap_mwh': 2067.1,
+  'price_eur_mwh': 47.241},
+ {'hour': 11,
+  'pbf_demand_mwh': 36127.9,
+  'Hydro UGH': 864.0,
+  'Run-of-river': 336.8,
+  'Nuclear': 2099.0,
+  'Wind': 1073.3,
+  'Solar PV': 28035.3,
+  'Solar thermal': 1833.6,
+  'Other renewables': 468.9,
+  'actual_thermal_gap_mwh': 1417.0,
+  'price_eur_mwh': 39.886},
+ {'hour': 12,
+  'pbf_demand_mwh': 37274.6,
+  'Hydro UGH': 861.7,
+  'Run-of-river': 311.8,
+  'Nuclear': 2095.0,
+  'Wind': 1407.9,
+  'Solar PV': 29312.6,
+  'Solar thermal': 1950.7,
+  'Other renewables': 466.9,
+  'actual_thermal_gap_mwh': 868.0,
+  'price_eur_mwh': 39.25},
+ {'hour': 13,
+  'pbf_demand_mwh': 38294.8,
+  'Hydro UGH': 823.2,
+  'Run-of-river': 316.1,
+  'Nuclear': 2091.2,
+  'Wind': 1979.4,
+  'Solar PV': 30061.0,
+  'Solar thermal': 1974.7,
+  'Other renewables': 466.3,
+  'actual_thermal_gap_mwh': 582.9,
+  'price_eur_mwh': 37.817},
+ {'hour': 14,
+  'pbf_demand_mwh': 38840.0,
+  'Hydro UGH': 354.9,
+  'Run-of-river': 297.7,
+  'Nuclear': 2090.8,
+  'Wind': 2709.8,
+  'Solar PV': 30157.3,
+  'Solar thermal': 1983.0,
+  'Other renewables': 465.2,
+  'actual_thermal_gap_mwh': 781.3,
+  'price_eur_mwh': 35.725},
+ {'hour': 15,
+  'pbf_demand_mwh': 38727.1,
+  'Hydro UGH': 90.2,
+  'Run-of-river': 297.7,
+  'Nuclear': 2089.2,
+  'Wind': 3463.3,
+  'Solar PV': 29821.2,
+  'Solar thermal': 1985.1,
+  'Other renewables': 455.9,
+  'actual_thermal_gap_mwh': 524.5,
+  'price_eur_mwh': 31.698},
+ {'hour': 16,
+  'pbf_demand_mwh': 38699.0,
+  'Hydro UGH': 89.7,
+  'Run-of-river': 298.2,
+  'Nuclear': 2091.2,
+  'Wind': 4175.4,
+  'Solar PV': 28806.7,
+  'Solar thermal': 1979.7,
+  'Other renewables': 450.7,
+  'actual_thermal_gap_mwh': 807.4,
+  'price_eur_mwh': 30.316},
+ {'hour': 17,
+  'pbf_demand_mwh': 38866.1,
+  'Hydro UGH': 91.2,
+  'Run-of-river': 302.8,
+  'Nuclear': 2091.1,
+  'Wind': 4818.4,
+  'Solar PV': 27368.1,
+  'Solar thermal': 1971.7,
+  'Other renewables': 461.1,
+  'actual_thermal_gap_mwh': 1761.7,
+  'price_eur_mwh': 31.924},
+ {'hour': 18,
+  'pbf_demand_mwh': 38463.4,
+  'Hydro UGH': 319.7,
+  'Run-of-river': 335.6,
+  'Nuclear': 2089.0,
+  'Wind': 5545.9,
+  'Solar PV': 25138.8,
+  'Solar thermal': 2027.1,
+  'Other renewables': 473.0,
+  'actual_thermal_gap_mwh': 2534.3,
+  'price_eur_mwh': 33.401},
+ {'hour': 19,
+  'pbf_demand_mwh': 37624.3,
+  'Hydro UGH': 966.9,
+  'Run-of-river': 423.7,
+  'Nuclear': 2096.8,
+  'Wind': 7055.8,
+  'Solar PV': 19005.2,
+  'Solar thermal': 1947.2,
+  'Other renewables': 485.0,
+  'actual_thermal_gap_mwh': 5643.7,
+  'price_eur_mwh': 40.922},
+ {'hour': 20,
+  'pbf_demand_mwh': 36057.3,
+  'Hydro UGH': 2650.7,
+  'Run-of-river': 436.7,
+  'Nuclear': 2101.2,
+  'Wind': 8955.1,
+  'Solar PV': 9664.7,
+  'Solar thermal': 1621.9,
+  'Other renewables': 575.5,
+  'actual_thermal_gap_mwh': 10051.5,
+  'price_eur_mwh': 58.566},
+ {'hour': 21,
+  'pbf_demand_mwh': 33876.9,
+  'Hydro UGH': 3987.6,
+  'Run-of-river': 479.0,
+  'Nuclear': 2112.8,
+  'Wind': 8932.2,
+  'Solar PV': 1877.2,
+  'Solar thermal': 1129.2,
+  'Other renewables': 577.4,
+  'actual_thermal_gap_mwh': 14781.5,
+  'price_eur_mwh': 71.865},
+ {'hour': 22,
+  'pbf_demand_mwh': 32050.7,
+  'Hydro UGH': 4123.8,
+  'Run-of-river': 493.8,
+  'Nuclear': 2113.0,
+  'Wind': 8993.1,
+  'Solar PV': 19.1,
+  'Solar thermal': 792.7,
+  'Other renewables': 576.8,
+  'actual_thermal_gap_mwh': 14938.4,
+  'price_eur_mwh': 74.338},
+ {'hour': 23,
+  'pbf_demand_mwh': 29836.6,
+  'Hydro UGH': 4078.8,
+  'Run-of-river': 493.3,
+  'Nuclear': 2103.0,
+  'Wind': 8712.2,
+  'Solar PV': 1.2,
+  'Solar thermal': 710.3,
+  'Other renewables': 578.6,
+  'actual_thermal_gap_mwh': 13159.2,
+  'price_eur_mwh': 70.573}]
+
+# The forecast remains driven by the model, but is moderately anchored in the
+# latest complete PBF day to avoid abrupt, implausible level shifts.
+D1_DEMAND_BLEND_WEIGHT = 0.25
+D1_GENERATION_BLEND_WEIGHT = 0.20
+
 
 GENERATION_WEATHER_VARIABLES = [
     "temperature_2m",
@@ -691,7 +984,7 @@ def build_forecast_features(frame: pd.DataFrame, demand_lookup: dict, trend_alph
     # Their differences provide an explicit measure of the most recent weekly
     # level change, which is useful during heatwaves, cold spells or abrupt
     # changes in economic/activity conditions.
-    for lag in [2, 3, 7, 9, 10, 14, 21, 28]:
+    for lag in [1, 2, 3, 7, 9, 10, 14, 21, 28]:
         out[f"lag_{lag}d"] = [
             demand_lookup.get(
                 (d - timedelta(days=lag), int(h)),
@@ -1946,7 +2239,7 @@ GENERATION_FEATURES = [
     "wind_speed_100m", "precipitation",
     "daily_temperature", "daily_radiation", "daily_cloud",
     "daily_wind", "daily_precipitation",
-    "gen_lag_2d", "gen_lag_3d", "gen_lag_7d",
+    "gen_lag_1d", "gen_lag_2d", "gen_lag_3d", "gen_lag_7d",
     "gen_lag_9d", "gen_lag_10d",
     "gen_lag_14d", "gen_lag_21d", "gen_lag_28d",
     "gen_change_d2_d9", "gen_change_d3_d10",
@@ -1961,17 +2254,109 @@ def load_forecast_pbf_history(
     technologies_tuple: tuple[str, ...],
     _token: str,
 ) -> pd.DataFrame:
+    """
+    Load NET PBF generation by technology:
+
+        net PBF = gross PBF - bilateral PBF
+
+    This is the same perimeter used by the user's historical thermal-gap
+    export. Using gross PBF would materially overstate nuclear and wind
+    generation available to the market and can create artificial negative gaps.
+    """
     results = []
+
+    def _fetch_technology(technology: str) -> pd.DataFrame:
+        gross = load_one_pbf_technology_hourly(
+            technology=technology,
+            indicator_ids=FORECAST_NON_THERMAL_INDICATORS[technology],
+            start_day=start_day,
+            end_day=end_day,
+            token=_token,
+        )
+        if gross.empty:
+            return pd.DataFrame()
+
+        gross = gross.rename(
+            columns={"energy_mwh": "gross_energy_mwh"}
+        )[["datetime", "technology", "gross_energy_mwh"]]
+
+        bilateral_ids = FORECAST_BILATERAL_INDICATORS.get(
+            technology,
+            [],
+        )
+        bilateral_frames = []
+        for indicator_id in bilateral_ids:
+            frame = fetch_one_pbf_indicator_hourly(
+                indicator_id=indicator_id,
+                start_day=start_day,
+                end_day=end_day,
+                token=_token,
+            )
+            if not frame.empty:
+                bilateral_frames.append(frame)
+
+        if bilateral_frames:
+            bilateral = pd.concat(
+                bilateral_frames,
+                ignore_index=True,
+            )
+            bilateral = (
+                bilateral.groupby("datetime", as_index=False)[
+                    "energy_mwh"
+                ]
+                .sum()
+                .rename(
+                    columns={
+                        "energy_mwh": "bilateral_energy_mwh"
+                    }
+                )
+            )
+        else:
+            bilateral = gross[["datetime"]].copy()
+            bilateral["bilateral_energy_mwh"] = 0.0
+
+        out = gross.merge(
+            bilateral,
+            on="datetime",
+            how="left",
+        )
+        out["bilateral_energy_mwh"] = (
+            pd.to_numeric(
+                out["bilateral_energy_mwh"],
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .clip(lower=0.0)
+        )
+        out["gross_energy_mwh"] = pd.to_numeric(
+            out["gross_energy_mwh"],
+            errors="coerce",
+        )
+        out["energy_mwh"] = (
+            out["gross_energy_mwh"]
+            - out["bilateral_energy_mwh"]
+        ).clip(lower=0.0)
+        out["net_to_gross_ratio"] = (
+            out["energy_mwh"]
+            / out["gross_energy_mwh"].replace(0, np.nan)
+        ).clip(lower=0.0, upper=1.10)
+
+        return out[
+            [
+                "datetime",
+                "technology",
+                "energy_mwh",
+                "gross_energy_mwh",
+                "bilateral_energy_mwh",
+                "net_to_gross_ratio",
+            ]
+        ]
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
             executor.submit(
-                load_one_pbf_technology_hourly,
+                _fetch_technology,
                 technology,
-                FORECAST_NON_THERMAL_INDICATORS[technology],
-                start_day,
-                end_day,
-                _token,
             ): technology
             for technology in technologies_tuple
         }
@@ -1985,7 +2370,14 @@ def load_forecast_pbf_history(
 
     if not results:
         return pd.DataFrame(
-            columns=["datetime", "technology", "energy_mwh"]
+            columns=[
+                "datetime",
+                "technology",
+                "energy_mwh",
+                "gross_energy_mwh",
+                "bilateral_energy_mwh",
+                "net_to_gross_ratio",
+            ]
         )
 
     history = pd.concat(results, ignore_index=True)
@@ -1993,31 +2385,175 @@ def load_forecast_pbf_history(
         history["datetime"],
         errors="coerce",
     ).dt.floor("h")
-    history["energy_mwh"] = pd.to_numeric(
-        history["energy_mwh"],
-        errors="coerce",
-    )
+
+    numeric_columns = [
+        "energy_mwh",
+        "gross_energy_mwh",
+        "bilateral_energy_mwh",
+        "net_to_gross_ratio",
+    ]
+    for column in numeric_columns:
+        history[column] = pd.to_numeric(
+            history[column],
+            errors="coerce",
+        )
 
     return (
         history.dropna(
             subset=["datetime", "technology", "energy_mwh"]
         )
-        .groupby(
-            ["datetime", "technology"],
-            as_index=False,
-        )["energy_mwh"]
-        .sum()
         .sort_values(["datetime", "technology"])
+        .drop_duplicates(
+            subset=["datetime", "technology"],
+            keep="last",
+        )
         .reset_index(drop=True)
     )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_pbf_demand_history(
+    start_day: date,
+    end_day: date,
+    _token: str,
+) -> pd.DataFrame:
+    demand = fetch_one_pbf_indicator_hourly(
+        indicator_id=PBF_DEMAND_INDICATOR_ID,
+        start_day=start_day,
+        end_day=end_day,
+        token=_token,
+    )
+    if demand.empty:
+        return pd.DataFrame(
+            columns=["datetime", "pbf_demand_mwh"]
+        )
+
+    return (
+        demand.rename(
+            columns={"energy_mwh": "pbf_demand_mwh"}
+        )[["datetime", "pbf_demand_mwh"]]
+        .sort_values("datetime")
+        .drop_duplicates("datetime", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def embedded_d1_calibration(
+    target_day: date,
+) -> pd.DataFrame:
+    calibration_day = target_day - timedelta(days=1)
+    if calibration_day != EMBEDDED_D1_CALIBRATION_DATE:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(
+        EMBEDDED_D1_CALIBRATION_RECORDS
+    )
+    out["date"] = calibration_day
+    out["datetime"] = (
+        pd.to_datetime(out["date"].astype(str))
+        + pd.to_timedelta(out["hour"], unit="h")
+    )
+
+    generation_columns = [
+        tech
+        for tech in FORECAST_NON_THERMAL_INDICATORS
+        if tech in out.columns
+    ]
+    out["non_thermal_net_mwh"] = out[
+        generation_columns
+    ].sum(axis=1)
+
+    return out.sort_values("datetime").reset_index(drop=True)
+
+
+def build_previous_day_calibration(
+    target_day: date,
+    technologies: list[str],
+    pbf_history: pd.DataFrame,
+    pbf_demand_history: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build the D-1 calibration profile from ESIOS, falling back to the supplied
+    16-Jul-2026 export when required.
+    """
+    calibration_day = target_day - timedelta(days=1)
+
+    generation = pbf_history[
+        pbf_history["datetime"].dt.date == calibration_day
+    ].copy()
+    demand = pbf_demand_history[
+        pbf_demand_history["datetime"].dt.date == calibration_day
+    ].copy()
+
+    if not generation.empty and not demand.empty:
+        generation_wide = (
+            generation.pivot_table(
+                index="datetime",
+                columns="technology",
+                values="energy_mwh",
+                aggfunc="sum",
+            )
+            .reset_index()
+        )
+        generation_wide.columns.name = None
+        out = demand.merge(
+            generation_wide,
+            on="datetime",
+            how="inner",
+        )
+        out["hour"] = out["datetime"].dt.hour
+
+        available = [
+            tech
+            for tech in technologies
+            if tech in out.columns
+        ]
+        out["non_thermal_net_mwh"] = out[
+            available
+        ].sum(axis=1)
+        out["actual_thermal_gap_mwh"] = (
+            out["pbf_demand_mwh"]
+            - out["non_thermal_net_mwh"]
+        )
+        out["calibration_source"] = "ESIOS D-1 net PBF"
+        return out.sort_values("datetime").reset_index(drop=True)
+
+    fallback = embedded_d1_calibration(target_day)
+    if fallback.empty:
+        return fallback
+
+    keep_columns = [
+        "datetime",
+        "hour",
+        "pbf_demand_mwh",
+        *[
+            tech
+            for tech in technologies
+            if tech in fallback.columns
+        ],
+        "non_thermal_net_mwh",
+        "actual_thermal_gap_mwh",
+        "price_eur_mwh",
+    ]
+    fallback = fallback[keep_columns].copy()
+    fallback["calibration_source"] = (
+        "User supplied 16-Jul-2026 PBF export"
+    )
+    return fallback
 
 
 def _generation_fallback(
     technology: str,
     target: pd.DataFrame,
 ) -> np.ndarray:
+    recent_anchor = (
+        0.60 * target["gen_lag_1d"]
+        + 0.40 * target["gen_adjusted_d7"]
+    )
     prediction = (
-        target["gen_adjusted_d7"]
+        recent_anchor
+        .fillna(target["gen_lag_1d"])
+        .fillna(target["gen_adjusted_d7"])
         .fillna(target["gen_same_hour_4w"])
         .fillna(target["gen_lag_2d"])
         .fillna(0.0)
@@ -2290,13 +2826,28 @@ def forecast_pbf_technology(
             "hour",
             "shortwave_radiation",
             "wind_speed_100m",
+            "gen_lag_1d",
             "gen_lag_2d",
             "gen_lag_7d",
             "gen_adjusted_d7",
         ]
     ].copy()
     output["technology"] = technology
-    output["forecast_mwh"] = prediction
+    output["model_net_forecast_mwh"] = prediction
+
+    # D-1 is known from the PBF programme before tomorrow's DA gate closure.
+    # Keep the model dominant, but anchor 20% in the latest complete net-PBF
+    # profile to prevent implausible jumps in solar hours.
+    d1_anchor = pd.to_numeric(
+        output["gen_lag_1d"],
+        errors="coerce",
+    )
+    output["forecast_mwh"] = (
+        (1.0 - D1_GENERATION_BLEND_WEIGHT)
+        * output["model_net_forecast_mwh"]
+        + D1_GENERATION_BLEND_WEIGHT
+        * d1_anchor.fillna(output["model_net_forecast_mwh"])
+    ).clip(lower=0.0)
 
     return output, {
         "Technology": technology,
@@ -2314,29 +2865,48 @@ def generate_thermal_gap_forecast(
     technologies: list[str],
     token: str,
 ) -> dict:
-    history_end = target_day - timedelta(days=2)
-    history_start = history_end - timedelta(
-        days=int(lookback_days)
+    # Demand model uses completed realised demand through D-2. PBF generation,
+    # bilateral programmes and PBF demand for D-1 are already known and are
+    # therefore included as calibration / lag information.
+    pbf_history_end = target_day - timedelta(days=1)
+    history_start = (
+        target_day
+        - timedelta(days=int(lookback_days))
+        - timedelta(days=2)
     )
 
     pbf_history = load_forecast_pbf_history(
         history_start,
-        history_end,
+        pbf_history_end,
         tuple(technologies),
+        token,
+    )
+    pbf_demand_history = load_pbf_demand_history(
+        history_start,
+        pbf_history_end,
         token,
     )
     weather_history = load_generation_weather_history(
         history_start,
-        history_end,
+        target_day - timedelta(days=2),
     )
     target_weather = load_generation_weather_forecast(
         target_day,
     )
 
     if pbf_history.empty:
-        raise ValueError("No historical PBF generation data.")
+        raise ValueError("No historical net PBF generation data.")
+    if pbf_demand_history.empty:
+        raise ValueError("No historical PBF demand data.")
     if weather_history.empty or target_weather.empty:
         raise ValueError("Generation weather data unavailable.")
+
+    d1_calibration = build_previous_day_calibration(
+        target_day,
+        technologies,
+        pbf_history,
+        pbf_demand_history,
+    )
 
     forecast_frames = []
     stats_rows = []
@@ -2348,7 +2918,7 @@ def generate_thermal_gap_forecast(
             stats_rows.append(
                 {
                     "Technology": technology,
-                    "Model": "No ESIOS history",
+                    "Model": "No ESIOS net-PBF history",
                     "Target feature values imputed": np.nan,
                     "Backtest MAE (MW)": np.nan,
                     "Backtest MAPE (%)": np.nan,
@@ -2367,13 +2937,14 @@ def generate_thermal_gap_forecast(
 
     if not forecast_frames:
         raise ValueError(
-            "No PBF generation forecast could be produced."
+            "No net PBF generation forecast could be produced."
         )
 
     generation_long = pd.concat(
         forecast_frames,
         ignore_index=True,
     )
+
     generation_wide = (
         generation_long.pivot_table(
             index=["datetime", "date", "hour"],
@@ -2402,21 +2973,75 @@ def generate_thermal_gap_forecast(
         demand["datetime"],
         errors="coerce",
     ).dt.floor("h")
+    demand["hour"] = demand["datetime"].dt.hour
 
     forecast = generation_wide.merge(
         demand,
-        on="datetime",
+        on=["datetime", "hour"],
         how="inner",
     )
+
+    # Align the total-demand model to the latest known PBF demand perimeter.
+    if not d1_calibration.empty:
+        d1_demand = d1_calibration[
+            ["hour", "pbf_demand_mwh"]
+        ].drop_duplicates("hour")
+        forecast = forecast.merge(
+            d1_demand.rename(
+                columns={
+                    "pbf_demand_mwh": "d1_pbf_demand_mwh"
+                }
+            ),
+            on="hour",
+            how="left",
+        )
+    else:
+        forecast["d1_pbf_demand_mwh"] = np.nan
+
+    forecast["pbf_demand_forecast_mwh"] = (
+        (1.0 - D1_DEMAND_BLEND_WEIGHT)
+        * forecast["selected_demand_mw"]
+        + D1_DEMAND_BLEND_WEIGHT
+        * forecast["d1_pbf_demand_mwh"].fillna(
+            forecast["selected_demand_mw"]
+        )
+    )
+
     forecast["thermal_gap_forecast_mwh"] = (
-        forecast["selected_demand_mw"]
+        forecast["pbf_demand_forecast_mwh"]
         - forecast["non_thermal_forecast_mwh"]
     )
 
-    demand_history = load_hourly_peninsular_demand(
-        history_start,
-        history_end,
-    )
+    if not d1_calibration.empty:
+        d1_reference = d1_calibration[
+            [
+                "hour",
+                "actual_thermal_gap_mwh",
+                "non_thermal_net_mwh",
+                "calibration_source",
+            ]
+        ].drop_duplicates("hour")
+        forecast = forecast.merge(
+            d1_reference.rename(
+                columns={
+                    "actual_thermal_gap_mwh": (
+                        "d1_actual_thermal_gap_mwh"
+                    ),
+                    "non_thermal_net_mwh": (
+                        "d1_non_thermal_net_mwh"
+                    ),
+                }
+            ),
+            on="hour",
+            how="left",
+        )
+    else:
+        forecast["d1_actual_thermal_gap_mwh"] = np.nan
+        forecast["d1_non_thermal_net_mwh"] = np.nan
+        forecast["calibration_source"] = "No D-1 calibration"
+
+    # Historical price training uses the same PBF-demand / NET-generation
+    # perimeter as the target forecast.
     pbf_history_wide = (
         pbf_history.pivot_table(
             index="datetime",
@@ -2436,7 +3061,7 @@ def generate_thermal_gap_forecast(
         pbf_history_wide[historical_techs].sum(axis=1)
     )
 
-    historical = demand_history.merge(
+    historical = pbf_demand_history.merge(
         pbf_history_wide[
             ["datetime", "non_thermal_mwh"]
         ],
@@ -2444,7 +3069,7 @@ def generate_thermal_gap_forecast(
         how="inner",
     )
     historical["thermal_gap_mwh"] = (
-        historical["demand_mw"]
+        historical["pbf_demand_mwh"]
         - historical["non_thermal_mwh"]
     )
 
@@ -2459,6 +3084,7 @@ def generate_thermal_gap_forecast(
         "historical": historical.sort_values(
             "datetime"
         ).reset_index(drop=True),
+        "d1_calibration": d1_calibration,
     }
 
 
@@ -2526,8 +3152,8 @@ def build_generation_forecast_chart(
         .encode(
             x="datetime:T",
             y=alt.Y(
-                "selected_demand_mw:Q",
-                title="Demand / PBF generation forecast (MW)",
+                "pbf_demand_forecast_mwh:Q",
+                title="PBF demand / net PBF generation forecast (MW)",
             ),
             tooltip=[
                 alt.Tooltip(
@@ -2536,8 +3162,8 @@ def build_generation_forecast_chart(
                     format="%d-%m-%Y %H:%M",
                 ),
                 alt.Tooltip(
-                    "selected_demand_mw:Q",
-                    title="Demand forecast",
+                    "pbf_demand_forecast_mwh:Q",
+                    title="PBF demand forecast",
                     format=",.0f",
                 ),
                 alt.Tooltip(
@@ -2614,12 +3240,44 @@ def build_thermal_gap_forecast_chart(
         )
     )
 
+    d1_line = (
+        alt.Chart(plot)
+        .mark_line(
+            color="#F97316",
+            strokeWidth=2.5,
+            strokeDash=[6, 3],
+            point=True,
+        )
+        .encode(
+            x=alt.X("datetime:T"),
+            y=alt.Y(
+                "d1_actual_thermal_gap_mwh:Q",
+                title="Forecast thermal gap (MW)",
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "datetime:T",
+                    title="Hour",
+                    format="%d-%m-%Y %H:%M",
+                ),
+                alt.Tooltip(
+                    "d1_actual_thermal_gap_mwh:Q",
+                    title="D-1 actual net-PBF gap",
+                    format=",.0f",
+                ),
+            ],
+        )
+    )
+
     zero = (
         alt.Chart(pd.DataFrame({"zero": [0]}))
         .mark_rule(color="#0F172A")
         .encode(y="zero:Q")
     )
-    return configure_chart(alt.layer(zero, bars), height=290)
+    return configure_chart(
+        alt.layer(zero, bars, d1_line),
+        height=290,
+    )
 
 
 # =========================================================
@@ -2781,6 +3439,231 @@ PRICE_FEATURES = [
 ]
 
 
+
+def empirical_similar_gap_price_reference(
+    historical_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+    max_candidates: int = 120,
+) -> pd.DataFrame:
+    """
+    Build an empirical price reference for each target hour using historical
+    observations with a similar thermal gap and nearby hour of day.
+
+    This avoids the incorrect structural assumption that a negative thermal gap
+    must imply an exact 0 EUR/MWh price. The historical sample captures other
+    balancing mechanisms that are not fully represented in the simplified gap:
+    exports, pumping, storage charging, curtailment and market constraints.
+    """
+    required = {
+        "thermal_gap_mwh",
+        "price_eur_mwh",
+        "hour",
+        "is_weekend",
+    }
+    if historical_data is None or historical_data.empty:
+        return pd.DataFrame(index=target_data.index)
+
+    history = historical_data.copy()
+    missing = required.difference(history.columns)
+    if missing:
+        return pd.DataFrame(index=target_data.index)
+
+    history["thermal_gap_mwh"] = pd.to_numeric(
+        history["thermal_gap_mwh"],
+        errors="coerce",
+    )
+    history["price_eur_mwh"] = pd.to_numeric(
+        history["price_eur_mwh"],
+        errors="coerce",
+    )
+    history = history.dropna(
+        subset=["thermal_gap_mwh", "price_eur_mwh", "hour"]
+    ).copy()
+
+    if history.empty:
+        return pd.DataFrame(index=target_data.index)
+
+    gap_scale = max(
+        float(history["thermal_gap_mwh"].std()),
+        2_500.0,
+    )
+
+    output_rows = []
+
+    for row in target_data.itertuples():
+        target_gap = float(row.thermal_gap_mwh)
+        target_hour = int(row.hour)
+        target_weekend = int(row.is_weekend)
+
+        candidates = history[
+            history["is_weekend"] == target_weekend
+        ].copy()
+
+        if len(candidates) < 50:
+            candidates = history.copy()
+
+        hour_distance = (
+            candidates["hour"] - target_hour
+        ).abs()
+        candidates["hour_distance"] = np.minimum(
+            hour_distance,
+            24 - hour_distance,
+        )
+        candidates["gap_distance"] = (
+            candidates["thermal_gap_mwh"] - target_gap
+        ).abs()
+
+        # Prefer observations within +/-2 hours. Relax automatically when
+        # the sample is too small.
+        local = candidates[
+            candidates["hour_distance"] <= 2
+        ].copy()
+        if len(local) >= 30:
+            candidates = local
+
+        candidates["distance_score"] = (
+            candidates["gap_distance"] / gap_scale
+            + candidates["hour_distance"] / 3.0
+        )
+        candidates = candidates.nsmallest(
+            max_candidates,
+            "distance_score",
+        )
+
+        if candidates.empty:
+            output_rows.append(
+                {
+                    "conditional_price_median_eur_mwh": np.nan,
+                    "conditional_price_p25_eur_mwh": np.nan,
+                    "conditional_price_p75_eur_mwh": np.nan,
+                    "probability_price_le_zero_pct": np.nan,
+                    "probability_price_below_5_pct": np.nan,
+                    "similar_gap_observations": 0,
+                }
+            )
+            continue
+
+        prices = candidates["price_eur_mwh"]
+
+        output_rows.append(
+            {
+                "conditional_price_median_eur_mwh": float(
+                    prices.median()
+                ),
+                "conditional_price_p25_eur_mwh": float(
+                    prices.quantile(0.25)
+                ),
+                "conditional_price_p75_eur_mwh": float(
+                    prices.quantile(0.75)
+                ),
+                "probability_price_le_zero_pct": float(
+                    (prices <= 0.0).mean() * 100.0
+                ),
+                "probability_price_below_5_pct": float(
+                    (prices <= 5.0).mean() * 100.0
+                ),
+                "similar_gap_observations": int(len(prices)),
+            }
+        )
+
+    result = pd.DataFrame(
+        output_rows,
+        index=target_data.index,
+    )
+    return result
+
+
+def blend_model_with_empirical_low_gap_reference(
+    raw_prediction,
+    model_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    Blend the model forecast with an empirical similar-gap price reference.
+
+    The empirical weight rises only when the forecast gap is unusually low
+    relative to history. There is no hard zero-price override.
+    """
+    empirical = empirical_similar_gap_price_reference(
+        model_data,
+        target_data,
+    )
+
+    raw = np.maximum(
+        np.asarray(raw_prediction, dtype=float),
+        0.0,
+    )
+
+    if empirical.empty:
+        return raw, empirical
+
+    historical_gap = pd.to_numeric(
+        model_data["thermal_gap_mwh"],
+        errors="coerce",
+    ).dropna()
+
+    if historical_gap.empty:
+        empirical["low_gap_blend_weight"] = 0.0
+        return raw, empirical
+
+    low_gap_threshold = float(
+        historical_gap.quantile(0.15)
+    )
+    extreme_low_gap = float(
+        historical_gap.quantile(0.01)
+    )
+
+    denominator = max(
+        low_gap_threshold - extreme_low_gap,
+        1_000.0,
+    )
+
+    severity = np.clip(
+        (
+            low_gap_threshold
+            - target_data["thermal_gap_mwh"].to_numpy(dtype=float)
+        )
+        / denominator,
+        0.0,
+        1.0,
+    )
+
+    # Normal hours remain almost entirely model-driven. Very low-gap hours
+    # receive up to 45% empirical calibration.
+    blend_weight = 0.05 + 0.40 * severity
+
+    empirical_median = pd.to_numeric(
+        empirical["conditional_price_median_eur_mwh"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    valid_empirical = np.isfinite(empirical_median)
+    blend_weight = np.where(
+        valid_empirical,
+        blend_weight,
+        0.0,
+    )
+    empirical_median = np.where(
+        valid_empirical,
+        np.maximum(empirical_median, 0.0),
+        raw,
+    )
+
+    blended = (
+        (1.0 - blend_weight) * raw
+        + blend_weight * empirical_median
+    )
+
+    empirical["low_gap_blend_weight"] = (
+        blend_weight * 100.0
+    )
+    empirical["historical_low_gap_threshold_mw"] = (
+        low_gap_threshold
+    )
+
+    return np.maximum(blended, 0.0), empirical
+
+
 def generate_price_forecast(
     target_day: date,
     historical_gap: pd.DataFrame,
@@ -2926,15 +3809,22 @@ def generate_price_forecast(
         ].to_numpy()
         model_name = "D-1 / D-7 anchor fallback"
 
-    validation_final = np.where(
-        validation["thermal_gap_mwh"].to_numpy() <= 0,
-        0,
-        np.maximum(validation_raw, 0),
+    # A negative simplified thermal gap does not mechanically imply a zero
+    # market price. Calibrate low-gap hours against historically similar
+    # observations instead of applying a hard 0 EUR/MWh rule.
+    validation_final, validation_empirical = (
+        blend_model_with_empirical_low_gap_reference(
+            validation_raw,
+            train if not train.empty else model_data,
+            validation,
+        )
     )
-    target_final = np.where(
-        target_data["thermal_gap_mwh"].to_numpy() <= 0,
-        0,
-        np.maximum(target_raw, 0),
+    target_final, target_empirical = (
+        blend_model_with_empirical_low_gap_reference(
+            target_raw,
+            model_data,
+            target_data,
+        )
     )
 
     cap = model_data["price_eur_mwh"].quantile(0.997)
@@ -2958,9 +3848,13 @@ def generate_price_forecast(
     ].copy()
     output["forecast_price_eur_mwh"] = target_final
     output["raw_model_price_eur_mwh"] = target_raw
-    output["zero_price_rule"] = (
+    output["negative_thermal_gap_flag"] = (
         output["thermal_gap_mwh"] <= 0
     )
+
+    if target_empirical is not None and not target_empirical.empty:
+        for column in target_empirical.columns:
+            output[column] = target_empirical[column].to_numpy()
 
     return {
         "forecast": output.sort_values(
@@ -3008,6 +3902,15 @@ def build_price_forecast_chart(
             ]
             .rename(columns={"price_anchor": "price"})
             .assign(series="Absolute-price anchor"),
+            price_forecast[
+                ["datetime", "conditional_price_median_eur_mwh"]
+            ]
+            .rename(
+                columns={
+                    "conditional_price_median_eur_mwh": "price"
+                }
+            )
+            .assign(series="Historical similar-gap median"),
         ],
         ignore_index=True,
     )
@@ -3017,6 +3920,7 @@ def build_price_forecast_chart(
         "Previous day",
         "Same weekday previous week",
         "Absolute-price anchor",
+        "Historical similar-gap median",
     ]
 
     chart = (
@@ -3043,12 +3947,13 @@ def build_price_forecast_chart(
                         "#F97316",
                         "#60A5FA",
                         "#64748B",
+                        "#A855F7",
                     ],
                 ),
                 legend=alt.Legend(
                     orient="top",
                     direction="horizontal",
-                    columns=4,
+                    columns=5,
                     labelLimit=300,
                 ),
             ),
@@ -3062,6 +3967,7 @@ def build_price_forecast_chart(
                         [5, 3],
                         [2, 2],
                         [8, 3],
+                        [3, 2],
                     ],
                 ),
             ),
@@ -3330,7 +4236,7 @@ forecast_generation_technologies = st.multiselect(
     options=list(FORECAST_NON_THERMAL_INDICATORS.keys()),
     default=FORECAST_NON_THERMAL_DEFAULT,
     help=(
-        "Thermal gap = selected demand forecast minus forecast PBF generation. "
+        "Thermal gap = PBF-calibrated demand minus forecast NET PBF generation. "
         "Run-of-river corresponds to Hydro non-UGH."
     ),
     key="forecast_generation_technologies",
@@ -3397,7 +4303,7 @@ if st.button(
                 token,
             )
 
-        st.session_state["day_ahead_result_v5"] = {
+        st.session_state["day_ahead_result_v7"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -3411,7 +4317,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v5")
+forecast_result = st.session_state.get("day_ahead_result_v7")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -3499,11 +4405,11 @@ if forecast_result:
 
         tg1, tg2, tg3, tg4, tg5 = st.columns(5)
         tg1.metric(
-            "Average selected demand",
-            f"{thermal_forecast['selected_demand_mw'].mean():,.0f} MW",
+            "Average PBF demand forecast",
+            f"{thermal_forecast['pbf_demand_forecast_mwh'].mean():,.0f} MW",
         )
         tg2.metric(
-            "Average forecast PBF generation",
+            "Average NET PBF generation",
             f"{thermal_forecast['non_thermal_forecast_mwh'].mean():,.0f} MW",
         )
         tg3.metric(
@@ -3526,11 +4432,42 @@ if forecast_result:
             use_container_width=True,
         )
 
+        d1_calibration = thermal_result.get("d1_calibration", pd.DataFrame())
+        if d1_calibration is not None and not d1_calibration.empty:
+            solar_hours = d1_calibration[
+                d1_calibration["hour"].between(10, 18)
+            ]
+            d1_min_gap = pd.to_numeric(
+                solar_hours["actual_thermal_gap_mwh"],
+                errors="coerce",
+            ).min()
+            d1_min_price = pd.to_numeric(
+                solar_hours.get(
+                    "price_eur_mwh",
+                    pd.Series(dtype=float),
+                ),
+                errors="coerce",
+            ).min()
+
+            st.info(
+                "D-1 calibration check: during solar hours the supplied "
+                f"net-PBF thermal gap remained positive, with a minimum of "
+                f"{d1_min_gap:,.0f} MW"
+                + (
+                    f", while the minimum DA price was "
+                    f"{d1_min_price:,.2f} €/MWh."
+                    if pd.notna(d1_min_price)
+                    else "."
+                )
+                + " This profile is now used as the latest calibration anchor."
+            )
+
         st.caption(
-            "Forecast thermal gap = selected demand forecast − forecast PBF "
-            "generation included above. Historical observations are used only "
-            "for training and calibration; no separate historical thermal-gap "
-            "plot is shown."
+            "Forecast thermal gap = PBF-calibrated demand forecast − forecast "
+            "NET PBF generation. Gross PBF is reduced by bilateral programmes. "
+            "The orange dashed line is the actual D-1 thermal-gap profile used "
+            "for calibration; historical observations remain hidden and are "
+            "used only for training."
         )
 
         with st.expander(
@@ -3543,10 +4480,12 @@ if forecast_result:
             )
             st.markdown(
                 """
-                - **Solar:** forecast radiation, cloud cover and recent PBF lags.
-                - **Wind:** forecast wind at 100 m and recent PBF lags.
-                - **Run-of-river:** Hydro non-UGH, precipitation and recent pattern.
-                - **Nuclear / other renewables:** recent PBF programme and calendar effects.
+                - Every technology is forecast in **net PBF terms**: gross PBF minus bilateral PBF.
+                - **Solar:** forecast radiation, cloud cover and D-1 / recent net-PBF lags.
+                - **Wind:** forecast wind at 100 m and D-1 / recent net-PBF lags.
+                - **Run-of-river:** Hydro non-UGH, precipitation and recent net programme.
+                - **Hydro UGH, nuclear and other renewables:** D-1 net programme and calendar effects.
+                - The supplied 16-Jul profile is embedded as a fallback calibration for the 17-Jul forecast.
                 """
             )
 
@@ -3576,9 +4515,16 @@ if forecast_result:
             "Forecast maximum",
             f"{forecast_prices.max():,.2f} €/MWh",
         )
+        likely_low_price_hours = int(
+            (
+                price_forecast[
+                    "probability_price_below_5_pct"
+                ] >= 50.0
+            ).sum()
+        )
         p4.metric(
-            "Zero-price hours",
-            f"{int((forecast_prices == 0).sum())} h",
+            "Likely ≤5 €/MWh hours",
+            f"{likely_low_price_hours} h",
         )
         p5.metric(
             "Forecast TB4",
@@ -3598,7 +4544,9 @@ if forecast_result:
             f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
             "unadjusted price anchor. Absolute values are anchored in the "
             "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. Thermal gap ≤ 0 is forced to 0 €/MWh."
+            "same-hour profile. Negative thermal gap no longer forces an "
+            "exact zero price: low-gap hours are calibrated against historical "
+            "hours with similar thermal gap and hour of day."
         )
 
         complete_output = thermal_forecast.merge(
@@ -3609,7 +4557,14 @@ if forecast_result:
                     "price_anchor",
                     "price_lag_1d",
                     "price_lag_7d",
-                    "zero_price_rule",
+                    "negative_thermal_gap_flag",
+                    "conditional_price_median_eur_mwh",
+                    "conditional_price_p25_eur_mwh",
+                    "conditional_price_p75_eur_mwh",
+                    "probability_price_le_zero_pct",
+                    "probability_price_below_5_pct",
+                    "low_gap_blend_weight",
+                    "similar_gap_observations",
                 ]
             ],
             on="datetime",
