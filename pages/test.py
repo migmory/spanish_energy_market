@@ -4575,17 +4575,21 @@ def apply_negative_gap_near_zero_calibration(
     target_data: pd.DataFrame,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
-    Strongly compress forecast prices when the simplified thermal gap is
-    negative, without imposing an exact zero-price rule.
+    Force forecast prices very close to zero whenever the simplified
+    thermal gap is negative.
 
-    Soft upper cap:
-        TG =     0 MW -> 8.0 EUR/MWh
-        TG = -1000 MW -> 6.25 EUR/MWh
-        TG = -2000 MW -> 4.50 EUR/MWh
-        TG = -3000 MW -> 2.75 EUR/MWh
-        TG <=-4000 MW -> 1.00 EUR/MWh
+    Exponential upper cap:
 
-    A small positive gap receives no structural cap.
+        cap = 0.01 + 1.50 * exp(-abs(TG) / 400)
+
+    Approximate values:
+        TG =  -100 MW -> 1.18 EUR/MWh
+        TG =  -250 MW -> 0.81 EUR/MWh
+        TG =  -500 MW -> 0.44 EUR/MWh
+        TG = -1000 MW -> 0.13 EUR/MWh
+        TG = -2000 MW -> 0.02 EUR/MWh
+
+    Positive thermal-gap hours remain fully model-driven.
     """
     prices = np.maximum(
         np.asarray(forecast_prices, dtype=float),
@@ -4598,17 +4602,14 @@ def apply_negative_gap_near_zero_calibration(
     ).fillna(0.0).to_numpy(dtype=float)
 
     negative_mask = gap < 0.0
+    negative_gap_abs = np.maximum(-gap, 0.0)
 
-    negative_severity = np.clip(
-        np.maximum(-gap, 0.0) / 4_000.0,
-        0.0,
-        1.0,
-    )
-
-    # Continuous cap from 8 EUR/MWh at a just-negative gap to 1 EUR/MWh
-    # for a gap at or below -4 GW.
+    # The cap is already low for a slightly negative gap and converges very
+    # quickly towards 0.01 EUR/MWh as the negative gap deepens.
     near_zero_cap = (
-        8.0 - 7.0 * negative_severity
+        0.01
+        + 1.50
+        * np.exp(-negative_gap_abs / 400.0)
     )
 
     calibrated = prices.copy()
@@ -4623,6 +4624,11 @@ def apply_negative_gap_near_zero_calibration(
                 negative_mask,
                 near_zero_cap,
                 np.nan,
+            ),
+            "negative_gap_absolute_mw": np.where(
+                negative_mask,
+                negative_gap_abs,
+                0.0,
             ),
             "negative_gap_price_before_calibration_eur_mwh": prices,
             "negative_gap_price_compression_eur_mwh": np.where(
@@ -5647,7 +5653,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v11"] = {
+        st.session_state["day_ahead_result_v12"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -5665,7 +5671,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v11")
+forecast_result = st.session_state.get("day_ahead_result_v12")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -5957,9 +5963,10 @@ if forecast_result:
             f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
             "unadjusted price anchor. Absolute values are anchored in the "
             "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. A negative thermal gap now imposes a "
-            "continuous near-zero price cap: approximately 8 €/MWh at a "
-            "just-negative gap, falling to 1 €/MWh at −4 GW or below. "
+            "same-hour profile. Any negative thermal gap now imposes a "
+            "strong near-zero cap: around 1.18 €/MWh at −100 MW, "
+            "0.44 €/MWh at −500 MW, 0.13 €/MWh at −1 GW and practically "
+            "0 €/MWh from roughly −2 GW onwards. "
             "Positive model residuals are also shrunk—especially "
             "during evening and night hours—and cannot exceed all recent "
             "references by a material amount unless the forecast thermal gap "
@@ -6129,6 +6136,7 @@ if forecast_result:
             "guardrail_reduction_eur_mwh",
             "guardrail_applied",
             "negative_gap_near_zero_cap_eur_mwh",
+            "negative_gap_absolute_mw",
             "negative_gap_price_before_calibration_eur_mwh",
             "negative_gap_price_compression_eur_mwh",
             "negative_gap_near_zero_applied",
