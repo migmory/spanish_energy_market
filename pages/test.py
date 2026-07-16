@@ -4569,6 +4569,78 @@ def recent_price_guardrails(
     return np.maximum(guarded, 0.0), diagnostics
 
 
+
+def apply_negative_gap_near_zero_calibration(
+    forecast_prices,
+    target_data: pd.DataFrame,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    Strongly compress forecast prices when the simplified thermal gap is
+    negative, without imposing an exact zero-price rule.
+
+    Soft upper cap:
+        TG =     0 MW -> 8.0 EUR/MWh
+        TG = -1000 MW -> 6.25 EUR/MWh
+        TG = -2000 MW -> 4.50 EUR/MWh
+        TG = -3000 MW -> 2.75 EUR/MWh
+        TG <=-4000 MW -> 1.00 EUR/MWh
+
+    A small positive gap receives no structural cap.
+    """
+    prices = np.maximum(
+        np.asarray(forecast_prices, dtype=float),
+        0.0,
+    )
+
+    gap = pd.to_numeric(
+        target_data["thermal_gap_mwh"],
+        errors="coerce",
+    ).fillna(0.0).to_numpy(dtype=float)
+
+    negative_mask = gap < 0.0
+
+    negative_severity = np.clip(
+        np.maximum(-gap, 0.0) / 4_000.0,
+        0.0,
+        1.0,
+    )
+
+    # Continuous cap from 8 EUR/MWh at a just-negative gap to 1 EUR/MWh
+    # for a gap at or below -4 GW.
+    near_zero_cap = (
+        8.0 - 7.0 * negative_severity
+    )
+
+    calibrated = prices.copy()
+    calibrated[negative_mask] = np.minimum(
+        prices[negative_mask],
+        near_zero_cap[negative_mask],
+    )
+
+    diagnostics = pd.DataFrame(
+        {
+            "negative_gap_near_zero_cap_eur_mwh": np.where(
+                negative_mask,
+                near_zero_cap,
+                np.nan,
+            ),
+            "negative_gap_price_before_calibration_eur_mwh": prices,
+            "negative_gap_price_compression_eur_mwh": np.where(
+                negative_mask,
+                np.maximum(prices - calibrated, 0.0),
+                0.0,
+            ),
+            "negative_gap_near_zero_applied": (
+                negative_mask
+                & (calibrated < prices - 1e-9)
+            ),
+        },
+        index=target_data.index,
+    )
+
+    return np.maximum(calibrated, 0.0), diagnostics
+
+
 def generate_price_forecast(
     target_day: date,
     historical_gap: pd.DataFrame,
@@ -4771,6 +4843,22 @@ def generate_price_forecast(
         hourly_bias_correction=hourly_bias_correction,
     )
 
+    # Thermal gap below zero is a very strong low-price signal. Apply this
+    # after all gas, anchor and residual adjustments so no later uplift can
+    # override the near-zero calibration.
+    validation_final, validation_negative_gap = (
+        apply_negative_gap_near_zero_calibration(
+            validation_final,
+            validation,
+        )
+    )
+    target_final, target_negative_gap = (
+        apply_negative_gap_near_zero_calibration(
+            target_final,
+            target_data,
+        )
+    )
+
     cap = model_data["price_eur_mwh"].quantile(0.997)
     if pd.notna(cap):
         target_final = np.minimum(
@@ -4811,6 +4899,15 @@ def generate_price_forecast(
     if target_guardrails is not None and not target_guardrails.empty:
         for column in target_guardrails.columns:
             output[column] = target_guardrails[column].to_numpy()
+
+    if (
+        target_negative_gap is not None
+        and not target_negative_gap.empty
+    ):
+        for column in target_negative_gap.columns:
+            output[column] = (
+                target_negative_gap[column].to_numpy()
+            )
 
     return {
         "forecast": output.sort_values(
@@ -5004,6 +5101,7 @@ def price_realization_metrics(
         "mae": np.nan,
         "rmse": np.nan,
         "mape": np.nan,
+        "smape": np.nan,
         "forecast_baseload": np.nan,
         "actual_baseload": np.nan,
         "baseload_error": np.nan,
@@ -5040,16 +5138,29 @@ def price_realization_metrics(
     return {
         "mae": float(error.abs().mean()),
         "rmse": float(np.sqrt((error ** 2).mean())),
+        # MAPE is reported only for hours where the realised absolute price
+        # exceeds 5 EUR/MWh; otherwise near-zero prices make it explode.
         "mape": (
             float(
                 (
-                    error[nonzero].abs()
-                    / actual[nonzero].abs()
+                    error[actual.abs() > 5.0].abs()
+                    / actual[actual.abs() > 5.0].abs()
                 ).mean()
                 * 100
             )
-            if nonzero.any()
+            if (actual.abs() > 5.0).any()
             else np.nan
+        ),
+        # Symmetric MAPE remains bounded between 0% and 200%.
+        "smape": float(
+            (
+                2.0 * error.abs()
+                / (
+                    actual.abs()
+                    + forecast.abs()
+                ).replace(0.0, np.nan)
+            ).mean()
+            * 100
         ),
         "forecast_baseload": float(forecast.mean()),
         "actual_baseload": float(actual.mean()),
@@ -5536,7 +5647,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v10"] = {
+        st.session_state["day_ahead_result_v11"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -5554,7 +5665,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v10")
+forecast_result = st.session_state.get("day_ahead_result_v11")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -5752,16 +5863,32 @@ if forecast_result:
             "Forecast maximum",
             f"{forecast_prices.max():,.2f} €/MWh",
         )
-        likely_low_price_hours = int(
-            (
+        negative_gap_hours = int(
+            price_forecast[
+                "negative_thermal_gap_flag"
+            ].sum()
+        )
+        negative_gap_average_price = (
+            price_forecast.loc[
                 price_forecast[
-                    "probability_price_below_5_pct"
-                ] >= 50.0
-            ).sum()
+                    "negative_thermal_gap_flag"
+                ],
+                "forecast_price_eur_mwh",
+            ].mean()
         )
         p4.metric(
-            "Likely ≤5 €/MWh hours",
-            f"{likely_low_price_hours} h",
+            "Negative-gap price",
+            (
+                f"{negative_gap_average_price:,.2f} €/MWh"
+                if negative_gap_hours > 0
+                else "—"
+            ),
+            delta=(
+                f"{negative_gap_hours} h"
+                if negative_gap_hours > 0
+                else None
+            ),
+            delta_color="off",
         )
         p5.metric(
             "Forecast TB4",
@@ -5830,8 +5957,10 @@ if forecast_result:
             f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
             "unadjusted price anchor. Absolute values are anchored in the "
             "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. Negative thermal gap does not force zero. "
-            "In addition, positive model residuals are now shrunk—especially "
+            "same-hour profile. A negative thermal gap now imposes a "
+            "continuous near-zero price cap: approximately 8 €/MWh at a "
+            "just-negative gap, falling to 1 €/MWh at −4 GW or below. "
+            "Positive model residuals are also shrunk—especially "
             "during evening and night hours—and cannot exceed all recent "
             "references by a material amount unless the forecast thermal gap "
             "is clearly higher than D-1 and D-7. The red dashed line shows the "
@@ -5906,8 +6035,12 @@ if forecast_result:
                     f"{real_metrics['rmse']:,.2f} €/MWh",
                 )
                 r5.metric(
-                    "Hourly MAPE",
-                    f"{real_metrics['mape']:,.2f}%",
+                    "Hourly sMAPE",
+                    f"{real_metrics['smape']:,.2f}%",
+                    help=(
+                        "Symmetric MAPE is bounded and remains meaningful "
+                        "when realised prices are close to zero."
+                    ),
                 )
                 r6.metric(
                     "TB4 error",
@@ -5963,41 +6096,53 @@ if forecast_result:
                 "publishes them and the forecast is rerun."
             )
 
+        requested_price_output_columns = [
+            "datetime",
+            "forecast_price_eur_mwh",
+            "price_anchor",
+            "price_lag_1d",
+            "price_lag_7d",
+            "mibgas_d1_eur_mwh",
+            "mibgas_d2_eur_mwh",
+            "mibgas_d7_eur_mwh",
+            "mibgas_7d_avg_eur_mwh",
+            "mibgas_change_d1_eur_mwh",
+            "mibgas_change_vs_7d_eur_mwh",
+            "mibgas_data_available",
+            "mibgas_x_positive_gap",
+            "negative_thermal_gap_flag",
+            "conditional_price_median_eur_mwh",
+            "conditional_price_p25_eur_mwh",
+            "conditional_price_p75_eur_mwh",
+            "probability_price_le_zero_pct",
+            "probability_price_below_5_pct",
+            "low_gap_blend_weight",
+            "similar_gap_observations",
+            "hourly_bias_correction_eur_mwh",
+            "model_residual_before_guardrail_eur_mwh",
+            "residual_shrink_factor",
+            "gap_shock_vs_recent_mw",
+            "gap_uplift_allowance_eur_mwh",
+            "gas_uplift_allowance_eur_mwh",
+            "recent_reference_upper_eur_mwh",
+            "price_upper_guardrail_eur_mwh",
+            "guardrail_reduction_eur_mwh",
+            "guardrail_applied",
+            "negative_gap_near_zero_cap_eur_mwh",
+            "negative_gap_price_before_calibration_eur_mwh",
+            "negative_gap_price_compression_eur_mwh",
+            "negative_gap_near_zero_applied",
+        ]
+
+        available_price_output_columns = [
+            column
+            for column in requested_price_output_columns
+            if column in price_forecast.columns
+        ]
+
         complete_output = thermal_forecast.merge(
             price_forecast[
-                [
-                    "datetime",
-                    "forecast_price_eur_mwh",
-                    "price_anchor",
-                    "price_lag_1d",
-                    "price_lag_7d",
-                    "mibgas_d1_eur_mwh",
-                    "mibgas_d2_eur_mwh",
-                    "mibgas_7d_eur_mwh",
-                    "mibgas_7d_avg_eur_mwh",
-                    "mibgas_change_d1_eur_mwh",
-                    "mibgas_change_vs_7d_eur_mwh",
-                    "mibgas_data_available",
-                    "mibgas_x_positive_gap",
-                    "negative_thermal_gap_flag",
-                    "conditional_price_median_eur_mwh",
-                    "conditional_price_p25_eur_mwh",
-                    "conditional_price_p75_eur_mwh",
-                    "probability_price_le_zero_pct",
-                    "probability_price_below_5_pct",
-                    "low_gap_blend_weight",
-                    "similar_gap_observations",
-                    "hourly_bias_correction_eur_mwh",
-                    "model_residual_before_guardrail_eur_mwh",
-                    "residual_shrink_factor",
-                    "gap_shock_vs_recent_mw",
-                    "gap_uplift_allowance_eur_mwh",
-                    "gas_uplift_allowance_eur_mwh",
-                    "recent_reference_upper_eur_mwh",
-                    "price_upper_guardrail_eur_mwh",
-                    "guardrail_reduction_eur_mwh",
-                    "guardrail_applied",
-                ]
+                available_price_output_columns
             ],
             on="datetime",
             how="left",
