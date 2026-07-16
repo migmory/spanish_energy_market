@@ -48,6 +48,7 @@ ESIOS_API_BASE = "https://api.esios.ree.es/indicators"
 REDATA_DEMAND_URL = "https://apidatos.ree.es/es/datos/demanda/evolucion"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
 CORP_GREEN_DARK = "#0F766E"
 CORP_GREEN = "#10B981"
@@ -867,33 +868,64 @@ def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFram
     )
 
 
-def _weighted_hourly_temperature(payload, points: list[dict]) -> pd.DataFrame:
+def _weighted_hourly_temperature(
+    payload,
+    points: list[dict],
+    source_variable: str = "temperature_2m",
+) -> pd.DataFrame:
+    """Population-weight a live or archived D-1 temperature forecast."""
     if isinstance(payload, dict):
         payload = [payload]
+
     frames = []
     for idx, item in enumerate(payload):
         if idx >= len(points):
             continue
+
         hourly = item.get("hourly", {}) or {}
         times = hourly.get("time", []) or []
-        values = hourly.get("temperature_2m", []) or []
+        values = hourly.get(source_variable, []) or []
+
         if not times or not values:
             continue
-        frame = pd.DataFrame({
-            "datetime": pd.to_datetime(times, errors="coerce"),
-            "temperature_c": pd.to_numeric(pd.Series(values), errors="coerce"),
-        })
+
+        frame = pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(times, errors="coerce"),
+                "temperature_c": pd.to_numeric(
+                    pd.Series(values),
+                    errors="coerce",
+                ),
+            }
+        )
         frame["weight"] = float(points[idx]["weight"])
-        frames.append(frame.dropna(subset=["datetime", "temperature_c"]))
+        frames.append(
+            frame.dropna(subset=["datetime", "temperature_c"])
+        )
 
     if not frames:
-        return pd.DataFrame(columns=["datetime", "temperature_c"])
+        return pd.DataFrame(
+            columns=["datetime", "temperature_c"]
+        )
 
     long = pd.concat(frames, ignore_index=True)
-    long["weighted"] = long["temperature_c"] * long["weight"]
-    out = long.groupby("datetime", as_index=False).agg(weighted=("weighted", "sum"), weight=("weight", "sum"))
-    out["temperature_c"] = out["weighted"] / out["weight"]
-    return out[["datetime", "temperature_c"]].sort_values("datetime")
+    long["weighted"] = (
+        long["temperature_c"] * long["weight"]
+    )
+    out = (
+        long.groupby("datetime", as_index=False)
+        .agg(
+            weighted=("weighted", "sum"),
+            weight=("weight", "sum"),
+        )
+    )
+    out["temperature_c"] = (
+        out["weighted"] / out["weight"]
+    )
+
+    return out[
+        ["datetime", "temperature_c"]
+    ].sort_values("datetime")
 
 
 def _temperature_points(mode: str) -> list[dict]:
@@ -923,19 +955,93 @@ def load_hourly_temperature_history(start_day: date, end_day: date, mode: str) -
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def load_hourly_temperature_forecast(target_day: date, mode: str) -> pd.DataFrame:
+def load_hourly_temperature_forecast(
+    target_day: date,
+    mode: str,
+) -> pd.DataFrame:
+    """
+    Weather input available at the day-ahead decision point.
+
+    Historical/today targets use Open-Meteo Previous Runs
+    temperature_2m_previous_day1. Tomorrow uses the latest live forecast.
+    """
     points = _temperature_points(mode)
-    params = {
-        "latitude": ",".join(str(p["latitude"]) for p in points),
-        "longitude": ",".join(str(p["longitude"]) for p in points),
-        "hourly": "temperature_2m",
+
+    common = {
+        "latitude": ",".join(
+            str(point["latitude"])
+            for point in points
+        ),
+        "longitude": ",".join(
+            str(point["longitude"])
+            for point in points
+        ),
         "timezone": "Europe/Madrid",
-        "forecast_days": min(max((target_day - date.today()).days + 1, 1), 16),
     }
-    response = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=120)
+
+    if target_day <= date.today():
+        source_variable = "temperature_2m_previous_day1"
+        params = {
+            **common,
+            "start_date": target_day.isoformat(),
+            "end_date": target_day.isoformat(),
+            "hourly": source_variable,
+        }
+        endpoint = OPEN_METEO_PREVIOUS_RUNS_URL
+    else:
+        source_variable = "temperature_2m"
+        params = {
+            **common,
+            "hourly": source_variable,
+            "forecast_days": min(
+                max(
+                    (target_day - date.today()).days + 1,
+                    1,
+                ),
+                16,
+            ),
+        }
+        endpoint = OPEN_METEO_FORECAST_URL
+
+    response = requests.get(
+        endpoint,
+        params=params,
+        timeout=120,
+    )
     response.raise_for_status()
-    out = _weighted_hourly_temperature(response.json(), points)
-    return out[out["datetime"].dt.date == target_day].reset_index(drop=True)
+
+    out = _weighted_hourly_temperature(
+        response.json(),
+        points,
+        source_variable=source_variable,
+    )
+    out = out[
+        out["datetime"].dt.date == target_day
+    ].copy()
+
+    expected = pd.DataFrame(
+        {
+            "datetime": pd.date_range(
+                start=pd.Timestamp(target_day),
+                periods=24,
+                freq="h",
+            )
+        }
+    )
+    out = (
+        expected.merge(out, on="datetime", how="left")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    out["temperature_c"] = (
+        pd.to_numeric(
+            out["temperature_c"],
+            errors="coerce",
+        )
+        .interpolate(limit_direction="both")
+    )
+
+    return out
 
 
 def national_holidays(years: list[int]) -> set[date]:
@@ -1938,7 +2044,14 @@ def build_pbf_average_chart(summary: pd.DataFrame):
 # =========================================================
 # STEP 2 — FORECAST PBF GENERATION AND THERMAL GAP
 # =========================================================
-def _weighted_generation_weather(payload) -> pd.DataFrame:
+def _weighted_generation_weather(
+    payload,
+    variable_suffix: str = "",
+) -> pd.DataFrame:
+    """
+    Geographically average live variables or archived variables ending in
+    _previous_day1. Returned columns keep the canonical variable names.
+    """
     if isinstance(payload, dict):
         payload = [payload]
 
@@ -1946,21 +2059,35 @@ def _weighted_generation_weather(payload) -> pd.DataFrame:
     for idx, item in enumerate(payload):
         if idx >= len(GENERATION_WEATHER_POINTS):
             continue
+
         hourly = item.get("hourly", {}) or {}
         times = hourly.get("time", []) or []
         if not times:
             continue
 
         frame = pd.DataFrame(
-            {"datetime": pd.to_datetime(times, errors="coerce")}
+            {
+                "datetime": pd.to_datetime(
+                    times,
+                    errors="coerce",
+                )
+            }
         )
+
         for variable in GENERATION_WEATHER_VARIABLES:
-            values = hourly.get(variable, []) or []
+            source_variable = (
+                f"{variable}{variable_suffix}"
+            )
+            values = hourly.get(source_variable, []) or []
             frame[variable] = (
-                pd.to_numeric(pd.Series(values), errors="coerce")
+                pd.to_numeric(
+                    pd.Series(values),
+                    errors="coerce",
+                )
                 if len(values) == len(times)
                 else np.nan
             )
+
         frame["weight"] = float(
             GENERATION_WEATHER_POINTS[idx]["weight"]
         )
@@ -1968,7 +2095,10 @@ def _weighted_generation_weather(payload) -> pd.DataFrame:
 
     if not frames:
         return pd.DataFrame(
-            columns=["datetime"] + GENERATION_WEATHER_VARIABLES
+            columns=[
+                "datetime",
+                *GENERATION_WEATHER_VARIABLES,
+            ]
         )
 
     long = pd.concat(frames, ignore_index=True)
@@ -1977,11 +2107,16 @@ def _weighted_generation_weather(payload) -> pd.DataFrame:
     for variable in GENERATION_WEATHER_VARIABLES:
         temp = long[
             ["datetime", "weight", variable]
-        ].dropna(subset=["datetime", variable]).copy()
+        ].dropna(
+            subset=["datetime", variable]
+        ).copy()
+
         if temp.empty:
             continue
 
-        temp["weighted"] = temp[variable] * temp["weight"]
+        temp["weighted"] = (
+            temp[variable] * temp["weight"]
+        )
         temp = (
             temp.groupby("datetime", as_index=False)
             .agg(
@@ -1990,21 +2125,33 @@ def _weighted_generation_weather(payload) -> pd.DataFrame:
             )
         )
         temp[variable] = (
-            temp["weighted"] / temp["available_weight"]
+            temp["weighted"]
+            / temp["available_weight"]
         )
         temp = temp[["datetime", variable]]
+
         result = (
             temp
             if result is None
-            else result.merge(temp, on="datetime", how="outer")
+            else result.merge(
+                temp,
+                on="datetime",
+                how="outer",
+            )
         )
 
     if result is None:
         return pd.DataFrame(
-            columns=["datetime"] + GENERATION_WEATHER_VARIABLES
+            columns=[
+                "datetime",
+                *GENERATION_WEATHER_VARIABLES,
+            ]
         )
 
-    return result.sort_values("datetime").reset_index(drop=True)
+    return (
+        result.sort_values("datetime")
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -2046,7 +2193,13 @@ def load_generation_weather_history(
 def load_generation_weather_forecast(
     target_day: date,
 ) -> pd.DataFrame:
-    params = {
+    """
+    Retrieve the weather information available at D-1.
+
+    Historical/today targets use Open-Meteo Previous Runs variables ending
+    in _previous_day1. Tomorrow uses the current live Best Match forecast.
+    """
+    common = {
         "latitude": ",".join(
             str(point["latitude"])
             for point in GENERATION_WEATHER_POINTS
@@ -2055,27 +2208,54 @@ def load_generation_weather_forecast(
             str(point["longitude"])
             for point in GENERATION_WEATHER_POINTS
         ),
-        "hourly": ",".join(GENERATION_WEATHER_VARIABLES),
         "timezone": "Europe/Madrid",
-        "forecast_days": min(
-            max((target_day - date.today()).days + 1, 1),
-            16,
-        ),
     }
+
+    if target_day <= date.today():
+        variable_suffix = "_previous_day1"
+        hourly_variables = [
+            f"{variable}{variable_suffix}"
+            for variable in GENERATION_WEATHER_VARIABLES
+        ]
+        params = {
+            **common,
+            "start_date": target_day.isoformat(),
+            "end_date": target_day.isoformat(),
+            "hourly": ",".join(hourly_variables),
+        }
+        endpoint = OPEN_METEO_PREVIOUS_RUNS_URL
+    else:
+        variable_suffix = ""
+        params = {
+            **common,
+            "hourly": ",".join(
+                GENERATION_WEATHER_VARIABLES
+            ),
+            "forecast_days": min(
+                max(
+                    (target_day - date.today()).days + 1,
+                    1,
+                ),
+                16,
+            ),
+        }
+        endpoint = OPEN_METEO_FORECAST_URL
+
     response = requests.get(
-        OPEN_METEO_FORECAST_URL,
+        endpoint,
         params=params,
         timeout=120,
     )
     response.raise_for_status()
-    forecast = _weighted_generation_weather(response.json())
+
+    forecast = _weighted_generation_weather(
+        response.json(),
+        variable_suffix=variable_suffix,
+    )
     forecast = forecast[
         forecast["datetime"].dt.date == target_day
     ].copy()
 
-    # Build a complete 24-hour local grid. Open-Meteo can occasionally omit a
-    # variable for one location/run, which previously caused all downstream
-    # Solar PV rows to be dropped by the strict dropna validation.
     expected = pd.DataFrame(
         {
             "datetime": pd.date_range(
@@ -2085,27 +2265,26 @@ def load_generation_weather_forecast(
             )
         }
     )
-    forecast = expected.merge(
-        forecast,
-        on="datetime",
-        how="left",
-    ).sort_values("datetime")
+    forecast = (
+        expected.merge(
+            forecast,
+            on="datetime",
+            how="left",
+        )
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
 
     for variable in GENERATION_WEATHER_VARIABLES:
         if variable not in forecast.columns:
             forecast[variable] = np.nan
+
         forecast[variable] = pd.to_numeric(
             forecast[variable],
             errors="coerce",
-        )
-        # Interpolate isolated missing forecast hours first. Any variable that
-        # is entirely unavailable is completed later from historical hourly
-        # climatology inside forecast_pbf_technology().
-        forecast[variable] = forecast[variable].interpolate(
-            limit_direction="both"
-        )
+        ).interpolate(limit_direction="both")
 
-    return forecast.reset_index(drop=True)
+    return forecast
 
 
 def _market_calendar(frame: pd.DataFrame) -> pd.DataFrame:
@@ -4215,6 +4394,203 @@ def forecast_tb4(prices: pd.Series) -> float:
     )
 
 
+def price_realization_metrics(
+    comparison: pd.DataFrame,
+) -> dict:
+    """Accuracy metrics for forecast versus realised DA prices."""
+    empty_result = {
+        "mae": np.nan,
+        "rmse": np.nan,
+        "mape": np.nan,
+        "forecast_baseload": np.nan,
+        "actual_baseload": np.nan,
+        "baseload_error": np.nan,
+        "forecast_tb4": np.nan,
+        "actual_tb4": np.nan,
+        "tb4_error": np.nan,
+    }
+
+    if comparison is None or comparison.empty:
+        return empty_result
+
+    actual = pd.to_numeric(
+        comparison["actual_price_eur_mwh"],
+        errors="coerce",
+    )
+    forecast = pd.to_numeric(
+        comparison["forecast_price_eur_mwh"],
+        errors="coerce",
+    )
+
+    valid = actual.notna() & forecast.notna()
+    actual = actual[valid]
+    forecast = forecast[valid]
+
+    if actual.empty:
+        return empty_result
+
+    error = forecast - actual
+    nonzero = actual.abs() > 1e-9
+
+    forecast_tb4_value = forecast_tb4(forecast)
+    actual_tb4_value = forecast_tb4(actual)
+
+    return {
+        "mae": float(error.abs().mean()),
+        "rmse": float(np.sqrt((error ** 2).mean())),
+        "mape": (
+            float(
+                (
+                    error[nonzero].abs()
+                    / actual[nonzero].abs()
+                ).mean()
+                * 100
+            )
+            if nonzero.any()
+            else np.nan
+        ),
+        "forecast_baseload": float(forecast.mean()),
+        "actual_baseload": float(actual.mean()),
+        "baseload_error": float(
+            forecast.mean() - actual.mean()
+        ),
+        "forecast_tb4": forecast_tb4_value,
+        "actual_tb4": actual_tb4_value,
+        "tb4_error": (
+            float(
+                forecast_tb4_value
+                - actual_tb4_value
+            )
+            if pd.notna(forecast_tb4_value)
+            and pd.notna(actual_tb4_value)
+            else np.nan
+        ),
+    }
+
+
+def build_forecast_vs_real_price_chart(
+    comparison: pd.DataFrame,
+):
+    if comparison is None or comparison.empty:
+        return None
+
+    long = pd.concat(
+        [
+            comparison[
+                ["datetime", "forecast_price_eur_mwh"]
+            ]
+            .rename(
+                columns={
+                    "forecast_price_eur_mwh": "price"
+                }
+            )
+            .assign(series="Forecast price"),
+            comparison[
+                ["datetime", "actual_price_eur_mwh"]
+            ]
+            .rename(
+                columns={
+                    "actual_price_eur_mwh": "price"
+                }
+            )
+            .assign(series="Real DA price"),
+        ],
+        ignore_index=True,
+    )
+
+    lines = (
+        alt.Chart(long)
+        .mark_line(
+            point=True,
+            strokeWidth=3.2,
+        )
+        .encode(
+            x=alt.X(
+                "datetime:T",
+                title=None,
+                axis=alt.Axis(
+                    format="%H:%M",
+                    labelAngle=0,
+                ),
+            ),
+            y=alt.Y(
+                "price:Q",
+                title="DA price (€/MWh)",
+                scale=alt.Scale(zero=True),
+            ),
+            color=alt.Color(
+                "series:N",
+                title="Price series",
+                scale=alt.Scale(
+                    domain=[
+                        "Forecast price",
+                        "Real DA price",
+                    ],
+                    range=[
+                        "#111827",
+                        "#16A34A",
+                    ],
+                ),
+                legend=alt.Legend(
+                    orient="top",
+                    direction="horizontal",
+                ),
+            ),
+            strokeDash=alt.StrokeDash(
+                "series:N",
+                legend=None,
+                scale=alt.Scale(
+                    domain=[
+                        "Forecast price",
+                        "Real DA price",
+                    ],
+                    range=[
+                        [6, 3],
+                        [1, 0],
+                    ],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "datetime:T",
+                    title="Hour",
+                    format="%d-%m-%Y %H:%M",
+                ),
+                alt.Tooltip(
+                    "series:N",
+                    title="Series",
+                ),
+                alt.Tooltip(
+                    "price:Q",
+                    title="€/MWh",
+                    format=",.2f",
+                ),
+            ],
+        )
+    )
+
+    error_area = (
+        alt.Chart(comparison)
+        .mark_area(
+            opacity=0.10,
+            color="#64748B",
+        )
+        .encode(
+            x=alt.X("datetime:T"),
+            y=alt.Y(
+                "forecast_price_eur_mwh:Q",
+                title="DA price (€/MWh)",
+            ),
+            y2="actual_price_eur_mwh:Q",
+        )
+    )
+
+    return configure_chart(
+        alt.layer(error_area, lines),
+        height=340,
+    )
+
+
 # =========================================================
 # APP
 # =========================================================
@@ -4398,9 +4774,11 @@ else:
 section_header("Step 1 — Day-ahead peninsular demand forecast")
 
 st.caption(
-    "Prototype of a next-day hourly demand curve using calendar effects, "
-    "forecast temperature, national holidays and historical demand lags. "
-    "Demand is cut off at target D-2 so incomplete D-1 demand is never used."
+    "Select tomorrow for a live forecast or any historical date from 2024 "
+    "for an operational backtest. Historical runs use the weather forecast "
+    "issued 24 hours before the selected day; demand is cut off at D-2, "
+    "PBF and prices at D-1, so realised target-day information is not used "
+    "until the Step 4 comparison."
 )
 
 fc1, fc2, fc3, fc4 = st.columns([1.0, 1.0, 1.1, 1.35])
@@ -4408,8 +4786,12 @@ with fc1:
     forecast_target_day = st.date_input(
         "Forecast target day",
         value=date.today() + timedelta(days=1),
-        min_value=date.today() + timedelta(days=1),
+        min_value=date(2024, 2, 1),
         max_value=date.today() + timedelta(days=1),
+        help=(
+            "Choose a historical date to recreate the forecast as if the "
+            "model were running on D-1, or choose tomorrow for the live run."
+        ),
         key="forecast_target_day",
     )
 with fc2:
@@ -4453,6 +4835,35 @@ forecast_generation_technologies = st.multiselect(
         "Run-of-river corresponds to Hydro non-UGH."
     ),
     key="forecast_generation_technologies",
+)
+
+forecast_as_of_day = forecast_target_day - timedelta(days=1)
+forecast_is_historical = forecast_target_day <= date.today()
+weather_input_label = (
+    "Archived D-1 forecast (_previous_day1)"
+    if forecast_is_historical
+    else "Live Open-Meteo Best Match"
+)
+
+st.markdown(
+    f"""
+    <div style="
+        background:#F8FAFC;
+        border:1px solid #CBD5E1;
+        border-radius:10px;
+        padding:10px 13px;
+        margin:6px 0 12px 0;
+        color:#334155;
+        font-size:0.90rem;
+    ">
+      <b>Forecast simulation date:</b> {forecast_as_of_day:%d/%m/%Y}
+      &nbsp;·&nbsp;
+      <b>Delivery date:</b> {forecast_target_day:%d/%m/%Y}
+      &nbsp;·&nbsp;
+      <b>Weather input:</b> {weather_input_label}
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 if st.button(
@@ -4516,12 +4927,23 @@ if st.button(
                 token,
             )
 
-        st.session_state["day_ahead_result_v8"] = {
+        # Loaded only after the forecast has been produced to prevent leakage.
+        realised_prices = load_esios_price_history(
+            forecast_target_day,
+            forecast_target_day,
+            token,
+        )
+
+        st.session_state["day_ahead_result_v9"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
             "thermal_result": thermal_result,
             "price_result": price_result,
+            "realised_prices": realised_prices,
+            "target_day": forecast_target_day,
+            "as_of_day": forecast_as_of_day,
+            "weather_input_label": weather_input_label,
             "generation_technologies": list(
                 forecast_generation_technologies
             ),
@@ -4530,7 +4952,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v8")
+forecast_result = st.session_state.get("day_ahead_result_v9")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -4769,6 +5191,121 @@ if forecast_result:
             "dynamic upper guardrail."
         )
 
+        # =================================================
+        # STEP 4 — compare against realised prices
+        # =================================================
+        realised_prices = forecast_result.get(
+            "realised_prices",
+            pd.DataFrame(),
+        )
+
+        if (
+            realised_prices is not None
+            and not realised_prices.empty
+        ):
+            comparison = price_forecast[
+                [
+                    "datetime",
+                    "forecast_price_eur_mwh",
+                ]
+            ].merge(
+                realised_prices[
+                    ["datetime", "price_eur_mwh"]
+                ].rename(
+                    columns={
+                        "price_eur_mwh": (
+                            "actual_price_eur_mwh"
+                        )
+                    }
+                ),
+                on="datetime",
+                how="inner",
+            )
+
+            if not comparison.empty:
+                section_header(
+                    "Step 4 — Forecast versus realised DA prices"
+                )
+
+                real_metrics = price_realization_metrics(
+                    comparison
+                )
+
+                r1, r2, r3, r4, r5, r6 = st.columns(6)
+                r1.metric(
+                    "Real baseload",
+                    f"{real_metrics['actual_baseload']:,.2f} €/MWh",
+                )
+                r2.metric(
+                    "Baseload error",
+                    f"{real_metrics['baseload_error']:+,.2f} €/MWh",
+                )
+                r3.metric(
+                    "Hourly MAE",
+                    f"{real_metrics['mae']:,.2f} €/MWh",
+                )
+                r4.metric(
+                    "Hourly RMSE",
+                    f"{real_metrics['rmse']:,.2f} €/MWh",
+                )
+                r5.metric(
+                    "Hourly MAPE",
+                    f"{real_metrics['mape']:,.2f}%",
+                )
+                r6.metric(
+                    "TB4 error",
+                    f"{real_metrics['tb4_error']:+,.2f} €/MWh",
+                )
+
+                realised_chart = (
+                    build_forecast_vs_real_price_chart(
+                        comparison
+                    )
+                )
+                if realised_chart is not None:
+                    st.altair_chart(
+                        realised_chart,
+                        use_container_width=True,
+                    )
+
+                st.caption(
+                    "The forecast was generated using only information "
+                    f"available by {forecast_result.get('as_of_day'):%d/%m/%Y}. "
+                    "Realised target-day prices are loaded afterwards and are "
+                    "used exclusively for this comparison."
+                )
+
+                with st.expander(
+                    "Hourly forecast error"
+                ):
+                    comparison["error_eur_mwh"] = (
+                        comparison[
+                            "forecast_price_eur_mwh"
+                        ]
+                        - comparison[
+                            "actual_price_eur_mwh"
+                        ]
+                    )
+                    comparison["absolute_error_eur_mwh"] = (
+                        comparison[
+                            "error_eur_mwh"
+                        ].abs()
+                    )
+                    st.dataframe(
+                        comparison,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+        else:
+            section_header(
+                "Step 4 — Forecast versus realised DA prices"
+            )
+            st.info(
+                "Real DA prices are not available yet for the selected "
+                "delivery date. This comparison will appear once ESIOS "
+                "publishes them and the forecast is rerun."
+            )
+
         complete_output = thermal_forecast.merge(
             price_forecast[
                 [
@@ -4963,9 +5500,10 @@ if forecast_result:
     )
 else:
     st.info(
-        "Press the button to generate tomorrow's demand forecast, PBF "
-        "generation, thermal gap and DA spot-price curve. The first run is "
-        "slower because historical demand, PBF and prices are cached."
+        "Select a delivery date and press the button. Historical dates are "
+        "recreated as an operational D-1 backtest; tomorrow uses the live "
+        "weather forecast. When realised DA prices exist, Step 4 compares "
+        "them directly against the forecast."
     )
 
 
