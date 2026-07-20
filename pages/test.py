@@ -164,8 +164,10 @@ FORECAST_BILATERAL_INDICATORS = {
     "Other renewables": [10234],
 }
 
-FORECAST_NON_THERMAL_DEFAULT = [
-    "Hydro UGH",
+# Exogenous / must-run generation deducted when calculating the structural
+# thermal gap. Hydro UGH is deliberately excluded because it is dispatchable
+# and reacts to prices and to the gap itself.
+STRUCTURAL_THERMAL_GAP_TECHS = [
     "Wind",
     "Solar PV",
     "Solar thermal",
@@ -173,6 +175,8 @@ FORECAST_NON_THERMAL_DEFAULT = [
     "Nuclear",
     "Other renewables",
 ]
+
+FORECAST_NON_THERMAL_DEFAULT = STRUCTURAL_THERMAL_GAP_TECHS.copy()
 
 FORECAST_TECH_COLORS = {
     "Hydro UGH": "#0EA5E9",
@@ -2645,14 +2649,24 @@ def embedded_d1_calibration(
         + pd.to_timedelta(out["hour"], unit="h")
     )
 
-    generation_columns = [
+    structural_columns = [
         tech
-        for tech in FORECAST_NON_THERMAL_INDICATORS
+        for tech in STRUCTURAL_THERMAL_GAP_TECHS
         if tech in out.columns
     ]
     out["non_thermal_net_mwh"] = out[
-        generation_columns
+        structural_columns
     ].sum(axis=1)
+
+    # Recalculate the D-1 reference on the corrected structural perimeter.
+    out["actual_thermal_gap_mwh"] = (
+        out["pbf_demand_mwh"]
+        - out["non_thermal_net_mwh"]
+    )
+    out["hydro_ugh_net_mwh"] = pd.to_numeric(
+        out.get("Hydro UGH", 0.0),
+        errors="coerce",
+    ).fillna(0.0)
 
     return out.sort_values("datetime").reset_index(drop=True)
 
@@ -2694,19 +2708,30 @@ def build_previous_day_calibration(
         )
         out["hour"] = out["datetime"].dt.hour
 
-        available = [
+        structural_available = [
             tech
             for tech in technologies
-            if tech in out.columns
+            if tech != "Hydro UGH"
+            and tech in out.columns
         ]
         out["non_thermal_net_mwh"] = out[
-            available
+            structural_available
         ].sum(axis=1)
+        out["hydro_ugh_net_mwh"] = (
+            pd.to_numeric(
+                out["Hydro UGH"],
+                errors="coerce",
+            ).fillna(0.0)
+            if "Hydro UGH" in out.columns
+            else 0.0
+        )
         out["actual_thermal_gap_mwh"] = (
             out["pbf_demand_mwh"]
             - out["non_thermal_net_mwh"]
         )
-        out["calibration_source"] = "ESIOS D-1 net PBF"
+        out["calibration_source"] = (
+            "ESIOS D-1 structural net PBF"
+        )
         return out.sort_values("datetime").reset_index(drop=True)
 
     fallback = embedded_d1_calibration(target_day)
@@ -2723,6 +2748,7 @@ def build_previous_day_calibration(
             if tech in fallback.columns
         ],
         "non_thermal_net_mwh",
+        "hydro_ugh_net_mwh",
         "actual_thermal_gap_mwh",
         "price_eur_mwh",
     ]
@@ -3148,13 +3174,25 @@ def generate_thermal_gap_forecast(
     )
     generation_wide.columns.name = None
 
-    available_technologies = [
+    structural_technologies = [
         tech
         for tech in technologies
-        if tech in generation_wide.columns
+        if tech != "Hydro UGH"
+        and tech in generation_wide.columns
     ]
     generation_wide["non_thermal_forecast_mwh"] = (
-        generation_wide[available_technologies].sum(axis=1)
+        generation_wide[structural_technologies].sum(axis=1)
+    )
+
+    # Flexible hydro is retained as a separate diagnostic, not deducted from
+    # the structural thermal gap.
+    generation_wide["hydro_ugh_forecast_mwh"] = (
+        pd.to_numeric(
+            generation_wide["Hydro UGH"],
+            errors="coerce",
+        ).fillna(0.0)
+        if "Hydro UGH" in generation_wide.columns
+        else 0.0
     )
 
     demand = selected_demand[
@@ -3198,9 +3236,15 @@ def generate_thermal_gap_forecast(
         )
     )
 
+    # Structural thermal gap: demand minus exogenous / must-run generation.
+    # Hydro UGH is dispatchable and is therefore not deducted here.
     forecast["thermal_gap_forecast_mwh"] = (
         forecast["pbf_demand_forecast_mwh"]
         - forecast["non_thermal_forecast_mwh"]
+    )
+    forecast["residual_gap_after_hydro_ugh_mwh"] = (
+        forecast["thermal_gap_forecast_mwh"]
+        - forecast["hydro_ugh_forecast_mwh"]
     )
 
     if not d1_calibration.empty:
@@ -3243,18 +3287,33 @@ def generate_thermal_gap_forecast(
         .reset_index()
     )
     pbf_history_wide.columns.name = None
-    historical_techs = [
+    historical_structural_techs = [
         tech
         for tech in technologies
-        if tech in pbf_history_wide.columns
+        if tech != "Hydro UGH"
+        and tech in pbf_history_wide.columns
     ]
     pbf_history_wide["non_thermal_mwh"] = (
-        pbf_history_wide[historical_techs].sum(axis=1)
+        pbf_history_wide[
+            historical_structural_techs
+        ].sum(axis=1)
+    )
+    pbf_history_wide["hydro_ugh_mwh"] = (
+        pd.to_numeric(
+            pbf_history_wide["Hydro UGH"],
+            errors="coerce",
+        ).fillna(0.0)
+        if "Hydro UGH" in pbf_history_wide.columns
+        else 0.0
     )
 
     historical = pbf_demand_history.merge(
         pbf_history_wide[
-            ["datetime", "non_thermal_mwh"]
+            [
+                "datetime",
+                "non_thermal_mwh",
+                "hydro_ugh_mwh",
+            ]
         ],
         on="datetime",
         how="inner",
@@ -5311,6 +5370,713 @@ def build_forecast_vs_real_price_chart(
 
 
 # =========================================================
+# STEP 5 — BESS VALUE OF THE PRICE FORECAST
+# =========================================================
+BESS_POWER_MW = 1.0
+BESS_ENERGY_MWH = 4.0
+BESS_RTE = 0.85
+BESS_CHARGE_EFFICIENCY = float(np.sqrt(BESS_RTE))
+BESS_DISCHARGE_EFFICIENCY = float(np.sqrt(BESS_RTE))
+BESS_CHARGE_HOURS = 4
+BESS_DISCHARGE_HOURS = 4
+BESS_ANNUALIZATION_DAYS = 365.0
+
+
+def optimize_chronological_tb4_schedule(
+    price_frame: pd.DataFrame,
+    price_column: str,
+    rte: float = BESS_RTE,
+    charge_hours: int = BESS_CHARGE_HOURS,
+    discharge_hours: int = BESS_DISCHARGE_HOURS,
+) -> dict | None:
+    """
+    Select one complete chronological 4-hour BESS cycle.
+
+    Assumptions:
+    - Battery starts empty.
+    - Charge at 1 MW during exactly four hourly periods.
+    - Every charge hour occurs before every discharge hour.
+    - Round-trip efficiency is split symmetrically:
+          eta_charge = eta_discharge = sqrt(RTE).
+    - To store 1 MWh, grid purchase is 1 / eta_charge MWh.
+    - To discharge 1 MWh from storage, grid sale is eta_discharge MWh.
+    - No degradation, fees or variable O&M.
+    """
+    required = {"datetime", price_column}
+    if (
+        price_frame is None
+        or price_frame.empty
+        or not required.issubset(price_frame.columns)
+    ):
+        return None
+
+    clean = price_frame[
+        ["datetime", price_column]
+    ].copy()
+    clean["datetime"] = pd.to_datetime(
+        clean["datetime"],
+        errors="coerce",
+    )
+    clean[price_column] = pd.to_numeric(
+        clean[price_column],
+        errors="coerce",
+    )
+    clean = (
+        clean.dropna(subset=["datetime", price_column])
+        .sort_values("datetime")
+        .drop_duplicates("datetime", keep="last")
+        .reset_index(drop=True)
+    )
+
+    if len(clean) < charge_hours + discharge_hours:
+        return None
+
+    best = None
+
+    # split_position is the last position where charging may occur.
+    for split_position in range(
+        charge_hours - 1,
+        len(clean) - discharge_hours,
+    ):
+        charge_candidates = clean.iloc[
+            : split_position + 1
+        ]
+        discharge_candidates = clean.iloc[
+            split_position + 1 :
+        ]
+
+        if (
+            len(charge_candidates) < charge_hours
+            or len(discharge_candidates) < discharge_hours
+        ):
+            continue
+
+        charge = (
+            charge_candidates.nsmallest(
+                charge_hours,
+                price_column,
+            )
+            .sort_values("datetime")
+            .reset_index(drop=True)
+        )
+        discharge = (
+            discharge_candidates.nlargest(
+                discharge_hours,
+                price_column,
+            )
+            .sort_values("datetime")
+            .reset_index(drop=True)
+        )
+
+        average_charge_price = float(
+            charge[price_column].mean()
+        )
+        average_discharge_price = float(
+            discharge[price_column].mean()
+        )
+        raw_tb4 = (
+            average_discharge_price
+            - average_charge_price
+        )
+        charge_efficiency = float(np.sqrt(rte))
+        discharge_efficiency = float(np.sqrt(rte))
+
+        rte_adjusted_spread = (
+            discharge_efficiency
+            * average_discharge_price
+            - average_charge_price
+            / charge_efficiency
+        )
+
+        charge_cost_eur = float(
+            BESS_POWER_MW
+            / charge_efficiency
+            * charge[price_column].sum()
+        )
+        discharge_revenue_eur = float(
+            BESS_POWER_MW
+            * discharge_efficiency
+            * discharge[price_column].sum()
+        )
+        daily_revenue_eur_mw = (
+            discharge_revenue_eur
+            - charge_cost_eur
+        )
+
+        candidate = {
+            "charge_hours": charge["datetime"].tolist(),
+            "discharge_hours": discharge["datetime"].tolist(),
+            "charge_prices": charge[
+                price_column
+            ].tolist(),
+            "discharge_prices": discharge[
+                price_column
+            ].tolist(),
+            "average_charge_price_eur_mwh": (
+                average_charge_price
+            ),
+            "average_discharge_price_eur_mwh": (
+                average_discharge_price
+            ),
+            "chronological_tb4_eur_mwh": raw_tb4,
+            "rte_adjusted_spread_eur_mwh": (
+                rte_adjusted_spread
+            ),
+            "charge_cost_eur_mw_day": charge_cost_eur,
+            "discharge_revenue_eur_mw_day": (
+                discharge_revenue_eur
+            ),
+            "daily_revenue_eur_mw": (
+                daily_revenue_eur_mw
+            ),
+            "annualized_revenue_eur_mw_yr": (
+                daily_revenue_eur_mw
+                * BESS_ANNUALIZATION_DAYS
+            ),
+            "rte": float(rte),
+            "charge_efficiency": charge_efficiency,
+            "discharge_efficiency": discharge_efficiency,
+            "battery_side_charge_power_mw": BESS_POWER_MW,
+            "battery_side_discharge_power_mw": BESS_POWER_MW,
+            "grid_charge_power_mw": (
+                BESS_POWER_MW / charge_efficiency
+            ),
+            "grid_discharge_power_mw": (
+                BESS_POWER_MW * discharge_efficiency
+            ),
+        }
+
+        if (
+            best is None
+            or candidate["daily_revenue_eur_mw"]
+            > best["daily_revenue_eur_mw"]
+        ):
+            best = candidate
+
+    return best
+
+
+def settle_bess_schedule_on_actual_prices(
+    schedule: dict | None,
+    actual_price_frame: pd.DataFrame,
+    actual_price_column: str = "actual_price_eur_mwh",
+    rte: float = BESS_RTE,
+) -> dict | None:
+    """
+    Settle a previously selected schedule against realised OMIE prices.
+
+    This is used for the forecast strategy: the hours are selected using the
+    forecast curve, but all purchases and sales are valued at actual prices.
+    """
+    if schedule is None:
+        return None
+
+    required = {"datetime", actual_price_column}
+    if (
+        actual_price_frame is None
+        or actual_price_frame.empty
+        or not required.issubset(actual_price_frame.columns)
+    ):
+        return None
+
+    actual = actual_price_frame[
+        ["datetime", actual_price_column]
+    ].copy()
+    actual["datetime"] = pd.to_datetime(
+        actual["datetime"],
+        errors="coerce",
+    )
+    actual[actual_price_column] = pd.to_numeric(
+        actual[actual_price_column],
+        errors="coerce",
+    )
+    actual = (
+        actual.dropna(
+            subset=["datetime", actual_price_column]
+        )
+        .drop_duplicates("datetime", keep="last")
+        .set_index("datetime")
+    )
+
+    charge_hours = [
+        pd.Timestamp(value)
+        for value in schedule["charge_hours"]
+    ]
+    discharge_hours = [
+        pd.Timestamp(value)
+        for value in schedule["discharge_hours"]
+    ]
+
+    if not all(
+        timestamp in actual.index
+        for timestamp in charge_hours + discharge_hours
+    ):
+        return None
+
+    charge_prices = actual.loc[
+        charge_hours,
+        actual_price_column,
+    ].astype(float)
+    discharge_prices = actual.loc[
+        discharge_hours,
+        actual_price_column,
+    ].astype(float)
+
+    average_charge_price = float(
+        charge_prices.mean()
+    )
+    average_discharge_price = float(
+        discharge_prices.mean()
+    )
+
+    charge_efficiency = float(np.sqrt(rte))
+    discharge_efficiency = float(np.sqrt(rte))
+
+    charge_cost = float(
+        BESS_POWER_MW
+        / charge_efficiency
+        * charge_prices.sum()
+    )
+    discharge_revenue = float(
+        BESS_POWER_MW
+        * discharge_efficiency
+        * discharge_prices.sum()
+    )
+    daily_revenue = discharge_revenue - charge_cost
+
+    settled = {
+        **schedule,
+        "actual_charge_prices": charge_prices.tolist(),
+        "actual_discharge_prices": (
+            discharge_prices.tolist()
+        ),
+        "actual_average_charge_price_eur_mwh": (
+            average_charge_price
+        ),
+        "actual_average_discharge_price_eur_mwh": (
+            average_discharge_price
+        ),
+        "actual_chronological_tb4_eur_mwh": (
+            average_discharge_price
+            - average_charge_price
+        ),
+        "actual_rte_adjusted_spread_eur_mwh": (
+            discharge_efficiency
+            * average_discharge_price
+            - average_charge_price
+            / charge_efficiency
+        ),
+        "actual_charge_efficiency": charge_efficiency,
+        "actual_discharge_efficiency": discharge_efficiency,
+        "actual_charge_cost_eur_mw_day": charge_cost,
+        "actual_discharge_revenue_eur_mw_day": (
+            discharge_revenue
+        ),
+        "actual_daily_revenue_eur_mw": daily_revenue,
+        "actual_annualized_revenue_eur_mw_yr": (
+            daily_revenue
+            * BESS_ANNUALIZATION_DAYS
+        ),
+    }
+    return settled
+
+
+def build_bess_dispatch_comparison_chart(
+    comparison: pd.DataFrame,
+    perfect_schedule: dict,
+    forecast_settlement: dict,
+):
+    """
+    Plot forecast and realised prices with the two selected dispatch schedules.
+    All dispatch markers are placed on the realised price curve.
+    """
+    if comparison is None or comparison.empty:
+        return None
+
+    price_long = pd.concat(
+        [
+            comparison[
+                ["datetime", "forecast_price_eur_mwh"]
+            ]
+            .rename(
+                columns={
+                    "forecast_price_eur_mwh": "price"
+                }
+            )
+            .assign(series="Forecast price"),
+            comparison[
+                ["datetime", "actual_price_eur_mwh"]
+            ]
+            .rename(
+                columns={
+                    "actual_price_eur_mwh": "price"
+                }
+            )
+            .assign(series="Real OMIE price"),
+        ],
+        ignore_index=True,
+    )
+
+    lines = (
+        alt.Chart(price_long)
+        .mark_line(
+            point=True,
+            strokeWidth=2.7,
+        )
+        .encode(
+            x=alt.X(
+                "datetime:T",
+                title=None,
+                axis=alt.Axis(
+                    format="%H:%M",
+                    labelAngle=0,
+                ),
+            ),
+            y=alt.Y(
+                "price:Q",
+                title="DA price (€/MWh)",
+                scale=alt.Scale(zero=False),
+            ),
+            color=alt.Color(
+                "series:N",
+                title="Price series",
+                scale=alt.Scale(
+                    domain=[
+                        "Forecast price",
+                        "Real OMIE price",
+                    ],
+                    range=[
+                        "#111827",
+                        "#16A34A",
+                    ],
+                ),
+            ),
+            strokeDash=alt.StrokeDash(
+                "series:N",
+                legend=None,
+                scale=alt.Scale(
+                    domain=[
+                        "Forecast price",
+                        "Real OMIE price",
+                    ],
+                    range=[
+                        [6, 3],
+                        [1, 0],
+                    ],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "datetime:T",
+                    title="Hour",
+                    format="%d-%m-%Y %H:%M",
+                ),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip(
+                    "price:Q",
+                    title="€/MWh",
+                    format=",.2f",
+                ),
+            ],
+        )
+    )
+
+    actual_lookup = (
+        comparison[
+            ["datetime", "actual_price_eur_mwh"]
+        ]
+        .drop_duplicates("datetime")
+        .set_index("datetime")[
+            "actual_price_eur_mwh"
+        ]
+    )
+
+    marker_rows = []
+
+    schedule_specs = [
+        (
+            "Real-price optimum",
+            perfect_schedule,
+            "#2563EB",
+        ),
+        (
+            "Forecast-selected",
+            forecast_settlement,
+            "#F97316",
+        ),
+    ]
+
+    for strategy, schedule, _ in schedule_specs:
+        if schedule is None:
+            continue
+
+        for action, datetimes in [
+            ("Charge", schedule["charge_hours"]),
+            ("Discharge", schedule["discharge_hours"]),
+        ]:
+            for timestamp in datetimes:
+                timestamp = pd.Timestamp(timestamp)
+                if timestamp not in actual_lookup.index:
+                    continue
+                marker_rows.append(
+                    {
+                        "datetime": timestamp,
+                        "actual_price_eur_mwh": float(
+                            actual_lookup.loc[timestamp]
+                        ),
+                        "strategy_action": (
+                            f"{strategy} — {action}"
+                        ),
+                    }
+                )
+
+    marker_frame = pd.DataFrame(marker_rows)
+
+    if marker_frame.empty:
+        return configure_chart(lines, height=380)
+
+    marker_domain = [
+        "Real-price optimum — Charge",
+        "Real-price optimum — Discharge",
+        "Forecast-selected — Charge",
+        "Forecast-selected — Discharge",
+    ]
+
+    markers = (
+        alt.Chart(marker_frame)
+        .mark_point(
+            filled=True,
+            size=155,
+            stroke="#FFFFFF",
+            strokeWidth=1.3,
+        )
+        .encode(
+            x=alt.X("datetime:T"),
+            y=alt.Y(
+                "actual_price_eur_mwh:Q",
+                title="DA price (€/MWh)",
+            ),
+            color=alt.Color(
+                "strategy_action:N",
+                title="BESS dispatch",
+                scale=alt.Scale(
+                    domain=marker_domain,
+                    range=[
+                        "#2563EB",
+                        "#2563EB",
+                        "#F97316",
+                        "#F97316",
+                    ],
+                ),
+                legend=alt.Legend(
+                    orient="top",
+                    direction="horizontal",
+                    columns=2,
+                    labelLimit=320,
+                ),
+            ),
+            shape=alt.Shape(
+                "strategy_action:N",
+                title="BESS dispatch",
+                scale=alt.Scale(
+                    domain=marker_domain,
+                    range=[
+                        "triangle-down",
+                        "triangle-up",
+                        "diamond",
+                        "square",
+                    ],
+                ),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "datetime:T",
+                    title="Hour",
+                    format="%d-%m-%Y %H:%M",
+                ),
+                alt.Tooltip(
+                    "strategy_action:N",
+                    title="Dispatch",
+                ),
+                alt.Tooltip(
+                    "actual_price_eur_mwh:Q",
+                    title="Real OMIE price",
+                    format=",.2f",
+                ),
+            ],
+        )
+    )
+
+    return configure_chart(
+        alt.layer(lines, markers),
+        height=390,
+    )
+
+
+def build_bess_annualized_revenue_chart(
+    perfect_revenue: float,
+    forecast_strategy_revenue: float,
+):
+    chart_data = pd.DataFrame(
+        {
+            "Strategy": [
+                "Real-price perfect foresight",
+                "Forecast-selected hours",
+            ],
+            "Annualized revenue": [
+                perfect_revenue,
+                forecast_strategy_revenue,
+            ],
+        }
+    )
+
+    chart = (
+        alt.Chart(chart_data)
+        .mark_bar(
+            cornerRadiusTopLeft=5,
+            cornerRadiusTopRight=5,
+        )
+        .encode(
+            x=alt.X(
+                "Strategy:N",
+                title=None,
+                sort=[
+                    "Real-price perfect foresight",
+                    "Forecast-selected hours",
+                ],
+                axis=alt.Axis(labelAngle=0),
+            ),
+            y=alt.Y(
+                "Annualized revenue:Q",
+                title="Annualized BESS revenue (€/MW/yr)",
+            ),
+            color=alt.Color(
+                "Strategy:N",
+                legend=None,
+                scale=alt.Scale(
+                    domain=[
+                        "Real-price perfect foresight",
+                        "Forecast-selected hours",
+                    ],
+                    range=[
+                        "#2563EB",
+                        "#F97316",
+                    ],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "Strategy:N",
+                    title="Strategy",
+                ),
+                alt.Tooltip(
+                    "Annualized revenue:Q",
+                    title="€/MW/yr",
+                    format=",.0f",
+                ),
+            ],
+        )
+    )
+
+    labels = (
+        alt.Chart(chart_data)
+        .mark_text(
+            dy=-10,
+            fontWeight="bold",
+        )
+        .encode(
+            x=alt.X(
+                "Strategy:N",
+                sort=[
+                    "Real-price perfect foresight",
+                    "Forecast-selected hours",
+                ],
+            ),
+            y=alt.Y("Annualized revenue:Q"),
+            text=alt.Text(
+                "Annualized revenue:Q",
+                format=",.0f",
+            ),
+        )
+    )
+
+    return configure_chart(
+        alt.layer(chart, labels),
+        height=320,
+    )
+
+
+def build_bess_schedule_table(
+    comparison: pd.DataFrame,
+    perfect_schedule: dict,
+    forecast_schedule: dict,
+) -> pd.DataFrame:
+    actual_lookup = (
+        comparison[
+            ["datetime", "actual_price_eur_mwh"]
+        ]
+        .drop_duplicates("datetime")
+        .set_index("datetime")[
+            "actual_price_eur_mwh"
+        ]
+    )
+    forecast_lookup = (
+        comparison[
+            ["datetime", "forecast_price_eur_mwh"]
+        ]
+        .drop_duplicates("datetime")
+        .set_index("datetime")[
+            "forecast_price_eur_mwh"
+        ]
+    )
+
+    rows = []
+
+    for strategy, schedule in [
+        ("Real-price perfect foresight", perfect_schedule),
+        ("Forecast-selected hours", forecast_schedule),
+    ]:
+        if schedule is None:
+            continue
+
+        for action, datetimes in [
+            ("Charge", schedule["charge_hours"]),
+            ("Discharge", schedule["discharge_hours"]),
+        ]:
+            for timestamp in datetimes:
+                timestamp = pd.Timestamp(timestamp)
+                rows.append(
+                    {
+                        "Strategy": strategy,
+                        "Action": action,
+                        "Hour": timestamp,
+                        "Forecast price (€/MWh)": (
+                            float(forecast_lookup.loc[timestamp])
+                            if timestamp in forecast_lookup.index
+                            else np.nan
+                        ),
+                        "Real OMIE price (€/MWh)": (
+                            float(actual_lookup.loc[timestamp])
+                            if timestamp in actual_lookup.index
+                            else np.nan
+                        ),
+                        "Grid power (MW)": (
+                            -BESS_POWER_MW
+                            / BESS_CHARGE_EFFICIENCY
+                            if action == "Charge"
+                            else BESS_POWER_MW
+                            * BESS_DISCHARGE_EFFICIENCY
+                        ),
+                    }
+                )
+
+    return pd.DataFrame(rows).sort_values(
+        ["Strategy", "Hour"]
+    ).reset_index(drop=True)
+
+
+# =========================================================
 # APP
 # =========================================================
 st.title("Demand, PBF thermal gap and DA price — forecast test")
@@ -5546,11 +6312,13 @@ with fc4:
     )
 
 forecast_generation_technologies = st.multiselect(
-    "PBF generation included in thermal gap",
+    "PBF generation forecast (Hydro UGH excluded from structural gap)",
     options=list(FORECAST_NON_THERMAL_INDICATORS.keys()),
     default=FORECAST_NON_THERMAL_DEFAULT,
     help=(
-        "Thermal gap = PBF-calibrated demand minus forecast NET PBF generation. "
+        "Structural thermal gap = PBF-calibrated demand minus forecast NET "
+        "wind, solar, nuclear, run-of-river and other renewables. Hydro UGH "
+        "is flexible and is not deducted from the structural gap. "
         "Run-of-river corresponds to Hydro non-UGH."
     ),
     key="forecast_generation_technologies",
@@ -5653,7 +6421,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v12"] = {
+        st.session_state["day_ahead_result_v15"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -5671,7 +6439,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v12")
+forecast_result = st.session_state.get("day_ahead_result_v15")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -5757,13 +6525,13 @@ if forecast_result:
             "thermal_gap_forecast_mwh"
         ]
 
-        tg1, tg2, tg3, tg4, tg5 = st.columns(5)
+        tg1, tg2, tg3, tg4, tg5, tg6 = st.columns(6)
         tg1.metric(
             "Average PBF demand forecast",
             f"{thermal_forecast['pbf_demand_forecast_mwh'].mean():,.0f} MW",
         )
         tg2.metric(
-            "Average NET PBF generation",
+            "Average structural NET PBF generation",
             f"{thermal_forecast['non_thermal_forecast_mwh'].mean():,.0f} MW",
         )
         tg3.metric(
@@ -5775,8 +6543,21 @@ if forecast_result:
             f"{thermal_gap.max():,.0f} MW",
         )
         tg5.metric(
-            "Negative-gap hours",
+            "Negative structural-gap hours",
             f"{int((thermal_gap <= 0).sum())} h",
+        )
+        tg6.metric(
+            "Hydro UGH forecast",
+            (
+                f"{thermal_forecast['hydro_ugh_forecast_mwh'].mean():,.0f} MW"
+                if "hydro_ugh_forecast_mwh"
+                in thermal_forecast.columns
+                else "—"
+            ),
+            help=(
+                "Shown separately. It is not deducted from the structural "
+                "thermal gap."
+            ),
         )
 
         st.altair_chart(
@@ -5817,11 +6598,11 @@ if forecast_result:
             )
 
         st.caption(
-            "Forecast thermal gap = PBF-calibrated demand forecast − forecast "
-            "NET PBF generation. Gross PBF is reduced by bilateral programmes. "
-            "The orange dashed line is the actual D-1 thermal-gap profile used "
-            "for calibration; historical observations remain hidden and are "
-            "used only for training."
+            "Structural thermal gap = PBF-calibrated demand forecast − NET "
+            "wind − solar − nuclear − run-of-river − other renewables. "
+            "Hydro UGH is dispatchable and is not deducted. Gross PBF is "
+            "reduced by bilateral programmes. The orange dashed line is the "
+            "corrected D-1 structural thermal-gap profile."
         )
 
         with st.expander(
@@ -5835,10 +6616,9 @@ if forecast_result:
             st.markdown(
                 """
                 - Every technology is forecast in **net PBF terms**: gross PBF minus bilateral PBF.
-                - **Solar:** forecast radiation, cloud cover and D-1 / recent net-PBF lags.
-                - **Wind:** forecast wind at 100 m and D-1 / recent net-PBF lags.
-                - **Run-of-river:** Hydro non-UGH, precipitation and recent net programme.
-                - **Hydro UGH, nuclear and other renewables:** D-1 net programme and calendar effects.
+                - **Solar, wind, nuclear, run-of-river and other renewables** are deducted from demand.
+                - **Run-of-river** corresponds to Hydro non-UGH and is treated as non-dispatchable.
+                - **Hydro UGH is forecast separately but is not deducted from the structural thermal gap**, because its dispatch responds to price and scarcity.
                 - The supplied 16-Jul profile is embedded as a fallback calibration for the 17-Jul forecast.
                 """
             )
@@ -6092,6 +6872,339 @@ if forecast_result:
                         comparison,
                         use_container_width=True,
                         hide_index=True,
+                    )
+
+
+                # =============================================
+                # STEP 5 — BESS revenue value of the forecast
+                # =============================================
+                section_header(
+                    "Step 5 — BESS revenue captured by the price forecast"
+                )
+
+                actual_perfect_schedule = (
+                    optimize_chronological_tb4_schedule(
+                        comparison,
+                        price_column=(
+                            "actual_price_eur_mwh"
+                        ),
+                        rte=BESS_RTE,
+                    )
+                )
+                forecast_optimal_schedule = (
+                    optimize_chronological_tb4_schedule(
+                        comparison,
+                        price_column=(
+                            "forecast_price_eur_mwh"
+                        ),
+                        rte=BESS_RTE,
+                    )
+                )
+                forecast_schedule_settlement = (
+                    settle_bess_schedule_on_actual_prices(
+                        forecast_optimal_schedule,
+                        comparison,
+                        actual_price_column=(
+                            "actual_price_eur_mwh"
+                        ),
+                        rte=BESS_RTE,
+                    )
+                )
+
+                if (
+                    actual_perfect_schedule is not None
+                    and forecast_schedule_settlement
+                    is not None
+                ):
+                    perfect_daily_revenue = float(
+                        actual_perfect_schedule[
+                            "daily_revenue_eur_mw"
+                        ]
+                    )
+                    forecast_realized_daily_revenue = (
+                        float(
+                            forecast_schedule_settlement[
+                                "actual_daily_revenue_eur_mw"
+                            ]
+                        )
+                    )
+
+                    perfect_annualized = float(
+                        actual_perfect_schedule[
+                            "annualized_revenue_eur_mw_yr"
+                        ]
+                    )
+                    forecast_realized_annualized = (
+                        float(
+                            forecast_schedule_settlement[
+                                "actual_annualized_revenue_eur_mw_yr"
+                            ]
+                        )
+                    )
+
+                    opportunity_loss = (
+                        perfect_daily_revenue
+                        - forecast_realized_daily_revenue
+                    )
+                    annualized_opportunity_loss = (
+                        perfect_annualized
+                        - forecast_realized_annualized
+                    )
+
+                    revenue_capture = (
+                        forecast_realized_daily_revenue
+                        / perfect_daily_revenue
+                        * 100.0
+                        if abs(perfect_daily_revenue)
+                        > 1e-9
+                        else np.nan
+                    )
+
+                    charge_overlap = len(
+                        set(
+                            actual_perfect_schedule[
+                                "charge_hours"
+                            ]
+                        ).intersection(
+                            set(
+                                forecast_optimal_schedule[
+                                    "charge_hours"
+                                ]
+                            )
+                        )
+                    )
+                    discharge_overlap = len(
+                        set(
+                            actual_perfect_schedule[
+                                "discharge_hours"
+                            ]
+                        ).intersection(
+                            set(
+                                forecast_optimal_schedule[
+                                    "discharge_hours"
+                                ]
+                            )
+                        )
+                    )
+
+                    b1, b2, b3, b4 = st.columns(4)
+                    b1.metric(
+                        "Real chronological TB4",
+                        (
+                            f"{actual_perfect_schedule['chronological_tb4_eur_mwh']:,.2f} "
+                            "€/MWh"
+                        ),
+                        help=(
+                            "Four cheapest realised hours followed "
+                            "chronologically by four realised discharge hours."
+                        ),
+                    )
+                    b2.metric(
+                        "Perfect-foresight revenue",
+                        (
+                            f"{perfect_daily_revenue:,.2f} "
+                            "€/MW-day"
+                        ),
+                        delta=(
+                            f"{perfect_annualized:,.0f} "
+                            "€/MW/yr"
+                        ),
+                        delta_color="off",
+                    )
+                    b3.metric(
+                        "Forecast-strategy revenue",
+                        (
+                            f"{forecast_realized_daily_revenue:,.2f} "
+                            "€/MW-day"
+                        ),
+                        delta=(
+                            f"{forecast_realized_annualized:,.0f} "
+                            "€/MW/yr"
+                        ),
+                        delta_color="off",
+                    )
+                    b4.metric(
+                        "Revenue capture",
+                        (
+                            f"{revenue_capture:,.1f}%"
+                            if pd.notna(revenue_capture)
+                            else "—"
+                        ),
+                        delta=(
+                            f"{-opportunity_loss:,.2f} "
+                            "€/MW-day vs optimum"
+                        ),
+                        delta_color=(
+                            "normal"
+                            if opportunity_loss <= 0
+                            else "inverse"
+                        ),
+                    )
+
+                    b5, b6, b7, b8 = st.columns(4)
+                    b5.metric(
+                        "Forecast expected revenue",
+                        (
+                            f"{forecast_optimal_schedule['daily_revenue_eur_mw']:,.2f} "
+                            "€/MW-day"
+                        ),
+                        help=(
+                            "Revenue expected from the forecast curve "
+                            "before actual OMIE settlement."
+                        ),
+                    )
+                    b6.metric(
+                        "Realized symmetric-efficiency spread",
+                        (
+                            f"{forecast_schedule_settlement['actual_rte_adjusted_spread_eur_mwh']:,.2f} "
+                            "€/MWh"
+                        ),
+                    )
+                    b7.metric(
+                        "Selected-hour overlap",
+                        (
+                            f"{charge_overlap}/4 charge · "
+                            f"{discharge_overlap}/4 discharge"
+                        ),
+                    )
+                    b8.metric(
+                        "Annualized opportunity loss",
+                        (
+                            f"{annualized_opportunity_loss:,.0f} "
+                            "€/MW/yr"
+                        ),
+                    )
+
+                    st.altair_chart(
+                        build_bess_annualized_revenue_chart(
+                            perfect_annualized,
+                            forecast_realized_annualized,
+                        ),
+                        use_container_width=True,
+                    )
+
+                    dispatch_chart = (
+                        build_bess_dispatch_comparison_chart(
+                            comparison,
+                            actual_perfect_schedule,
+                            forecast_schedule_settlement,
+                        )
+                    )
+                    if dispatch_chart is not None:
+                        st.altair_chart(
+                            dispatch_chart,
+                            use_container_width=True,
+                        )
+
+                    st.caption(
+                        "Both strategies use the same 1 MW / 4 MWh "
+                        "battery, start the day empty and complete one "
+                        "full chronological cycle. The 85% round-trip "
+                        "efficiency is split symmetrically, so both one-way "
+                        "efficiencies equal sqrt(0.85) = 92.20%. For each "
+                        "1 MWh stored, the grid purchase is 1/sqrt(0.85) "
+                        "MWh; for each 1 MWh discharged from the battery, "
+                        "sqrt(0.85) MWh is sold to the grid. Daily revenue "
+                        "is therefore calculated as sale price × sqrt(0.85) "
+                        "minus purchase price / sqrt(0.85), and is annualized by "
+                        "multiplying by 365. The forecast strategy "
+                        "selects its hours using forecast prices but "
+                        "is settled entirely against realised OMIE "
+                        "prices."
+                    )
+
+                    schedule_table = build_bess_schedule_table(
+                        comparison,
+                        actual_perfect_schedule,
+                        forecast_optimal_schedule,
+                    )
+
+                    with st.expander(
+                        "Selected BESS charge and discharge hours"
+                    ):
+                        st.dataframe(
+                            schedule_table.style.format(
+                                {
+                                    "Forecast price (€/MWh)": (
+                                        "{:,.2f}"
+                                    ),
+                                    "Real OMIE price (€/MWh)": (
+                                        "{:,.2f}"
+                                    ),
+                                    "Grid power (MW)": "{:,.2f}",
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        bess_summary_export = pd.DataFrame(
+                            [
+                                {
+                                    "Strategy": (
+                                        "Real-price perfect foresight"
+                                    ),
+                                    "Chronological TB4 (€/MWh)": (
+                                        actual_perfect_schedule[
+                                            "chronological_tb4_eur_mwh"
+                                        ]
+                                    ),
+                                    "RTE-adjusted spread (€/MWh)": (
+                                        actual_perfect_schedule[
+                                            "rte_adjusted_spread_eur_mwh"
+                                        ]
+                                    ),
+                                    "Daily revenue (€/MW-day)": (
+                                        perfect_daily_revenue
+                                    ),
+                                    "Annualized revenue (€/MW/yr)": (
+                                        perfect_annualized
+                                    ),
+                                },
+                                {
+                                    "Strategy": (
+                                        "Forecast-selected, settled real"
+                                    ),
+                                    "Chronological TB4 (€/MWh)": (
+                                        forecast_schedule_settlement[
+                                            "actual_chronological_tb4_eur_mwh"
+                                        ]
+                                    ),
+                                    "RTE-adjusted spread (€/MWh)": (
+                                        forecast_schedule_settlement[
+                                            "actual_rte_adjusted_spread_eur_mwh"
+                                        ]
+                                    ),
+                                    "Daily revenue (€/MW-day)": (
+                                        forecast_realized_daily_revenue
+                                    ),
+                                    "Annualized revenue (€/MW/yr)": (
+                                        forecast_realized_annualized
+                                    ),
+                                },
+                            ]
+                        )
+
+                        st.download_button(
+                            "Download BESS forecast-value backtest CSV",
+                            data=(
+                                bess_summary_export.to_csv(
+                                    index=False
+                                ).encode("utf-8")
+                            ),
+                            file_name=(
+                                "bess_forecast_value_"
+                                f"{forecast_result.get('target_day')}.csv"
+                            ),
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                else:
+                    st.warning(
+                        "The BESS forecast-value comparison could "
+                        "not be calculated because fewer than eight "
+                        "complete hourly forecast/real price points "
+                        "were available."
                     )
         else:
             section_header(
