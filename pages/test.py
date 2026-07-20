@@ -8431,7 +8431,7 @@ run_ytd_batch = st.button(
 
 if run_ytd_batch:
     try:
-        ytd_token = require_token()
+        ytd_token = require_esios_token()
     except Exception as exc:
         st.error(str(exc))
         ytd_token = None
