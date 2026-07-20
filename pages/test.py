@@ -5681,6 +5681,429 @@ def settle_bess_schedule_on_actual_prices(
     return settled
 
 
+
+BESS_PRICE_CURVE_BENCHMARKS = {
+    "Final forecast — black": "forecast_price_eur_mwh",
+    "Previous day": "price_lag_1d",
+    "Previous week": "price_lag_7d",
+    "Price anchor": "price_anchor",
+    "Similar-gap median": "conditional_price_median_eur_mwh",
+}
+
+BESS_PRICE_CURVE_SHORT_LABELS = {
+    "Final forecast — black": "Final forecast",
+    "Previous day": "D-1",
+    "Previous week": "D-7",
+    "Price anchor": "Price anchor",
+    "Similar-gap median": "Similar-gap",
+}
+
+BESS_PRICE_CURVE_SLUGS = {
+    "Final forecast — black": "final_forecast",
+    "Previous day": "previous_day",
+    "Previous week": "previous_week",
+    "Price anchor": "price_anchor",
+    "Similar-gap median": "similar_gap",
+}
+
+
+def evaluate_bess_price_curve_benchmarks(
+    price_forecast: pd.DataFrame,
+    actual_price_frame: pd.DataFrame,
+    perfect_schedule: dict | None,
+    actual_price_column: str = "actual_price_eur_mwh",
+    rte: float = BESS_RTE,
+) -> pd.DataFrame:
+    """
+    Select a chronological 4h/4h BESS schedule independently with each
+    available price curve and settle every selected schedule against the same
+    realised OMIE prices.
+
+    This isolates the economic usefulness of the shape/ranking of each curve.
+    """
+    if (
+        price_forecast is None
+        or price_forecast.empty
+        or actual_price_frame is None
+        or actual_price_frame.empty
+        or perfect_schedule is None
+    ):
+        return pd.DataFrame()
+
+    actual = actual_price_frame[
+        ["datetime", actual_price_column]
+    ].copy()
+    actual["datetime"] = pd.to_datetime(
+        actual["datetime"],
+        errors="coerce",
+    )
+    actual[actual_price_column] = pd.to_numeric(
+        actual[actual_price_column],
+        errors="coerce",
+    )
+    actual = actual.dropna(
+        subset=["datetime", actual_price_column]
+    )
+
+    perfect_revenue = float(
+        perfect_schedule["daily_revenue_eur_mw"]
+    )
+    perfect_charge = set(
+        pd.Timestamp(value)
+        for value in perfect_schedule["charge_hours"]
+    )
+    perfect_discharge = set(
+        pd.Timestamp(value)
+        for value in perfect_schedule["discharge_hours"]
+    )
+
+    rows = []
+
+    for strategy_name, price_column in (
+        BESS_PRICE_CURVE_BENCHMARKS.items()
+    ):
+        if price_column not in price_forecast.columns:
+            continue
+
+        curve = price_forecast[
+            ["datetime", price_column]
+        ].copy()
+        curve["datetime"] = pd.to_datetime(
+            curve["datetime"],
+            errors="coerce",
+        )
+        curve[price_column] = pd.to_numeric(
+            curve[price_column],
+            errors="coerce",
+        )
+
+        curve = curve.merge(
+            actual,
+            on="datetime",
+            how="inner",
+        ).dropna(
+            subset=[
+                "datetime",
+                price_column,
+                actual_price_column,
+            ]
+        )
+
+        if len(curve) < 23:
+            continue
+
+        schedule = optimize_chronological_tb4_schedule(
+            curve,
+            price_column=price_column,
+            rte=rte,
+        )
+        settlement = settle_bess_schedule_on_actual_prices(
+            schedule,
+            curve,
+            actual_price_column=actual_price_column,
+            rte=rte,
+        )
+
+        if schedule is None or settlement is None:
+            continue
+
+        realised_revenue = float(
+            settlement[
+                "actual_daily_revenue_eur_mw"
+            ]
+        )
+        expected_revenue = float(
+            schedule["daily_revenue_eur_mw"]
+        )
+        capture_pct = (
+            100.0
+            * realised_revenue
+            / perfect_revenue
+            if abs(perfect_revenue) > 1e-9
+            else np.nan
+        )
+
+        charge_hours = set(
+            pd.Timestamp(value)
+            for value in schedule["charge_hours"]
+        )
+        discharge_hours = set(
+            pd.Timestamp(value)
+            for value in schedule["discharge_hours"]
+        )
+
+        rows.append(
+            {
+                "Strategy": strategy_name,
+                "Short label": (
+                    BESS_PRICE_CURVE_SHORT_LABELS[
+                        strategy_name
+                    ]
+                ),
+                "Slug": (
+                    BESS_PRICE_CURVE_SLUGS[
+                        strategy_name
+                    ]
+                ),
+                "Price column": price_column,
+                "Revenue capture (%)": capture_pct,
+                "Realised revenue (€/MW-day)": (
+                    realised_revenue
+                ),
+                "Expected revenue (€/MW-day)": (
+                    expected_revenue
+                ),
+                "Annualized realised revenue (€/MW/yr)": (
+                    realised_revenue
+                    * BESS_ANNUALIZATION_DAYS
+                ),
+                "Opportunity loss (€/MW-day)": (
+                    perfect_revenue
+                    - realised_revenue
+                ),
+                "Charge overlap": len(
+                    perfect_charge.intersection(
+                        charge_hours
+                    )
+                ),
+                "Discharge overlap": len(
+                    perfect_discharge.intersection(
+                        discharge_hours
+                    )
+                ),
+                "Charge hours": _hours_as_text(
+                    schedule["charge_hours"]
+                ),
+                "Discharge hours": _hours_as_text(
+                    schedule["discharge_hours"]
+                ),
+                "Forecast chronological TB4 (€/MWh)": (
+                    schedule[
+                        "chronological_tb4_eur_mwh"
+                    ]
+                ),
+                "Realised RTE-adjusted spread (€/MWh)": (
+                    settlement[
+                        "actual_rte_adjusted_spread_eur_mwh"
+                    ]
+                ),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    output = pd.DataFrame(rows)
+    final_capture = output.loc[
+        output["Slug"] == "final_forecast",
+        "Revenue capture (%)",
+    ]
+    final_capture_value = (
+        float(final_capture.iloc[0])
+        if not final_capture.empty
+        else np.nan
+    )
+    output["Difference vs final (pp)"] = (
+        output["Revenue capture (%)"]
+        - final_capture_value
+    )
+    output["Rank"] = (
+        output["Revenue capture (%)"]
+        .rank(
+            method="min",
+            ascending=False,
+        )
+        .astype("Int64")
+    )
+
+    return output.sort_values(
+        ["Rank", "Strategy"]
+    ).reset_index(drop=True)
+
+
+def build_price_curve_capture_chart(
+    benchmark: pd.DataFrame,
+):
+    if benchmark is None or benchmark.empty:
+        return None
+
+    plot = benchmark.copy()
+
+    chart = (
+        alt.Chart(plot)
+        .mark_bar(
+            cornerRadiusTopLeft=5,
+            cornerRadiusTopRight=5,
+        )
+        .encode(
+            x=alt.X(
+                "Short label:N",
+                title=None,
+                sort=[
+                    "Final forecast",
+                    "D-1",
+                    "D-7",
+                    "Price anchor",
+                    "Similar-gap",
+                ],
+                axis=alt.Axis(labelAngle=0),
+            ),
+            y=alt.Y(
+                "Revenue capture (%):Q",
+                title="Revenue captured vs real perfect foresight (%)",
+            ),
+            color=alt.Color(
+                "Short label:N",
+                legend=None,
+                scale=alt.Scale(
+                    domain=[
+                        "Final forecast",
+                        "D-1",
+                        "D-7",
+                        "Price anchor",
+                        "Similar-gap",
+                    ],
+                    range=[
+                        "#111827",
+                        "#F97316",
+                        "#60A5FA",
+                        "#64748B",
+                        "#A855F7",
+                    ],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "Strategy:N",
+                    title="Price curve",
+                ),
+                alt.Tooltip(
+                    "Revenue capture (%):Q",
+                    title="Capture",
+                    format=",.1f",
+                ),
+                alt.Tooltip(
+                    "Realised revenue (€/MW-day):Q",
+                    title="Realised €/MW-day",
+                    format=",.2f",
+                ),
+                alt.Tooltip(
+                    "Difference vs final (pp):Q",
+                    title="Difference vs final",
+                    format="+.1f",
+                ),
+                alt.Tooltip(
+                    "Charge hours:N",
+                    title="Charge",
+                ),
+                alt.Tooltip(
+                    "Discharge hours:N",
+                    title="Discharge",
+                ),
+            ],
+        )
+    )
+
+    labels = (
+        alt.Chart(plot)
+        .mark_text(
+            dy=-10,
+            fontWeight="bold",
+        )
+        .encode(
+            x=alt.X(
+                "Short label:N",
+                sort=[
+                    "Final forecast",
+                    "D-1",
+                    "D-7",
+                    "Price anchor",
+                    "Similar-gap",
+                ],
+            ),
+            y=alt.Y("Revenue capture (%):Q"),
+            text=alt.Text(
+                "Revenue capture (%):Q",
+                format=",.1f",
+            ),
+        )
+    )
+
+    return configure_chart(
+        alt.layer(chart, labels),
+        height=310,
+    )
+
+
+def ytd_price_curve_capture_summary(
+    successful: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Aggregate realised BESS revenue by price curve across walk-forward dates.
+    """
+    if successful is None or successful.empty:
+        return pd.DataFrame()
+
+    perfect_column = (
+        "perfect_foresight_daily_revenue_eur_mw"
+    )
+    if perfect_column not in successful.columns:
+        return pd.DataFrame()
+
+    perfect_total = pd.to_numeric(
+        successful[perfect_column],
+        errors="coerce",
+    ).sum()
+    tested_days = len(successful)
+
+    rows = []
+    for strategy_name, slug in BESS_PRICE_CURVE_SLUGS.items():
+        revenue_column = (
+            f"{slug}_realized_daily_revenue_eur_mw"
+        )
+        if revenue_column not in successful.columns:
+            continue
+
+        revenue_total = pd.to_numeric(
+            successful[revenue_column],
+            errors="coerce",
+        ).sum()
+        rows.append(
+            {
+                "Strategy": strategy_name,
+                "Short label": (
+                    BESS_PRICE_CURVE_SHORT_LABELS[
+                        strategy_name
+                    ]
+                ),
+                "YTD realised revenue (€/MW)": (
+                    revenue_total
+                ),
+                "Revenue capture (%)": (
+                    100.0
+                    * revenue_total
+                    / perfect_total
+                    if abs(perfect_total) > 1e-9
+                    else np.nan
+                ),
+                "Annualized revenue (€/MW/yr)": (
+                    revenue_total
+                    / tested_days
+                    * BESS_ANNUALIZATION_DAYS
+                    if tested_days > 0
+                    else np.nan
+                ),
+                "YTD opportunity loss (€/MW)": (
+                    perfect_total - revenue_total
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(
+        "Revenue capture (%)",
+        ascending=False,
+    ).reset_index(drop=True)
+
 def build_bess_dispatch_comparison_chart(
     comparison: pd.DataFrame,
     perfect_schedule: dict,
@@ -6079,8 +6502,8 @@ def build_bess_schedule_table(
 # =========================================================
 # YTD DAILY WALK-FORWARD BACKTEST
 # =========================================================
-YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v16"
-YTD_BACKTEST_CHECKPOINT_VERSION = "v16"
+YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v16_2"
+YTD_BACKTEST_CHECKPOINT_VERSION = "v16_2"
 
 
 def _safe_ratio(
@@ -6176,8 +6599,18 @@ def run_one_walk_forward_backtest_day(
         )
 
     price_forecast = price_result["forecast"].copy()
+
+    ytd_curve_columns = [
+        "datetime",
+        *[
+            column
+            for column in BESS_PRICE_CURVE_BENCHMARKS.values()
+            if column in price_forecast.columns
+        ],
+    ]
+
     comparison = price_forecast[
-        ["datetime", "forecast_price_eur_mwh"]
+        ytd_curve_columns
     ].merge(
         realised_prices[
             ["datetime", "price_eur_mwh"]
@@ -6238,6 +6671,42 @@ def run_one_walk_forward_backtest_day(
         raise ValueError(
             "The chronological BESS schedules could not be completed."
         )
+
+    ytd_curve_benchmark = (
+        evaluate_bess_price_curve_benchmarks(
+            price_forecast=price_forecast,
+            actual_price_frame=comparison,
+            perfect_schedule=perfect_schedule,
+            actual_price_column="actual_price_eur_mwh",
+            rte=BESS_RTE,
+        )
+    )
+
+    ytd_curve_values = {}
+    if not ytd_curve_benchmark.empty:
+        for benchmark_row in (
+            ytd_curve_benchmark.itertuples(index=False)
+        ):
+            slug = getattr(benchmark_row, "Slug")
+            # itertuples sanitises names containing punctuation, so use
+            # the original dataframe row for the metric fields.
+            original_row = ytd_curve_benchmark[
+                ytd_curve_benchmark["Slug"] == slug
+            ].iloc[0]
+            ytd_curve_values[
+                f"{slug}_realized_daily_revenue_eur_mw"
+            ] = float(
+                original_row[
+                    "Realised revenue (€/MW-day)"
+                ]
+            )
+            ytd_curve_values[
+                f"{slug}_revenue_capture_pct"
+            ] = float(
+                original_row[
+                    "Revenue capture (%)"
+                ]
+            )
 
     perfect_daily_revenue = float(
         perfect_schedule["daily_revenue_eur_mw"]
@@ -6421,6 +6890,7 @@ def run_one_walk_forward_backtest_day(
         "demand_model_validation_mape_pct": float(
             demand_result["model_stats"]["mape"]
         ),
+        **ytd_curve_values,
     }
 
 
@@ -7149,7 +7619,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v16"] = {
+        st.session_state["day_ahead_result_v16_2"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -7167,7 +7637,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v16")
+forecast_result = st.session_state.get("day_ahead_result_v16_2")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -7768,6 +8238,185 @@ if forecast_result:
                             else "inverse"
                         ),
                     )
+
+                    curve_benchmark = (
+                        evaluate_bess_price_curve_benchmarks(
+                            price_forecast=price_forecast,
+                            actual_price_frame=comparison,
+                            perfect_schedule=(
+                                actual_perfect_schedule
+                            ),
+                            actual_price_column=(
+                                "actual_price_eur_mwh"
+                            ),
+                            rte=BESS_RTE,
+                        )
+                    )
+
+                    if not curve_benchmark.empty:
+                        st.markdown(
+                            "#### Revenue capture by price curve"
+                        )
+                        st.caption(
+                            "Each curve independently selects its four "
+                            "charge hours and four later discharge hours. "
+                            "Every schedule is then settled against the same "
+                            "real OMIE prices. The dynamic upper guardrail is "
+                            "not included because it is a cap, not a forecast."
+                        )
+
+                        benchmark_display_order = [
+                            "final_forecast",
+                            "previous_day",
+                            "previous_week",
+                            "price_anchor",
+                            "similar_gap",
+                        ]
+                        benchmark_by_slug = (
+                            curve_benchmark.set_index("Slug")
+                        )
+
+                        benchmark_columns = st.columns(
+                            len(benchmark_display_order)
+                        )
+                        final_capture_for_delta = (
+                            float(
+                                benchmark_by_slug.loc[
+                                    "final_forecast",
+                                    "Revenue capture (%)",
+                                ]
+                            )
+                            if "final_forecast"
+                            in benchmark_by_slug.index
+                            else np.nan
+                        )
+
+                        for metric_column, slug in zip(
+                            benchmark_columns,
+                            benchmark_display_order,
+                        ):
+                            if slug not in benchmark_by_slug.index:
+                                continue
+
+                            row = benchmark_by_slug.loc[slug]
+                            capture_value = float(
+                                row["Revenue capture (%)"]
+                            )
+                            realised_value = float(
+                                row[
+                                    "Realised revenue (€/MW-day)"
+                                ]
+                            )
+
+                            if slug == "final_forecast":
+                                delta_text = (
+                                    f"{realised_value:,.2f} "
+                                    "€/MW-day realised"
+                                )
+                                delta_color = "off"
+                            else:
+                                difference_pp = (
+                                    capture_value
+                                    - final_capture_for_delta
+                                )
+                                delta_text = (
+                                    f"{difference_pp:+,.1f} pp "
+                                    "vs final"
+                                )
+                                delta_color = (
+                                    "normal"
+                                    if difference_pp >= 0
+                                    else "inverse"
+                                )
+
+                            metric_column.metric(
+                                label=str(
+                                    row["Short label"]
+                                ),
+                                value=(
+                                    f"{capture_value:,.1f}%"
+                                ),
+                                delta=delta_text,
+                                delta_color=delta_color,
+                                help=(
+                                    f"Realised revenue: "
+                                    f"{realised_value:,.2f} €/MW-day. "
+                                    f"Charge: {row['Charge hours']}. "
+                                    f"Discharge: "
+                                    f"{row['Discharge hours']}."
+                                ),
+                            )
+
+                        best_curve = curve_benchmark.iloc[0]
+                        final_row = curve_benchmark[
+                            curve_benchmark["Slug"]
+                            == "final_forecast"
+                        ]
+
+                        if (
+                            not final_row.empty
+                            and best_curve["Slug"]
+                            != "final_forecast"
+                        ):
+                            st.info(
+                                f"Best curve for this day: "
+                                f"**{best_curve['Strategy']}**, capturing "
+                                f"{best_curve['Revenue capture (%)']:,.1f}% "
+                                f"of perfect-foresight revenue, "
+                                f"{best_curve['Difference vs final (pp)']:+,.1f} "
+                                "percentage points versus the final black "
+                                "forecast. This is a useful signal for testing "
+                                "blended price curves, but the weighting should "
+                                "be decided from the multi-day walk-forward "
+                                "results rather than from one day."
+                            )
+
+                        curve_capture_chart = (
+                            build_price_curve_capture_chart(
+                                curve_benchmark
+                            )
+                        )
+                        if curve_capture_chart is not None:
+                            st.altair_chart(
+                                curve_capture_chart,
+                                use_container_width=True,
+                            )
+
+                        with st.expander(
+                            "Detailed BESS capture by price curve"
+                        ):
+                            st.dataframe(
+                                curve_benchmark.style.format(
+                                    {
+                                        "Revenue capture (%)": (
+                                            "{:,.1f}%"
+                                        ),
+                                        "Realised revenue (€/MW-day)": (
+                                            "{:,.2f}"
+                                        ),
+                                        "Expected revenue (€/MW-day)": (
+                                            "{:,.2f}"
+                                        ),
+                                        "Annualized realised revenue (€/MW/yr)": (
+                                            "{:,.0f}"
+                                        ),
+                                        "Opportunity loss (€/MW-day)": (
+                                            "{:,.2f}"
+                                        ),
+                                        "Difference vs final (pp)": (
+                                            "{:+,.1f}"
+                                        ),
+                                        "Forecast chronological TB4 (€/MWh)": (
+                                            "{:,.2f}"
+                                        ),
+                                        "Realised RTE-adjusted spread (€/MWh)": (
+                                            "{:,.2f}"
+                                        ),
+                                    }
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
                     b5, b6, b7, b8 = st.columns(4)
                     b5.metric(
@@ -8689,6 +9338,61 @@ if not ytd_results.empty:
                 "discharge"
             ),
         )
+
+        ytd_curve_summary = (
+            ytd_price_curve_capture_summary(
+                successful_ytd
+            )
+        )
+
+        if not ytd_curve_summary.empty:
+            st.subheader(
+                "YTD BESS revenue capture by price curve"
+            )
+            st.caption(
+                "This is the relevant comparison for deciding whether the "
+                "final black forecast should be blended with D-1, D-7, the "
+                "price anchor or the similar-gap curve. It aggregates realised "
+                "BESS revenue across all successfully backtested days."
+            )
+
+            ytd_curve_chart = (
+                build_price_curve_capture_chart(
+                    ytd_curve_summary.rename(
+                        columns={
+                            "YTD realised revenue (€/MW)": (
+                                "Realised revenue (€/MW-day)"
+                            )
+                        }
+                    )
+                )
+            )
+            if ytd_curve_chart is not None:
+                st.altair_chart(
+                    ytd_curve_chart,
+                    use_container_width=True,
+                )
+
+            st.dataframe(
+                ytd_curve_summary.style.format(
+                    {
+                        "YTD realised revenue (€/MW)": (
+                            "{:,.0f}"
+                        ),
+                        "Revenue capture (%)": (
+                            "{:,.1f}%"
+                        ),
+                        "Annualized revenue (€/MW/yr)": (
+                            "{:,.0f}"
+                        ),
+                        "YTD opportunity loss (€/MW)": (
+                            "{:,.0f}"
+                        ),
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         cumulative_chart = (
             build_ytd_cumulative_revenue_chart(
