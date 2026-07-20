@@ -6077,6 +6077,734 @@ def build_bess_schedule_table(
 
 
 # =========================================================
+# YTD DAILY WALK-FORWARD BACKTEST
+# =========================================================
+YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v16"
+YTD_BACKTEST_CHECKPOINT_VERSION = "v16"
+
+
+def _safe_ratio(
+    numerator: float,
+    denominator: float,
+) -> float:
+    if (
+        pd.isna(numerator)
+        or pd.isna(denominator)
+        or abs(float(denominator)) <= 1e-9
+    ):
+        return np.nan
+    return float(numerator) / float(denominator)
+
+
+def _hours_as_text(values) -> str:
+    if values is None:
+        return ""
+    return ", ".join(
+        pd.Timestamp(value).strftime("%H:%M")
+        for value in values
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def run_one_walk_forward_backtest_day(
+    target_day: date,
+    lookback_days: int,
+    temperature_mode: str,
+    trend_alpha: float,
+    demand_source: str,
+    technologies_tuple: tuple[str, ...],
+    _token: str,
+) -> dict:
+    """
+    Recreate one complete operational D-1 forecast and settle it against the
+    realised target-day OMIE prices.
+
+    Information cut-offs are inherited from the single-day engine:
+    - Demand history: through D-2.
+    - Target weather: archived forecast issued at D-1.
+    - PBF, bilateral programmes, spot prices and gas inputs: through D-1.
+    - Realised target-day prices are loaded only after the forecast is built.
+    """
+    forecast_as_of_day = target_day - timedelta(days=1)
+
+    demand_result = generate_day_ahead_forecast(
+        target_day=target_day,
+        lookback_days=int(lookback_days),
+        temperature_mode=temperature_mode,
+        trend_alpha=float(trend_alpha),
+    )
+
+    demand_forecast = demand_result["forecast"].copy()
+
+    if demand_source.startswith("Model"):
+        demand_forecast["selected_demand_mw"] = (
+            demand_forecast["forecast_mw"]
+        )
+        demand_source_label = "Model forecast"
+    else:
+        demand_forecast["selected_demand_mw"] = (
+            demand_forecast["trend_adjusted_lag_7d"]
+        )
+        demand_source_label = "Previous week + recent trend"
+
+    thermal_result = generate_thermal_gap_forecast(
+        target_day=target_day,
+        lookback_days=int(lookback_days),
+        selected_demand=demand_forecast[
+            ["datetime", "selected_demand_mw"]
+        ],
+        technologies=list(technologies_tuple),
+        token=_token,
+    )
+
+    price_result = generate_price_forecast(
+        target_day=target_day,
+        historical_gap=thermal_result["historical"],
+        forecast_gap=thermal_result["forecast"],
+        token=_token,
+    )
+
+    realised_prices = load_esios_price_history(
+        start_day=target_day,
+        end_day=target_day,
+        _token=_token,
+    )
+
+    if realised_prices.empty:
+        raise ValueError(
+            "Real target-day OMIE prices are not available."
+        )
+
+    price_forecast = price_result["forecast"].copy()
+    comparison = price_forecast[
+        ["datetime", "forecast_price_eur_mwh"]
+    ].merge(
+        realised_prices[
+            ["datetime", "price_eur_mwh"]
+        ].rename(
+            columns={
+                "price_eur_mwh": "actual_price_eur_mwh"
+            }
+        ),
+        on="datetime",
+        how="inner",
+    )
+
+    comparison["forecast_price_eur_mwh"] = pd.to_numeric(
+        comparison["forecast_price_eur_mwh"],
+        errors="coerce",
+    )
+    comparison["actual_price_eur_mwh"] = pd.to_numeric(
+        comparison["actual_price_eur_mwh"],
+        errors="coerce",
+    )
+    comparison = comparison.dropna(
+        subset=[
+            "datetime",
+            "forecast_price_eur_mwh",
+            "actual_price_eur_mwh",
+        ]
+    ).sort_values("datetime")
+
+    if len(comparison) < 23:
+        raise ValueError(
+            f"Only {len(comparison)} complete forecast/real price hours."
+        )
+
+    price_metrics = price_realization_metrics(comparison)
+
+    perfect_schedule = optimize_chronological_tb4_schedule(
+        comparison,
+        price_column="actual_price_eur_mwh",
+        rte=BESS_RTE,
+    )
+    forecast_schedule = optimize_chronological_tb4_schedule(
+        comparison,
+        price_column="forecast_price_eur_mwh",
+        rte=BESS_RTE,
+    )
+    forecast_settlement = settle_bess_schedule_on_actual_prices(
+        forecast_schedule,
+        comparison,
+        actual_price_column="actual_price_eur_mwh",
+        rte=BESS_RTE,
+    )
+
+    if (
+        perfect_schedule is None
+        or forecast_schedule is None
+        or forecast_settlement is None
+    ):
+        raise ValueError(
+            "The chronological BESS schedules could not be completed."
+        )
+
+    perfect_daily_revenue = float(
+        perfect_schedule["daily_revenue_eur_mw"]
+    )
+    forecast_realized_daily_revenue = float(
+        forecast_settlement[
+            "actual_daily_revenue_eur_mw"
+        ]
+    )
+    forecast_expected_daily_revenue = float(
+        forecast_schedule["daily_revenue_eur_mw"]
+    )
+
+    opportunity_loss = (
+        perfect_daily_revenue
+        - forecast_realized_daily_revenue
+    )
+    revenue_capture_pct = (
+        100.0
+        * _safe_ratio(
+            forecast_realized_daily_revenue,
+            perfect_daily_revenue,
+        )
+    )
+
+    perfect_charge_set = set(
+        pd.Timestamp(value)
+        for value in perfect_schedule["charge_hours"]
+    )
+    forecast_charge_set = set(
+        pd.Timestamp(value)
+        for value in forecast_schedule["charge_hours"]
+    )
+    perfect_discharge_set = set(
+        pd.Timestamp(value)
+        for value in perfect_schedule["discharge_hours"]
+    )
+    forecast_discharge_set = set(
+        pd.Timestamp(value)
+        for value in forecast_schedule["discharge_hours"]
+    )
+
+    thermal_forecast = thermal_result["forecast"].copy()
+    thermal_gap = pd.to_numeric(
+        thermal_forecast["thermal_gap_forecast_mwh"],
+        errors="coerce",
+    )
+
+    actual_prices = comparison["actual_price_eur_mwh"]
+    forecast_prices = comparison["forecast_price_eur_mwh"]
+
+    return {
+        "checkpoint_version": YTD_BACKTEST_CHECKPOINT_VERSION,
+        "target_day": target_day.isoformat(),
+        "as_of_day": forecast_as_of_day.isoformat(),
+        "status": "ok",
+        "error": "",
+        "demand_source": demand_source_label,
+        "temperature_mode": temperature_mode,
+        "lookback_days": int(lookback_days),
+        "trend_alpha": float(trend_alpha),
+        "technologies": " | ".join(technologies_tuple),
+        "complete_price_hours": int(len(comparison)),
+        "forecast_baseload_eur_mwh": float(
+            forecast_prices.mean()
+        ),
+        "actual_baseload_eur_mwh": float(
+            actual_prices.mean()
+        ),
+        "baseload_error_eur_mwh": float(
+            price_metrics["baseload_error"]
+        ),
+        "price_mae_eur_mwh": float(
+            price_metrics["mae"]
+        ),
+        "price_rmse_eur_mwh": float(
+            price_metrics["rmse"]
+        ),
+        "price_smape_pct": float(
+            price_metrics["smape"]
+        ),
+        "forecast_min_price_eur_mwh": float(
+            forecast_prices.min()
+        ),
+        "actual_min_price_eur_mwh": float(
+            actual_prices.min()
+        ),
+        "forecast_max_price_eur_mwh": float(
+            forecast_prices.max()
+        ),
+        "actual_max_price_eur_mwh": float(
+            actual_prices.max()
+        ),
+        "forecast_zero_or_negative_hours": int(
+            (forecast_prices <= 0).sum()
+        ),
+        "actual_zero_or_negative_hours": int(
+            (actual_prices <= 0).sum()
+        ),
+        "forecast_chronological_tb4_eur_mwh": float(
+            forecast_schedule[
+                "chronological_tb4_eur_mwh"
+            ]
+        ),
+        "actual_chronological_tb4_eur_mwh": float(
+            perfect_schedule[
+                "chronological_tb4_eur_mwh"
+            ]
+        ),
+        "tb4_error_eur_mwh": float(
+            forecast_schedule[
+                "chronological_tb4_eur_mwh"
+            ]
+            - perfect_schedule[
+                "chronological_tb4_eur_mwh"
+            ]
+        ),
+        "forecast_expected_daily_revenue_eur_mw": (
+            forecast_expected_daily_revenue
+        ),
+        "forecast_strategy_realized_daily_revenue_eur_mw": (
+            forecast_realized_daily_revenue
+        ),
+        "perfect_foresight_daily_revenue_eur_mw": (
+            perfect_daily_revenue
+        ),
+        "daily_opportunity_loss_eur_mw": (
+            opportunity_loss
+        ),
+        "revenue_capture_pct": revenue_capture_pct,
+        "forecast_strategy_annualized_eur_mw_yr": (
+            forecast_realized_daily_revenue
+            * BESS_ANNUALIZATION_DAYS
+        ),
+        "perfect_foresight_annualized_eur_mw_yr": (
+            perfect_daily_revenue
+            * BESS_ANNUALIZATION_DAYS
+        ),
+        "annualized_opportunity_loss_eur_mw_yr": (
+            opportunity_loss
+            * BESS_ANNUALIZATION_DAYS
+        ),
+        "charge_hour_overlap": int(
+            len(
+                perfect_charge_set.intersection(
+                    forecast_charge_set
+                )
+            )
+        ),
+        "discharge_hour_overlap": int(
+            len(
+                perfect_discharge_set.intersection(
+                    forecast_discharge_set
+                )
+            )
+        ),
+        "perfect_charge_hours": _hours_as_text(
+            perfect_schedule["charge_hours"]
+        ),
+        "perfect_discharge_hours": _hours_as_text(
+            perfect_schedule["discharge_hours"]
+        ),
+        "forecast_charge_hours": _hours_as_text(
+            forecast_schedule["charge_hours"]
+        ),
+        "forecast_discharge_hours": _hours_as_text(
+            forecast_schedule["discharge_hours"]
+        ),
+        "average_forecast_thermal_gap_mw": float(
+            thermal_gap.mean()
+        ),
+        "minimum_forecast_thermal_gap_mw": float(
+            thermal_gap.min()
+        ),
+        "negative_forecast_thermal_gap_hours": int(
+            (thermal_gap < 0).sum()
+        ),
+        "demand_model_validation_mae_mw": float(
+            demand_result["model_stats"]["mae"]
+        ),
+        "demand_model_validation_mape_pct": float(
+            demand_result["model_stats"]["mape"]
+        ),
+    }
+
+
+def failed_walk_forward_row(
+    target_day: date,
+    exc: Exception,
+) -> dict:
+    return {
+        "checkpoint_version": (
+            YTD_BACKTEST_CHECKPOINT_VERSION
+        ),
+        "target_day": target_day.isoformat(),
+        "as_of_day": (
+            target_day - timedelta(days=1)
+        ).isoformat(),
+        "status": "error",
+        "error": str(exc)[:500],
+    }
+
+
+def normalize_walk_forward_results(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    output = frame.copy()
+
+    if "target_day" not in output.columns:
+        return pd.DataFrame()
+
+    output["target_day"] = pd.to_datetime(
+        output["target_day"],
+        errors="coerce",
+    ).dt.date
+    output = output.dropna(subset=["target_day"])
+
+    if "status" not in output.columns:
+        output["status"] = "ok"
+
+    output = (
+        output.sort_values("target_day")
+        .drop_duplicates(
+            subset=["target_day"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+    return output
+
+
+def aggregate_walk_forward_monthly(
+    successful: pd.DataFrame,
+) -> pd.DataFrame:
+    if successful is None or successful.empty:
+        return pd.DataFrame()
+
+    monthly = successful.copy()
+    monthly["target_day"] = pd.to_datetime(
+        monthly["target_day"],
+        errors="coerce",
+    )
+    monthly["month"] = monthly[
+        "target_day"
+    ].dt.to_period("M").astype(str)
+
+    result = (
+        monthly.groupby("month", as_index=False)
+        .agg(
+            days=("target_day", "count"),
+            price_mae_eur_mwh=(
+                "price_mae_eur_mwh",
+                "mean",
+            ),
+            price_smape_pct=(
+                "price_smape_pct",
+                "mean",
+            ),
+            actual_baseload_eur_mwh=(
+                "actual_baseload_eur_mwh",
+                "mean",
+            ),
+            forecast_baseload_eur_mwh=(
+                "forecast_baseload_eur_mwh",
+                "mean",
+            ),
+            perfect_revenue_eur_mw=(
+                "perfect_foresight_daily_revenue_eur_mw",
+                "sum",
+            ),
+            forecast_strategy_revenue_eur_mw=(
+                "forecast_strategy_realized_daily_revenue_eur_mw",
+                "sum",
+            ),
+            opportunity_loss_eur_mw=(
+                "daily_opportunity_loss_eur_mw",
+                "sum",
+            ),
+            average_charge_overlap=(
+                "charge_hour_overlap",
+                "mean",
+            ),
+            average_discharge_overlap=(
+                "discharge_hour_overlap",
+                "mean",
+            ),
+        )
+    )
+
+    result["revenue_capture_pct"] = (
+        100.0
+        * result[
+            "forecast_strategy_revenue_eur_mw"
+        ]
+        / result[
+            "perfect_revenue_eur_mw"
+        ].replace(0.0, np.nan)
+    )
+    result[
+        "forecast_strategy_annualized_eur_mw_yr"
+    ] = (
+        result[
+            "forecast_strategy_revenue_eur_mw"
+        ]
+        / result["days"]
+        * BESS_ANNUALIZATION_DAYS
+    )
+    result[
+        "perfect_annualized_eur_mw_yr"
+    ] = (
+        result["perfect_revenue_eur_mw"]
+        / result["days"]
+        * BESS_ANNUALIZATION_DAYS
+    )
+
+    return result
+
+
+def build_ytd_cumulative_revenue_chart(
+    successful: pd.DataFrame,
+):
+    if successful is None or successful.empty:
+        return None
+
+    plot = successful.sort_values(
+        "target_day"
+    ).copy()
+    plot["target_day"] = pd.to_datetime(
+        plot["target_day"],
+        errors="coerce",
+    )
+    plot[
+        "Forecast-selected hours"
+    ] = plot[
+        "forecast_strategy_realized_daily_revenue_eur_mw"
+    ].cumsum()
+    plot[
+        "Real-price perfect foresight"
+    ] = plot[
+        "perfect_foresight_daily_revenue_eur_mw"
+    ].cumsum()
+
+    long = plot.melt(
+        id_vars=["target_day"],
+        value_vars=[
+            "Forecast-selected hours",
+            "Real-price perfect foresight",
+        ],
+        var_name="Strategy",
+        value_name="Cumulative revenue",
+    )
+
+    chart = (
+        alt.Chart(long)
+        .mark_line(
+            strokeWidth=3,
+        )
+        .encode(
+            x=alt.X(
+                "target_day:T",
+                title=None,
+                axis=alt.Axis(format="%d-%b"),
+            ),
+            y=alt.Y(
+                "Cumulative revenue:Q",
+                title="Cumulative realised BESS revenue (€/MW)",
+            ),
+            color=alt.Color(
+                "Strategy:N",
+                title="Strategy",
+                scale=alt.Scale(
+                    domain=[
+                        "Real-price perfect foresight",
+                        "Forecast-selected hours",
+                    ],
+                    range=[
+                        "#2563EB",
+                        "#F97316",
+                    ],
+                ),
+                legend=alt.Legend(
+                    orient="top",
+                    direction="horizontal",
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "target_day:T",
+                    title="Date",
+                    format="%d-%m-%Y",
+                ),
+                alt.Tooltip(
+                    "Strategy:N",
+                    title="Strategy",
+                ),
+                alt.Tooltip(
+                    "Cumulative revenue:Q",
+                    title="Cumulative €/MW",
+                    format=",.1f",
+                ),
+            ],
+        )
+    )
+    return configure_chart(chart, height=350)
+
+
+def build_ytd_rolling_capture_chart(
+    successful: pd.DataFrame,
+    rolling_days: int = 30,
+):
+    if successful is None or successful.empty:
+        return None
+
+    plot = successful.sort_values(
+        "target_day"
+    ).copy()
+    plot["target_day"] = pd.to_datetime(
+        plot["target_day"],
+        errors="coerce",
+    )
+
+    perfect_rolling = plot[
+        "perfect_foresight_daily_revenue_eur_mw"
+    ].rolling(
+        rolling_days,
+        min_periods=max(5, rolling_days // 4),
+    ).sum()
+
+    forecast_rolling = plot[
+        "forecast_strategy_realized_daily_revenue_eur_mw"
+    ].rolling(
+        rolling_days,
+        min_periods=max(5, rolling_days // 4),
+    ).sum()
+
+    plot["rolling_capture_pct"] = (
+        100.0
+        * forecast_rolling
+        / perfect_rolling.replace(0.0, np.nan)
+    )
+
+    chart = (
+        alt.Chart(plot)
+        .mark_line(
+            point=True,
+            strokeWidth=2.7,
+            color="#0F766E",
+        )
+        .encode(
+            x=alt.X(
+                "target_day:T",
+                title=None,
+                axis=alt.Axis(format="%d-%b"),
+            ),
+            y=alt.Y(
+                "rolling_capture_pct:Q",
+                title=(
+                    f"{rolling_days}-day rolling "
+                    "revenue capture (%)"
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(
+                    "target_day:T",
+                    title="Date",
+                    format="%d-%m-%Y",
+                ),
+                alt.Tooltip(
+                    "rolling_capture_pct:Q",
+                    title="Revenue capture",
+                    format=",.1f",
+                ),
+            ],
+        )
+    )
+
+    hundred = (
+        alt.Chart(pd.DataFrame({"capture": [100.0]}))
+        .mark_rule(
+            color="#64748B",
+            strokeDash=[5, 3],
+        )
+        .encode(y="capture:Q")
+    )
+
+    return configure_chart(
+        alt.layer(hundred, chart),
+        height=310,
+    )
+
+
+def build_monthly_bess_revenue_chart(
+    monthly: pd.DataFrame,
+):
+    if monthly is None or monthly.empty:
+        return None
+
+    long = monthly.melt(
+        id_vars=["month"],
+        value_vars=[
+            "perfect_annualized_eur_mw_yr",
+            "forecast_strategy_annualized_eur_mw_yr",
+        ],
+        var_name="Strategy",
+        value_name="Annualized revenue",
+    )
+    long["Strategy"] = long["Strategy"].map(
+        {
+            "perfect_annualized_eur_mw_yr": (
+                "Real-price perfect foresight"
+            ),
+            "forecast_strategy_annualized_eur_mw_yr": (
+                "Forecast-selected hours"
+            ),
+        }
+    )
+
+    chart = (
+        alt.Chart(long)
+        .mark_bar()
+        .encode(
+            x=alt.X(
+                "month:N",
+                title=None,
+                sort=monthly["month"].tolist(),
+            ),
+            y=alt.Y(
+                "Annualized revenue:Q",
+                title="Monthly behaviour annualized (€/MW/yr)",
+            ),
+            xOffset="Strategy:N",
+            color=alt.Color(
+                "Strategy:N",
+                title="Strategy",
+                scale=alt.Scale(
+                    domain=[
+                        "Real-price perfect foresight",
+                        "Forecast-selected hours",
+                    ],
+                    range=[
+                        "#2563EB",
+                        "#F97316",
+                    ],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("month:N", title="Month"),
+                alt.Tooltip(
+                    "Strategy:N",
+                    title="Strategy",
+                ),
+                alt.Tooltip(
+                    "Annualized revenue:Q",
+                    title="€/MW/yr",
+                    format=",.0f",
+                ),
+            ],
+        )
+    )
+
+    return configure_chart(chart, height=330)
+
+
+# =========================================================
 # APP
 # =========================================================
 st.title("Demand, PBF thermal gap and DA price — forecast test")
@@ -6421,7 +7149,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v15"] = {
+        st.session_state["day_ahead_result_v16"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -6439,7 +7167,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v15")
+forecast_result = st.session_state.get("day_ahead_result_v16")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -7436,6 +8164,618 @@ else:
         "recreated as an operational D-1 backtest; tomorrow uses the live "
         "weather forecast. When realised DA prices exist, Step 4 compares "
         "them directly against the forecast."
+    )
+
+
+# =========================================================
+# YTD DAILY WALK-FORWARD BACKTEST UI
+# =========================================================
+section_header(
+    "Step 6 — 2026 YTD daily walk-forward forecast backtest"
+)
+
+st.caption(
+    "This section reruns the complete demand → net-PBF generation → "
+    "structural thermal-gap → DA-price → BESS workflow independently for "
+    "every selected delivery day. Each day uses only information available "
+    "at D-1/D-2, selects the BESS hours from the forecast and settles those "
+    "hours against realised OMIE prices."
+)
+
+yt1, yt2, yt3, yt4 = st.columns(
+    [1.0, 1.0, 1.15, 1.25]
+)
+
+with yt1:
+    ytd_start_day = st.date_input(
+        "Walk-forward start",
+        value=date(2026, 1, 1),
+        min_value=date(2024, 2, 1),
+        max_value=max(
+            date.today() - timedelta(days=1),
+            date(2024, 2, 1),
+        ),
+        key="ytd_walk_forward_start",
+    )
+
+with yt2:
+    ytd_end_day = st.date_input(
+        "Walk-forward end",
+        value=max(
+            date(2026, 1, 1),
+            date.today() - timedelta(days=1),
+        ),
+        min_value=ytd_start_day,
+        max_value=max(
+            date.today() - timedelta(days=1),
+            ytd_start_day,
+        ),
+        key="ytd_walk_forward_end",
+    )
+
+with yt3:
+    ytd_batch_size_label = st.selectbox(
+        "Days processed per click",
+        [
+            "3 days",
+            "7 days",
+            "14 days",
+            "31 days",
+            "All pending days",
+        ],
+        index=1,
+        help=(
+            "The exact daily model is computationally heavy. "
+            "Run it in batches and download a checkpoint after each batch."
+        ),
+        key="ytd_walk_forward_batch_size",
+    )
+
+with yt4:
+    ytd_retry_failed = st.checkbox(
+        "Retry failed dates",
+        value=True,
+        help=(
+            "Retries dates that previously failed because of an API or "
+            "temporary data-availability issue."
+        ),
+        key="ytd_retry_failed",
+    )
+
+yc1, yc2, yc3, yc4 = st.columns(
+    [1.0, 1.0, 1.1, 1.35]
+)
+
+with yc1:
+    ytd_lookback_days = st.select_slider(
+        "YTD training history",
+        options=[365, 450, 550, 650, 730],
+        value=550,
+        format_func=lambda value: f"{value} days",
+        key="ytd_walk_forward_lookback",
+    )
+
+with yc2:
+    ytd_trend_alpha = st.slider(
+        "YTD weekly-trend α",
+        min_value=0.0,
+        max_value=1.5,
+        value=1.0,
+        step=0.1,
+        key="ytd_walk_forward_trend_alpha",
+    )
+
+with yc3:
+    ytd_demand_source = st.selectbox(
+        "YTD demand curve",
+        [
+            "Model forecast — green",
+            "Previous week + recent trend — orange",
+        ],
+        index=0,
+        key="ytd_walk_forward_demand_source",
+    )
+
+with yc4:
+    ytd_temperature_mode = st.selectbox(
+        "YTD temperature proxy",
+        [
+            "Spain weighted proxy",
+            "Madrid",
+        ],
+        index=0,
+        key="ytd_walk_forward_temperature_mode",
+    )
+
+ytd_technologies = st.multiselect(
+    "YTD structural-gap technologies",
+    options=list(
+        FORECAST_NON_THERMAL_INDICATORS.keys()
+    ),
+    default=FORECAST_NON_THERMAL_DEFAULT,
+    help=(
+        "Hydro UGH may be forecast as a diagnostic but remains excluded "
+        "from the structural thermal gap."
+    ),
+    key="ytd_walk_forward_technologies",
+)
+
+checkpoint_upload = st.file_uploader(
+    "Optional: upload a previous YTD checkpoint CSV",
+    type=["csv"],
+    key="ytd_checkpoint_upload",
+)
+
+load_checkpoint_col, reset_checkpoint_col = st.columns(2)
+
+with load_checkpoint_col:
+    load_checkpoint = st.button(
+        "Load uploaded checkpoint",
+        use_container_width=True,
+        disabled=checkpoint_upload is None,
+        key="load_ytd_checkpoint",
+    )
+
+with reset_checkpoint_col:
+    reset_checkpoint = st.button(
+        "Reset YTD backtest",
+        use_container_width=True,
+        key="reset_ytd_checkpoint",
+    )
+
+if reset_checkpoint:
+    st.session_state[
+        YTD_BACKTEST_STATE_KEY
+    ] = pd.DataFrame()
+    st.success("YTD backtest results were reset.")
+
+if load_checkpoint and checkpoint_upload is not None:
+    try:
+        uploaded_checkpoint = pd.read_csv(
+            checkpoint_upload
+        )
+        uploaded_checkpoint = (
+            normalize_walk_forward_results(
+                uploaded_checkpoint
+            )
+        )
+        st.session_state[
+            YTD_BACKTEST_STATE_KEY
+        ] = uploaded_checkpoint
+        st.success(
+            f"Loaded {len(uploaded_checkpoint):,} checkpoint rows."
+        )
+    except Exception as exc:
+        st.error(f"Could not load checkpoint: {exc}")
+
+existing_ytd_results = normalize_walk_forward_results(
+    st.session_state.get(
+        YTD_BACKTEST_STATE_KEY,
+        pd.DataFrame(),
+    )
+)
+
+all_target_days = [
+    timestamp.date()
+    for timestamp in pd.date_range(
+        start=ytd_start_day,
+        end=ytd_end_day,
+        freq="D",
+    )
+]
+
+processed_status = {}
+if not existing_ytd_results.empty:
+    processed_status = {
+        row.target_day: row.status
+        for row in existing_ytd_results[
+            ["target_day", "status"]
+        ].itertuples(index=False)
+    }
+
+pending_target_days = []
+for target_day_value in all_target_days:
+    status = processed_status.get(target_day_value)
+
+    if status is None:
+        pending_target_days.append(target_day_value)
+    elif status == "error" and ytd_retry_failed:
+        pending_target_days.append(target_day_value)
+
+batch_size_map = {
+    "3 days": 3,
+    "7 days": 7,
+    "14 days": 14,
+    "31 days": 31,
+    "All pending days": len(pending_target_days),
+}
+selected_batch_size = batch_size_map[
+    ytd_batch_size_label
+]
+
+status_1, status_2, status_3, status_4 = st.columns(4)
+status_1.metric(
+    "Dates in selected range",
+    f"{len(all_target_days):,}",
+)
+status_2.metric(
+    "Completed dates",
+    f"{sum(status == 'ok' for status in processed_status.values()):,}",
+)
+status_3.metric(
+    "Failed dates",
+    f"{sum(status == 'error' for status in processed_status.values()):,}",
+)
+status_4.metric(
+    "Pending / retry dates",
+    f"{len(pending_target_days):,}",
+)
+
+st.warning(
+    "An exact January-to-date run retrains the demand, generation and price "
+    "models for every delivery day and makes many API calls. A full YTD run "
+    "can take a long time on Streamlit Cloud. The checkpoint lets you process "
+    "it safely in several batches without losing completed dates."
+)
+
+run_ytd_batch = st.button(
+    "Run next YTD walk-forward batch",
+    type="primary",
+    use_container_width=True,
+    disabled=(
+        not pending_target_days
+        or not ytd_technologies
+    ),
+    key="run_ytd_walk_forward_batch",
+)
+
+if run_ytd_batch:
+    try:
+        ytd_token = require_token()
+    except Exception as exc:
+        st.error(str(exc))
+        ytd_token = None
+
+    if ytd_token is not None:
+        dates_to_run = pending_target_days[
+            :selected_batch_size
+        ]
+
+        progress = st.progress(0.0)
+        progress_text = st.empty()
+
+        result_rows = (
+            existing_ytd_results.to_dict(
+                orient="records"
+            )
+            if not existing_ytd_results.empty
+            else []
+        )
+
+        for index_value, target_day_value in enumerate(
+            dates_to_run,
+            start=1,
+        ):
+            progress_text.write(
+                "Running delivery date "
+                f"**{target_day_value:%d/%m/%Y}** "
+                f"({index_value}/{len(dates_to_run)})"
+            )
+
+            try:
+                result_row = (
+                    run_one_walk_forward_backtest_day(
+                        target_day=target_day_value,
+                        lookback_days=int(
+                            ytd_lookback_days
+                        ),
+                        temperature_mode=(
+                            ytd_temperature_mode
+                        ),
+                        trend_alpha=float(
+                            ytd_trend_alpha
+                        ),
+                        demand_source=(
+                            ytd_demand_source
+                        ),
+                        technologies_tuple=tuple(
+                            ytd_technologies
+                        ),
+                        _token=ytd_token,
+                    )
+                )
+            except Exception as exc:
+                result_row = failed_walk_forward_row(
+                    target_day_value,
+                    exc,
+                )
+
+            result_rows = [
+                row
+                for row in result_rows
+                if str(row.get("target_day"))
+                != target_day_value.isoformat()
+                and row.get("target_day")
+                != target_day_value
+            ]
+            result_rows.append(result_row)
+
+            interim = normalize_walk_forward_results(
+                pd.DataFrame(result_rows)
+            )
+            st.session_state[
+                YTD_BACKTEST_STATE_KEY
+            ] = interim
+
+            progress.progress(
+                index_value / len(dates_to_run)
+            )
+
+        progress_text.empty()
+        progress.empty()
+
+        completed_batch = normalize_walk_forward_results(
+            st.session_state[
+                YTD_BACKTEST_STATE_KEY
+            ]
+        )
+        batch_successes = completed_batch[
+            completed_batch["target_day"].isin(
+                dates_to_run
+            )
+            & (completed_batch["status"] == "ok")
+        ]
+        batch_failures = completed_batch[
+            completed_batch["target_day"].isin(
+                dates_to_run
+            )
+            & (completed_batch["status"] == "error")
+        ]
+
+        st.success(
+            f"Batch finished: {len(batch_successes)} successful "
+            f"and {len(batch_failures)} failed dates."
+        )
+
+ytd_results = normalize_walk_forward_results(
+    st.session_state.get(
+        YTD_BACKTEST_STATE_KEY,
+        existing_ytd_results,
+    )
+)
+
+if not ytd_results.empty:
+    st.download_button(
+        "Download / save YTD checkpoint CSV",
+        data=ytd_results.to_csv(
+            index=False
+        ).encode("utf-8"),
+        file_name=(
+            f"ytd_walk_forward_checkpoint_"
+            f"{ytd_start_day}_{ytd_end_day}.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True,
+        key="download_ytd_checkpoint",
+    )
+
+    ytd_range_results = ytd_results[
+        ytd_results["target_day"].isin(
+            all_target_days
+        )
+    ].copy()
+
+    successful_ytd = ytd_range_results[
+        ytd_range_results["status"] == "ok"
+    ].copy()
+    failed_ytd = ytd_range_results[
+        ytd_range_results["status"] == "error"
+    ].copy()
+
+    if not successful_ytd.empty:
+        numeric_columns = [
+            column
+            for column in successful_ytd.columns
+            if column
+            not in {
+                "checkpoint_version",
+                "target_day",
+                "as_of_day",
+                "status",
+                "error",
+                "demand_source",
+                "temperature_mode",
+                "technologies",
+                "perfect_charge_hours",
+                "perfect_discharge_hours",
+                "forecast_charge_hours",
+                "forecast_discharge_hours",
+            }
+        ]
+        for column in numeric_columns:
+            successful_ytd[column] = pd.to_numeric(
+                successful_ytd[column],
+                errors="coerce",
+            )
+
+        tested_days = len(successful_ytd)
+
+        perfect_total = successful_ytd[
+            "perfect_foresight_daily_revenue_eur_mw"
+        ].sum()
+        forecast_total = successful_ytd[
+            "forecast_strategy_realized_daily_revenue_eur_mw"
+        ].sum()
+        total_opportunity_loss = (
+            perfect_total - forecast_total
+        )
+        aggregate_capture = (
+            100.0
+            * _safe_ratio(
+                forecast_total,
+                perfect_total,
+            )
+        )
+
+        perfect_annualized = (
+            perfect_total
+            / tested_days
+            * BESS_ANNUALIZATION_DAYS
+        )
+        forecast_annualized = (
+            forecast_total
+            / tested_days
+            * BESS_ANNUALIZATION_DAYS
+        )
+
+        section_header(
+            "YTD walk-forward results"
+        )
+
+        yr1, yr2, yr3, yr4, yr5, yr6 = st.columns(6)
+        yr1.metric(
+            "Successful days",
+            f"{tested_days:,}",
+        )
+        yr2.metric(
+            "Forecast strategy YTD",
+            f"{forecast_total:,.0f} €/MW",
+        )
+        yr3.metric(
+            "Perfect foresight YTD",
+            f"{perfect_total:,.0f} €/MW",
+        )
+        yr4.metric(
+            "YTD revenue capture",
+            (
+                f"{aggregate_capture:,.1f}%"
+                if pd.notna(aggregate_capture)
+                else "—"
+            ),
+        )
+        yr5.metric(
+            "Cumulative opportunity loss",
+            f"{total_opportunity_loss:,.0f} €/MW",
+        )
+        yr6.metric(
+            "Average price MAE",
+            (
+                f"{successful_ytd['price_mae_eur_mwh'].mean():,.2f} "
+                "€/MWh"
+            ),
+        )
+
+        ya1, ya2, ya3, ya4 = st.columns(4)
+        ya1.metric(
+            "Forecast strategy annualized",
+            f"{forecast_annualized:,.0f} €/MW/yr",
+        )
+        ya2.metric(
+            "Perfect foresight annualized",
+            f"{perfect_annualized:,.0f} €/MW/yr",
+        )
+        ya3.metric(
+            "Average hourly sMAPE",
+            (
+                f"{successful_ytd['price_smape_pct'].mean():,.1f}%"
+            ),
+        )
+        ya4.metric(
+            "Average selected-hour overlap",
+            (
+                f"{successful_ytd['charge_hour_overlap'].mean():,.2f}/4 "
+                "charge · "
+                f"{successful_ytd['discharge_hour_overlap'].mean():,.2f}/4 "
+                "discharge"
+            ),
+        )
+
+        cumulative_chart = (
+            build_ytd_cumulative_revenue_chart(
+                successful_ytd
+            )
+        )
+        if cumulative_chart is not None:
+            st.altair_chart(
+                cumulative_chart,
+                use_container_width=True,
+            )
+
+        rolling_chart = build_ytd_rolling_capture_chart(
+            successful_ytd,
+            rolling_days=30,
+        )
+        if rolling_chart is not None:
+            st.altair_chart(
+                rolling_chart,
+                use_container_width=True,
+            )
+
+        monthly_ytd = aggregate_walk_forward_monthly(
+            successful_ytd
+        )
+        monthly_chart = build_monthly_bess_revenue_chart(
+            monthly_ytd
+        )
+        if monthly_chart is not None:
+            st.altair_chart(
+                monthly_chart,
+                use_container_width=True,
+            )
+
+        st.subheader("Monthly walk-forward summary")
+        st.dataframe(
+            monthly_ytd.style.format(
+                {
+                    "price_mae_eur_mwh": "{:,.2f}",
+                    "price_smape_pct": "{:,.1f}%",
+                    "actual_baseload_eur_mwh": "{:,.2f}",
+                    "forecast_baseload_eur_mwh": "{:,.2f}",
+                    "perfect_revenue_eur_mw": "{:,.0f}",
+                    "forecast_strategy_revenue_eur_mw": "{:,.0f}",
+                    "opportunity_loss_eur_mw": "{:,.0f}",
+                    "revenue_capture_pct": "{:,.1f}%",
+                    "forecast_strategy_annualized_eur_mw_yr": "{:,.0f}",
+                    "perfect_annualized_eur_mw_yr": "{:,.0f}",
+                    "average_charge_overlap": "{:,.2f}",
+                    "average_discharge_overlap": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander(
+            "Daily YTD walk-forward results"
+        ):
+            st.dataframe(
+                successful_ytd.sort_values(
+                    "target_day"
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if not failed_ytd.empty:
+        with st.expander(
+            f"Failed dates ({len(failed_ytd)})"
+        ):
+            st.dataframe(
+                failed_ytd[
+                    [
+                        "target_day",
+                        "as_of_day",
+                        "error",
+                    ]
+                ].sort_values("target_day"),
+                use_container_width=True,
+                hide_index=True,
+            )
+else:
+    st.info(
+        "No YTD dates have been processed yet. Start with a small batch "
+        "to validate the APIs, then continue until the selected range is "
+        "complete."
     )
 
 
