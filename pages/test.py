@@ -47,6 +47,14 @@ MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 ESIOS_API_BASE = "https://api.esios.ree.es/indicators"
 REDATA_DEMAND_URL = "https://apidatos.ree.es/es/datos/demanda/evolucion"
+REDATA_REALTIME_DEMAND_URL = (
+    "https://apidatos.ree.es/es/datos/demanda/demanda-tiempo-real"
+)
+
+# Official System Operator D+1 demand forecast. Indicator 1775 is the daily
+# D+1 forecast snapshot intended for the day-ahead horizon. The public REData
+# real-time forecast is used as a no-token fallback when available.
+REE_D1_DEMAND_FORECAST_INDICATOR_ID = 1775
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
@@ -884,6 +892,166 @@ def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFram
     )
 
 
+@st.cache_data(show_spinner=False, ttl=900)
+def load_ree_official_demand_forecast(
+    target_day: date,
+    _token: str,
+) -> dict:
+    """
+    Load the official REE demand forecast for the selected delivery day.
+
+    Priority:
+    1. ESIOS indicator 1775: daily D+1 demand forecast.
+    2. Public REData ``demanda-tiempo-real`` forecast series.
+
+    The function never stops the app: an unavailable REE curve is returned as
+    an empty dataframe and the proprietary model can still be executed.
+    """
+    expected = pd.DataFrame(
+        {
+            "datetime": pd.date_range(
+                start=pd.Timestamp(target_day),
+                periods=24,
+                freq="h",
+            )
+        }
+    )
+
+    errors = []
+
+    # -----------------------------------------------------
+    # Source 1: ESIOS daily D+1 demand forecast, indicator 1775
+    # -----------------------------------------------------
+    try:
+        start_local = pd.Timestamp(target_day, tz="Europe/Madrid")
+        end_local = pd.Timestamp(
+            target_day + timedelta(days=1),
+            tz="Europe/Madrid",
+        )
+        response = requests.get(
+            (
+                f"{ESIOS_API_BASE}/"
+                f"{REE_D1_DEMAND_FORECAST_INDICATOR_ID}"
+            ),
+            headers=esios_headers(_token),
+            params={
+                "start_date": start_local.tz_convert("UTC").strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "end_date": end_local.tz_convert("UTC").strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "time_trunc": "hour",
+                "time_agg": "average",
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        parsed = parse_esios_values(response.json())
+
+        if not parsed.empty:
+            official = (
+                parsed.groupby("datetime", as_index=False)["value"]
+                .mean()
+                .rename(columns={"value": "ree_forecast_mw"})
+            )
+            official = expected.merge(
+                official,
+                on="datetime",
+                how="left",
+            )
+            official["ree_forecast_mw"] = pd.to_numeric(
+                official["ree_forecast_mw"],
+                errors="coerce",
+            ).interpolate(limit_direction="both")
+
+            if official["ree_forecast_mw"].notna().sum() >= 23:
+                return {
+                    "forecast": official,
+                    "source": "ESIOS indicator 1775 — REE D+1 forecast",
+                    "available": True,
+                    "error": "",
+                }
+    except Exception as exc:
+        errors.append(f"ESIOS 1775: {type(exc).__name__}: {exc}")
+
+    # -----------------------------------------------------
+    # Source 2: public REData real-time demand widget
+    # -----------------------------------------------------
+    try:
+        response = requests.get(
+            REDATA_REALTIME_DEMAND_URL,
+            params={
+                "start_date": f"{target_day.isoformat()}T00:00",
+                "end_date": f"{target_day.isoformat()}T23:59",
+                "time_trunc": "hour",
+                "geo_trunc": "electric_system",
+                "geo_limit": "peninsular",
+                "geo_ids": "8741",
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        raw = parse_redata_hourly(response.json())
+
+        if not raw.empty:
+            normalised_title = (
+                raw["title"]
+                .astype(str)
+                .str.lower()
+                .str.normalize("NFKD")
+                .str.encode("ascii", errors="ignore")
+                .str.decode("utf-8")
+            )
+            forecast_rows = raw[
+                normalised_title.str.contains(
+                    "demanda prevista|forecast demand|forecast",
+                    regex=True,
+                    na=False,
+                )
+            ].copy()
+
+            if not forecast_rows.empty:
+                official = (
+                    forecast_rows.groupby("datetime", as_index=False)["value"]
+                    .mean()
+                    .rename(columns={"value": "ree_forecast_mw"})
+                )
+                official["datetime"] = pd.to_datetime(
+                    official["datetime"],
+                    errors="coerce",
+                ).dt.floor("h")
+                official = expected.merge(
+                    official,
+                    on="datetime",
+                    how="left",
+                )
+                official["ree_forecast_mw"] = pd.to_numeric(
+                    official["ree_forecast_mw"],
+                    errors="coerce",
+                ).interpolate(limit_direction="both")
+
+                if official["ree_forecast_mw"].notna().sum() >= 23:
+                    return {
+                        "forecast": official,
+                        "source": (
+                            "REData demanda-tiempo-real — "
+                            "official REE forecast"
+                        ),
+                        "available": True,
+                        "error": "",
+                    }
+    except Exception as exc:
+        errors.append(f"REData: {type(exc).__name__}: {exc}")
+
+    return {
+        "forecast": expected.assign(ree_forecast_mw=np.nan),
+        "source": "REE forecast unavailable",
+        "available": False,
+        "error": " | ".join(errors),
+    }
+
+
 def _weighted_hourly_temperature(
     payload,
     points: list[dict],
@@ -1318,83 +1486,141 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
 
 
 def build_day_ahead_chart(forecast: pd.DataFrame):
-    band = alt.Chart(forecast).mark_area(opacity=0.16, color=CORP_GREEN).encode(
-        x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
-        y=alt.Y("p10_mw:Q", title="Demand (MW)", scale=alt.Scale(zero=False)),
+    band = alt.Chart(forecast).mark_area(
+        opacity=0.16,
+        color=CORP_GREEN,
+    ).encode(
+        x=alt.X(
+            "datetime:T",
+            title=None,
+            axis=alt.Axis(format="%H:%M", labelAngle=0),
+        ),
+        y=alt.Y(
+            "p10_mw:Q",
+            title="Demand (MW)",
+            scale=alt.Scale(zero=False),
+        ),
         y2="p90_mw:Q",
     )
 
-    lines = pd.concat([
-        forecast[["datetime", "forecast_mw"]]
-        .rename(columns={"forecast_mw": "value"})
-        .assign(series="Model forecast"),
+    series_specs = [
+        (
+            "forecast_mw",
+            "Model forecast",
+            "#0F766E",
+            [1, 0],
+        ),
+        (
+            "ree_forecast_mw",
+            "REE official D+1 forecast",
+            "#22C55E",
+            [4, 2],
+        ),
+        (
+            "trend_adjusted_lag_7d",
+            "Previous week + recent trend",
+            "#F97316",
+            [8, 3],
+        ),
+        (
+            "lag_7d",
+            "Same weekday previous week",
+            "#64748B",
+            [5, 3],
+        ),
+        (
+            "lag_2d",
+            "D-2 actual reference",
+            "#93C5FD",
+            [2, 2],
+        ),
+    ]
 
-        forecast[["datetime", "trend_adjusted_lag_7d"]]
-        .rename(columns={"trend_adjusted_lag_7d": "value"})
-        .assign(series="Previous week + recent trend"),
+    frames = []
+    domain = []
+    colour_range = []
+    dash_range = []
 
-        forecast[["datetime", "lag_7d"]]
-        .rename(columns={"lag_7d": "value"})
-        .assign(series="Same weekday previous week"),
+    for column, label, colour, dash in series_specs:
+        if column not in forecast.columns:
+            continue
 
-        forecast[["datetime", "lag_2d"]]
-        .rename(columns={"lag_2d": "value"})
-        .assign(series="D-2 actual reference"),
-    ], ignore_index=True)
+        frame = forecast[["datetime", column]].copy()
+        frame[column] = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        )
+        frame = frame.dropna(subset=[column])
+        if frame.empty:
+            continue
+
+        frames.append(
+            frame.rename(columns={column: "value"}).assign(
+                series=label
+            )
+        )
+        domain.append(label)
+        colour_range.append(colour)
+        dash_range.append(dash)
+
+    if not frames:
+        return configure_chart(band, height=430)
+
+    lines = pd.concat(frames, ignore_index=True)
 
     chart = alt.Chart(lines).mark_line(strokeWidth=3).encode(
-        x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
-        y=alt.Y("value:Q", title="Demand (MW)", scale=alt.Scale(zero=False)),
+        x=alt.X(
+            "datetime:T",
+            title=None,
+            axis=alt.Axis(format="%H:%M", labelAngle=0),
+        ),
+        y=alt.Y(
+            "value:Q",
+            title="Demand (MW)",
+            scale=alt.Scale(zero=False),
+        ),
         color=alt.Color(
             "series:N",
             title="Forecast series",
             scale=alt.Scale(
-                domain=[
-                    "Model forecast",
-                    "Previous week + recent trend",
-                    "Same weekday previous week",
-                    "D-2 actual reference",
-                ],
-                range=[
-                    "#22C55E",
-                    "#F97316",
-                    "#64748B",
-                    "#93C5FD",
-                ],
+                domain=domain,
+                range=colour_range,
             ),
             legend=alt.Legend(
                 orient="top",
                 direction="horizontal",
-                columns=4,
-                labelLimit=360,
+                columns=3,
+                labelLimit=380,
                 titleLimit=240,
-                symbolLimit=360,
+                symbolLimit=380,
             ),
         ),
         strokeDash=alt.StrokeDash(
-            "series:N", legend=None,
+            "series:N",
+            legend=None,
             scale=alt.Scale(
-                domain=[
-                    "Model forecast",
-                    "Previous week + recent trend",
-                    "Same weekday previous week",
-                    "D-2 actual reference",
-                ],
-                range=[
-                    [1, 0],
-                    [8, 3],
-                    [5, 3],
-                    [2, 2],
-                ],
+                domain=domain,
+                range=dash_range,
             ),
         ),
         tooltip=[
-            alt.Tooltip("datetime:T", title="Hour", format="%d-%m-%Y %H:%M"),
+            alt.Tooltip(
+                "datetime:T",
+                title="Hour",
+                format="%d-%m-%Y %H:%M",
+            ),
             alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("value:Q", title="Demand", format=",.0f"),
+            alt.Tooltip(
+                "value:Q",
+                title="Demand",
+                format=",.0f",
+            ),
         ],
     )
-    return configure_chart(alt.layer(band, chart), height=430)
+    return configure_chart(
+        alt.layer(band, chart),
+        height=430,
+    )
 
 
 def build_backtest_chart(backtest: pd.DataFrame):
@@ -7502,7 +7728,8 @@ with fc4:
     downstream_demand_source = st.selectbox(
         "Demand used for thermal gap",
         [
-            "Model forecast — green",
+            "Model forecast — dark green",
+            "REE official D+1 forecast — bright green",
             "Previous week + recent trend — orange",
         ],
         index=0,
@@ -7574,11 +7801,40 @@ if st.button(
 
         forecast_for_market = demand_result["forecast"].copy()
 
+        ree_demand_result = load_ree_official_demand_forecast(
+            forecast_target_day,
+            token,
+        )
+        ree_demand_forecast = ree_demand_result["forecast"]
+        forecast_for_market = forecast_for_market.merge(
+            ree_demand_forecast,
+            on="datetime",
+            how="left",
+        )
+
         if downstream_demand_source.startswith("Model"):
             forecast_for_market["selected_demand_mw"] = (
                 forecast_for_market["forecast_mw"]
             )
-            demand_source_label = "Model forecast — green"
+            demand_source_label = "Model forecast — dark green"
+        elif downstream_demand_source.startswith("REE"):
+            if (
+                not ree_demand_result["available"]
+                or forecast_for_market[
+                    "ree_forecast_mw"
+                ].notna().sum() < 23
+            ):
+                raise ValueError(
+                    "The official REE D+1 demand forecast is not available "
+                    "for the selected delivery day yet. Select the model "
+                    "forecast or rerun after REE publishes the D+1 curve."
+                )
+            forecast_for_market["selected_demand_mw"] = (
+                forecast_for_market["ree_forecast_mw"]
+            )
+            demand_source_label = (
+                "REE official D+1 forecast — bright green"
+            )
         else:
             forecast_for_market["selected_demand_mw"] = (
                 forecast_for_market[
@@ -7619,7 +7875,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v16_2"] = {
+        st.session_state["day_ahead_result_v16_3"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -7629,6 +7885,9 @@ if st.button(
             "target_day": forecast_target_day,
             "as_of_day": forecast_as_of_day,
             "weather_input_label": weather_input_label,
+            "ree_demand_source": ree_demand_result["source"],
+            "ree_demand_available": ree_demand_result["available"],
+            "ree_demand_error": ree_demand_result["error"],
             "generation_technologies": list(
                 forecast_generation_technologies
             ),
@@ -7637,17 +7896,52 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v16_2")
+forecast_result = st.session_state.get("day_ahead_result_v16_3")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
     minimum = forecast_df.loc[forecast_df["forecast_mw"].idxmin()]
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Forecast average", f"{forecast_df['forecast_mw'].mean():,.0f} MW")
-    m2.metric("Forecast peak", f"{peak['forecast_mw']:,.0f} MW", delta=f"{int(peak['hour']):02d}:00", delta_color="off")
-    m3.metric("Forecast minimum", f"{minimum['forecast_mw']:,.0f} MW", delta=f"{int(minimum['hour']):02d}:00", delta_color="off")
-    m4.metric("Forecast temperature", f"{forecast_df['temperature_c'].mean():,.1f} °C")
+    ree_available = (
+        "ree_forecast_mw" in forecast_df.columns
+        and forecast_df["ree_forecast_mw"].notna().sum() >= 23
+    )
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric(
+        "Model average",
+        f"{forecast_df['forecast_mw'].mean():,.0f} MW",
+    )
+    m2.metric(
+        "Model peak",
+        f"{peak['forecast_mw']:,.0f} MW",
+        delta=f"{int(peak['hour']):02d}:00",
+        delta_color="off",
+    )
+    m3.metric(
+        "Model minimum",
+        f"{minimum['forecast_mw']:,.0f} MW",
+        delta=f"{int(minimum['hour']):02d}:00",
+        delta_color="off",
+    )
+    m4.metric(
+        "REE official average",
+        (
+            f"{forecast_df['ree_forecast_mw'].mean():,.0f} MW"
+            if ree_available
+            else "Unavailable"
+        ),
+        delta=(
+            f"{forecast_df['ree_forecast_mw'].mean() - forecast_df['forecast_mw'].mean():+,.0f} MW vs model"
+            if ree_available
+            else None
+        ),
+        delta_color="off",
+    )
+    m5.metric(
+        "Forecast temperature",
+        f"{forecast_df['temperature_c'].mean():,.1f} °C",
+    )
 
     st.markdown(
         """
@@ -7661,7 +7955,8 @@ if forecast_result:
             font-size:0.88rem;
             font-weight:650;
         ">
-          <span><span style="display:inline-block;width:30px;border-top:3px solid #22C55E;margin-right:7px;vertical-align:middle;"></span>Model forecast</span>
+          <span><span style="display:inline-block;width:30px;border-top:3px solid #0F766E;margin-right:7px;vertical-align:middle;"></span>Model forecast</span>
+          <span><span style="display:inline-block;width:30px;border-top:3px dashed #22C55E;margin-right:7px;vertical-align:middle;"></span>REE official D+1 forecast</span>
           <span><span style="display:inline-block;width:30px;border-top:3px dashed #F97316;margin-right:7px;vertical-align:middle;"></span>Previous week + recent trend</span>
           <span><span style="display:inline-block;width:30px;border-top:3px dashed #64748B;margin-right:7px;vertical-align:middle;"></span>Same weekday previous week</span>
           <span><span style="display:inline-block;width:30px;border-top:3px dotted #93C5FD;margin-right:7px;vertical-align:middle;"></span>D-2 actual reference</span>
@@ -7670,7 +7965,27 @@ if forecast_result:
         """,
         unsafe_allow_html=True,
     )
-    st.altair_chart(build_day_ahead_chart(forecast_df), use_container_width=True)
+    st.altair_chart(
+        build_day_ahead_chart(forecast_df),
+        use_container_width=True,
+    )
+
+    if forecast_result.get("ree_demand_available", False):
+        model_vs_ree_mae = (
+            forecast_df["forecast_mw"]
+            - forecast_df["ree_forecast_mw"]
+        ).abs().mean()
+        st.caption(
+            "Official REE demand source: "
+            f"{forecast_result.get('ree_demand_source')}. "
+            f"Mean absolute difference between our model and REE: "
+            f"{model_vs_ree_mae:,.0f} MW."
+        )
+    else:
+        st.info(
+            "The official REE D+1 curve is not available for this run. "
+            "The proprietary demand forecast remains available."
+        )
 
     average_trend = forecast_df["recent_weekly_trend_mw"].mean()
     evening_mask = forecast_df["hour"].between(18, 22)
