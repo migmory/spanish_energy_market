@@ -28,6 +28,7 @@ pg = st.navigation(
             st.Page("pages/3_BESS.py", title="BESS", icon="🔋"),
             st.Page("pages/4_Email_Report.py", title="Email Report", icon="📨"),
             st.Page("pages/5_MIBGAS.py", title="MIBGAS", icon="🔥"),
+            st.Page("pages/9_Day-Ahead_forecast.py", title="MIBGAS", icon="🎯"),
             st.Page("pages/test.py", title="test", icon="🧪"),
             st.Page("pages/test2.py", title="test2", icon="🧪"),
         ],
@@ -36,6 +37,7 @@ pg = st.navigation(
         ],
         "Hedging": [
             st.Page("pages/7_PPA_DASS_Settlements.py", title="Solar PPA & DASS Settlements", icon="🛡️"),
+            st.Page("pages/8_Hybrid_PPA.py", title="Hybrid PPA (solar + BESS) Settlements", icon="🔰"),
         ],
     }
 )
