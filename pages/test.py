@@ -161,6 +161,12 @@ DA_GAP_PERIMETER = (
     "DA residual demand minus non-bilateral low-marginal-cost PBF generation"
 )
 
+# No fixed 8.7/9 GW self-consumption plant is added to, or deducted from, the
+# thermal gap. Installed power is not hourly generation. Any future explicit
+# self-consumption adjustment must be an hourly production estimate and must
+# be applied only to a demand curve whose published perimeter includes it.
+EXPLICIT_SELF_CONSUMPTION_ADJUSTMENT_ENABLED = False
+
 # Gross PBF technology indicators.
 FORECAST_NON_THERMAL_INDICATORS = {
     "Hydro UGH": [1],
@@ -3742,6 +3748,10 @@ def generate_thermal_gap_forecast(
         np.nan,
     )
 
+    # Explicit confirmation for diagnostics/exports: the model does not add or
+    # subtract a fixed self-consumption capacity or generation profile.
+    forecast["explicit_self_consumption_adjustment_mwh"] = 0.0
+
     # Price-relevant DA structural thermal gap:
     # residual DA demand minus non-bilateral low-MC generation.
     # Hydro UGH remains dispatchable and is not deducted.
@@ -4835,13 +4845,57 @@ def empirical_similar_gap_price_reference(
         target_gap = float(row.thermal_gap_mwh)
         target_hour = int(row.hour)
         target_weekend = int(row.is_weekend)
+        target_holiday = int(getattr(row, "is_holiday", 0))
+        target_month = int(getattr(row, "month", 1))
 
-        candidates = history[
-            history["is_weekend"] == target_weekend
-        ].copy()
+        # First preserve the target day type. Holidays are compared with other
+        # holidays where enough observations exist; otherwise weekend/weekday
+        # status is retained.
+        if target_holiday:
+            holiday_candidates = history[
+                history["is_holiday"] == 1
+            ].copy()
+            candidates = (
+                holiday_candidates
+                if len(holiday_candidates) >= 35
+                else history[
+                    history["is_weekend"] == target_weekend
+                ].copy()
+            )
+        else:
+            candidates = history[
+                (history["is_weekend"] == target_weekend)
+                & (history["is_holiday"] == 0)
+            ].copy()
 
         if len(candidates) < 50:
+            candidates = history[
+                history["is_weekend"] == target_weekend
+            ].copy()
+        if len(candidates) < 50:
             candidates = history.copy()
+
+        month_distance = (
+            candidates["month"] - target_month
+        ).abs()
+        candidates["month_distance"] = np.minimum(
+            month_distance,
+            12 - month_distance,
+        )
+
+        # Prefer the same season. December low-gap hours should not be matched
+        # predominantly with May-August solar-surplus observations.
+        same_season = candidates[
+            candidates["month_distance"] <= 1
+        ].copy()
+        if len(same_season) >= 45:
+            candidates = same_season
+        else:
+            nearby_season = candidates[
+                candidates["month_distance"] <= 2
+            ].copy()
+            if len(nearby_season) >= 45:
+                candidates = nearby_season
 
         hour_distance = (
             candidates["hour"] - target_hour
@@ -4865,6 +4919,7 @@ def empirical_similar_gap_price_reference(
         candidates["distance_score"] = (
             candidates["gap_distance"] / gap_scale
             + candidates["hour_distance"] / 3.0
+            + candidates["month_distance"] / 2.0
         )
 
         # Where available, prefer historical observations with a similar D-1
@@ -4990,9 +5045,10 @@ def blend_model_with_empirical_low_gap_reference(
         1.0,
     )
 
-    # Normal hours remain almost entirely model-driven. Very low-gap hours
-    # receive up to 45% empirical calibration.
-    blend_weight = 0.05 + 0.40 * severity
+    # Normal hours remain mostly model-driven. Very low-gap hours receive up
+    # to 65% empirical calibration. Candidate selection is now seasonal, so a
+    # winter low-gap hour is not pulled toward a summer zero-price regime.
+    blend_weight = 0.08 + 0.57 * severity
 
     empirical_median = pd.to_numeric(
         empirical["conditional_price_median_eur_mwh"],
@@ -5084,11 +5140,12 @@ def recent_price_guardrails(
     hours = target["hour"].to_numpy(dtype=int)
     evening_or_night = (hours >= 18) | (hours <= 6)
 
-    # Positive residuals are shrunk more aggressively overnight/evening.
+    # Preserve more of the modelled evening residual. The previous setting
+    # systematically flattened the 19:00-22:00 ramp and understated TB4.
     positive_shrink = np.where(
         evening_or_night,
-        0.30 + 0.40 * shock_strength,
-        0.48 + 0.32 * shock_strength,
+        0.45 + 0.45 * shock_strength,
+        0.52 + 0.38 * shock_strength,
     )
     negative_shrink = np.where(
         evening_or_night,
@@ -5143,12 +5200,12 @@ def recent_price_guardrails(
         dtype=float
     )
 
-    # Allow only a modest buffer above recent references unless tomorrow's
-    # thermal gap is genuinely higher. 3 EUR/MWh per additional GW, capped.
+    # Allow a clearer evening scarcity premium when tomorrow's residual gap is
+    # genuinely higher than D-1/D-7. The former allowance capped valid peaks.
     gap_uplift_allowance = np.clip(
-        np.maximum(gap_shock, 0.0) * 0.003,
+        np.maximum(gap_shock, 0.0) * 0.0045,
         0.0,
-        22.0,
+        32.0,
     )
 
     # A higher D-1 MIBGAS price can justify a higher CCGT-linked electricity
@@ -5167,7 +5224,7 @@ def recent_price_guardrails(
         20.0,
     )
 
-    base_buffer = np.where(evening_or_night, 4.0, 6.0)
+    base_buffer = np.where(evening_or_night, 9.0, 7.0)
     upper_guardrail = (
         recent_upper
         + base_buffer
@@ -5329,43 +5386,34 @@ def apply_negative_gap_soft_calibration(
         .to_numpy(dtype=float)
     )
 
-    # The compression rises gradually and reaches its maximum only from about
-    # -3.5 GW. Slightly negative gaps remain almost entirely model-driven.
+    # Compression rises gradually and reaches maximum only from about -5 GW.
+    # A mildly negative gap should not create an artificial winter collapse.
     severity = np.clip(
-        negative_gap_abs / 3_500.0,
+        negative_gap_abs / 5_000.0,
         0.0,
         1.0,
     )
 
-    # At maximum severity, retain 30% of the recent reference plus an 8 €/MWh
-    # buffer. This is intentionally much less restrictive than the former
-    # near-zero exponential cap.
+    # At maximum severity retain half of the recent/seasonal reference plus a
+    # 10 EUR/MWh buffer. Extreme summer surplus can still produce low prices,
+    # while winter gaps do not automatically collapse to 40 EUR/MWh.
     soft_cap = (
-        8.0
+        10.0
         + recent_reference
-        * (1.0 - 0.70 * severity)
+        * (1.0 - 0.50 * severity)
     )
 
-    # Never impose a cap below the historical lower quartile observed at
-    # similar gaps. Conversely, the similar-gap P75 provides a reasonable
-    # ceiling reference when recent daily lags are unusually low.
+    # Do not push the cap below the seasonal similar-gap P25. The former P75
+    # floor was counterproductive: it prevented summer midday prices from
+    # falling sufficiently and produced a poor July capture/spread fit.
     empirical_p25_values = empirical_p25.to_numpy(dtype=float)
-    empirical_p75_values = empirical_p75.to_numpy(dtype=float)
 
     soft_cap = np.where(
         np.isfinite(empirical_p25_values),
         np.maximum(soft_cap, empirical_p25_values),
         soft_cap,
     )
-    soft_cap = np.where(
-        np.isfinite(empirical_p75_values),
-        np.maximum(
-            soft_cap,
-            0.85 * empirical_p75_values,
-        ),
-        soft_cap,
-    )
-    soft_cap = np.maximum(soft_cap, 8.0)
+    soft_cap = np.maximum(soft_cap, 10.0)
 
     calibrated = prices.copy()
     calibrated[negative_mask] = np.minimum(
@@ -5410,6 +5458,176 @@ def apply_negative_gap_soft_calibration(
     )
 
     return np.maximum(calibrated, 0.0), diagnostics
+
+
+def apply_seasonal_intraday_shape_calibration(
+    forecast_prices,
+    historical_data: pd.DataFrame,
+    target_data: pd.DataFrame,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    Calibrate the 24-hour shape using historical days from the same season and
+    day type, while preserving the forecast daily price level.
+
+    This addresses two recurrent shape errors:
+      - excessive winter midday collapses;
+      - summer evening peaks that are too flat and solar troughs that are too
+        shallow.
+
+    Historical prices are normalised by each day's baseload before taking the
+    median hourly shape, so the calibration changes the curve shape rather than
+    mechanically copying an old price level.
+    """
+    raw = np.maximum(
+        np.asarray(forecast_prices, dtype=float),
+        0.0,
+    )
+    diagnostics = pd.DataFrame(
+        index=target_data.index,
+    )
+
+    if historical_data is None or historical_data.empty:
+        diagnostics["seasonal_shape_applied"] = False
+        return raw, diagnostics
+
+    history = historical_data.copy()
+    required = {
+        "date",
+        "hour",
+        "month",
+        "is_weekend",
+        "is_holiday",
+        "price_eur_mwh",
+    }
+    if required.difference(history.columns):
+        diagnostics["seasonal_shape_applied"] = False
+        return raw, diagnostics
+
+    target_month = int(target_data["month"].iloc[0])
+    target_weekend = int(target_data["is_weekend"].iloc[0])
+    target_holiday = int(target_data["is_holiday"].iloc[0])
+
+    month_distance = (
+        history["month"] - target_month
+    ).abs()
+    history["month_distance"] = np.minimum(
+        month_distance,
+        12 - month_distance,
+    )
+
+    if target_holiday:
+        candidates = history[
+            (history["is_holiday"] == 1)
+            & (history["month_distance"] <= 2)
+        ].copy()
+    else:
+        candidates = history[
+            (history["is_holiday"] == 0)
+            & (history["is_weekend"] == target_weekend)
+            & (history["month_distance"] <= 1)
+        ].copy()
+
+    candidate_days = candidates["date"].nunique()
+    if candidate_days < 8:
+        candidates = history[
+            (history["is_weekend"] == target_weekend)
+            & (history["month_distance"] <= 2)
+        ].copy()
+        candidate_days = candidates["date"].nunique()
+
+    if candidate_days < 6:
+        diagnostics["seasonal_shape_applied"] = False
+        diagnostics["seasonal_shape_candidate_days"] = candidate_days
+        return raw, diagnostics
+
+    candidates["price_eur_mwh"] = pd.to_numeric(
+        candidates["price_eur_mwh"],
+        errors="coerce",
+    )
+    daily_baseload = (
+        candidates.groupby("date")["price_eur_mwh"]
+        .mean()
+        .rename("daily_baseload")
+    )
+    candidates = candidates.merge(
+        daily_baseload,
+        on="date",
+        how="left",
+    )
+    candidates = candidates[
+        candidates["daily_baseload"] > 5.0
+    ].copy()
+    candidates["normalised_shape"] = (
+        candidates["price_eur_mwh"]
+        / candidates["daily_baseload"]
+    ).clip(lower=0.0, upper=3.5)
+
+    hourly_shape = (
+        candidates.groupby("hour")["normalised_shape"]
+        .median()
+        .reindex(range(24))
+        .interpolate(limit_direction="both")
+    )
+
+    if hourly_shape.notna().sum() < 23:
+        diagnostics["seasonal_shape_applied"] = False
+        diagnostics["seasonal_shape_candidate_days"] = candidate_days
+        return raw, diagnostics
+
+    target_hours = target_data["hour"].to_numpy(dtype=int)
+    shape_factor = hourly_shape.reindex(
+        target_hours
+    ).to_numpy(dtype=float)
+
+    # Preserve the modelled baseload. Only the intraday profile is calibrated.
+    forecast_baseload = float(np.mean(raw))
+    shape_reference = np.maximum(
+        forecast_baseload * shape_factor,
+        0.0,
+    )
+
+    winter = target_month in {11, 12, 1, 2}
+    summer = target_month in {6, 7, 8}
+    base_weight = 0.48 if winter else (0.45 if summer else 0.32)
+    if target_holiday:
+        base_weight = min(base_weight + 0.07, 0.55)
+
+    # Preserve extreme negative-gap signals: seasonal shape should not erase a
+    # genuinely exceptional surplus hour.
+    negative_gap = np.maximum(
+        -pd.to_numeric(
+            target_data["thermal_gap_mwh"],
+            errors="coerce",
+        ).fillna(0.0).to_numpy(dtype=float),
+        0.0,
+    )
+    gap_severity = np.clip(
+        negative_gap / 6_000.0,
+        0.0,
+        1.0,
+    )
+    effective_weight = base_weight * (
+        1.0 - 0.55 * gap_severity
+    )
+
+    correction = shape_reference - raw
+    # Avoid one calibration step creating unrealistic jumps.
+    correction = np.clip(correction, -45.0, 45.0)
+    calibrated = raw + effective_weight * correction
+    calibrated = np.maximum(calibrated, 0.0)
+
+    diagnostics["seasonal_shape_reference_eur_mwh"] = shape_reference
+    diagnostics["seasonal_shape_factor"] = shape_factor
+    diagnostics["seasonal_shape_weight_pct"] = effective_weight * 100.0
+    diagnostics["seasonal_shape_correction_eur_mwh"] = (
+        calibrated - raw
+    )
+    diagnostics["seasonal_shape_candidate_days"] = candidate_days
+    diagnostics["seasonal_shape_applied"] = (
+        np.abs(calibrated - raw) > 1e-6
+    )
+
+    return calibrated, diagnostics
 
 
 def generate_price_forecast(
@@ -5632,6 +5850,24 @@ def generate_price_forecast(
         )
     )
 
+    # Finally calibrate the 24-hour shape using comparable seasonal days.
+    # This preserves the target baseload while correcting excessive winter
+    # troughs and flattened summer evening ramps.
+    validation_final, validation_seasonal_shape = (
+        apply_seasonal_intraday_shape_calibration(
+            validation_final,
+            train if not train.empty else model_data,
+            validation,
+        )
+    )
+    target_final, target_seasonal_shape = (
+        apply_seasonal_intraday_shape_calibration(
+            target_final,
+            model_data,
+            target_data,
+        )
+    )
+
     cap = model_data["price_eur_mwh"].quantile(0.997)
     if pd.notna(cap):
         target_final = np.minimum(
@@ -5680,6 +5916,15 @@ def generate_price_forecast(
         for column in target_negative_gap.columns:
             output[column] = (
                 target_negative_gap[column].to_numpy()
+            )
+
+    if (
+        target_seasonal_shape is not None
+        and not target_seasonal_shape.empty
+    ):
+        for column in target_seasonal_shape.columns:
+            output[column] = (
+                target_seasonal_shape[column].to_numpy()
             )
 
     return {
@@ -8357,7 +8602,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v16_6_soft_gap_demand_lines"] = {
+        st.session_state["day_ahead_result_v16_7_seasonal_price_shape"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -8378,7 +8623,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v16_6_soft_gap_demand_lines")
+forecast_result = st.session_state.get("day_ahead_result_v16_7_seasonal_price_shape")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -8507,7 +8752,9 @@ if forecast_result:
             "deducting the bilateral programme. The stacked area is "
             "non-bilateral low-marginal-cost PBF generation. The thermal gap "
             "and price model use the dashed green DA-residual demand, not the "
-            "solid total-demand line. Base total-demand source: "
+            "solid total-demand line. No fixed 8.7/9 GW self-consumption "
+            "plant is added to or deducted from this gap; the explicit "
+            "self-consumption adjustment is 0 MW. Base total-demand source: "
             f"{forecast_result.get('demand_source_label', 'Model forecast')}."
         )
 
@@ -8760,11 +9007,13 @@ if forecast_result:
             f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
             "unadjusted price anchor. Absolute values are anchored in the "
             "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. A negative thermal gap now applies only a "
-            "soft dynamic cap based on the depth of the gap, recent same-hour "
-            "prices and the empirical distribution observed at similar gaps. "
-            "Slightly negative gaps remain mostly model-driven and no negative "
-            "gap is automatically forced to zero. "
+            "same-hour profile. Similar-gap observations are filtered by "
+            "season and day type, preventing winter hours from being calibrated "
+            "against summer solar-surplus regimes. A negative gap applies only "
+            "a soft dynamic cap, and a final normalised seasonal shape "
+            "calibration preserves baseload while correcting winter troughs "
+            "and summer evening ramps. No negative gap is automatically forced "
+            "to zero. "
             "Positive model residuals are also shrunk—especially "
             "during evening and night hours—and cannot exceed all recent "
             "references by a material amount unless the forecast thermal gap "
@@ -9452,6 +9701,12 @@ if forecast_result:
             "negative_gap_price_before_calibration_eur_mwh",
             "negative_gap_price_compression_eur_mwh",
             "negative_gap_soft_cap_applied",
+            "seasonal_shape_reference_eur_mwh",
+            "seasonal_shape_factor",
+            "seasonal_shape_weight_pct",
+            "seasonal_shape_correction_eur_mwh",
+            "seasonal_shape_candidate_days",
+            "seasonal_shape_applied",
         ]
 
         available_price_output_columns = [
