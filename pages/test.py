@@ -147,7 +147,19 @@ PBF_COLOR_RANGE = [
 # DOWNSTREAM MARKET FORECAST
 # =========================================================
 PRICE_INDICATOR_ID = 600
+
+# Total programmed PBF demand: daily-market acquisitions plus physical
+# bilateral acquisitions.
 PBF_DEMAND_INDICATOR_ID = 10141
+
+# Total physical bilateral sales in the PBF. At system level these sales have
+# an equivalent acquisition side, so they are deducted from total PBF demand
+# to estimate demand exposed to the day-ahead auction.
+PBF_TOTAL_BILATERAL_SALES_INDICATOR_ID = 10235
+
+DA_GAP_PERIMETER = (
+    "DA residual demand minus non-bilateral low-marginal-cost PBF generation"
+)
 
 # Gross PBF technology indicators.
 FORECAST_NON_THERMAL_INDICATORS = {
@@ -160,8 +172,10 @@ FORECAST_NON_THERMAL_INDICATORS = {
     "Other renewables": [10074],
 }
 
-# Bilateral programmes must be deducted from gross PBF to obtain the net
-# programme that is comparable with the price-setting thermal-gap definition.
+# Physical bilateral generation is deducted from total PBF generation by
+# technology. The resulting series is the generation volume still exposed to
+# the day-ahead market. The matching bilateral demand is deducted separately
+# through indicator 10235.
 FORECAST_BILATERAL_INDICATORS = {
     "Hydro UGH": [421],
     "Wind": [432, 433],
@@ -466,10 +480,20 @@ EMBEDDED_D1_CALIBRATION_RECORDS = [{'hour': 0,
   'actual_thermal_gap_mwh': 13159.2,
   'price_eur_mwh': 70.573}]
 
-# The forecast remains driven by the model, but is moderately anchored in the
-# latest complete PBF day to avoid abrupt, implausible level shifts.
+# The forecast remains model-driven but is anchored in the latest complete
+# non-bilateral PBF profile. Stable technologies receive a stronger anchor.
 D1_DEMAND_BLEND_WEIGHT = 0.25
 D1_GENERATION_BLEND_WEIGHT = 0.20
+
+GENERATION_D1_BLEND_WEIGHTS = {
+    "Nuclear": 0.80,
+    "Other renewables": 0.65,
+    "Run-of-river": 0.55,
+    "Hydro UGH": 0.45,
+    "Wind": 0.35,
+    "Solar PV": 0.30,
+    "Solar thermal": 0.35,
+}
 
 
 GENERATION_WEATHER_VARIABLES = [
@@ -2676,13 +2700,13 @@ def load_forecast_pbf_history(
     _token: str,
 ) -> pd.DataFrame:
     """
-    Load NET PBF generation by technology:
+    Load the non-bilateral PBF programme by technology:
 
-        net PBF = gross PBF - bilateral PBF
+        generation exposed to DA = total PBF - bilateral PBF
 
-    This is the same perimeter used by the user's historical thermal-gap
-    export. Using gross PBF would materially overstate nuclear and wind
-    generation available to the market and can create artificial negative gaps.
+    This is the low-marginal-cost generation volume that remains exposed to
+    the day-ahead auction. Consistency requires deducting total bilateral sales
+    from PBF demand as well; that adjustment is made separately below.
     """
     results = []
 
@@ -2859,6 +2883,171 @@ def load_pbf_demand_history(
     )
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_total_bilateral_sales_history(
+    start_day: date,
+    end_day: date,
+    _token: str,
+) -> pd.DataFrame:
+    """
+    Load the total PBF physical bilateral sales programme.
+
+    At system level, physical bilateral sales have a matching acquisition side.
+    This series is therefore used to remove bilateral demand from total PBF
+    demand before estimating the volume exposed to the day-ahead auction.
+    """
+    bilateral = fetch_one_pbf_indicator_hourly(
+        indicator_id=PBF_TOTAL_BILATERAL_SALES_INDICATOR_ID,
+        start_day=start_day,
+        end_day=end_day,
+        token=_token,
+    )
+    if bilateral.empty:
+        return pd.DataFrame(
+            columns=["datetime", "bilateral_sales_mwh"]
+        )
+
+    out = bilateral.rename(
+        columns={"energy_mwh": "bilateral_sales_mwh"}
+    )[["datetime", "bilateral_sales_mwh"]].copy()
+
+    out["datetime"] = pd.to_datetime(
+        out["datetime"],
+        errors="coerce",
+    ).dt.floor("h")
+    out["bilateral_sales_mwh"] = (
+        pd.to_numeric(
+            out["bilateral_sales_mwh"],
+            errors="coerce",
+        )
+        .clip(lower=0.0)
+    )
+
+    return (
+        out.dropna(subset=["datetime", "bilateral_sales_mwh"])
+        .sort_values("datetime")
+        .drop_duplicates("datetime", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def forecast_total_bilateral_sales(
+    target_day: date,
+    bilateral_history: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Forecast D+1 bilateral sales without using target-day information.
+
+    Bilateral nominations are typically persistent by weekday and hour. The
+    forecast combines D-1 with the same weekday in the previous four weeks.
+    Missing lags are handled through a recent same-weekday/hour median.
+    """
+    expected = pd.DataFrame(
+        {
+            "datetime": pd.date_range(
+                start=pd.Timestamp(target_day),
+                periods=24,
+                freq="h",
+            )
+        }
+    )
+    expected["date"] = expected["datetime"].dt.date
+    expected["hour"] = expected["datetime"].dt.hour
+
+    history = bilateral_history.copy()
+    history["datetime"] = pd.to_datetime(
+        history["datetime"],
+        errors="coerce",
+    )
+    history["date"] = history["datetime"].dt.date
+    history["hour"] = history["datetime"].dt.hour
+    history["dow"] = history["datetime"].dt.dayofweek
+    history["bilateral_sales_mwh"] = pd.to_numeric(
+        history["bilateral_sales_mwh"],
+        errors="coerce",
+    )
+    history = history.dropna(
+        subset=["date", "hour", "bilateral_sales_mwh"]
+    )
+
+    lookup = {
+        (row.date, int(row.hour)): float(row.bilateral_sales_mwh)
+        for row in history.itertuples(index=False)
+    }
+
+    for lag in [1, 7, 14, 21, 28]:
+        expected[f"bilateral_lag_{lag}d"] = [
+            lookup.get(
+                (delivery_date - timedelta(days=lag), int(hour)),
+                np.nan,
+            )
+            for delivery_date, hour in zip(
+                expected["date"],
+                expected["hour"],
+            )
+        ]
+
+    target_dow = pd.Timestamp(target_day).dayofweek
+    recent_start = target_day - timedelta(days=70)
+    recent = history[
+        (history["date"] >= recent_start)
+        & (history["date"] < target_day)
+        & (history["dow"] == target_dow)
+    ].copy()
+
+    same_weekday_median = (
+        recent.groupby("hour")["bilateral_sales_mwh"].median()
+        if not recent.empty
+        else pd.Series(dtype=float)
+    )
+    same_hour_median = (
+        history[
+            (history["date"] >= recent_start)
+            & (history["date"] < target_day)
+        ]
+        .groupby("hour")["bilateral_sales_mwh"]
+        .median()
+    )
+
+    expected["bilateral_same_weekday_median_mwh"] = (
+        expected["hour"].map(same_weekday_median)
+    )
+    expected["bilateral_same_hour_median_mwh"] = (
+        expected["hour"].map(same_hour_median)
+    )
+
+    weighted_columns = {
+        "bilateral_lag_1d": 0.15,
+        "bilateral_lag_7d": 0.40,
+        "bilateral_lag_14d": 0.20,
+        "bilateral_lag_21d": 0.10,
+        "bilateral_lag_28d": 0.05,
+        "bilateral_same_weekday_median_mwh": 0.10,
+    }
+
+    numerator = pd.Series(0.0, index=expected.index)
+    denominator = pd.Series(0.0, index=expected.index)
+
+    for column, weight in weighted_columns.items():
+        values = pd.to_numeric(expected[column], errors="coerce")
+        available = values.notna()
+        numerator = numerator + values.fillna(0.0) * weight
+        denominator = denominator + available.astype(float) * weight
+
+    expected["bilateral_sales_forecast_mwh"] = (
+        numerator
+        / denominator.replace(0.0, np.nan)
+    )
+    expected["bilateral_sales_forecast_mwh"] = (
+        expected["bilateral_sales_forecast_mwh"]
+        .fillna(expected["bilateral_same_hour_median_mwh"])
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+
+    return expected.sort_values("datetime").reset_index(drop=True)
+
+
 def embedded_d1_calibration(
     target_day: date,
 ) -> pd.DataFrame:
@@ -2902,10 +3091,19 @@ def build_previous_day_calibration(
     technologies: list[str],
     pbf_history: pd.DataFrame,
     pbf_demand_history: pd.DataFrame,
+    bilateral_sales_history: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Build the D-1 calibration profile from ESIOS, falling back to the supplied
-    16-Jul-2026 export when required.
+    Build a D-1 reference using one consistent day-ahead market perimeter:
+
+        DA residual demand
+        = total PBF demand - total bilateral sales
+
+        non-bilateral low-MC generation
+        = total PBF generation - bilateral generation by technology
+
+        DA structural thermal gap
+        = DA residual demand - non-bilateral low-MC generation
     """
     calibration_day = target_day - timedelta(days=1)
 
@@ -2915,74 +3113,76 @@ def build_previous_day_calibration(
     demand = pbf_demand_history[
         pbf_demand_history["datetime"].dt.date == calibration_day
     ].copy()
+    bilateral = bilateral_sales_history[
+        bilateral_sales_history["datetime"].dt.date == calibration_day
+    ].copy()
 
-    if not generation.empty and not demand.empty:
-        generation_wide = (
-            generation.pivot_table(
-                index="datetime",
-                columns="technology",
-                values="energy_mwh",
-                aggfunc="sum",
-            )
-            .reset_index()
+    if generation.empty or demand.empty or bilateral.empty:
+        # The legacy embedded profile has no total bilateral-demand series and
+        # is therefore not comparable with the corrected DA perimeter.
+        return pd.DataFrame()
+
+    generation_wide = (
+        generation.pivot_table(
+            index="datetime",
+            columns="technology",
+            values="energy_mwh",
+            aggfunc="sum",
         )
-        generation_wide.columns.name = None
-        out = demand.merge(
+        .reset_index()
+    )
+    generation_wide.columns.name = None
+
+    out = (
+        demand.merge(
+            bilateral[["datetime", "bilateral_sales_mwh"]],
+            on="datetime",
+            how="inner",
+        )
+        .merge(
             generation_wide,
             on="datetime",
             how="inner",
         )
-        out["hour"] = out["datetime"].dt.hour
-
-        structural_available = [
-            tech
-            for tech in technologies
-            if tech != "Hydro UGH"
-            and tech in out.columns
-        ]
-        out["non_thermal_net_mwh"] = out[
-            structural_available
-        ].sum(axis=1)
-        out["hydro_ugh_net_mwh"] = (
-            pd.to_numeric(
-                out["Hydro UGH"],
-                errors="coerce",
-            ).fillna(0.0)
-            if "Hydro UGH" in out.columns
-            else 0.0
-        )
-        out["actual_thermal_gap_mwh"] = (
-            out["pbf_demand_mwh"]
-            - out["non_thermal_net_mwh"]
-        )
-        out["calibration_source"] = (
-            "ESIOS D-1 structural net PBF"
-        )
-        return out.sort_values("datetime").reset_index(drop=True)
-
-    fallback = embedded_d1_calibration(target_day)
-    if fallback.empty:
-        return fallback
-
-    keep_columns = [
-        "datetime",
-        "hour",
-        "pbf_demand_mwh",
-        *[
-            tech
-            for tech in technologies
-            if tech in fallback.columns
-        ],
-        "non_thermal_net_mwh",
-        "hydro_ugh_net_mwh",
-        "actual_thermal_gap_mwh",
-        "price_eur_mwh",
-    ]
-    fallback = fallback[keep_columns].copy()
-    fallback["calibration_source"] = (
-        "User supplied 16-Jul-2026 PBF export"
     )
-    return fallback
+    out["hour"] = out["datetime"].dt.hour
+
+    structural_available = [
+        tech
+        for tech in technologies
+        if tech != "Hydro UGH"
+        and tech in out.columns
+    ]
+    out["non_thermal_net_mwh"] = out[
+        structural_available
+    ].sum(axis=1)
+
+    out["hydro_ugh_net_mwh"] = (
+        pd.to_numeric(
+            out["Hydro UGH"],
+            errors="coerce",
+        ).fillna(0.0)
+        if "Hydro UGH" in out.columns
+        else 0.0
+    )
+
+    out["da_demand_mwh"] = (
+        pd.to_numeric(out["pbf_demand_mwh"], errors="coerce")
+        - pd.to_numeric(
+            out["bilateral_sales_mwh"],
+            errors="coerce",
+        )
+    ).clip(lower=0.0)
+
+    out["actual_thermal_gap_mwh"] = (
+        out["da_demand_mwh"]
+        - out["non_thermal_net_mwh"]
+    )
+    out["calibration_source"] = (
+        "ESIOS D-1 DA residual demand / non-bilateral PBF"
+    )
+
+    return out.sort_values("datetime").reset_index(drop=True)
 
 
 def _generation_fallback(
@@ -3278,23 +3478,39 @@ def forecast_pbf_technology(
     output["technology"] = technology
     output["model_net_forecast_mwh"] = prediction
 
-    # D-1 is known from the PBF programme before tomorrow's DA gate closure.
-    # Keep the model dominant, but anchor 20% in the latest complete net-PBF
-    # profile to prevent implausible jumps in solar hours.
+    # D-1 non-bilateral PBF is the latest programme available without target
+    # leakage. Stable technologies receive a stronger D-1 anchor.
     d1_anchor = pd.to_numeric(
         output["gen_lag_1d"],
         errors="coerce",
     )
+    d1_blend_weight = float(
+        GENERATION_D1_BLEND_WEIGHTS.get(
+            technology,
+            D1_GENERATION_BLEND_WEIGHT,
+        )
+    )
+
     output["forecast_mwh"] = (
-        (1.0 - D1_GENERATION_BLEND_WEIGHT)
+        (1.0 - d1_blend_weight)
         * output["model_net_forecast_mwh"]
-        + D1_GENERATION_BLEND_WEIGHT
+        + d1_blend_weight
         * d1_anchor.fillna(output["model_net_forecast_mwh"])
     ).clip(lower=0.0)
 
     return output, {
         "Technology": technology,
+        "PBF perimeter": "Non-bilateral generation exposed to DA",
         "Model": model_name,
+        "D-1 blend weight": d1_blend_weight,
+        "D-1 average (MW)": (
+            float(d1_anchor.mean())
+            if d1_anchor.notna().any()
+            else np.nan
+        ),
+        "Forecast average (MW)": float(
+            output["forecast_mwh"].mean()
+        ),
         "Target feature values imputed": int(imputed_cells),
         "Backtest MAE (MW)": stats.get("mae"),
         "Backtest MAPE (%)": stats.get("mape"),
@@ -3329,6 +3545,11 @@ def generate_thermal_gap_forecast(
         pbf_history_end,
         token,
     )
+    bilateral_sales_history = load_total_bilateral_sales_history(
+        history_start,
+        pbf_history_end,
+        token,
+    )
     weather_history = load_generation_weather_history(
         history_start,
         target_day - timedelta(days=2),
@@ -3338,9 +3559,14 @@ def generate_thermal_gap_forecast(
     )
 
     if pbf_history.empty:
-        raise ValueError("No historical net PBF generation data.")
+        raise ValueError("No historical non-bilateral PBF generation data.")
     if pbf_demand_history.empty:
-        raise ValueError("No historical PBF demand data.")
+        raise ValueError("No historical total PBF demand data.")
+    if bilateral_sales_history.empty:
+        raise ValueError(
+            "No historical total bilateral PBF sales data "
+            "(ESIOS indicator 10235)."
+        )
     if weather_history.empty or target_weather.empty:
         raise ValueError("Generation weather data unavailable.")
 
@@ -3349,6 +3575,12 @@ def generate_thermal_gap_forecast(
         technologies,
         pbf_history,
         pbf_demand_history,
+        bilateral_sales_history,
+    )
+
+    bilateral_sales_forecast = forecast_total_bilateral_sales(
+        target_day,
+        bilateral_sales_history,
     )
 
     forecast_frames = []
@@ -3361,7 +3593,11 @@ def generate_thermal_gap_forecast(
             stats_rows.append(
                 {
                     "Technology": technology,
-                    "Model": "No ESIOS net-PBF history",
+                    "PBF perimeter": "Non-bilateral generation exposed to DA",
+                    "Model": "No ESIOS non-bilateral PBF history",
+                    "D-1 blend weight": np.nan,
+                    "D-1 average (MW)": np.nan,
+                    "Forecast average (MW)": np.nan,
                     "Target feature values imputed": np.nan,
                     "Backtest MAE (MW)": np.nan,
                     "Backtest MAPE (%)": np.nan,
@@ -3380,7 +3616,7 @@ def generate_thermal_gap_forecast(
 
     if not forecast_frames:
         raise ValueError(
-            "No net PBF generation forecast could be produced."
+            "No non-bilateral PBF generation forecast could be produced."
         )
 
     generation_long = pd.concat(
@@ -3430,13 +3666,28 @@ def generate_thermal_gap_forecast(
     ).dt.floor("h")
     demand["hour"] = demand["datetime"].dt.hour
 
-    forecast = generation_wide.merge(
-        demand,
-        on=["datetime", "hour"],
-        how="inner",
+    forecast = (
+        generation_wide.merge(
+            demand,
+            on=["datetime", "hour"],
+            how="inner",
+        )
+        .merge(
+            bilateral_sales_forecast[
+                [
+                    "datetime",
+                    "bilateral_sales_forecast_mwh",
+                    "bilateral_lag_1d",
+                    "bilateral_lag_7d",
+                ]
+            ],
+            on="datetime",
+            how="left",
+        )
     )
 
-    # Align the total-demand model to the latest known PBF demand perimeter.
+    # Align the selected total-demand model to the latest known total-PBF
+    # demand perimeter.
     if not d1_calibration.empty:
         d1_demand = d1_calibration[
             ["hour", "pbf_demand_mwh"]
@@ -3462,10 +3713,32 @@ def generate_thermal_gap_forecast(
         )
     )
 
-    # Structural thermal gap: demand minus exogenous / must-run generation.
-    # Hydro UGH is dispatchable and is therefore not deducted here.
-    forecast["thermal_gap_forecast_mwh"] = (
+    # Remove physical bilateral acquisitions from total PBF demand. Indicator
+    # 10235 is total bilateral sales; at system level the physical acquisition
+    # side is equal. Cap the forecast defensively to avoid negative DA demand.
+    forecast["bilateral_sales_forecast_mwh"] = (
+        pd.to_numeric(
+            forecast["bilateral_sales_forecast_mwh"],
+            errors="coerce",
+        )
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    forecast["bilateral_sales_forecast_mwh"] = np.minimum(
+        forecast["bilateral_sales_forecast_mwh"],
+        0.95 * forecast["pbf_demand_forecast_mwh"].clip(lower=0.0),
+    )
+
+    forecast["da_demand_forecast_mwh"] = (
         forecast["pbf_demand_forecast_mwh"]
+        - forecast["bilateral_sales_forecast_mwh"]
+    ).clip(lower=0.0)
+
+    # Price-relevant DA structural thermal gap:
+    # residual DA demand minus non-bilateral low-MC generation.
+    # Hydro UGH remains dispatchable and is not deducted.
+    forecast["thermal_gap_forecast_mwh"] = (
+        forecast["da_demand_forecast_mwh"]
         - forecast["non_thermal_forecast_mwh"]
     )
     forecast["residual_gap_after_hydro_ugh_mwh"] = (
@@ -3477,6 +3750,9 @@ def generate_thermal_gap_forecast(
         d1_reference = d1_calibration[
             [
                 "hour",
+                "pbf_demand_mwh",
+                "bilateral_sales_mwh",
+                "da_demand_mwh",
                 "actual_thermal_gap_mwh",
                 "non_thermal_net_mwh",
                 "calibration_source",
@@ -3485,6 +3761,11 @@ def generate_thermal_gap_forecast(
         forecast = forecast.merge(
             d1_reference.rename(
                 columns={
+                    "pbf_demand_mwh": "d1_total_pbf_demand_mwh",
+                    "bilateral_sales_mwh": (
+                        "d1_bilateral_sales_mwh"
+                    ),
+                    "da_demand_mwh": "d1_da_demand_mwh",
                     "actual_thermal_gap_mwh": (
                         "d1_actual_thermal_gap_mwh"
                     ),
@@ -3497,9 +3778,12 @@ def generate_thermal_gap_forecast(
             how="left",
         )
     else:
+        forecast["d1_total_pbf_demand_mwh"] = np.nan
+        forecast["d1_bilateral_sales_mwh"] = np.nan
+        forecast["d1_da_demand_mwh"] = np.nan
         forecast["d1_actual_thermal_gap_mwh"] = np.nan
         forecast["d1_non_thermal_net_mwh"] = np.nan
-        forecast["calibration_source"] = "No D-1 calibration"
+        forecast["calibration_source"] = "No D-1 DA-perimeter calibration"
 
     # Historical price training uses the same PBF-demand / NET-generation
     # perimeter as the target forecast.
@@ -3533,19 +3817,30 @@ def generate_thermal_gap_forecast(
         else 0.0
     )
 
-    historical = pbf_demand_history.merge(
-        pbf_history_wide[
-            [
-                "datetime",
-                "non_thermal_mwh",
-                "hydro_ugh_mwh",
-            ]
-        ],
-        on="datetime",
-        how="inner",
+    historical = (
+        pbf_demand_history.merge(
+            bilateral_sales_history,
+            on="datetime",
+            how="inner",
+        )
+        .merge(
+            pbf_history_wide[
+                [
+                    "datetime",
+                    "non_thermal_mwh",
+                    "hydro_ugh_mwh",
+                ]
+            ],
+            on="datetime",
+            how="inner",
+        )
     )
-    historical["thermal_gap_mwh"] = (
+    historical["da_demand_mwh"] = (
         historical["pbf_demand_mwh"]
+        - historical["bilateral_sales_mwh"]
+    ).clip(lower=0.0)
+    historical["thermal_gap_mwh"] = (
+        historical["da_demand_mwh"]
         - historical["non_thermal_mwh"]
     )
 
@@ -3561,6 +3856,9 @@ def generate_thermal_gap_forecast(
             "datetime"
         ).reset_index(drop=True),
         "d1_calibration": d1_calibration,
+        "bilateral_sales_forecast": bilateral_sales_forecast,
+        "bilateral_sales_history": bilateral_sales_history,
+        "gap_perimeter": DA_GAP_PERIMETER,
     }
 
 
@@ -3589,7 +3887,7 @@ def build_generation_forecast_chart(
             ),
             y=alt.Y(
                 "sum(forecast_mwh):Q",
-                title="Demand / PBF generation forecast (MW)",
+                title="DA residual demand / non-bilateral PBF (MW)",
                 stack="zero",
             ),
             color=alt.Color(
@@ -3628,8 +3926,8 @@ def build_generation_forecast_chart(
         .encode(
             x="datetime:T",
             y=alt.Y(
-                "pbf_demand_forecast_mwh:Q",
-                title="PBF demand / net PBF generation forecast (MW)",
+                "da_demand_forecast_mwh:Q",
+                title="DA residual demand / non-bilateral PBF (MW)",
             ),
             tooltip=[
                 alt.Tooltip(
@@ -3639,12 +3937,22 @@ def build_generation_forecast_chart(
                 ),
                 alt.Tooltip(
                     "pbf_demand_forecast_mwh:Q",
-                    title="PBF demand forecast",
+                    title="Total PBF demand",
+                    format=",.0f",
+                ),
+                alt.Tooltip(
+                    "bilateral_sales_forecast_mwh:Q",
+                    title="Bilateral demand forecast",
+                    format=",.0f",
+                ),
+                alt.Tooltip(
+                    "da_demand_forecast_mwh:Q",
+                    title="DA residual demand",
                     format=",.0f",
                 ),
                 alt.Tooltip(
                     "non_thermal_forecast_mwh:Q",
-                    title="Non-thermal PBF",
+                    title="Non-bilateral low-MC PBF",
                     format=",.0f",
                 ),
             ],
@@ -3698,13 +4006,23 @@ def build_thermal_gap_forecast_chart(
                     format="%d-%m-%Y %H:%M",
                 ),
                 alt.Tooltip(
-                    "selected_demand_mw:Q",
-                    title="Demand forecast",
+                    "pbf_demand_forecast_mwh:Q",
+                    title="Total PBF demand",
+                    format=",.0f",
+                ),
+                alt.Tooltip(
+                    "bilateral_sales_forecast_mwh:Q",
+                    title="Bilateral demand",
+                    format=",.0f",
+                ),
+                alt.Tooltip(
+                    "da_demand_forecast_mwh:Q",
+                    title="DA residual demand",
                     format=",.0f",
                 ),
                 alt.Tooltip(
                     "non_thermal_forecast_mwh:Q",
-                    title="Non-thermal PBF",
+                    title="Non-bilateral low-MC PBF",
                     format=",.0f",
                 ),
                 alt.Tooltip(
@@ -3738,7 +4056,7 @@ def build_thermal_gap_forecast_chart(
                 ),
                 alt.Tooltip(
                     "d1_actual_thermal_gap_mwh:Q",
-                    title="D-1 actual net-PBF gap",
+                    title="D-1 actual DA residual gap",
                     format=",.0f",
                 ),
             ],
@@ -7875,7 +8193,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v16_3"] = {
+        st.session_state["day_ahead_result_v16_5_da_residual_gap"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -7896,7 +8214,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v16_3")
+forecast_result = st.session_state.get("day_ahead_result_v16_5_da_residual_gap")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -8020,10 +8338,12 @@ if forecast_result:
         generation_long = thermal_result["generation_long"]
 
         st.caption(
-            "The black line is the selected demand curve: "
-            f"{forecast_result.get('demand_source_label', 'Model forecast')}. "
-            "The stacked area is the hourly PBF forecast for wind, solar, "
-            "run-of-river, nuclear and other selected technologies."
+            "The black line is forecast demand exposed to the day-ahead "
+            "auction: total PBF demand minus total physical bilateral sales. "
+            "The stacked area is non-bilateral low-marginal-cost PBF "
+            "generation for wind, solar, run-of-river, nuclear and the other "
+            "selected technologies. Base total-demand source: "
+            f"{forecast_result.get('demand_source_label', 'Model forecast')}."
         )
 
         st.altair_chart(
@@ -8038,28 +8358,32 @@ if forecast_result:
             "thermal_gap_forecast_mwh"
         ]
 
-        tg1, tg2, tg3, tg4, tg5, tg6 = st.columns(6)
+        tg1, tg2, tg3, tg4, tg5, tg6, tg7 = st.columns(7)
         tg1.metric(
-            "Average PBF demand forecast",
+            "Average total PBF demand",
             f"{thermal_forecast['pbf_demand_forecast_mwh'].mean():,.0f} MW",
         )
         tg2.metric(
-            "Average structural NET PBF generation",
-            f"{thermal_forecast['non_thermal_forecast_mwh'].mean():,.0f} MW",
+            "Average bilateral demand",
+            f"{thermal_forecast['bilateral_sales_forecast_mwh'].mean():,.0f} MW",
         )
         tg3.metric(
-            "Average thermal gap",
-            f"{thermal_gap.mean():,.0f} MW",
+            "Average DA residual demand",
+            f"{thermal_forecast['da_demand_forecast_mwh'].mean():,.0f} MW",
         )
         tg4.metric(
-            "Peak thermal gap",
-            f"{thermal_gap.max():,.0f} MW",
+            "Average non-bilateral low-MC PBF",
+            f"{thermal_forecast['non_thermal_forecast_mwh'].mean():,.0f} MW",
         )
         tg5.metric(
-            "Negative structural-gap hours",
-            f"{int((thermal_gap <= 0).sum())} h",
+            "Average DA thermal gap",
+            f"{thermal_gap.mean():,.0f} MW",
         )
         tg6.metric(
+            "Peak DA thermal gap",
+            f"{thermal_gap.max():,.0f} MW",
+        )
+        tg7.metric(
             "Hydro UGH forecast",
             (
                 f"{thermal_forecast['hydro_ugh_forecast_mwh'].mean():,.0f} MW"
@@ -8068,8 +8392,8 @@ if forecast_result:
                 else "—"
             ),
             help=(
-                "Shown separately. It is not deducted from the structural "
-                "thermal gap."
+                "Non-bilateral Hydro UGH is shown separately because it is "
+                "dispatchable and is not deducted from the structural gap."
             ),
         )
 
@@ -8099,7 +8423,7 @@ if forecast_result:
 
             st.info(
                 "D-1 calibration check: during solar hours the supplied "
-                f"net-PBF thermal gap remained positive, with a minimum of "
+                f"DA-residual thermal gap remained positive, with a minimum of "
                 f"{d1_min_gap:,.0f} MW"
                 + (
                     f", while the minimum DA price was "
@@ -8111,11 +8435,11 @@ if forecast_result:
             )
 
         st.caption(
-            "Structural thermal gap = PBF-calibrated demand forecast − NET "
-            "wind − solar − nuclear − run-of-river − other renewables. "
-            "Hydro UGH is dispatchable and is not deducted. Gross PBF is "
-            "reduced by bilateral programmes. The orange dashed line is the "
-            "corrected D-1 structural thermal-gap profile."
+            "DA structural thermal gap = (total PBF demand − total bilateral "
+            "sales) − non-bilateral wind − solar − nuclear − run-of-river − "
+            "other renewables. Hydro UGH is dispatchable and is shown "
+            "separately. The orange dashed line is the D-1 reference calculated "
+            "with exactly the same DA-market perimeter."
         )
 
         with st.expander(
@@ -8128,11 +8452,12 @@ if forecast_result:
             )
             st.markdown(
                 """
-                - Every technology is forecast in **net PBF terms**: gross PBF minus bilateral PBF.
-                - **Solar, wind, nuclear, run-of-river and other renewables** are deducted from demand.
+                - **DA residual demand** is total programmed PBF demand minus total bilateral PBF sales (indicator 10235).
+                - Each technology is forecast as **non-bilateral PBF generation**: total PBF minus its bilateral programme.
+                - The price-relevant gap is **DA residual demand minus non-bilateral low-MC generation**.
                 - **Run-of-river** corresponds to Hydro non-UGH and is treated as non-dispatchable.
-                - **Hydro UGH is forecast separately but is not deducted from the structural thermal gap**, because its dispatch responds to price and scarcity.
-                - The supplied 16-Jul profile is embedded as a fallback calibration for the 17-Jul forecast.
+                - **Hydro UGH is forecast separately but is not deducted**, because its dispatch responds to price and scarcity.
+                - The former embedded 16-Jul profile is not used as a fallback because it does not contain total bilateral demand and would mix perimeters.
                 """
             )
 
