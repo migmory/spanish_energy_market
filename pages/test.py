@@ -3734,6 +3734,14 @@ def generate_thermal_gap_forecast(
         - forecast["bilateral_sales_forecast_mwh"]
     ).clip(lower=0.0)
 
+    forecast["da_demand_share_of_total_pct"] = np.where(
+        forecast["pbf_demand_forecast_mwh"] > 0,
+        100.0
+        * forecast["da_demand_forecast_mwh"]
+        / forecast["pbf_demand_forecast_mwh"],
+        np.nan,
+    )
+
     # Price-relevant DA structural thermal gap:
     # residual DA demand minus non-bilateral low-MC generation.
     # Hydro UGH remains dispatchable and is not deducted.
@@ -3887,7 +3895,7 @@ def build_generation_forecast_chart(
             ),
             y=alt.Y(
                 "sum(forecast_mwh):Q",
-                title="DA residual demand / non-bilateral PBF (MW)",
+                title="Demand and non-bilateral PBF generation (MW)",
                 stack="zero",
             ),
             color=alt.Color(
@@ -3920,14 +3928,20 @@ def build_generation_forecast_chart(
         )
     )
 
-    demand_line = (
+    # Physical / total PBF demand. This is the line users normally recognise as
+    # system demand and avoids presenting the DA residual as if it were total
+    # Spanish demand.
+    total_demand_line = (
         alt.Chart(forecast)
-        .mark_line(color="#111827", strokeWidth=3.2)
+        .mark_line(
+            color="#111827",
+            strokeWidth=3.2,
+        )
         .encode(
             x="datetime:T",
             y=alt.Y(
-                "da_demand_forecast_mwh:Q",
-                title="DA residual demand / non-bilateral PBF (MW)",
+                "pbf_demand_forecast_mwh:Q",
+                title="Demand and non-bilateral PBF generation (MW)",
             ),
             tooltip=[
                 alt.Tooltip(
@@ -3942,7 +3956,7 @@ def build_generation_forecast_chart(
                 ),
                 alt.Tooltip(
                     "bilateral_sales_forecast_mwh:Q",
-                    title="Bilateral demand forecast",
+                    title="Bilateral programme",
                     format=",.0f",
                 ),
                 alt.Tooltip(
@@ -3959,8 +3973,38 @@ def build_generation_forecast_chart(
         )
     )
 
+    # Demand exposed to the DA auction after deducting the bilateral programme.
+    da_residual_line = (
+        alt.Chart(forecast)
+        .mark_line(
+            color="#0F766E",
+            strokeWidth=2.7,
+            strokeDash=[8, 5],
+        )
+        .encode(
+            x="datetime:T",
+            y="da_demand_forecast_mwh:Q",
+            tooltip=[
+                alt.Tooltip(
+                    "datetime:T",
+                    title="Hour",
+                    format="%d-%m-%Y %H:%M",
+                ),
+                alt.Tooltip(
+                    "da_demand_forecast_mwh:Q",
+                    title="DA residual demand",
+                    format=",.0f",
+                ),
+            ],
+        )
+    )
+
     return configure_chart(
-        alt.layer(area, demand_line).resolve_scale(y="shared"),
+        alt.layer(
+            area,
+            total_demand_line,
+            da_residual_line,
+        ).resolve_scale(y="shared"),
         height=360,
     )
 
@@ -5173,26 +5217,25 @@ def recent_price_guardrails(
 
 
 
-def apply_negative_gap_near_zero_calibration(
+def apply_negative_gap_soft_calibration(
     forecast_prices,
     target_data: pd.DataFrame,
+    empirical_reference: pd.DataFrame | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
-    Force forecast prices very close to zero whenever the simplified
-    thermal gap is negative.
+    Apply a soft, dynamic cap in negative thermal-gap hours.
 
-    Exponential upper cap:
+    A negative simplified gap is a strong low-price signal, but it does not
+    imply an exact zero price. Exports, pumping, storage charging, curtailment,
+    technical constraints and other market effects can support positive prices.
 
-        cap = 0.01 + 1.50 * exp(-abs(TG) / 400)
+    The cap therefore depends on:
+      - the depth of the negative gap;
+      - recent same-hour price references;
+      - the empirical distribution of prices observed at similar gaps.
 
-    Approximate values:
-        TG =  -100 MW -> 1.18 EUR/MWh
-        TG =  -250 MW -> 0.81 EUR/MWh
-        TG =  -500 MW -> 0.44 EUR/MWh
-        TG = -1000 MW -> 0.13 EUR/MWh
-        TG = -2000 MW -> 0.02 EUR/MWh
-
-    Positive thermal-gap hours remain fully model-driven.
+    There is no forced zero-price floor or override. The model can still
+    forecast zero when its historical and market inputs support that outcome.
     """
     prices = np.maximum(
         np.asarray(forecast_prices, dtype=float),
@@ -5207,26 +5250,145 @@ def apply_negative_gap_near_zero_calibration(
     negative_mask = gap < 0.0
     negative_gap_abs = np.maximum(-gap, 0.0)
 
-    # The cap is already low for a slightly negative gap and converges very
-    # quickly towards 0.01 EUR/MWh as the negative gap deepens.
-    near_zero_cap = (
-        0.01
-        + 1.50
-        * np.exp(-negative_gap_abs / 400.0)
+    reference_frame = pd.DataFrame(
+        {
+            "price_anchor": pd.to_numeric(
+                target_data.get(
+                    "price_anchor",
+                    pd.Series(np.nan, index=target_data.index),
+                ),
+                errors="coerce",
+            ),
+            "price_lag_1d": pd.to_numeric(
+                target_data.get(
+                    "price_lag_1d",
+                    pd.Series(np.nan, index=target_data.index),
+                ),
+                errors="coerce",
+            ),
+            "price_lag_7d": pd.to_numeric(
+                target_data.get(
+                    "price_lag_7d",
+                    pd.Series(np.nan, index=target_data.index),
+                ),
+                errors="coerce",
+            ),
+            "same_hour_price_4w": pd.to_numeric(
+                target_data.get(
+                    "same_hour_price_4w",
+                    pd.Series(np.nan, index=target_data.index),
+                ),
+                errors="coerce",
+            ),
+        },
+        index=target_data.index,
     )
+
+    empirical_p25 = pd.Series(
+        np.nan,
+        index=target_data.index,
+        dtype=float,
+    )
+    empirical_p75 = pd.Series(
+        np.nan,
+        index=target_data.index,
+        dtype=float,
+    )
+
+    if empirical_reference is not None and not empirical_reference.empty:
+        if "conditional_price_p25_eur_mwh" in empirical_reference.columns:
+            empirical_p25 = pd.to_numeric(
+                empirical_reference[
+                    "conditional_price_p25_eur_mwh"
+                ],
+                errors="coerce",
+            ).set_axis(target_data.index)
+
+        if "conditional_price_p75_eur_mwh" in empirical_reference.columns:
+            empirical_p75 = pd.to_numeric(
+                empirical_reference[
+                    "conditional_price_p75_eur_mwh"
+                ],
+                errors="coerce",
+            ).set_axis(target_data.index)
+
+        if "conditional_price_median_eur_mwh" in empirical_reference.columns:
+            reference_frame["similar_gap_median"] = pd.to_numeric(
+                empirical_reference[
+                    "conditional_price_median_eur_mwh"
+                ],
+                errors="coerce",
+            ).set_axis(target_data.index)
+
+    # Median is more robust than taking the minimum recent reference. A single
+    # anomalous zero-price day should not automatically force tomorrow to zero.
+    recent_reference = (
+        reference_frame.median(axis=1, skipna=True)
+        .fillna(pd.Series(prices, index=target_data.index))
+        .clip(lower=0.0)
+        .to_numpy(dtype=float)
+    )
+
+    # The compression rises gradually and reaches its maximum only from about
+    # -3.5 GW. Slightly negative gaps remain almost entirely model-driven.
+    severity = np.clip(
+        negative_gap_abs / 3_500.0,
+        0.0,
+        1.0,
+    )
+
+    # At maximum severity, retain 30% of the recent reference plus an 8 €/MWh
+    # buffer. This is intentionally much less restrictive than the former
+    # near-zero exponential cap.
+    soft_cap = (
+        8.0
+        + recent_reference
+        * (1.0 - 0.70 * severity)
+    )
+
+    # Never impose a cap below the historical lower quartile observed at
+    # similar gaps. Conversely, the similar-gap P75 provides a reasonable
+    # ceiling reference when recent daily lags are unusually low.
+    empirical_p25_values = empirical_p25.to_numpy(dtype=float)
+    empirical_p75_values = empirical_p75.to_numpy(dtype=float)
+
+    soft_cap = np.where(
+        np.isfinite(empirical_p25_values),
+        np.maximum(soft_cap, empirical_p25_values),
+        soft_cap,
+    )
+    soft_cap = np.where(
+        np.isfinite(empirical_p75_values),
+        np.maximum(
+            soft_cap,
+            0.85 * empirical_p75_values,
+        ),
+        soft_cap,
+    )
+    soft_cap = np.maximum(soft_cap, 8.0)
 
     calibrated = prices.copy()
     calibrated[negative_mask] = np.minimum(
         prices[negative_mask],
-        near_zero_cap[negative_mask],
+        soft_cap[negative_mask],
     )
 
     diagnostics = pd.DataFrame(
         {
-            "negative_gap_near_zero_cap_eur_mwh": np.where(
+            "negative_gap_soft_cap_eur_mwh": np.where(
                 negative_mask,
-                near_zero_cap,
+                soft_cap,
                 np.nan,
+            ),
+            "negative_gap_reference_price_eur_mwh": np.where(
+                negative_mask,
+                recent_reference,
+                np.nan,
+            ),
+            "negative_gap_severity_pct": np.where(
+                negative_mask,
+                severity * 100.0,
+                0.0,
             ),
             "negative_gap_absolute_mw": np.where(
                 negative_mask,
@@ -5239,7 +5401,7 @@ def apply_negative_gap_near_zero_calibration(
                 np.maximum(prices - calibrated, 0.0),
                 0.0,
             ),
-            "negative_gap_near_zero_applied": (
+            "negative_gap_soft_cap_applied": (
                 negative_mask
                 & (calibrated < prices - 1e-9)
             ),
@@ -5452,19 +5614,21 @@ def generate_price_forecast(
         hourly_bias_correction=hourly_bias_correction,
     )
 
-    # Thermal gap below zero is a very strong low-price signal. Apply this
-    # after all gas, anchor and residual adjustments so no later uplift can
-    # override the near-zero calibration.
+    # A negative gap is a strong low-price signal, but not an automatic
+    # zero-price condition. Apply a soft dynamic cap after the main model,
+    # empirical blend and recent-reference guardrails.
     validation_final, validation_negative_gap = (
-        apply_negative_gap_near_zero_calibration(
+        apply_negative_gap_soft_calibration(
             validation_final,
             validation,
+            validation_empirical,
         )
     )
     target_final, target_negative_gap = (
-        apply_negative_gap_near_zero_calibration(
+        apply_negative_gap_soft_calibration(
             target_final,
             target_data,
+            target_empirical,
         )
     )
 
@@ -8193,7 +8357,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v16_5_da_residual_gap"] = {
+        st.session_state["day_ahead_result_v16_6_soft_gap_demand_lines"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -8214,7 +8378,7 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v16_5_da_residual_gap")
+forecast_result = st.session_state.get("day_ahead_result_v16_6_soft_gap_demand_lines")
 if forecast_result:
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
@@ -8338,11 +8502,12 @@ if forecast_result:
         generation_long = thermal_result["generation_long"]
 
         st.caption(
-            "The black line is forecast demand exposed to the day-ahead "
-            "auction: total PBF demand minus total physical bilateral sales. "
-            "The stacked area is non-bilateral low-marginal-cost PBF "
-            "generation for wind, solar, run-of-river, nuclear and the other "
-            "selected technologies. Base total-demand source: "
+            "The solid black line is total forecast PBF demand. The dashed "
+            "green line is demand exposed to the day-ahead auction after "
+            "deducting the bilateral programme. The stacked area is "
+            "non-bilateral low-marginal-cost PBF generation. The thermal gap "
+            "and price model use the dashed green DA-residual demand, not the "
+            "solid total-demand line. Base total-demand source: "
             f"{forecast_result.get('demand_source_label', 'Model forecast')}."
         )
 
@@ -8358,7 +8523,7 @@ if forecast_result:
             "thermal_gap_forecast_mwh"
         ]
 
-        tg1, tg2, tg3, tg4, tg5, tg6, tg7 = st.columns(7)
+        tg1, tg2, tg3, tg4, tg5, tg6, tg7, tg8 = st.columns(8)
         tg1.metric(
             "Average total PBF demand",
             f"{thermal_forecast['pbf_demand_forecast_mwh'].mean():,.0f} MW",
@@ -8384,6 +8549,20 @@ if forecast_result:
             f"{thermal_gap.max():,.0f} MW",
         )
         tg7.metric(
+            "DA demand share",
+            (
+                f"{thermal_forecast['da_demand_share_of_total_pct'].mean():,.1f}%"
+                if "da_demand_share_of_total_pct"
+                in thermal_forecast.columns
+                else "—"
+            ),
+            help=(
+                "Share of total PBF demand remaining after deducting the "
+                "bilateral programme. This explains why DA residual demand "
+                "can be materially below physical system demand."
+            ),
+        )
+        tg8.metric(
             "Hydro UGH forecast",
             (
                 f"{thermal_forecast['hydro_ugh_forecast_mwh'].mean():,.0f} MW"
@@ -8581,10 +8760,11 @@ if forecast_result:
             f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
             "unadjusted price anchor. Absolute values are anchored in the "
             "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. Any negative thermal gap now imposes a "
-            "strong near-zero cap: around 1.18 €/MWh at −100 MW, "
-            "0.44 €/MWh at −500 MW, 0.13 €/MWh at −1 GW and practically "
-            "0 €/MWh from roughly −2 GW onwards. "
+            "same-hour profile. A negative thermal gap now applies only a "
+            "soft dynamic cap based on the depth of the gap, recent same-hour "
+            "prices and the empirical distribution observed at similar gaps. "
+            "Slightly negative gaps remain mostly model-driven and no negative "
+            "gap is automatically forced to zero. "
             "Positive model residuals are also shrunk—especially "
             "during evening and night hours—and cannot exceed all recent "
             "references by a material amount unless the forecast thermal gap "
@@ -9265,11 +9445,13 @@ if forecast_result:
             "price_upper_guardrail_eur_mwh",
             "guardrail_reduction_eur_mwh",
             "guardrail_applied",
-            "negative_gap_near_zero_cap_eur_mwh",
+            "negative_gap_soft_cap_eur_mwh",
+            "negative_gap_reference_price_eur_mwh",
+            "negative_gap_severity_pct",
             "negative_gap_absolute_mw",
             "negative_gap_price_before_calibration_eur_mwh",
             "negative_gap_price_compression_eur_mwh",
-            "negative_gap_near_zero_applied",
+            "negative_gap_soft_cap_applied",
         ]
 
         available_price_output_columns = [
