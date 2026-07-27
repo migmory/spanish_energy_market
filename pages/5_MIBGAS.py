@@ -892,6 +892,42 @@ def load_gie_inventory(
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
+
+    # ALSI still uses an older API schema in some endpoint/account combinations.
+    # Canonicalise common field-name variants before calculating metrics.
+    def coalesce_api_field(canonical: str, aliases: list[str]) -> None:
+        if canonical in df.columns:
+            return
+        normalised = {normalize_col_name(c): c for c in df.columns}
+        for alias in aliases:
+            source = normalised.get(normalize_col_name(alias))
+            if source is not None:
+                df[canonical] = df[source]
+                return
+
+    coalesce_api_field("lngInventory", [
+        "lngInventory", "lng_inventory", "inventory", "lngStock", "lng_stock",
+        "lngVolume", "lng_volume", "gasInStorage", "gas_in_storage",
+    ])
+    coalesce_api_field("dtmi", [
+        "dtmi", "declaredTotalMaxInventory", "declared_max_inventory",
+        "maxInventory", "max_inventory", "storageCapacity", "storage_capacity",
+        "lngStorageCapacity", "lng_storage_capacity", "workingGasVolume",
+    ])
+    coalesce_api_field("inventory_pct", [
+        "inventory_pct", "inventoryPercentage", "inventory_percentage",
+        "inventoryFull", "inventory_full", "fillLevel", "fill_level",
+        "stockLevel", "stock_level", "inventoryLevel", "inventory_level",
+        "lngInventoryLevel", "full",
+    ])
+    coalesce_api_field("sendOut", [
+        "sendOut", "send_out", "sendout", "dailySendOut", "daily_send_out",
+    ])
+    coalesce_api_field("dtrs", [
+        "dtrs", "declaredTotalReferenceSendOut", "referenceSendOutCapacity",
+        "reference_send_out_capacity", "sendOutCapacity", "send_out_capacity",
+    ])
+
     date_col = next(
         (c for c in ["gasDayStart", "gasDayStartedOn", "gasDay", "gas_day", "date", "day"] if c in df.columns),
         None,
@@ -903,7 +939,7 @@ def load_gie_inventory(
     numeric_cols = [
         "gasInStorage", "consumption", "consumptionFull", "injection", "withdrawal",
         "workingGasVolume", "injectionCapacity", "withdrawalCapacity", "trend", "full",
-        "lngInventory", "sendOut", "dtmi", "dtrs",
+        "lngInventory", "inventory_pct", "sendOut", "dtmi", "dtrs",
     ]
 
     def gie_to_numeric(series: pd.Series) -> pd.Series:
@@ -929,8 +965,12 @@ def load_gie_inventory(
         if {"injection", "withdrawal"}.issubset(df.columns):
             df["net_flow_gwh_d"] = df["injection"] - df["withdrawal"]
     else:
-        if {"lngInventory", "dtmi"}.issubset(df.columns):
+        # Prefer a percentage directly supplied by ALSI. Otherwise derive it
+        # from LNG inventory divided by declared maximum inventory.
+        if "inventory_pct" not in df.columns and {"lngInventory", "dtmi"}.issubset(df.columns):
             df["inventory_pct"] = 100 * df["lngInventory"] / df["dtmi"].replace(0, pd.NA)
+        elif "inventory_pct" in df.columns:
+            df["inventory_pct"] = pd.to_numeric(df["inventory_pct"], errors="coerce")
 
     df = df.dropna(subset=["gas_day"])
     df = df.drop_duplicates(subset=["gas_day"], keep="last")
@@ -939,10 +979,10 @@ def load_gie_inventory(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_gie_map_snapshot(platform: str, end_date, api_key: str) -> pd.DataFrame:
-    """Load the latest available inventory value for each map country."""
+def load_gie_map_snapshot(platform: str, end_date, api_key: str, metric_col: str) -> pd.DataFrame:
+    """Load the latest non-null selected inventory metric for each map country."""
     end_ts = pd.Timestamp(end_date).normalize()
-    start_ts = end_ts - pd.Timedelta(days=14)
+    start_ts = end_ts - pd.Timedelta(days=45)
     rows = []
 
     for country_name, meta in GIE_MAP_COUNTRIES.items():
@@ -954,9 +994,12 @@ def load_gie_map_snapshot(platform: str, end_date, api_key: str) -> pd.DataFrame
                 end_date=end_ts,
                 api_key=api_key,
             )
-            if df.empty:
+            if df.empty or metric_col not in df.columns:
                 continue
-            latest = df.sort_values("gas_day").iloc[-1].copy()
+            valid = df[df[metric_col].notna()].sort_values("gas_day")
+            if valid.empty:
+                continue
+            latest = valid.iloc[-1].copy()
             latest["country_label"] = country_name
             latest["country_code"] = meta["code"].upper()
             latest["iso_alpha3"] = meta["iso_alpha3"]
@@ -1247,14 +1290,19 @@ def render_gie_inventory_section():
             })
         return
 
-    latest = inventory.iloc[-1]
+    def latest_non_null(col: str):
+        if col not in inventory.columns:
+            return pd.NA
+        valid = inventory.loc[inventory[col].notna(), ["gas_day", col]].sort_values("gas_day")
+        return valid.iloc[-1][col] if not valid.empty else pd.NA
+
     m1, m2, m3, m4 = st.columns(4)
 
     if platform == "agsi":
-        m1.metric("Storage filling level", _metric_text(latest.get("full"), 1, "%"))
-        m2.metric("Gas in storage", _metric_text(latest.get("gasInStorage"), 1, " TWh"))
-        m3.metric("Working gas volume", _metric_text(latest.get("workingGasVolume"), 1, " TWh"))
-        m4.metric("Net daily flow", _metric_text(latest.get("net_flow_gwh_d"), 0, " GWh/d"))
+        m1.metric("Storage filling level", _metric_text(latest_non_null("full"), 1, "%"))
+        m2.metric("Gas in storage", _metric_text(latest_non_null("gasInStorage"), 1, " TWh"))
+        m3.metric("Working gas volume", _metric_text(latest_non_null("workingGasVolume"), 1, " TWh"))
+        m4.metric("Net daily flow", _metric_text(latest_non_null("net_flow_gwh_d"), 0, " GWh/d"))
 
         metric_label = st.radio(
             "Inventory chart metric",
@@ -1270,10 +1318,10 @@ def render_gie_inventory_section():
             map_suffix = " TWh"
         st.subheader("Europe map - underground gas storage")
     else:
-        m1.metric("LNG inventory", _metric_text(latest.get("lngInventory"), 1, " thousand m³ LNG"))
-        m2.metric("Tank filling level", _metric_text(latest.get("inventory_pct"), 1, "%"))
-        m3.metric("Send-out", _metric_text(latest.get("sendOut"), 1, " GWh/d"))
-        m4.metric("Declared max inventory", _metric_text(latest.get("dtmi"), 1, " thousand m³ LNG"))
+        m1.metric("LNG inventory", _metric_text(latest_non_null("lngInventory"), 1, " thousand m³ LNG"))
+        m2.metric("Tank filling level", _metric_text(latest_non_null("inventory_pct"), 1, "%"))
+        m3.metric("Send-out", _metric_text(latest_non_null("sendOut"), 1, " GWh/d"))
+        m4.metric("Declared max inventory", _metric_text(latest_non_null("dtmi"), 1, " thousand m³ LNG"))
 
         metric_label = st.radio(
             "Inventory chart metric",
@@ -1291,7 +1339,12 @@ def render_gie_inventory_section():
 
     try:
         with st.spinner("Loading Europe map snapshot..."):
-            map_snapshot = load_gie_map_snapshot(platform=platform, end_date=end_date, api_key=api_key)
+            map_snapshot = load_gie_map_snapshot(
+                platform=platform,
+                end_date=end_date,
+                api_key=api_key,
+                metric_col=value_col,
+            )
     except Exception:
         map_snapshot = pd.DataFrame()
 
@@ -1314,7 +1367,11 @@ def render_gie_inventory_section():
             rename_map = {value_col: metric_label}
             st.dataframe(display_df.rename(columns=rename_map), use_container_width=True, hide_index=True)
     else:
-        st.info("Map snapshot not available for the selected platform yet.")
+        returned_cols = ", ".join(sorted(map(str, inventory.columns.tolist())))
+        st.info(
+            "The API returned ALSI rows, but no non-null value was available for the selected map metric. "
+            f"Returned fields: {returned_cols}"
+        )
 
     st.subheader(f"{country_label} inventory - seasonal comparison")
     inventory_chart = build_gie_seasonal_chart(inventory, value_col, y_title, tooltip_title)
