@@ -793,7 +793,7 @@ def _request_gie_page(
     api_key: str,
     api_mode: str | None = None,
 ) -> tuple[list[dict], int | None, str]:
-    """Request GIE data using API V2 first and the legacy endpoint as fallback."""
+    """Request AGSI via V2 and ALSI via its still-applicable V4 data endpoint."""
     platform = platform.lower()
     country_code = country_code.lower()
     base_url = f"https://{platform}.gie.eu"
@@ -825,8 +825,39 @@ def _request_gie_page(
             {"from": start_s, "till": end_s},
         ),
     }
-    modes = [api_mode] if api_mode in candidates else ["v2", "legacy"]
+    # IMPORTANT: the current common API documentation explicitly notes that
+    # the older V4 data endpoint remains applicable to ALSI. The generic V2
+    # endpoint can return valid rows and send-out values while leaving LNG
+    # inventory and DTMI empty. Therefore ALSI must prefer /api/data/{code}.
+    if api_mode in candidates:
+        modes = [api_mode]
+    elif platform == "alsi":
+        modes = ["legacy", "v2"]
+    else:
+        modes = ["v2", "legacy"]
+
     errors = []
+
+    def alsi_rows_have_inventory_values(rows: list[dict]) -> bool:
+        if platform != "alsi" or not rows:
+            return bool(rows)
+        aliases = {
+            "lnginventory", "lng_inventory", "inventory", "lngstock",
+            "lng_stock", "lngvolume", "lng_volume", "dtmi",
+            "declaredtotalmaxinventory", "maxinventory",
+        }
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key, value in row.items():
+                if normalize_col_name(key) not in aliases:
+                    continue
+                if value is None:
+                    continue
+                if isinstance(value, str) and value.strip() in {"", "-", "--", "null", "None", "N/A"}:
+                    continue
+                return True
+        return False
 
     for mode in modes:
         url, params = candidates[mode]
@@ -835,6 +866,13 @@ def _request_gie_page(
             response.raise_for_status()
             payload = response.json()
             rows, last_page = _gie_payload_rows(payload)
+
+            # A V2 ALSI response containing only send-out is not sufficient for
+            # the inventory KPIs/map. Continue to the documented V4 endpoint.
+            if platform == "alsi" and mode == "v2" and rows and not alsi_rows_have_inventory_values(rows):
+                errors.append("v2: rows returned but LNG inventory/DTMI values were empty")
+                continue
+
             if rows or mode == modes[-1]:
                 return rows, last_page, mode
         except Exception as exc:
