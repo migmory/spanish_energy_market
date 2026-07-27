@@ -9,6 +9,7 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
+import pydeck as pdk
 
 try:
     import paramiko
@@ -688,6 +689,23 @@ GIE_COUNTRY_OPTIONS = {
     "Belgium": "be",
 }
 
+GIE_MAP_COUNTRIES = {
+    "Spain": {"code": "es", "iso_alpha3": "ESP", "lat": 40.20, "lon": -3.50},
+    "Portugal": {"code": "pt", "iso_alpha3": "PRT", "lat": 39.60, "lon": -8.00},
+    "France": {"code": "fr", "iso_alpha3": "FRA", "lat": 46.30, "lon": 2.20},
+    "Germany": {"code": "de", "iso_alpha3": "DEU", "lat": 51.10, "lon": 10.40},
+    "Italy": {"code": "it", "iso_alpha3": "ITA", "lat": 42.80, "lon": 12.50},
+    "Netherlands": {"code": "nl", "iso_alpha3": "NLD", "lat": 52.20, "lon": 5.30},
+    "Belgium": {"code": "be", "iso_alpha3": "BEL", "lat": 50.70, "lon": 4.60},
+    "Austria": {"code": "at", "iso_alpha3": "AUT", "lat": 47.60, "lon": 14.20},
+    "Czechia": {"code": "cz", "iso_alpha3": "CZE", "lat": 49.80, "lon": 15.40},
+    "Hungary": {"code": "hu", "iso_alpha3": "HUN", "lat": 47.10, "lon": 19.40},
+    "Poland": {"code": "pl", "iso_alpha3": "POL", "lat": 52.10, "lon": 19.30},
+    "Croatia": {"code": "hr", "iso_alpha3": "HRV", "lat": 45.30, "lon": 16.10},
+    "Greece": {"code": "gr", "iso_alpha3": "GRC", "lat": 39.10, "lon": 22.30},
+    "Lithuania": {"code": "lt", "iso_alpha3": "LTU", "lat": 55.20, "lon": 23.80},
+}
+
 
 def get_gie_api_key(platform: str) -> str | None:
     """Use one shared GIE key, with optional platform-specific fallbacks."""
@@ -975,6 +993,7 @@ def render_gie_inventory_section():
         st.write("")
         if st.button("Refresh GIE data", key="refresh_gie_data"):
             load_gie_inventory.clear()
+            load_gie_map_snapshot.clear()
             st.rerun()
 
     if not isinstance(gie_dates, (tuple, list)) or len(gie_dates) != 2:
@@ -1032,9 +1051,11 @@ def render_gie_inventory_section():
         )
         if metric_label.startswith("Filling"):
             value_col, y_title, tooltip_title = "full", "Storage filling level (%)", "Fill level %"
+            map_suffix = "%"
         else:
             value_col, y_title, tooltip_title = "gasInStorage", "Gas in storage (TWh)", "Gas in storage TWh"
-        st.subheader(f"{country_label} underground gas storage - seasonal comparison")
+            map_suffix = " TWh"
+        st.subheader("Europe map - underground gas storage")
     else:
         m1.metric("LNG inventory", _metric_text(latest.get("lngInventory"), 1, " thousand m³ LNG"))
         m2.metric("Tank filling level", _metric_text(latest.get("inventory_pct"), 1, "%"))
@@ -1049,10 +1070,40 @@ def render_gie_inventory_section():
         )
         if metric_label.startswith("Tank"):
             value_col, y_title, tooltip_title = "inventory_pct", "LNG tank filling level (%)", "Fill level %"
+            map_suffix = "%"
         else:
             value_col, y_title, tooltip_title = "lngInventory", "LNG inventory (thousand m³)", "LNG inventory"
-        st.subheader(f"{country_label} LNG inventory - seasonal comparison")
+            map_suffix = " thousand m³"
+        st.subheader("Europe map - LNG inventory")
 
+    try:
+        with st.spinner("Loading Europe map snapshot..."):
+            map_snapshot = load_gie_map_snapshot(platform=platform, end_date=end_date, api_key=api_key)
+    except Exception:
+        map_snapshot = pd.DataFrame()
+
+    if not map_snapshot.empty and value_col in map_snapshot.columns:
+        latest_map_day = pd.to_datetime(map_snapshot["gas_day"], errors="coerce").max()
+        if pd.notna(latest_map_day):
+            st.caption(f"Latest available map snapshot: {latest_map_day.strftime('%Y-%m-%d')}")
+        map_deck = build_gie_bubble_map(
+            map_snapshot,
+            metric_col=value_col,
+            metric_title=metric_label,
+            suffix=map_suffix,
+        )
+        if map_deck is not None:
+            st.pydeck_chart(map_deck, use_container_width=True)
+
+        with st.expander("Show map snapshot values"):
+            map_display_cols = [c for c in ["country_label", "gas_day", value_col] if c in map_snapshot.columns]
+            display_df = map_snapshot[map_display_cols].copy().sort_values(value_col, ascending=False)
+            rename_map = {value_col: metric_label}
+            st.dataframe(display_df.rename(columns=rename_map), use_container_width=True, hide_index=True)
+    else:
+        st.info("Map snapshot not available for the selected platform yet.")
+
+    st.subheader(f"{country_label} inventory - seasonal comparison")
     inventory_chart = build_gie_seasonal_chart(inventory, value_col, y_title, tooltip_title)
     if inventory_chart is not None:
         st.altair_chart(inventory_chart, use_container_width=True)
