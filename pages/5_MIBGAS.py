@@ -748,7 +748,7 @@ def _request_gie_page(
     api_key: str,
     api_mode: str | None = None,
 ) -> tuple[list[dict], int | None, str]:
-    """Request one page, supporting both current and legacy GIE endpoint layouts."""
+    """Request GIE data, preferring the documented /api/data/{code} endpoint."""
     platform = platform.lower()
     base_url = f"https://{platform}.gie.eu"
     headers = {
@@ -759,7 +759,15 @@ def _request_gie_page(
     start_s = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_s = pd.Timestamp(end_date).strftime("%Y-%m-%d")
 
+    # GIE's documented historical endpoint uses /api/data/{eu|countryCode}
+    # and the query parameters `from` and `till`. It returns the complete
+    # requested period in a single response, so no page parameter is sent.
     candidates = {
+        "documented": (
+            f"{base_url}/api/data/{country_code.lower()}",
+            {"from": start_s, "till": end_s},
+        ),
+        # Kept only as a fallback for deployments exposing the newer layout.
         "current": (
             f"{base_url}/api",
             {
@@ -770,30 +778,29 @@ def _request_gie_page(
                 "page": page,
             },
         ),
-        "legacy": (
-            f"{base_url}/api/data/{country_code.lower()}",
-            {
-                "from": start_s,
-                "till": end_s,
-                "page": page,
-            },
-        ),
     }
-    modes = [api_mode] if api_mode in candidates else ["current", "legacy"]
+    modes = [api_mode] if api_mode in candidates else ["documented", "current"]
     errors = []
 
     for mode in modes:
         url, params = candidates[mode]
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=35)
+            response = requests.get(url, params=params, headers=headers, timeout=45)
             response.raise_for_status()
             payload = response.json()
             rows, last_page = _gie_payload_rows(payload)
-            return rows, last_page, mode
+
+            # Some unsupported endpoint variants reply HTTP 200 with an empty
+            # array. In that case continue to the documented fallback rather
+            # than treating the request as a successful empty dataset.
+            if rows or mode == modes[-1]:
+                return rows, last_page, mode
         except Exception as exc:
             errors.append(f"{mode}: {exc}")
 
-    raise ValueError(" | ".join(errors))
+    if errors:
+        raise ValueError(" | ".join(errors))
+    return [], None, modes[-1]
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -822,14 +829,17 @@ def load_gie_inventory(
         )
         all_rows.extend(rows)
 
+        # The documented /api/data/{code} endpoint returns the entire selected
+        # period in one call. Only the optional newer endpoint is paginated.
+        if api_mode == "documented":
+            break
+
         if reported_last_page is not None:
             last_page = reported_last_page
         if not rows:
             break
         if last_page is not None and page >= last_page:
             break
-        # Current API normally honours size=300. For endpoints without explicit
-        # pagination metadata, a short page indicates the end of the dataset.
         if last_page is None and len(rows) < 300:
             break
         page += 1
@@ -867,6 +877,122 @@ def load_gie_inventory(
     df = df.dropna(subset=["gas_day"])
     df = df.drop_duplicates(subset=["gas_day"], keep="last")
     return df.sort_values("gas_day").reset_index(drop=True)
+
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_gie_map_snapshot(platform: str, end_date, api_key: str) -> pd.DataFrame:
+    """Load the latest available inventory value for each map country."""
+    end_ts = pd.Timestamp(end_date).normalize()
+    start_ts = end_ts - pd.Timedelta(days=14)
+    rows = []
+
+    for country_name, meta in GIE_MAP_COUNTRIES.items():
+        try:
+            df = load_gie_inventory(
+                platform=platform,
+                country_code=meta["code"],
+                start_date=start_ts,
+                end_date=end_ts,
+                api_key=api_key,
+            )
+            if df.empty:
+                continue
+            latest = df.sort_values("gas_day").iloc[-1].copy()
+            latest["country_label"] = country_name
+            latest["country_code"] = meta["code"].upper()
+            latest["iso_alpha3"] = meta["iso_alpha3"]
+            latest["lat"] = meta["lat"]
+            latest["lon"] = meta["lon"]
+            rows.append(latest)
+        except Exception:
+            # Countries without data for a platform/date are simply omitted.
+            continue
+
+    return pd.DataFrame(rows)
+
+
+def _add_map_style_columns(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+    tmp = df.copy()
+    vals = pd.to_numeric(tmp[metric_col], errors="coerce").fillna(0)
+    max_val = max(float(vals.max()) if len(vals) else 0.0, 1.0)
+    rel = (vals / max_val).clip(lower=0, upper=1)
+
+    tmp["map_radius"] = 25_000 + rel.pow(0.7) * 140_000
+    tmp["color_r"] = (255 - rel * 160).round().astype(int)
+    tmp["color_g"] = (120 + rel * 110).round().astype(int)
+    tmp["color_b"] = (90 + rel * 40).round().astype(int)
+    tmp["fill_color"] = tmp[["color_r", "color_g", "color_b"]].values.tolist()
+    return tmp
+
+
+def build_gie_bubble_map(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_title: str,
+    suffix: str = "",
+):
+    if df.empty or metric_col not in df.columns:
+        return None
+
+    keep = [
+        c for c in [
+            "country_label", "country_code", "iso_alpha3", "lat", "lon", "gas_day", metric_col
+        ] if c in df.columns
+    ]
+    tmp = df[keep].copy()
+    tmp[metric_col] = pd.to_numeric(tmp[metric_col], errors="coerce")
+    tmp = tmp.dropna(subset=[metric_col, "lat", "lon"])
+    if tmp.empty:
+        return None
+
+    tmp = _add_map_style_columns(tmp, metric_col)
+    tmp["gas_day_label"] = pd.to_datetime(tmp["gas_day"], errors="coerce").dt.strftime("%Y-%m-%d")
+    tmp["value_label"] = tmp[metric_col].map(lambda x: f"{x:,.1f}{suffix}")
+
+    scatter = pdk.Layer(
+        "ScatterplotLayer",
+        data=tmp,
+        get_position="[lon, lat]",
+        get_radius="map_radius",
+        get_fill_color="fill_color",
+        get_line_color=[30, 41, 59],
+        line_width_min_pixels=1,
+        pickable=True,
+        opacity=0.78,
+        stroked=True,
+    )
+    labels = pdk.Layer(
+        "TextLayer",
+        data=tmp,
+        get_position="[lon, lat]",
+        get_text="country_code",
+        get_size=13,
+        get_color=[17, 24, 39],
+        get_alignment_baseline="center",
+    )
+
+    tooltip = {
+        "html": (
+            f"<b>{{country_label}}</b><br/>"
+            f"{metric_title}: {{value_label}}<br/>"
+            "Gas day: {gas_day_label}"
+        ),
+        "style": {"backgroundColor": "white", "color": "#111827"},
+    }
+
+    return pdk.Deck(
+        map_provider="carto",
+        map_style="light",
+        initial_view_state=pdk.ViewState(
+            latitude=48.5,
+            longitude=10.5,
+            zoom=3.35,
+            pitch=0,
+        ),
+        layers=[scatter, labels],
+        tooltip=tooltip,
+    )
 
 
 def _metric_text(value, decimals: int = 1, suffix: str = "") -> str:
@@ -1031,7 +1157,11 @@ def render_gie_inventory_section():
         return
 
     if inventory.empty:
-        st.warning("The GIE API returned no inventory data for the selected geography and period.")
+        st.warning(
+            "The GIE API returned no inventory data for the selected geography and period. "
+            "The app queried the official `/api/data/{code}` historical endpoint; "
+            "check the API-key platform permissions and then press Refresh GIE data."
+        )
         return
 
     latest = inventory.iloc[-1]
