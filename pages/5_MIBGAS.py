@@ -259,11 +259,40 @@ def load_local_history() -> tuple[pd.DataFrame, pd.DataFrame]:
 # =========================================================
 # SFTP LIVE 2026
 # =========================================================
-def get_secret(name: str, default=None):
+def _search_secret_case_insensitive(container, target_name: str):
+    """Recursively find a secret by name, including nested TOML sections."""
     try:
-        return st.secrets.get(name, default)
+        items = container.items()
     except Exception:
-        return default
+        return None
+
+    target = str(target_name).strip().lower()
+    for key, value in items:
+        if str(key).strip().lower() == target and value not in (None, ""):
+            return value
+
+    for _, value in items:
+        if hasattr(value, "items"):
+            found = _search_secret_case_insensitive(value, target_name)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def get_secret(name: str, default=None):
+    """Read top-level, nested, case-insensitive Streamlit secrets or env vars."""
+    try:
+        found = _search_secret_case_insensitive(st.secrets, name)
+        if found not in (None, ""):
+            return found
+    except Exception:
+        pass
+
+    for env_name in (name, name.upper(), name.lower()):
+        env_value = os.getenv(env_name)
+        if env_value:
+            return env_value
+    return default
 
 
 def load_private_key():
@@ -708,11 +737,21 @@ GIE_MAP_COUNTRIES = {
 
 
 def get_gie_api_key(platform: str) -> str | None:
-    """Use one shared GIE key, with optional platform-specific fallbacks."""
-    shared = get_secret("GIE_API_KEY")
-    specific = get_secret(f"{platform.upper()}_API_KEY")
-    key = shared or specific
-    return str(key).strip() if key else None
+    """Use shared, platform-specific, aliased, or temporary-session GIE keys."""
+    aliases = [
+        "GIE_API_KEY", "GIE_KEY",
+        f"{platform.upper()}_API_KEY", f"{platform.upper()}_KEY",
+        "x-key", "X_KEY",
+    ]
+    for alias in aliases:
+        key = get_secret(alias)
+        if key:
+            cleaned = str(key).strip().strip('"').strip("'")
+            if cleaned:
+                return cleaned
+
+    session_key = st.session_state.get("gie_manual_api_key")
+    return str(session_key).strip() if session_key else None
 
 
 def _gie_payload_rows(payload) -> tuple[list[dict], int | None]:
@@ -725,11 +764,16 @@ def _gie_payload_rows(payload) -> tuple[list[dict], int | None]:
     if payload.get("error"):
         raise ValueError(str(payload["error"]))
 
-    rows = payload.get("data", payload.get("results", []))
+    rows = payload.get("data", payload.get("results", payload.get("items", [])))
+    if isinstance(rows, dict):
+        rows = rows.get("data", rows.get("results", rows.get("items", [])))
     if rows is None:
         rows = []
     if not isinstance(rows, list):
-        raise ValueError("GIE API response does not contain a valid data array.")
+        raise ValueError(
+            "GIE API response does not contain a valid data array. "
+            f"Top-level fields: {list(payload.keys())}"
+        )
 
     last_page = payload.get("last_page", payload.get("lastPage"))
     try:
@@ -849,7 +893,7 @@ def load_gie_inventory(
 
     df = pd.DataFrame(all_rows)
     date_col = next(
-        (c for c in ["gasDayStart", "gasDayStartedOn", "gas_day", "date"] if c in df.columns),
+        (c for c in ["gasDayStart", "gasDayStartedOn", "gasDay", "gas_day", "date", "day"] if c in df.columns),
         None,
     )
     if date_col is None:
@@ -861,9 +905,23 @@ def load_gie_inventory(
         "workingGasVolume", "injectionCapacity", "withdrawalCapacity", "trend", "full",
         "lngInventory", "sendOut", "dtmi", "dtrs",
     ]
+
+    def gie_to_numeric(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_numeric_dtype(series):
+            return pd.to_numeric(series, errors="coerce")
+        s = series.astype(str).str.strip()
+        s = s.replace({"": pd.NA, "-": pd.NA, "--": pd.NA, "None": pd.NA, "null": pd.NA})
+        s = s.str.replace("%", "", regex=False)
+        s = s.str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
+        both = s.str.contains(",", na=False) & s.str.contains(r"\.", regex=True, na=False)
+        s.loc[both] = s.loc[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+        only_comma = s.str.contains(",", na=False) & ~s.str.contains(r"\.", regex=True, na=False)
+        s.loc[only_comma] = s.loc[only_comma].str.replace(",", ".", regex=False)
+        return pd.to_numeric(s, errors="coerce")
+
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = gie_to_numeric(df[col])
 
     if platform.lower() == "agsi":
         if "full" not in df.columns and {"gasInStorage", "workingGasVolume"}.issubset(df.columns):
@@ -1133,11 +1191,22 @@ def render_gie_inventory_section():
     platform = "agsi" if "AGSI" in inventory_view else "alsi"
     api_key = get_gie_api_key(platform)
     if not api_key:
-        st.info(
-            "Add `GIE_API_KEY` to Streamlit Secrets after registering for free API access. "
-            "Choose access to both AGSI+ and ALSI when creating the key."
+        st.warning(
+            "The app is not detecting the GIE key in this Streamlit deployment. "
+            "This version accepts top-level or nested Secrets and common key aliases."
         )
-        st.code('GIE_API_KEY = "PASTE_YOUR_GIE_API_KEY_HERE"', language="toml")
+        manual_key = st.text_input(
+            "Temporary GIE API key for this browser session",
+            type="password",
+            key="gie_manual_key_input",
+            help="Use this only to test the connection. Keep the permanent key in Streamlit Secrets.",
+        )
+        if manual_key:
+            st.session_state["gie_manual_api_key"] = manual_key.strip()
+            st.rerun()
+        with st.expander("Permanent Streamlit Secrets configuration"):
+            st.code('GIE_API_KEY = "PASTE_YOUR_GIE_API_KEY_HERE"', language="toml")
+            st.caption("Save it in this app's Secrets and reboot. Do not place it inside the multiline MIBGAS_SFTP_KEY value.")
         return
 
     try:
@@ -1152,16 +1221,30 @@ def render_gie_inventory_section():
     except Exception as exc:
         st.error(
             f"Could not load {platform.upper()} data: {exc}. "
-            "Check that the API key is active and authorised for this platform."
+            "The API key was detected, but the request or returned schema failed."
         )
+        with st.expander("GIE connection diagnostics"):
+            st.write({
+                "platform": platform.upper(),
+                "geography": country_label,
+                "country_code": GIE_COUNTRY_OPTIONS[country_label],
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "api_key_detected": True,
+            })
         return
 
     if inventory.empty:
-        st.warning(
-            "The GIE API returned no inventory data for the selected geography and period. "
-            "The app queried the official `/api/data/{code}` historical endpoint; "
-            "check the API-key platform permissions and then press Refresh GIE data."
-        )
+        st.warning("The GIE API returned no inventory rows for the selected geography and period.")
+        with st.expander("GIE request diagnostics"):
+            st.write({
+                "platform": platform.upper(),
+                "geography": country_label,
+                "country_code": GIE_COUNTRY_OPTIONS[country_label],
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "api_key_detected": bool(api_key),
+            })
         return
 
     latest = inventory.iloc[-1]
@@ -1223,7 +1306,7 @@ def render_gie_inventory_section():
             suffix=map_suffix,
         )
         if map_deck is not None:
-            st.pydeck_chart(map_deck, use_container_width=True)
+            st.pydeck_chart(map_deck, use_container_width=True, height=520)
 
         with st.expander("Show map snapshot values"):
             map_display_cols = [c for c in ["country_label", "gas_day", value_col] if c in map_snapshot.columns]
