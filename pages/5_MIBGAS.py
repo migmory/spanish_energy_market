@@ -733,6 +733,7 @@ GIE_MAP_COUNTRIES = {
     "Croatia": {"code": "hr", "iso_alpha3": "HRV", "lat": 45.30, "lon": 16.10},
     "Greece": {"code": "gr", "iso_alpha3": "GRC", "lat": 39.10, "lon": 22.30},
     "Lithuania": {"code": "lt", "iso_alpha3": "LTU", "lat": 55.20, "lon": 23.80},
+    "Finland": {"code": "fi", "iso_alpha3": "FIN", "lat": 64.50, "lon": 26.00},
 }
 
 
@@ -792,8 +793,9 @@ def _request_gie_page(
     api_key: str,
     api_mode: str | None = None,
 ) -> tuple[list[dict], int | None, str]:
-    """Request GIE data, preferring the documented /api/data/{code} endpoint."""
+    """Request GIE data using API V2 first and the legacy endpoint as fallback."""
     platform = platform.lower()
+    country_code = country_code.lower()
     base_url = f"https://{platform}.gie.eu"
     headers = {
         "x-key": api_key,
@@ -803,27 +805,27 @@ def _request_gie_page(
     start_s = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_s = pd.Timestamp(end_date).strftime("%Y-%m-%d")
 
-    # GIE's documented historical endpoint uses /api/data/{eu|countryCode}
-    # and the query parameters `from` and `till`. It returns the complete
-    # requested period in a single response, so no page parameter is sent.
+    # API V2 uses type=eu for the EU aggregate and country=xx for countries.
+    # Using country=eu can return an incomplete/empty schema on ALSI.
+    v2_params = {
+        "from": start_s,
+        "to": end_s,
+        "size": 300,
+        "page": page,
+    }
+    if country_code == "eu":
+        v2_params["type"] = "eu"
+    else:
+        v2_params["country"] = country_code
+
     candidates = {
-        "documented": (
-            f"{base_url}/api/data/{country_code.lower()}",
+        "v2": (f"{base_url}/api", v2_params),
+        "legacy": (
+            f"{base_url}/api/data/{country_code}",
             {"from": start_s, "till": end_s},
         ),
-        # Kept only as a fallback for deployments exposing the newer layout.
-        "current": (
-            f"{base_url}/api",
-            {
-                "country": country_code.lower(),
-                "from": start_s,
-                "to": end_s,
-                "size": 300,
-                "page": page,
-            },
-        ),
     }
-    modes = [api_mode] if api_mode in candidates else ["documented", "current"]
+    modes = [api_mode] if api_mode in candidates else ["v2", "legacy"]
     errors = []
 
     for mode in modes:
@@ -833,10 +835,6 @@ def _request_gie_page(
             response.raise_for_status()
             payload = response.json()
             rows, last_page = _gie_payload_rows(payload)
-
-            # Some unsupported endpoint variants reply HTTP 200 with an empty
-            # array. In that case continue to the documented fallback rather
-            # than treating the request as a successful empty dataset.
             if rows or mode == modes[-1]:
                 return rows, last_page, mode
         except Exception as exc:
@@ -873,9 +871,9 @@ def load_gie_inventory(
         )
         all_rows.extend(rows)
 
-        # The documented /api/data/{code} endpoint returns the entire selected
-        # period in one call. Only the optional newer endpoint is paginated.
-        if api_mode == "documented":
+        # The legacy /api/data/{code} endpoint returns the entire selected
+        # period in one call. API V2 is paginated.
+        if api_mode == "legacy":
             break
 
         if reported_last_page is not None:
@@ -896,14 +894,30 @@ def load_gie_inventory(
     # ALSI still uses an older API schema in some endpoint/account combinations.
     # Canonicalise common field-name variants before calculating metrics.
     def coalesce_api_field(canonical: str, aliases: list[str]) -> None:
-        if canonical in df.columns:
-            return
+        """Fill a canonical field from aliases, even when it already exists but is null."""
         normalised = {normalize_col_name(c): c for c in df.columns}
-        for alias in aliases:
+        result = pd.Series(pd.NA, index=df.index, dtype="object")
+
+        # Keep any valid canonical values first, then fill gaps from aliases.
+        ordered_aliases = [canonical] + [a for a in aliases if normalize_col_name(a) != normalize_col_name(canonical)]
+        seen_sources = set()
+        for alias in ordered_aliases:
             source = normalised.get(normalize_col_name(alias))
-            if source is not None:
-                df[canonical] = df[source]
-                return
+            if source is None or source in seen_sources:
+                continue
+            seen_sources.add(source)
+            candidate = df[source].copy()
+            if not pd.api.types.is_numeric_dtype(candidate):
+                candidate = candidate.astype("string").str.strip()
+                candidate = candidate.replace({
+                    "": pd.NA, "-": pd.NA, "--": pd.NA,
+                    "None": pd.NA, "none": pd.NA,
+                    "null": pd.NA, "NULL": pd.NA,
+                    "N/A": pd.NA, "n/a": pd.NA,
+                })
+            result = result.combine_first(candidate)
+
+        df[canonical] = result
 
     coalesce_api_field("lngInventory", [
         "lngInventory", "lng_inventory", "inventory", "lngStock", "lng_stock",
@@ -965,12 +979,17 @@ def load_gie_inventory(
         if {"injection", "withdrawal"}.issubset(df.columns):
             df["net_flow_gwh_d"] = df["injection"] - df["withdrawal"]
     else:
-        # Prefer a percentage directly supplied by ALSI. Otherwise derive it
-        # from LNG inventory divided by declared maximum inventory.
-        if "inventory_pct" not in df.columns and {"lngInventory", "dtmi"}.issubset(df.columns):
-            df["inventory_pct"] = 100 * df["lngInventory"] / df["dtmi"].replace(0, pd.NA)
-        elif "inventory_pct" in df.columns:
+        # ALSI V2 calls the stock field `inventory`; legacy responses may call it
+        # `lngInventory`. The canonical field above combines both. Always fill
+        # missing percentages from inventory / declared maximum inventory.
+        if "inventory_pct" not in df.columns:
+            df["inventory_pct"] = pd.Series(pd.NA, index=df.index, dtype="Float64")
+        else:
             df["inventory_pct"] = pd.to_numeric(df["inventory_pct"], errors="coerce")
+
+        if {"lngInventory", "dtmi"}.issubset(df.columns):
+            derived_pct = 100 * df["lngInventory"] / df["dtmi"].replace(0, pd.NA)
+            df["inventory_pct"] = df["inventory_pct"].combine_first(derived_pct)
 
     df = df.dropna(subset=["gas_day"])
     df = df.drop_duplicates(subset=["gas_day"], keep="last")
