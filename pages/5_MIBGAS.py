@@ -7,6 +7,7 @@ from pathlib import Path
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
 try:
@@ -674,6 +675,419 @@ def render_forwards_section(forwards_f: pd.DataFrame):
     with st.expander("Show forward data"):
         st.dataframe(forwards_f.sort_values(["trading_day", "product"], ascending=[False, True]), use_container_width=True, hide_index=True)
 # =========================================================
+# GIE AGSI / ALSI INVENTORY API
+# =========================================================
+GIE_COUNTRY_OPTIONS = {
+    "EU total": "eu",
+    "Spain": "es",
+    "Portugal": "pt",
+    "France": "fr",
+    "Germany": "de",
+    "Italy": "it",
+    "Netherlands": "nl",
+    "Belgium": "be",
+}
+
+
+def get_gie_api_key(platform: str) -> str | None:
+    """Use one shared GIE key, with optional platform-specific fallbacks."""
+    shared = get_secret("GIE_API_KEY")
+    specific = get_secret(f"{platform.upper()}_API_KEY")
+    key = shared or specific
+    return str(key).strip() if key else None
+
+
+def _gie_payload_rows(payload) -> tuple[list[dict], int | None]:
+    """Extract API rows and pagination metadata from either API response format."""
+    if isinstance(payload, list):
+        return payload, None
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected response format from GIE API.")
+
+    if payload.get("error"):
+        raise ValueError(str(payload["error"]))
+
+    rows = payload.get("data", payload.get("results", []))
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        raise ValueError("GIE API response does not contain a valid data array.")
+
+    last_page = payload.get("last_page", payload.get("lastPage"))
+    try:
+        last_page = int(last_page) if last_page is not None else None
+    except (TypeError, ValueError):
+        last_page = None
+    return rows, last_page
+
+
+def _request_gie_page(
+    platform: str,
+    country_code: str,
+    start_date,
+    end_date,
+    page: int,
+    api_key: str,
+    api_mode: str | None = None,
+) -> tuple[list[dict], int | None, str]:
+    """Request one page, supporting both current and legacy GIE endpoint layouts."""
+    platform = platform.lower()
+    base_url = f"https://{platform}.gie.eu"
+    headers = {
+        "x-key": api_key,
+        "Accept": "application/json",
+        "User-Agent": "NexwellPower-Streamlit/1.0",
+    }
+    start_s = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+    end_s = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+
+    candidates = {
+        "current": (
+            f"{base_url}/api",
+            {
+                "country": country_code.lower(),
+                "from": start_s,
+                "to": end_s,
+                "size": 300,
+                "page": page,
+            },
+        ),
+        "legacy": (
+            f"{base_url}/api/data/{country_code.lower()}",
+            {
+                "from": start_s,
+                "till": end_s,
+                "page": page,
+            },
+        ),
+    }
+    modes = [api_mode] if api_mode in candidates else ["current", "legacy"]
+    errors = []
+
+    for mode in modes:
+        url, params = candidates[mode]
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=35)
+            response.raise_for_status()
+            payload = response.json()
+            rows, last_page = _gie_payload_rows(payload)
+            return rows, last_page, mode
+        except Exception as exc:
+            errors.append(f"{mode}: {exc}")
+
+    raise ValueError(" | ".join(errors))
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_gie_inventory(
+    platform: str,
+    country_code: str,
+    start_date,
+    end_date,
+    api_key: str,
+) -> pd.DataFrame:
+    """Download and standardise AGSI underground storage or ALSI LNG inventory data."""
+    all_rows: list[dict] = []
+    page = 1
+    last_page = None
+    api_mode = None
+
+    while page <= 100:
+        rows, reported_last_page, api_mode = _request_gie_page(
+            platform=platform,
+            country_code=country_code,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            api_key=api_key,
+            api_mode=api_mode,
+        )
+        all_rows.extend(rows)
+
+        if reported_last_page is not None:
+            last_page = reported_last_page
+        if not rows:
+            break
+        if last_page is not None and page >= last_page:
+            break
+        # Current API normally honours size=300. For endpoints without explicit
+        # pagination metadata, a short page indicates the end of the dataset.
+        if last_page is None and len(rows) < 300:
+            break
+        page += 1
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    date_col = next(
+        (c for c in ["gasDayStart", "gasDayStartedOn", "gas_day", "date"] if c in df.columns),
+        None,
+    )
+    if date_col is None:
+        raise ValueError(f"No gas-day date field found. Columns returned: {df.columns.tolist()}")
+
+    df["gas_day"] = pd.to_datetime(df[date_col], errors="coerce")
+    numeric_cols = [
+        "gasInStorage", "consumption", "consumptionFull", "injection", "withdrawal",
+        "workingGasVolume", "injectionCapacity", "withdrawalCapacity", "trend", "full",
+        "lngInventory", "sendOut", "dtmi", "dtrs",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if platform.lower() == "agsi":
+        if "full" not in df.columns and {"gasInStorage", "workingGasVolume"}.issubset(df.columns):
+            df["full"] = 100 * df["gasInStorage"] / df["workingGasVolume"].replace(0, pd.NA)
+        if {"injection", "withdrawal"}.issubset(df.columns):
+            df["net_flow_gwh_d"] = df["injection"] - df["withdrawal"]
+    else:
+        if {"lngInventory", "dtmi"}.issubset(df.columns):
+            df["inventory_pct"] = 100 * df["lngInventory"] / df["dtmi"].replace(0, pd.NA)
+
+    df = df.dropna(subset=["gas_day"])
+    df = df.drop_duplicates(subset=["gas_day"], keep="last")
+    return df.sort_values("gas_day").reset_index(drop=True)
+
+
+def _metric_text(value, decimals: int = 1, suffix: str = "") -> str:
+    if pd.isna(value):
+        return "-"
+    return f"{float(value):,.{decimals}f}{suffix}"
+
+
+def build_gie_seasonal_chart(df: pd.DataFrame, value_col: str, y_title: str, tooltip_title: str):
+    if df.empty or value_col not in df.columns:
+        return None
+    tmp = df[["gas_day", value_col]].dropna().copy()
+    if tmp.empty:
+        return None
+
+    tmp["year"] = tmp["gas_day"].dt.year.astype(str)
+    tmp["actual_date"] = tmp["gas_day"].dt.strftime("%Y-%m-%d")
+    tmp["season_date"] = pd.to_datetime("2000-" + tmp["gas_day"].dt.strftime("%m-%d"), errors="coerce")
+    latest_year = tmp["year"].astype(int).max()
+
+    chart = (
+        alt.Chart(tmp)
+        .mark_line(interpolate="monotone")
+        .encode(
+            x=alt.X("season_date:T", title=None, axis=alt.Axis(format="%b", labelAngle=0)),
+            y=alt.Y(f"{value_col}:Q", title=y_title, scale=alt.Scale(zero=False)),
+            color=alt.Color("year:N", title="Year", sort="descending"),
+            detail="year:N",
+            strokeWidth=alt.condition(
+                f"datum.year == '{latest_year}'",
+                alt.value(3.5),
+                alt.value(1.5),
+            ),
+            opacity=alt.condition(
+                f"datum.year == '{latest_year}'",
+                alt.value(1.0),
+                alt.value(0.65),
+            ),
+            tooltip=[
+                alt.Tooltip("actual_date:N", title="Gas day"),
+                alt.Tooltip("year:N", title="Year"),
+                alt.Tooltip(f"{value_col}:Q", title=tooltip_title, format=",.2f"),
+            ],
+        )
+    )
+    return apply_common_chart_style(chart, height=390)
+
+
+def build_gie_flow_chart(df: pd.DataFrame, platform: str):
+    if df.empty:
+        return None
+
+    if platform == "agsi":
+        flow_cols = [c for c in ["injection", "withdrawal"] if c in df.columns]
+        labels = {"injection": "Injection", "withdrawal": "Withdrawal"}
+        y_title = "GWh/d"
+    else:
+        flow_cols = [c for c in ["sendOut", "dtrs"] if c in df.columns]
+        labels = {"sendOut": "Send-out", "dtrs": "Reference send-out capacity"}
+        y_title = "GWh/d"
+
+    if not flow_cols:
+        return None
+
+    tmp = df[["gas_day"] + flow_cols].melt(
+        id_vars="gas_day",
+        value_vars=flow_cols,
+        var_name="series",
+        value_name="value",
+    ).dropna(subset=["value"])
+    tmp["series"] = tmp["series"].map(labels).fillna(tmp["series"])
+
+    chart = (
+        alt.Chart(tmp)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("gas_day:T", title=None, axis=alt.Axis(format="%b-%Y", labelAngle=0)),
+            y=alt.Y("value:Q", title=y_title, scale=alt.Scale(zero=False)),
+            color=alt.Color("series:N", title=None),
+            tooltip=[
+                alt.Tooltip("gas_day:T", title="Gas day", format="%Y-%m-%d"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title=y_title, format=",.1f"),
+            ],
+        )
+    )
+    return apply_common_chart_style(chart, height=310)
+
+
+def render_gie_inventory_section():
+    section_header("European gas inventories - GIE AGSI / ALSI")
+    st.caption(
+        "Daily underground gas storage and LNG terminal data. "
+        "Source: Gas Infrastructure Europe (GIE), AGSI / ALSI Transparency Platforms."
+    )
+
+    c1, c2, c3, c4 = st.columns([1.25, 1.25, 1.25, 0.8])
+    with c1:
+        inventory_view = st.radio(
+            "Dataset",
+            options=["Underground storage (AGSI)", "LNG inventory (ALSI)"],
+            horizontal=True,
+            key="gie_inventory_view",
+        )
+    with c2:
+        country_label = st.selectbox(
+            "Geography",
+            options=list(GIE_COUNTRY_OPTIONS.keys()),
+            index=0,
+            key="gie_country",
+        )
+    today = pd.Timestamp.today().date()
+    default_start = pd.Timestamp(year=max(today.year - 3, 2011), month=1, day=1).date()
+    with c3:
+        gie_dates = st.date_input(
+            "Inventory period",
+            value=(default_start, today),
+            min_value=pd.Timestamp("2011-01-01").date(),
+            max_value=today,
+            key="gie_inventory_dates",
+        )
+    with c4:
+        st.write("")
+        st.write("")
+        if st.button("Refresh GIE data", key="refresh_gie_data"):
+            load_gie_inventory.clear()
+            st.rerun()
+
+    if not isinstance(gie_dates, (tuple, list)) or len(gie_dates) != 2:
+        st.info("Select both a start and an end date.")
+        return
+    start_date, end_date = gie_dates
+    if start_date > end_date:
+        st.warning("The inventory start date must be before the end date.")
+        return
+
+    platform = "agsi" if "AGSI" in inventory_view else "alsi"
+    api_key = get_gie_api_key(platform)
+    if not api_key:
+        st.info(
+            "Add `GIE_API_KEY` to Streamlit Secrets after registering for free API access. "
+            "Choose access to both AGSI+ and ALSI when creating the key."
+        )
+        st.code('GIE_API_KEY = "PASTE_YOUR_GIE_API_KEY_HERE"', language="toml")
+        return
+
+    try:
+        with st.spinner(f"Loading {platform.upper()} inventory data..."):
+            inventory = load_gie_inventory(
+                platform=platform,
+                country_code=GIE_COUNTRY_OPTIONS[country_label],
+                start_date=start_date,
+                end_date=end_date,
+                api_key=api_key,
+            )
+    except Exception as exc:
+        st.error(
+            f"Could not load {platform.upper()} data: {exc}. "
+            "Check that the API key is active and authorised for this platform."
+        )
+        return
+
+    if inventory.empty:
+        st.warning("The GIE API returned no inventory data for the selected geography and period.")
+        return
+
+    latest = inventory.iloc[-1]
+    m1, m2, m3, m4 = st.columns(4)
+
+    if platform == "agsi":
+        m1.metric("Storage filling level", _metric_text(latest.get("full"), 1, "%"))
+        m2.metric("Gas in storage", _metric_text(latest.get("gasInStorage"), 1, " TWh"))
+        m3.metric("Working gas volume", _metric_text(latest.get("workingGasVolume"), 1, " TWh"))
+        m4.metric("Net daily flow", _metric_text(latest.get("net_flow_gwh_d"), 0, " GWh/d"))
+
+        metric_label = st.radio(
+            "Inventory chart metric",
+            options=["Filling level (%)", "Gas in storage (TWh)"],
+            horizontal=True,
+            key="agsi_metric",
+        )
+        if metric_label.startswith("Filling"):
+            value_col, y_title, tooltip_title = "full", "Storage filling level (%)", "Fill level %"
+        else:
+            value_col, y_title, tooltip_title = "gasInStorage", "Gas in storage (TWh)", "Gas in storage TWh"
+        st.subheader(f"{country_label} underground gas storage - seasonal comparison")
+    else:
+        m1.metric("LNG inventory", _metric_text(latest.get("lngInventory"), 1, " thousand m³ LNG"))
+        m2.metric("Tank filling level", _metric_text(latest.get("inventory_pct"), 1, "%"))
+        m3.metric("Send-out", _metric_text(latest.get("sendOut"), 1, " GWh/d"))
+        m4.metric("Declared max inventory", _metric_text(latest.get("dtmi"), 1, " thousand m³ LNG"))
+
+        metric_label = st.radio(
+            "Inventory chart metric",
+            options=["Tank filling level (%)", "LNG inventory (thousand m³)"],
+            horizontal=True,
+            key="alsi_metric",
+        )
+        if metric_label.startswith("Tank"):
+            value_col, y_title, tooltip_title = "inventory_pct", "LNG tank filling level (%)", "Fill level %"
+        else:
+            value_col, y_title, tooltip_title = "lngInventory", "LNG inventory (thousand m³)", "LNG inventory"
+        st.subheader(f"{country_label} LNG inventory - seasonal comparison")
+
+    inventory_chart = build_gie_seasonal_chart(inventory, value_col, y_title, tooltip_title)
+    if inventory_chart is not None:
+        st.altair_chart(inventory_chart, use_container_width=True)
+    else:
+        st.warning(f"No values were returned for {metric_label}.")
+
+    st.subheader("Daily operational flows")
+    flow_chart = build_gie_flow_chart(inventory, platform)
+    if flow_chart is not None:
+        st.altair_chart(flow_chart, use_container_width=True)
+
+    with st.expander("Show and download GIE inventory data"):
+        display_cols = [
+            c for c in [
+                "gas_day", "name", "code", "status",
+                "gasInStorage", "full", "workingGasVolume", "injection", "withdrawal", "net_flow_gwh_d",
+                "lngInventory", "inventory_pct", "sendOut", "dtmi", "dtrs", "info",
+            ] if c in inventory.columns
+        ]
+        st.dataframe(
+            inventory[display_cols].sort_values("gas_day", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv = inventory.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            f"Download {platform.upper()} inventory CSV",
+            data=csv,
+            file_name=f"gie_{platform}_{GIE_COUNTRY_OPTIONS[country_label]}_{start_date}_{end_date}.csv",
+            mime="text/csv",
+            key=f"download_{platform}_inventory",
+        )
+
+
+# =========================================================
 # PAGE
 # =========================================================
 st.title("MIBGAS - Spain Gas Prices")
@@ -748,6 +1162,9 @@ st.markdown("---")
 render_actuals_section(actuals_f)
 render_forwards_section(forwards_f)
 
+st.markdown("---")
+render_gie_inventory_section()
+
 tab_raw, tab_diagnostics = st.tabs(["Raw data", "Diagnostics"])
 
 with tab_raw:
@@ -763,5 +1180,5 @@ with tab_diagnostics:
     if not sftp_log.empty:
         st.dataframe(sftp_log, use_container_width=True, hide_index=True)
     st.write("Secrets expected in Streamlit Cloud → App → Settings → Secrets:")
-    secrets_example = 'MIBGAS_SFTP_HOST = "secureftp.mibgas.es"\nMIBGAS_SFTP_PORT = 22\nMIBGAS_SFTP_USER = "m.moreno"\nMIBGAS_SFTP_BASE_PATH = "/secureftpbucket.omie.es/MIBGAS"\n\nMIBGAS_SFTP_KEY = """\n-----BEGIN OPENSSH PRIVATE KEY-----\nPASTE_FULL_GASkey_CONTENT_HERE\n-----END OPENSSH PRIVATE KEY-----\n"""'
+    secrets_example = 'GIE_API_KEY = "PASTE_YOUR_GIE_API_KEY_HERE"\n\nMIBGAS_SFTP_HOST = "secureftp.mibgas.es"\nMIBGAS_SFTP_PORT = 22\nMIBGAS_SFTP_USER = "m.moreno"\nMIBGAS_SFTP_BASE_PATH = "/secureftpbucket.omie.es/MIBGAS"\n\nMIBGAS_SFTP_KEY = """\n-----BEGIN OPENSSH PRIVATE KEY-----\nPASTE_FULL_GASkey_CONTENT_HERE\n-----END OPENSSH PRIVATE KEY-----\n"""'
     st.code(secrets_example, language="toml")
