@@ -994,18 +994,73 @@ def load_gie_inventory(
         "lngInventory", "inventory_pct", "sendOut", "dtmi", "dtrs",
     ]
 
+    def _extract_numeric_scalar(value):
+        """Extract a numeric scalar from ALSI values, including nested JSON objects."""
+        if value is None or value is pd.NA:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return value
+
+        # Current GIE responses can wrap values in objects such as
+        # {"value": "5373.25", ...}. Prefer common value keys first.
+        if isinstance(value, dict):
+            preferred_keys = (
+                "value", "amount", "total", "current", "raw", "rawValue",
+                "numericValue", "reportedValue", "inventory", "lngInventory",
+                "dtmi", "sendOut", "dtrs", "percentage", "percent", "pct",
+            )
+            for key in preferred_keys:
+                if key in value:
+                    parsed = _extract_numeric_scalar(value[key])
+                    if parsed is not None:
+                        return parsed
+            for nested in value.values():
+                parsed = _extract_numeric_scalar(nested)
+                if parsed is not None:
+                    return parsed
+            return None
+
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                parsed = _extract_numeric_scalar(nested)
+                if parsed is not None:
+                    return parsed
+            return None
+
+        s = str(value).strip()
+        if s in {"", "-", "--", "None", "none", "null", "NULL", "N/A", "n/a"}:
+            return None
+        s = re.sub(r"<[^>]+>", "", s)
+        s = s.replace("%", "").replace("\u00a0", "").replace(" ", "")
+
+        # Keep only a plausible signed decimal number if units or labels are present.
+        matches = re.findall(r"[-+]?\d[\d.,]*", s)
+        if not matches:
+            return None
+        s = matches[0]
+
+        if "," in s and "." in s:
+            # Decide decimal separator by the last occurrence.
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        elif "," in s:
+            parts = s.split(",")
+            if len(parts[-1]) <= 3:
+                s = s.replace(",", ".")
+            else:
+                s = s.replace(",", "")
+
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
     def gie_to_numeric(series: pd.Series) -> pd.Series:
-        if pd.api.types.is_numeric_dtype(series):
-            return pd.to_numeric(series, errors="coerce")
-        s = series.astype(str).str.strip()
-        s = s.replace({"": pd.NA, "-": pd.NA, "--": pd.NA, "None": pd.NA, "null": pd.NA})
-        s = s.str.replace("%", "", regex=False)
-        s = s.str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
-        both = s.str.contains(",", na=False) & s.str.contains(r"\.", regex=True, na=False)
-        s.loc[both] = s.loc[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-        only_comma = s.str.contains(",", na=False) & ~s.str.contains(r"\.", regex=True, na=False)
-        s.loc[only_comma] = s.loc[only_comma].str.replace(",", ".", regex=False)
-        return pd.to_numeric(s, errors="coerce")
+        return pd.to_numeric(series.map(_extract_numeric_scalar), errors="coerce")
 
     for col in numeric_cols:
         if col in df.columns:
@@ -1429,6 +1484,15 @@ def render_gie_inventory_section():
             "The API returned ALSI rows, but no non-null value was available for the selected map metric. "
             f"Returned fields: {returned_cols}"
         )
+        if platform == "alsi":
+            raw_diag_cols = [c for c in ["gas_day", "inventory", "lngInventory", "dtmi", "inventory_pct", "sendOut", "dtrs"] if c in inventory.columns]
+            if raw_diag_cols:
+                with st.expander("ALSI raw-value diagnostics"):
+                    diag = inventory[raw_diag_cols].tail(10).copy()
+                    for c in diag.columns:
+                        if c != "gas_day":
+                            diag[c] = diag[c].map(lambda x: repr(x))
+                    st.dataframe(diag, use_container_width=True, hide_index=True)
 
     st.subheader(f"{country_label} inventory - seasonal comparison")
     inventory_chart = build_gie_seasonal_chart(inventory, value_col, y_title, tooltip_title)
