@@ -736,6 +736,12 @@ GIE_MAP_COUNTRIES = {
     "Finland": {"code": "fi", "iso_alpha3": "FIN", "lat": 64.50, "lon": 26.00},
 }
 
+ALSI_MAP_COUNTRY_NAMES = [
+    "Spain", "Portugal", "France", "Germany", "Italy", "Netherlands",
+    "Belgium", "Poland", "Croatia", "Greece", "Lithuania", "Finland",
+]
+
+
 
 def get_gie_api_key(platform: str) -> str | None:
     """Use shared, platform-specific, aliased, or temporary-session GIE keys."""
@@ -796,6 +802,7 @@ def _request_gie_page(
     """Request AGSI via V2 and ALSI via its still-applicable V4 data endpoint."""
     platform = platform.lower()
     country_code = country_code.lower()
+    country_code_api = country_code.upper()
     base_url = f"https://{platform}.gie.eu"
     headers = {
         "x-key": api_key,
@@ -816,7 +823,8 @@ def _request_gie_page(
     if country_code == "eu":
         v2_params["type"] = "eu"
     else:
-        v2_params["country"] = country_code
+        # GIE documents country filters as two-character uppercase codes.
+        v2_params["country"] = country_code_api
 
     candidates = {
         "v2": (f"{base_url}/api", v2_params),
@@ -831,32 +839,44 @@ def _request_gie_page(
     # inventory and DTMI empty. Therefore ALSI must prefer /api/data/{code}.
     if api_mode in candidates:
         modes = [api_mode]
-    elif platform == "alsi":
+    elif platform == "alsi" and country_code == "eu":
+        # The legacy EU aggregate is reliable for ALSI.
         modes = ["legacy", "v2"]
+    elif platform == "alsi":
+        # Country aggregates are documented on /api?country=XX.
+        # /api/data/{country} can return rows with send-out but empty inventory.
+        modes = ["v2", "legacy"]
     else:
         modes = ["v2", "legacy"]
 
     errors = []
 
+    def _has_nonempty_value(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return value.strip() not in {"", "-", "--", "null", "None", "N/A", "n/a"}
+        if isinstance(value, dict):
+            return any(_has_nonempty_value(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(_has_nonempty_value(v) for v in value)
+        return True
+
     def alsi_rows_have_inventory_values(rows: list[dict]) -> bool:
         if platform != "alsi" or not rows:
             return bool(rows)
         aliases = {
-            "lnginventory", "lng_inventory", "inventory", "lngstock",
-            "lng_stock", "lngvolume", "lng_volume", "dtmi",
-            "declaredtotalmaxinventory", "maxinventory",
+            "lnginventory", "inventory", "lngstock", "lngvolume", "dtmi",
+            "declaredtotalmaxinventory", "maxinventory", "storagecapacity",
+            "lngstoragecapacity", "inventorypct", "inventorypercentage",
+            "filllevel", "inventorylevel",
         }
         for row in rows:
             if not isinstance(row, dict):
                 continue
             for key, value in row.items():
-                if normalize_col_name(key) not in aliases:
-                    continue
-                if value is None:
-                    continue
-                if isinstance(value, str) and value.strip() in {"", "-", "--", "null", "None", "N/A"}:
-                    continue
-                return True
+                if normalize_col_name(key) in aliases and _has_nonempty_value(value):
+                    return True
         return False
 
     for mode in modes:
@@ -867,10 +887,10 @@ def _request_gie_page(
             payload = response.json()
             rows, last_page = _gie_payload_rows(payload)
 
-            # A V2 ALSI response containing only send-out is not sufficient for
-            # the inventory KPIs/map. Continue to the documented V4 endpoint.
-            if platform == "alsi" and mode == "v2" and rows and not alsi_rows_have_inventory_values(rows):
-                errors.append("v2: rows returned but LNG inventory/DTMI values were empty")
+            # A response containing only send-out is not sufficient for the
+            # inventory KPIs/map. Try the alternative endpoint instead.
+            if platform == "alsi" and rows and not alsi_rows_have_inventory_values(rows):
+                errors.append(f"{mode}: rows returned but LNG inventory/DTMI values were empty")
                 continue
 
             if rows or mode == modes[-1]:
@@ -1097,7 +1117,10 @@ def load_gie_map_snapshot(platform: str, end_date, api_key: str, metric_col: str
     start_ts = end_ts - pd.Timedelta(days=45)
     rows = []
 
-    for country_name, meta in GIE_MAP_COUNTRIES.items():
+    map_country_names = ALSI_MAP_COUNTRY_NAMES if platform.lower() == "alsi" else list(GIE_MAP_COUNTRIES)
+
+    for country_name in map_country_names:
+        meta = GIE_MAP_COUNTRIES[country_name]
         try:
             df = load_gie_inventory(
                 platform=platform,
@@ -1162,6 +1185,9 @@ def build_gie_bubble_map(
     tmp = _add_map_style_columns(tmp, metric_col)
     tmp["gas_day_label"] = pd.to_datetime(tmp["gas_day"], errors="coerce").dt.strftime("%Y-%m-%d")
     tmp["value_label"] = tmp[metric_col].map(lambda x: f"{x:,.1f}{suffix}")
+    tmp["map_label"] = tmp.apply(
+        lambda r: f"{r['country_code']}\n{r['value_label']}", axis=1
+    )
 
     scatter = pdk.Layer(
         "ScatterplotLayer",
@@ -1179,10 +1205,13 @@ def build_gie_bubble_map(
         "TextLayer",
         data=tmp,
         get_position="[lon, lat]",
-        get_text="country_code",
-        get_size=13,
+        get_text="map_label",
+        get_size=15,
         get_color=[17, 24, 39],
-        get_alignment_baseline="center",
+        get_alignment_baseline="bottom",
+        get_text_anchor="middle",
+        get_pixel_offset="[0, -24]",
+        pickable=False,
     )
 
     tooltip = {
@@ -1481,8 +1510,9 @@ def render_gie_inventory_section():
     else:
         returned_cols = ", ".join(sorted(map(str, inventory.columns.tolist())))
         st.info(
-            "The API returned ALSI rows, but no non-null value was available for the selected map metric. "
-            f"Returned fields: {returned_cols}"
+            "ALSI loaded the EU aggregate, but no valid country-level inventory values were returned for the map. "
+            "The map queries /api?country=XX for each LNG country and ignores responses containing only send-out. "
+            f"EU fields returned: {returned_cols}"
         )
         if platform == "alsi":
             raw_diag_cols = [c for c in ["gas_day", "inventory", "lngInventory", "dtmi", "inventory_pct", "sendOut", "dtrs"] if c in inventory.columns]
