@@ -612,29 +612,53 @@ def normalize_generation_upload(
 ) -> pd.DataFrame:
     """Normalise uploaded solar generation profiles.
 
-    profile_mode="repeat_single_year" keeps the previous behaviour: one hourly
-    profile is repeated across all selected years.
+    Uploaded generation values are interpreted directly as hourly MWh and are
+    passed to the optimisation without scaling them to the BESS power.
 
-    profile_mode="profile_by_year" expects Date + Hour + generation columns and
-    uses the specific hourly profile supplied for each selected year.
+    profile_mode="repeat_single_year" repeats one hourly profile across all
+    selected years. profile_mode="profile_by_year" expects Date + Hour +
+    generation columns and uses the specific profile supplied for each year.
     """
     df = pd.read_excel(uploaded_file)
     if df.empty:
         raise ValueError("Uploaded generation file is empty.")
 
-    col_map = {c.lower().strip(): c for c in df.columns}
+    col_map = {str(c).lower().strip(): c for c in df.columns}
     gen_col = None
 
-    for candidate in ["generation", "generacion", "gen"]:
+    for candidate in [
+        "generation",
+        "generacion",
+        "gen",
+        "generation (mwh)",
+        "generacion (mwh)",
+        "gen (mwh)",
+    ]:
         if candidate in col_map:
             gen_col = col_map[candidate]
             break
 
     if gen_col is None:
-        raise ValueError("Generation file must contain a column named generation, generacion, or gen.")
+        raise ValueError(
+            "Generation file must contain a generation column, preferably 'Generation (MWh)'."
+        )
 
-    date_col = col_map.get("date") or col_map.get("dia")
-    hour_col = col_map.get("hour") or col_map.get("hora")
+    date_col = (
+        col_map.get("date")
+        or col_map.get("dia")
+        or col_map.get("date (utc+1=cet)")
+        or col_map.get("date (utc+1 / cet)")
+        or col_map.get("dia (utc+1=cet)")
+        or col_map.get("dia (utc+1 / cet)")
+    )
+    hour_col = (
+        col_map.get("hour")
+        or col_map.get("hora")
+        or col_map.get("hour (utc+1=cet)")
+        or col_map.get("hour (utc+1 / cet)")
+        or col_map.get("hora (utc+1=cet)")
+        or col_map.get("hora (utc+1 / cet)")
+    )
 
     if profile_mode == "profile_by_year":
         if not (date_col and hour_col):
@@ -705,16 +729,62 @@ def normalize_generation_upload(
 
 
 def build_template_generation_excel(example_path: Path) -> bytes:
-    if example_path.exists():
-        return example_path.read_bytes()
+    """Build a one-year hourly template in fixed UTC+1 / CET time.
 
+    Generation values are expressed in MWh and, when uploaded again, are used
+    directly by the optimiser without any BESS-MW scaling.
+    """
     idx = make_year_hour_index(2025)
-    out = idx[["Hour"]].copy()
-    out["generacion"] = ""
+    out = pd.DataFrame(
+        {
+            "Date (UTC+1=CET)": idx["Date"],
+            "Hour (UTC+1=CET)": idx["Hour"],
+            "Generation (MWh)": "",
+        }
+    )
+
+    # Keep the repo's example generation values in the downloadable template,
+    # but standardise the headers and units shown to the user.
+    if example_path.exists():
+        try:
+            example = pd.read_excel(example_path)
+            example_cols = {str(c).lower().strip(): c for c in example.columns}
+            example_gen_col = next(
+                (
+                    example_cols[c]
+                    for c in [
+                        "generation",
+                        "generacion",
+                        "gen",
+                        "generation (mwh)",
+                        "generacion (mwh)",
+                    ]
+                    if c in example_cols
+                ),
+                None,
+            )
+            if example_gen_col is not None:
+                values = pd.to_numeric(example[example_gen_col], errors="coerce")
+                n = min(len(values), len(out))
+                out.loc[: n - 1, "Generation (MWh)"] = values.iloc[:n].to_numpy()
+        except Exception:
+            # A blank, correctly formatted template is still preferable to
+            # returning an incompatible example workbook.
+            pass
 
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="generation_template")
+        notes = pd.DataFrame(
+            {
+                "Instructions": [
+                    "Time basis: fixed UTC+1 (CET).",
+                    "Enter hourly solar generation in MWh.",
+                    "Uploaded MWh values are used directly in the optimisation and are not scaled to BESS MW.",
+                ]
+            }
+        )
+        notes.to_excel(writer, index=False, sheet_name="README")
     bio.seek(0)
     return bio.getvalue()
 
@@ -723,14 +793,35 @@ def build_template_generation_by_year_excel(years: list[int]) -> bytes:
     rows = []
     for year in years:
         idx = make_year_hour_index(year)
-        tmp = idx[["Date", "Hour"]].copy()
-        tmp["generacion"] = ""
+        tmp = pd.DataFrame(
+            {
+                "Date (UTC+1=CET)": idx["Date"],
+                "Hour (UTC+1=CET)": idx["Hour"],
+                "Generation (MWh)": "",
+            }
+        )
         rows.append(tmp)
 
-    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["Date", "Hour", "generacion"])
+    out = (
+        pd.concat(rows, ignore_index=True)
+        if rows
+        else pd.DataFrame(
+            columns=["Date (UTC+1=CET)", "Hour (UTC+1=CET)", "Generation (MWh)"]
+        )
+    )
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="generation_by_year_template")
+        notes = pd.DataFrame(
+            {
+                "Instructions": [
+                    "Time basis: fixed UTC+1 (CET).",
+                    "Enter hourly solar generation in MWh for every selected year.",
+                    "Uploaded MWh values are used directly in the optimisation and are not scaled to BESS MW.",
+                ]
+            }
+        )
+        notes.to_excel(writer, index=False, sheet_name="README")
     bio.seek(0)
     return bio.getvalue()
 
@@ -1014,7 +1105,7 @@ def build_dataset(
             generation_df = normalize_generation_upload(
                 uploaded_generation_file,
                 years,
-                scale_factor=bess_mw,
+                scale_factor=1.0,
                 profile_mode=generation_profile_mode,
             )
         else:
@@ -1988,7 +2079,8 @@ with left:
         index=0,
         help=(
             "Use the default 1-year solar profile, upload one profile to repeat across all selected years, "
-            "or upload Date/Hour/generation rows for each selected year."
+            "or upload Date/Hour/Generation (MWh) rows for each selected year. Uploaded profiles use "
+            "fixed UTC+1 (CET), and their MWh values are passed directly to the optimisation."
         ),
     )
 
@@ -2001,8 +2093,9 @@ with left:
             "Upload generation Excel",
             type=["xlsx"],
             help=(
-                "Values are assumed to be for a 1 MW solar plant and are automatically scaled to the equivalent BESS MW. "
-                "For 'different hourly profile by year', include Date/dia, Hour/hora and generation/generacion for every selected year."
+                "Enter hourly generation directly in MWh using fixed UTC+1 (CET). These MWh values are used "
+                "as-is in the optimisation and are not scaled to the equivalent BESS MW. For 'different hourly "
+                "profile by year', include Date, Hour and Generation (MWh) for every selected year."
             ),
             key="generation_upload",
         )
@@ -2037,9 +2130,9 @@ with right:
     if mode == "Standalone BESS":
         st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
     elif mode == "BESS with demand":
-        st.info("omie_venta = price, omie_compra = same price, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = generic vector from data.xlsx")
+        st.info("omie_venta = price, omie_compra = same price. The default 1 MW solar profile is scaled to BESS MW; uploaded generation is interpreted directly as hourly MWh and is not scaled. consumo = generic vector from data.xlsx")
     else:
-        st.info("omie_venta = price, omie_compra = 1000, default solar generation = uploaded/example 1 MW profile scaled to BESS MW, consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 €/MWh is intentionally unattractive.")
+        st.info("omie_venta = price, omie_compra = 1000. The default 1 MW solar profile is scaled to BESS MW; uploaded generation is interpreted directly as hourly MWh and is not scaled. consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 €/MWh is intentionally unattractive.")
 
     st.markdown("### Degradation logic")
     st.info("If degradation is enabled, effective storage capacity for forward years is adjusted as: BESS size (MWh) × SOH(%). BESS power (MW) remains constant.")
