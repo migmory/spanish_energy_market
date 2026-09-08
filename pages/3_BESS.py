@@ -1178,6 +1178,11 @@ def build_effective_capacity_table(
     return pd.DataFrame(rows)
 
 
+# POI NOTE:
+# The grid-connection (POI) MW is intentionally independent from BESS power MW.
+# This prevents infeasibility when PV/POI and BESS inverter sizes differ.
+# A heavily penalised curtailment slack is also included as a last-resort feasibility safeguard.
+
 def optimize_day_pulp(
     df_day: pd.DataFrame,
     capacity_mwh: float,
@@ -1185,6 +1190,7 @@ def optimize_day_pulp(
     eta_ch: float = 1.0,
     eta_dis: float = 1.0,
     cycle_limit_factor: float = 1.0,
+    poi_mw: float | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     df_day = df_day.sort_values("hora").reset_index(drop=True).copy()
     n = len(df_day)
@@ -1194,10 +1200,11 @@ def optimize_day_pulp(
     gen = df_day["generacion"].astype(float).tolist()
     load = df_day["consumo"].astype(float).tolist()
 
-    max_power = power_mw
-    # Export / import gate is capped at the BESS inverter power.
-    # This keeps g_to_grid + batt_for_sell within BESS size * c-rate.
-    max_grid_flow = max(max_power, 1e-9)
+    max_power = float(power_mw)
+    # POI / grid-connection power is independent from BESS inverter power.
+    # Backwards-compatible default: if no POI is supplied, use BESS MW.
+    max_grid_flow = max(float(poi_mw if poi_mw is not None else power_mw), 1e-9)
+    emergency_curtailment_penalty_eur_mwh = 10_000.0
 
     model = pulp.LpProblem("bess_daily_optimization", pulp.LpMaximize)
 
@@ -1208,6 +1215,7 @@ def optimize_day_pulp(
     batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
     batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
     grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
+    curtailment = pulp.LpVariable.dicts("curtailment", range(n), lowBound=0)
     soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
     is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
     is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
@@ -1222,7 +1230,7 @@ def optimize_day_pulp(
         model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
         model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
 
-        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == gen[t]
+        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] + curtailment[t] == gen[t]
         model += load[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
 
         model += soc[t + 1] == (
@@ -1247,11 +1255,19 @@ def optimize_day_pulp(
         + batt_for_sell[t] * omie_sell[t]
         - grid_purchase[t] * omie_buy[t]
         - grid_charge[t] * omie_buy[t]
+        - emergency_curtailment_penalty_eur_mwh * curtailment[t]
         for t in range(n)
     )
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     model.solve(solver)
+    solver_status = pulp.LpStatus.get(model.status, str(model.status))
+    if solver_status != "Optimal":
+        day_label = str(df_day["dia"].iloc[0]) if n else "unknown day"
+        raise RuntimeError(
+            f"CBC optimisation failed for {day_label}: {solver_status}. "
+            f"Check POI MW, BESS MW/MWh, demand and other constraints."
+        )
 
     def vals(var_dict):
         return [pulp.value(var_dict[i]) if pulp.value(var_dict[i]) is not None else 0.0 for i in range(n)]
@@ -1271,6 +1287,8 @@ def optimize_day_pulp(
             "batt_for_load": vals(batt_for_load),
             "batt_for_sell": vals(batt_for_sell),
             "grid_purchase": vals(grid_purchase),
+            "curtailment": vals(curtailment),
+            "poi_limit_mw": [max_grid_flow] * n,
             "soc": [pulp.value(soc[i + 1]) if pulp.value(soc[i + 1]) is not None else 0.0 for i in range(n)],
         }
     )
@@ -1370,6 +1388,7 @@ def optimize_window_pulp(
     eta_ch: float = 1.0,
     eta_dis: float = 1.0,
     cycle_limit_factor: float = 1.0,
+    poi_mw: float | None = None,
 ) -> pd.DataFrame:
     """Optimize a forward-looking window starting at soc0; used by rolling 24h MPC."""
     df_win = df_win.sort_values("timestamp").reset_index(drop=True).copy()
@@ -1382,8 +1401,9 @@ def optimize_window_pulp(
     gen = df_win["generacion"].astype(float).tolist()
     load = df_win["consumo"].astype(float).tolist()
 
-    max_power = power_mw
-    max_grid_flow = max(max_power, 1e-9)
+    max_power = float(power_mw)
+    max_grid_flow = max(float(poi_mw if poi_mw is not None else power_mw), 1e-9)
+    emergency_curtailment_penalty_eur_mwh = 10_000.0
 
     model = pulp.LpProblem("bess_rolling_24h_window", pulp.LpMaximize)
 
@@ -1394,6 +1414,7 @@ def optimize_window_pulp(
     batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
     batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
     grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
+    curtailment = pulp.LpVariable.dicts("curtailment", range(n), lowBound=0)
     soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
     is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
     is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
@@ -1407,7 +1428,7 @@ def optimize_window_pulp(
         model += g_to_grid[t] + batt_for_sell[t] <= max_grid_flow * is_export[t]
         model += grid_purchase[t] + grid_charge[t] <= max_grid_flow * (1 - is_export[t])
 
-        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] == gen[t]
+        model += g_to_grid[t] + g_to_batt[t] + g_to_self[t] + curtailment[t] == gen[t]
         model += load[t] - g_to_self[t] == batt_for_load[t] + grid_purchase[t]
 
         model += soc[t + 1] == (
@@ -1428,11 +1449,19 @@ def optimize_window_pulp(
         + batt_for_sell[t] * omie_sell[t]
         - grid_purchase[t] * omie_buy[t]
         - grid_charge[t] * omie_buy[t]
+        - emergency_curtailment_penalty_eur_mwh * curtailment[t]
         for t in range(n)
     )
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     model.solve(solver)
+    solver_status = pulp.LpStatus.get(model.status, str(model.status))
+    if solver_status != "Optimal":
+        first_ts = str(df_win["timestamp"].iloc[0]) if n else "unknown timestamp"
+        raise RuntimeError(
+            f"CBC rolling optimisation failed from {first_ts}: {solver_status}. "
+            f"Check POI MW, BESS MW/MWh, demand and other constraints."
+        )
 
     def vals(var_dict):
         return [pulp.value(var_dict[i]) if pulp.value(var_dict[i]) is not None else 0.0 for i in range(n)]
@@ -1452,6 +1481,8 @@ def optimize_window_pulp(
             "batt_for_load": vals(batt_for_load),
             "batt_for_sell": vals(batt_for_sell),
             "grid_purchase": vals(grid_purchase),
+            "curtailment": vals(curtailment),
+            "poi_limit_mw": [max_grid_flow] * n,
             "soc": [pulp.value(soc[i + 1]) if pulp.value(soc[i + 1]) is not None else 0.0 for i in range(n)],
         }
     )
@@ -1474,6 +1505,7 @@ def simulate_rolling_24h_pulp(
     eta_dis: float = 1.0,
     cycle_limit_factor: float = 1.0,
     horizon: int = 24,
+    poi_mw: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Rolling/MPC 24h: optimize the next 24h, apply only the first hour, update SOC, repeat."""
     df_year = df_year.sort_values("timestamp").reset_index(drop=True).copy()
@@ -1495,6 +1527,7 @@ def simulate_rolling_24h_pulp(
             eta_ch=eta_ch,
             eta_dis=eta_dis,
             cycle_limit_factor=cycle_limit_factor,
+            poi_mw=poi_mw,
         )
         if res_win.empty:
             continue
@@ -1515,6 +1548,7 @@ def run_optimization(
     eta_ch: float,
     eta_dis: float,
     cycle_limit_factor: float,
+    poi_mw: float | None = None,
     optimization_method: str = "fixed_24h",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     results_all = []
@@ -1544,6 +1578,7 @@ def run_optimization(
                 eta_dis=eta_dis,
                 cycle_limit_factor=cycle_limit_factor,
                 horizon=24,
+                poi_mw=poi_mw,
             )
             if not year_dispatch.empty:
                 year_dispatch["Year"] = year
@@ -1570,6 +1605,7 @@ def run_optimization(
                     eta_ch=eta_ch,
                     eta_dis=eta_dis,
                     cycle_limit_factor=cycle_limit_factor,
+                    poi_mw=poi_mw,
                 )
                 res["Year"] = year
                 res["effective_capacity_mwh"] = year_capacity
@@ -1612,6 +1648,8 @@ def build_variable_definitions() -> pd.DataFrame:
                 "batt_for_load",
                 "batt_for_sell",
                 "grid_purchase",
+                "curtailment",
+                "poi_limit_mw",
                 "soc",
                 "Revenue BESS (€)",
                 "hybrid profile (MWh)",
@@ -1624,6 +1662,8 @@ def build_variable_definitions() -> pd.DataFrame:
                 "Battery discharge used to satisfy on-site demand (BTM cases).",
                 "Battery discharge exported to the market / grid.",
                 "Spot market energy purchased to satisfy on-site demand.",
+                "Emergency PV curtailment used only when required to keep POI/BESS/SOC constraints feasible; it is heavily penalised in the objective.",
+                "Selected POI / grid-connection power limit applied to total hourly import/export.",
                 "State of charge.",
                 "BESS revenue calculated as -g_to_batt*omie_venta - grid_charge*omie_compra + batt_for_sell*omie_venta.",
                 "Hybrid exported profile calculated as g_to_grid - grid_charge + batt_for_sell.",
@@ -2041,6 +2081,29 @@ with left:
     bess_mw = base_capacity_mwh * c_rate
     st.caption(f"Equivalent BESS power: {bess_mw:,.3f} MW")
 
+    poi_setting = st.radio(
+        "POI / grid-connection limit",
+        ["Same as BESS power", "Use different POI MW"],
+        index=0,
+        horizontal=True,
+        help=(
+            "This limits total hourly grid export (PV direct + BESS discharge) and total hourly grid import. "
+            "Choose a different POI when the project grid connection is not equal to the BESS inverter MW."
+        ),
+    )
+    if poi_setting == "Use different POI MW":
+        poi_mw = st.number_input(
+            "POI / grid-connection capacity (MW)",
+            min_value=0.01,
+            value=float(max(bess_mw, 0.01)),
+            step=0.1,
+            format="%.3f",
+            help="Example: Andújar x2 can use a 57 MW POI while the BESS itself remains 26.091 MW.",
+        )
+    else:
+        poi_mw = float(bess_mw)
+    st.caption(f"Grid import/export limit used by optimiser: {poi_mw:,.3f} MW")
+
     assume_degradation = st.radio("Assume degradation", ["No", "Yes"], horizontal=True, index=0)
     use_degradation = assume_degradation == "Yes"
 
@@ -2123,6 +2186,13 @@ with right:
     st.info("Historical years use the hourly prices generated and stored by the Day Ahead module in historical_data/day_ahead_spain_spot_600_raw.csv.")
     st.info("Forward years can use repo nominal curves — Aurora Dec-25 or Baringa Apr-26 — or a user-uploaded custom hourly price curve from 2027 onwards.")
 
+    st.markdown("### POI / grid connection")
+    st.info(
+        "The POI limit can be set independently from BESS MW. The optimiser caps total hourly grid export "
+        "(PV direct + BESS discharge) and total hourly grid import at the selected POI MW. A heavily penalised "
+        "curtailment variable is included only as a feasibility safeguard if PV cannot physically be exported or stored."
+    )
+
     st.markdown("### Optimisation method")
     st.info("The BESS tab can run either Fixed 24h window or Rolling 24h window. All embedded TB4 / revenue BESS calculations in other report pages remain on the Fixed 24h window by default.")
 
@@ -2203,6 +2273,7 @@ if run_button:
                 eta_ch=eta_ch,
                 eta_dis=eta_dis,
                 cycle_limit_factor=cycle_limit_factor,
+                poi_mw=poi_mw,
                 optimization_method=optimization_method,
             )
 
@@ -2227,6 +2298,8 @@ if run_button:
                     "base_capacity_mwh",
                     "c_rate",
                     "bess_mw_constant",
+                    "poi_setting",
+                    "poi_mw",
                     "eta_ch",
                     "eta_dis",
                     "cycles_day_setting",
@@ -2251,6 +2324,8 @@ if run_button:
                     base_capacity_mwh,
                     c_rate,
                     bess_mw,
+                    poi_setting,
+                    poi_mw,
                     eta_ch,
                     eta_dis,
                     cycle_limit_option,
