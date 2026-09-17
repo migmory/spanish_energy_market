@@ -1032,7 +1032,8 @@ def build_generic_vectors(default_data: pd.DataFrame, target_years: list[int]) -
     return pd.concat(gen_rows, ignore_index=True), pd.concat(load_rows, ignore_index=True)
 
 
-def build_default_solar_generation(target_years: list[int], bess_mw: float, default_solar_profile: pd.DataFrame) -> pd.DataFrame:
+def build_default_solar_generation(target_years: list[int], pv_mw: float, default_solar_profile: pd.DataFrame) -> pd.DataFrame:
+    """Scale the embedded 1 MW solar profile to the selected PV capacity."""
     rows = []
     for year in target_years:
         idx = make_year_hour_index(year)
@@ -1044,7 +1045,7 @@ def build_default_solar_generation(target_years: list[int], bess_mw: float, defa
             base["hour_of_year"] = np.arange(1, h + 1)
 
         merged = idx.merge(base[["hour_of_year", "generation"]], on="hour_of_year", how="left")
-        merged["generation"] = merged["generation"].fillna(0.0) * bess_mw
+        merged["generation"] = merged["generation"].fillna(0.0) * pv_mw
         rows.append(merged[["timestamp", "Date", "Hour", "year", "generation"]])
 
     return pd.concat(rows, ignore_index=True)
@@ -1088,6 +1089,7 @@ def build_dataset(
     default_data: pd.DataFrame,
     default_solar_profile: pd.DataFrame,
     bess_mw: float,
+    pv_mw: float | None = None,
     uploaded_generation_file=None,
     generation_profile_mode: str = "repeat_single_year",
     forward_prices: pd.DataFrame | None = None,
@@ -1109,7 +1111,12 @@ def build_dataset(
                 profile_mode=generation_profile_mode,
             )
         else:
-            generation_df = build_default_solar_generation(years, bess_mw, default_solar_profile)
+            # Backwards-compatible fallback for callers that do not yet pass
+            # an independent PV capacity. The Streamlit UI always supplies it.
+            selected_pv_mw = float(bess_mw if pv_mw is None else pv_mw)
+            if selected_pv_mw < 0:
+                raise ValueError("PV capacity cannot be negative.")
+            generation_df = build_default_solar_generation(years, selected_pv_mw, default_solar_profile)
     else:
         generation_df = default_gen.copy()
         generation_df["generation"] = 0.0
@@ -2151,6 +2158,36 @@ with left:
     generation_profile_mode = "profile_by_year" if generation_source == "Upload different hourly profile by year" else "repeat_single_year"
     uploaded_generation = None
 
+    # The embedded solar curve is a normalised 1 MW profile. Size it from the
+    # POI rather than from BESS power so PV, BESS and grid connection can all be
+    # configured independently.
+    pv_sizing_basis = "Not applicable"
+    pv_to_poi_ratio = 0.0
+    pv_mw = 0.0
+    if mode != "Standalone BESS" and not use_uploaded_generation:
+        pv_sizing_basis = "Default 1 MW profile scaled by PV / POI ratio"
+        pv_to_poi_ratio = st.number_input(
+            "PV / POI ratio (x)",
+            min_value=0.0,
+            value=1.0,
+            step=0.1,
+            format="%.3f",
+            help=(
+                "Multiplies the embedded 1 MW solar profile by POI MW x this ratio. "
+                "Example: POI 1 MW and ratio 2.0 gives 2 MWac of PV, while BESS power remains independent."
+            ),
+        )
+        pv_mw = float(poi_mw) * float(pv_to_poi_ratio)
+        st.caption(
+            f"PV capacity applied to default profile: {pv_mw:,.3f} MWac "
+            f"({poi_mw:,.3f} MW POI x {pv_to_poi_ratio:,.3f})"
+        )
+    elif mode != "Standalone BESS":
+        pv_sizing_basis = "Uploaded hourly generation used directly"
+        st.caption(
+            "PV / POI scaling is not applied to uploaded profiles because their hourly MWh values are used directly."
+        )
+
     if use_uploaded_generation:
         uploaded_generation = st.file_uploader(
             "Upload generation Excel",
@@ -2193,6 +2230,21 @@ with right:
         "curtailment variable is included only as a feasibility safeguard if PV cannot physically be exported or stored."
     )
 
+    st.markdown("### PV sizing")
+    if mode == "Standalone BESS":
+        st.info("PV sizing is not applicable in Standalone BESS mode.")
+    elif use_uploaded_generation:
+        st.info(
+            "Uploaded generation is interpreted directly as hourly MWh and is not scaled. "
+            "The PV / POI ratio applies only to the embedded default 1 MW solar profile."
+        )
+    else:
+        st.info(
+            f"The embedded 1 MW solar profile is multiplied by {pv_mw:,.3f} MWac, calculated as "
+            f"{poi_mw:,.3f} MW POI x {pv_to_poi_ratio:,.3f}. PV generation above the POI can be stored "
+            "behind the connection point, subject to BESS limits, or curtailed if it cannot be exported or stored."
+        )
+
     st.markdown("### Optimisation method")
     st.info("The BESS tab can run either Fixed 24h window or Rolling 24h window. All embedded TB4 / revenue BESS calculations in other report pages remain on the Fixed 24h window by default.")
 
@@ -2200,9 +2252,9 @@ with right:
     if mode == "Standalone BESS":
         st.info("omie_venta = price, omie_compra = same price, generacion = 0, consumo = 0")
     elif mode == "BESS with demand":
-        st.info("omie_venta = price, omie_compra = same price. The default 1 MW solar profile is scaled to BESS MW; uploaded generation is interpreted directly as hourly MWh and is not scaled. consumo = generic vector from data.xlsx")
+        st.info("omie_venta = price, omie_compra = same price. The default 1 MW solar profile is scaled to the selected PV MW, independently from BESS MW; uploaded generation is interpreted directly as hourly MWh and is not scaled. consumo = generic vector from data.xlsx")
     else:
-        st.info("omie_venta = price, omie_compra = 1000. The default 1 MW solar profile is scaled to BESS MW; uploaded generation is interpreted directly as hourly MWh and is not scaled. consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 €/MWh is intentionally unattractive.")
+        st.info("omie_venta = price, omie_compra = 1000. The default 1 MW solar profile is scaled to the selected PV MW, independently from BESS MW; uploaded generation is interpreted directly as hourly MWh and is not scaled. consumo = 0. In this mode the battery will typically only cycle when there is solar available to charge it, because charging from grid at 1000 EUR/MWh is intentionally unattractive.")
 
     st.markdown("### Degradation logic")
     st.info("If degradation is enabled, effective storage capacity for forward years is adjusted as: BESS size (MWh) × SOH(%). BESS power (MW) remains constant.")
@@ -2251,6 +2303,7 @@ if run_button:
                 default_data=default_data,
                 default_solar_profile=default_solar_profile,
                 bess_mw=bess_mw,
+                pv_mw=pv_mw,
                 uploaded_generation_file=uploaded_generation,
                 generation_profile_mode=generation_profile_mode,
                 forward_prices=forward_prices,
@@ -2300,6 +2353,9 @@ if run_button:
                     "bess_mw_constant",
                     "poi_setting",
                     "poi_mw",
+                    "pv_sizing_basis",
+                    "pv_to_poi_ratio",
+                    "pv_mw",
                     "eta_ch",
                     "eta_dis",
                     "cycles_day_setting",
@@ -2326,6 +2382,9 @@ if run_button:
                     bess_mw,
                     poi_setting,
                     poi_mw,
+                    pv_sizing_basis,
+                    pv_to_poi_ratio if mode != "Standalone BESS" and not use_uploaded_generation else "",
+                    pv_mw if mode != "Standalone BESS" and not use_uploaded_generation else "",
                     eta_ch,
                     eta_dis,
                     cycle_limit_option,
