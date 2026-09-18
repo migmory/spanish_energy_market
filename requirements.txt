@@ -10,7 +10,7 @@ plotly
 paramiko
 lxml
 reportlab
-scipy
+scipy>=1.11
 beautifulsoup4
 scikit-learn
 python-dateutil
