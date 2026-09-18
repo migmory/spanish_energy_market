@@ -1,24 +1,29 @@
-
 """
-Hybrid PPA (Solar + BESS) — future fixed-for-floating settlement dashboard.
+Hybrid PPA (Solar + BESS) settlements.
 
-Workbook expected in: data/HPPA_wDEmand.xlsx
+Data sources expected under data/:
+- Historic values 2025-2026.csv
+- aurora q2-26 capt_price_no_demand_2027-2036.xlsx
+- baringa q2-26 captured hybrid_no demand_2027-2036.xlsx
 
-Data lineage:
-- `monthly_summary`: monthly solar and hybrid captured prices / volumes / revenues.
-- `dispatch`: hourly market prices and hybrid dispatch, used for baseload prices and
-  the representative operational-day chart.
-- `stats` (sheet 2): daily BESS economics, used to select the default representative day.
+The loader is tolerant to suffixes such as "(1)" or "(2)" and to minor
+filename variations. Historical values are used through the last month
+available in the CSV. From 2027 onwards the user selects Aurora or Baringa.
 
-Settlement sign convention:
-- Positive = payment to the PPA buyer / offtaker.
-- Settlement = (hybrid captured price - fixed Hybrid PPA price) × contracted hybrid volume.
+Settlement convention:
+    settlement €/MWh = captured hybrid price - Hybrid PPA fixed price
+Positive values represent payment to the buyer / offtaker.
+
+Cash settlement uses a user-defined annual contracted Hybrid PPA volume,
+allocated monthly in proportion to calendar days. This avoids inventing
+historical production volumes that are not present in the historical CSV.
 """
 
 from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import re
 
 import altair as alt
 import numpy as np
@@ -26,269 +31,280 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# -----------------------------------------------------------------------------
-# Page setup and corporate palette
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Hybrid PPA (Solar + BESS)", layout="wide")
+
+# =============================================================================
+# PAGE SETUP / CORPORATE STYLE
+# =============================================================================
+st.set_page_config(page_title="Hybrid PPA Settlements", layout="wide")
 
 GREEN = "#1f8a5f"
 GREEN_DARK = "#0f6b47"
 GREEN_SOFT = "#e6f4ee"
-GREEN_LIGHT = "#62b58f"
-BLUE = "#285a84"
-BLUE_SOFT = "#eaf1f7"
-GOLD = "#d9aa2b"
-GOLD_SOFT = "#fff7d9"
+DASS_GREEN = "#198754"
 ORANGE = "#e8862e"
+GOLD = "#d9aa2b"
+BLUE = "#285a84"
 RED = "#cf4d4d"
 INK = "#12332a"
 MUTED = "#6b7f78"
-GRID = "#edf3f0"
-
-ETA_CH = 0.925
-ETA_DIS = 0.925
-RTE = ETA_CH * ETA_DIS  # 0.855625
-BESS_POWER_MW = 1.0
-BESS_DURATION_H = 4.0
-BESS_CAPACITY_MWH = BESS_POWER_MW * BESS_DURATION_H
-DOD = 1.0
-CYCLES_PER_DAY = 1.0
 
 st.markdown(
     f"""
     <style>
     .block-container {{
-        padding-top: 1.05rem;
+        padding-top: 1.1rem;
         max-width: 1850px;
         padding-left: 2.2rem;
         padding-right: 2.2rem;
     }}
     html, body, [class*="css"] {{
-        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+        font-family: "Inter","Segoe UI",system-ui,sans-serif;
     }}
-    .hp-hero {{
-        background: linear-gradient(118deg, {GREEN_DARK} 0%, {GREEN} 58%, #35aa7a 100%);
-        border-radius: 20px;
-        padding: 28px 34px;
-        color: white;
-        box-shadow: 0 10px 28px rgba(15,107,71,.20);
-        margin-bottom: 18px;
-    }}
-    .hp-pill {{
-        display: inline-block;
-        background: rgba(255,255,255,.94);
-        color: {GREEN_DARK};
-        padding: 5px 13px;
-        border-radius: 999px;
-        font-size: .73rem;
-        font-weight: 900;
-        letter-spacing: .075em;
-        text-transform: uppercase;
-        margin-bottom: 10px;
-    }}
-    .hp-hero h1 {{
-        color: white;
-        margin: 0;
-        font-size: 2.05rem;
-        font-weight: 900;
-        letter-spacing: -.025em;
-    }}
-    .hp-hero p {{
-        margin: 7px 0 0 0;
-        color: #dcf1e8;
-        max-width: 1050px;
-        font-size: .96rem;
-        line-height: 1.45;
-    }}
-    .hp-module {{
-        margin: 24px 0 14px 0;
-        padding: 18px 22px;
-        border: 1px solid #cfe8dc;
+
+    .nx-hero {{
+        background: linear-gradient(120deg, {GREEN_DARK} 0%, {GREEN} 55%, #2fae79 100%);
         border-radius: 18px;
-        background: linear-gradient(120deg, #fbfffd 0%, {GREEN_SOFT} 100%);
+        padding: 26px 32px;
+        color: #fff;
+        margin-bottom: 18px;
+        box-shadow: 0 8px 24px rgba(15,107,71,.18);
+    }}
+    .nx-hero h1 {{
+        font-size: 2.0rem;
+        font-weight: 800;
+        margin: 0;
+        letter-spacing: -.02em;
+        color: #fff;
+    }}
+    .nx-hero p {{
+        margin: 6px 0 0 0;
+        color: #d9efe6;
+        font-size: .95rem;
+        max-width: 1050px;
+    }}
+    .nx-pill {{
+        display:inline-block;
+        background:#fff;
+        color:{GREEN_DARK};
+        font-weight:700;
+        font-size:.75rem;
+        padding:4px 12px;
+        border-radius:999px;
+        margin-bottom:10px;
+        letter-spacing:.06em;
+        text-transform:uppercase;
+    }}
+
+    .nx-module-banner {{
+        margin: 26px 0 14px 0;
+        padding: 18px 22px;
+        border-radius: 18px;
+        border: 1px solid #cfe8dc;
+        background: linear-gradient(120deg, #f7fcfa 0%, #e6f4ee 100%);
+        box-shadow: 0 6px 18px rgba(18,51,42,.07);
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 18px;
-        box-shadow: 0 6px 18px rgba(18,51,42,.07);
     }}
-    .hp-module-title {{
+    .nx-module-title {{
         font-size: 1.28rem;
         font-weight: 900;
         color: {INK};
-        letter-spacing: -.012em;
+        letter-spacing: -.01em;
     }}
-    .hp-module-sub {{
-        margin-top: 4px;
+    .nx-module-subtitle {{
+        margin-top: 3px;
         color: {MUTED};
         font-size: .9rem;
     }}
-    .hp-module-tag {{
+    .nx-module-tag {{
+        padding: 8px 14px;
+        border-radius: 999px;
         border: 1.5px solid {GREEN_DARK};
         color: {GREEN_DARK};
-        padding: 8px 15px;
-        border-radius: 999px;
-        font-size: .75rem;
+        font-size: .76rem;
         font-weight: 900;
-        letter-spacing: .075em;
-        text-transform: uppercase;
-        white-space: nowrap;
-    }}
-    .hp-assumptions {{
-        display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
-        gap: 10px;
-        margin: 12px 0 18px 0;
-    }}
-    .hp-assumption {{
-        background: white;
-        border: 1px solid #dce9e3;
-        border-radius: 14px;
-        padding: 12px 14px;
-        box-shadow: 0 3px 10px rgba(18,51,42,.045);
-        text-align: center;
-    }}
-    .hp-assumption .a-label {{
-        color: {MUTED};
-        font-size: .70rem;
-        font-weight: 850;
         letter-spacing: .07em;
-        text-transform: uppercase;
-    }}
-    .hp-assumption .a-value {{
-        color: {INK};
-        margin-top: 4px;
-        font-size: 1.18rem;
-        font-weight: 900;
-    }}
-    .hp-kpi {{
-        background: white;
-        border: 1px solid #e2ece7;
-        border-radius: 18px;
-        min-height: 142px;
-        padding: 21px 22px;
-        text-align: center;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        box-shadow: 0 4px 14px rgba(18,51,42,.06);
-    }}
-    .hp-kpi .k-label {{
-        color: {MUTED};
-        font-size: .75rem;
-        font-weight: 850;
-        letter-spacing: .07em;
-        text-transform: uppercase;
-    }}
-    .hp-kpi .k-value {{
-        margin-top: 5px;
-        font-size: 2.8rem;
-        font-weight: 950;
-        line-height: 1;
-        letter-spacing: -.045em;
-        color: {INK};
-    }}
-    .hp-kpi .k-unit {{
-        margin-left: 4px;
-        color: {MUTED};
-        font-size: 1.02rem;
-        font-weight: 800;
-        letter-spacing: 0;
-    }}
-    .hp-kpi .k-foot {{
-        margin-top: 8px;
-        color: {MUTED};
-        font-size: .8rem;
-        line-height: 1.3;
-    }}
-    .hp-kpi.positive .k-value {{ color: {GREEN_DARK}; }}
-    .hp-kpi.negative .k-value {{ color: {RED}; }}
-    .hp-kpi.gold .k-value {{ color: #9a7210; }}
-    .hp-kpi.blue .k-value {{ color: {BLUE}; }}
-    .hp-chart-title {{
-        margin: 23px 0 5px 0;
-        border-left: 5px solid {GREEN_DARK};
-        padding-left: 10px;
-        color: {INK};
-        font-size: 1.04rem;
-        font-weight: 900;
-    }}
-    .hp-chart-note {{
-        margin: 0 0 9px 15px;
-        color: {MUTED};
-        font-size: .82rem;
-    }}
-    .hp-callout {{
-        margin: 12px 0 6px 0;
-        padding: 12px 16px;
-        background: {GOLD_SOFT};
-        color: #735b15;
-        border: 1px solid #ead38a;
-        border-radius: 13px;
-        font-size: .86rem;
-        font-weight: 650;
-    }}
-    .hp-table-note {{
-        color: {MUTED};
-        font-size: .82rem;
-        margin: 3px 0 10px 0;
-    }}
-    .hp-print-card {{
-        margin-top: 30px;
-        padding: 18px 22px;
-        border: 1px solid #cfe8dc;
-        border-radius: 18px;
-        background: linear-gradient(120deg, #fbfffd 0%, {GREEN_SOFT} 100%);
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 18px;
-    }}
-    .hp-print-title {{ color: {INK}; font-size: 1.22rem; font-weight: 900; }}
-    .hp-print-sub {{ color: {MUTED}; font-size: .88rem; margin-top: 4px; }}
-    .hp-print-seal {{
-        color: {GREEN_DARK};
-        border: 2px solid {GREEN_DARK};
-        border-radius: 999px;
-        padding: 9px 16px;
-        font-size: .77rem;
-        font-weight: 900;
-        letter-spacing: .075em;
         white-space: nowrap;
+        text-transform: uppercase;
     }}
-    div[role="radiogroup"] {{ gap: 6px; }}
+
+    .kpi {{
+        background:#fff;
+        border:1px solid #e5eeea;
+        border-radius:18px;
+        padding:22px 24px 20px 24px;
+        box-shadow:0 3px 12px rgba(18,51,42,.06);
+        min-height:138px;
+        height:100%;
+        text-align:center;
+        display:flex;
+        flex-direction:column;
+        justify-content:center;
+    }}
+    .kpi .label {{
+        color:{MUTED};
+        font-size:.8rem;
+        font-weight:700;
+        text-transform:uppercase;
+        letter-spacing:.07em;
+    }}
+    .kpi .value {{
+        font-size:3.0rem;
+        font-weight:800;
+        letter-spacing:-.035em;
+        line-height:1.05;
+        margin-top:4px;
+        color:{INK};
+    }}
+    .kpi .unit {{
+        font-size:1.05rem;
+        font-weight:700;
+        color:{MUTED};
+        margin-left:5px;
+    }}
+    .kpi .foot {{
+        color:{MUTED};
+        font-size:.8rem;
+        margin-top:8px;
+    }}
+    .kpi.pos .value {{ color:{GREEN_DARK}; }}
+    .kpi.neg .value {{ color:{RED}; }}
+    .kpi.blue .value {{ color:{BLUE}; }}
+    .kpi.gold .value {{ color:#9a7210; }}
+
+    .nx-price-grid {{
+        display:grid;
+        grid-template-columns:repeat(3,minmax(0,1fr));
+        gap:14px;
+        margin:14px 0 10px 0;
+    }}
+    .nx-price-card {{
+        background:linear-gradient(180deg,#fbfffc 0%,#e9f8ee 100%);
+        border:1px solid #bfe0cb;
+        border-radius:18px;
+        padding:18px 20px;
+        box-shadow:0 5px 16px rgba(18,51,42,.055);
+    }}
+    .nx-price-label {{
+        font-size:.76rem;
+        color:{MUTED};
+        text-transform:uppercase;
+        letter-spacing:.08em;
+        font-weight:850;
+    }}
+    .nx-price-value {{
+        margin-top:5px;
+        font-size:2.75rem;
+        line-height:.98;
+        font-weight:950;
+        letter-spacing:-.04em;
+        color:{INK};
+    }}
+    .nx-price-value .unit {{
+        font-size:1rem;
+        letter-spacing:0;
+        color:{MUTED};
+        margin-left:4px;
+        font-weight:850;
+    }}
+    .nx-price-foot {{
+        margin-top:8px;
+        color:{MUTED};
+        font-size:.83rem;
+        line-height:1.3;
+    }}
+
+    .nx-chart-title {{
+        margin:20px 0 6px 0;
+        padding-left:10px;
+        border-left:5px solid {GREEN_DARK};
+        color:{INK};
+        font-size:1.02rem;
+        font-weight:900;
+    }}
+    .nx-chart-note {{
+        color:{MUTED};
+        font-size:.82rem;
+        margin:-2px 0 8px 15px;
+    }}
+
+    .nx-callout {{
+        margin:10px 0 14px 0;
+        padding:11px 15px;
+        border-radius:12px;
+        color:#16653f;
+        background:rgba(183,235,199,.38);
+        border:1px solid #bfe0cb;
+        font-size:.86rem;
+        font-weight:650;
+    }}
+
+    .nx-print-card {{
+        margin-top:34px;
+        padding:18px 22px;
+        border:1px solid #cfe8dc;
+        border-radius:18px;
+        background:linear-gradient(120deg,#f7fcfa 0%,#e6f4ee 100%);
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:18px;
+        box-shadow:0 3px 14px rgba(18,51,42,.06);
+    }}
+    .nx-print-title {{
+        font-size:1.25rem;
+        font-weight:850;
+        color:{INK};
+    }}
+    .nx-print-subtitle {{
+        font-size:.9rem;
+        color:{MUTED};
+        margin-top:4px;
+    }}
+    .nx-print-seal {{
+        border:2px solid {GREEN_DARK};
+        color:{GREEN_DARK};
+        border-radius:999px;
+        padding:10px 18px;
+        font-size:.82rem;
+        font-weight:900;
+        letter-spacing:.08em;
+        white-space:nowrap;
+    }}
+
+    div[role="radiogroup"] {{ gap:6px; }}
     div[role="radiogroup"] > label {{
-        background: #f4f8f6;
-        border: 1px solid #dbe7e1;
-        border-radius: 999px;
-        padding: 4px 14px 4px 8px;
+        background:#f4f8f6;
+        border:1px solid #dbe7e1;
+        border-radius:999px;
+        padding:4px 14px 4px 8px;
     }}
     div[role="radiogroup"] > label:has(input:checked) {{
-        background: {GREEN_SOFT};
-        border-color: {GREEN};
-        font-weight: 800;
+        background:{GREEN_SOFT};
+        border-color:{GREEN};
+        font-weight:700;
     }}
-    div[data-testid="stExpander"] {{
-        border-radius: 14px;
-        border: 1px solid #e2ece7;
+
+    @media (max-width:900px) {{
+        .nx-price-grid {{ grid-template-columns:1fr; }}
     }}
-    @media (max-width: 1050px) {{
-        .hp-assumptions {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-    }}
-    @media (max-width: 700px) {{
-        .hp-assumptions {{ grid-template-columns: 1fr 1fr; }}
-        .hp-module {{ display: block; }}
-        .hp-module-tag {{ display: inline-block; margin-top: 10px; }}
-    }}
+
     @media print {{
-        @page {{ size: A4 landscape; margin: 8mm; }}
+        @page {{ size:A4 landscape; margin:8mm; }}
         header, footer, [data-testid="stToolbar"], [data-testid="stSidebar"],
-        [data-testid="stDecoration"], .stDeployButton {{ display: none !important; }}
-        .block-container {{ max-width: 100% !important; padding: .3rem .5rem !important; }}
-        button {{ display: none !important; }}
-        .hp-hero, .hp-module, .hp-kpi, .hp-print-card {{
-            box-shadow: none !important;
-            break-inside: avoid;
+        [data-testid="stDecoration"], .stDeployButton {{
+            display:none !important;
+        }}
+        .block-container {{
+            max-width:100% !important;
+            padding:.3rem .5rem !important;
+        }}
+        button {{ display:none !important; }}
+        .nx-hero, .nx-module-banner, .kpi, .nx-print-card {{
+            break-inside:avoid;
+            box-shadow:none !important;
         }}
     }}
     </style>
@@ -298,104 +314,164 @@ st.markdown(
 
 st.markdown(
     """
-    <div class="hp-hero">
-      <span class="hp-pill">Future hedge · fixed-for-floating · solar + storage</span>
-      <h1>Hybrid PPA (Solar + BESS)</h1>
+    <div class="nx-hero">
+      <span class="nx-pill">Offtaker view · Hybrid PPA settlements</span>
+      <h1>Hybrid PPA (Solar + BESS) Settlements</h1>
       <p>
-        Forward settlement view for a hybrid asset combining solar generation and a
-        4-hour battery. Compare solar capture, baseload and the reshaped hybrid capture,
-        review the hourly operating profile, and quantify the settlement against a fixed
-        Hybrid PPA price.
+        Historical captured prices for 2025-2026 and forward Hybrid PPA settlement
+        scenarios for 2027-2036. Select Aurora Q2-26 or Baringa Q2-26 and compare
+        captured solar, baseload and captured hybrid prices against a fixed Hybrid PPA price.
       </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# -----------------------------------------------------------------------------
-# Paths and utility functions
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# PATHS AND FILE DISCOVERY
+# =============================================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
-DATA_FILE_CANDIDATES = [
-    DATA_DIR / "HPPA_wDEmand.xlsx",
-    DATA_DIR / "HPPA_wDemand.xlsx",
-    BASE_DIR / "HPPA_wDEmand.xlsx",
-    BASE_DIR / "HPPA_wDemand.xlsx",
-]
 
 
-def resolve_data_file() -> Path | None:
-    for candidate in DATA_FILE_CANDIDATES:
-        if candidate.exists():
-            return candidate
-    return None
+def _normalise_filename(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
 
 
-def _excel_datetime(values: pd.Series) -> pd.Series:
-    """Parse Excel serials, Python datetimes or text dates robustly."""
-    if pd.api.types.is_datetime64_any_dtype(values):
-        return pd.to_datetime(values, errors="coerce")
+def resolve_data_file(
+    preferred_names: list[str],
+    required_tokens: list[str],
+    suffixes: set[str],
+) -> Path | None:
+    """Resolve exact preferred names first, then tolerant keyword matching."""
+    for name in preferred_names:
+        p = DATA_DIR / name
+        if p.exists():
+            return p
 
-    numeric = pd.to_numeric(values, errors="coerce")
-    parsed_numeric = pd.to_datetime(
-        numeric,
-        unit="D",
-        origin="1899-12-30",
-        errors="coerce",
-    )
-    parsed_text = pd.to_datetime(values, errors="coerce")
-    return parsed_numeric.where(numeric.notna(), parsed_text)
+    if not DATA_DIR.exists():
+        return None
+
+    tokens = [_normalise_filename(t) for t in required_tokens]
+    candidates: list[Path] = []
+    for p in DATA_DIR.iterdir():
+        if not p.is_file() or p.suffix.lower() not in suffixes:
+            continue
+        normalised = _normalise_filename(p.name)
+        if all(token in normalised for token in tokens):
+            candidates.append(p)
+
+    if not candidates:
+        return None
+
+    # Prefer the most recently modified matching file, useful when "(1)" / "(2)"
+    # versions coexist in the repository.
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def kpi_card(col, label: str, value: str, unit: str, foot: str, tone: str = "") -> None:
+HIST_FILE = resolve_data_file(
+    [
+        "Historic values 2025-2026.csv",
+        "Historic values 2025-2026(2).csv",
+    ],
+    ["historic", "2025", "2026"],
+    {".csv"},
+)
+
+AURORA_FILE = resolve_data_file(
+    [
+        "aurora q2-26 capt_price_no_demand_2027-2036.xlsx",
+        "aurora q2-26 capt_price_no_demand_2027-2036(1).xlsx",
+    ],
+    ["aurora", "q2", "26", "capt", "no", "demand", "2027", "2036"],
+    {".xlsx", ".xls"},
+)
+
+BARINGA_FILE = resolve_data_file(
+    [
+        "baringa q2-26 captured hybrid_no demand_2027-2036.xlsx",
+        "baringa q2-26 captured hybrid_no demand_2027-2036(2).xlsx",
+    ],
+    ["baringa", "q2", "26", "captured", "hybrid", "no", "demand", "2027", "2036"],
+    {".xlsx", ".xls"},
+)
+
+
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+def kpi(col, label: str, value: str, unit: str = "", foot: str = "", tone: str = ""):
     col.markdown(
         f"""
-        <div class="hp-kpi {tone}">
-          <div class="k-label">{label}</div>
-          <div class="k-value">{value}<span class="k-unit">{unit}</span></div>
-          <div class="k-foot">{foot}</div>
+        <div class="kpi {tone}">
+          <div class="label">{label}</div>
+          <div class="value">{value}<span class="unit">{unit}</span></div>
+          <div class="foot">{foot}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def chart_heading(title: str, note: str) -> None:
-    st.markdown(f"<div class='hp-chart-title'>{title}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='hp-chart-note'>{note}</div>", unsafe_allow_html=True)
+def module_banner(title: str, subtitle: str, tag: str):
+    st.markdown(
+        f"""
+        <div class="nx-module-banner">
+          <div>
+            <div class="nx-module-title">{title}</div>
+            <div class="nx-module-subtitle">{subtitle}</div>
+          </div>
+          <div class="nx-module-tag">{tag}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def style_chart(chart: alt.Chart | alt.LayerChart) -> alt.Chart | alt.LayerChart:
+def price_card(label: str, value: str, unit: str, foot: str) -> str:
+    return f"""
+    <div class="nx-price-card">
+      <div class="nx-price-label">{label}</div>
+      <div class="nx-price-value">{value}<span class="unit">{unit}</span></div>
+      <div class="nx-price-foot">{foot}</div>
+    </div>
+    """
+
+
+def price_grid(cards: list[str]):
+    st.markdown("<div class='nx-price-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def chart_heading(title: str, subtitle: str = ""):
+    st.markdown(f"<div class='nx-chart-title'>{title}</div>", unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f"<div class='nx-chart-note'>{subtitle}</div>", unsafe_allow_html=True)
+
+
+def style_chart(ch):
     return (
-        chart.configure_axis(
+        ch.configure_axis(
             labelColor=MUTED,
             titleColor=MUTED,
-            gridColor=GRID,
+            gridColor="#eef4f1",
             domainColor="#dbe7e1",
             labelFontSize=11,
             titleFontSize=12,
         )
-        .configure_legend(
-            orient="top",
-            direction="horizontal",
-            title=None,
+        .configure_header(
+            labelFontSize=13,
+            labelFontWeight="bold",
             labelColor=INK,
-            labelFontSize=11,
-            symbolSize=120,
+            titleColor=MUTED,
         )
         .configure_view(strokeWidth=0)
     )
 
 
-def _period_x(granularity: str) -> alt.X:
+def _x_encoding(granularity: str):
     if granularity == "Annual":
-        return alt.X(
-            "period:N",
-            title=None,
-            sort=None,
-            axis=alt.Axis(labelAngle=0, labelPadding=8),
-        )
+        return alt.X("period:N", title=None, sort=None, axis=alt.Axis(labelAngle=0))
     return alt.X(
         "date:T",
         title=None,
@@ -404,285 +480,395 @@ def _period_x(granularity: str) -> alt.X:
             labelAngle=-45,
             labelOverlap="greedy",
             tickCount=24,
+            labelFontSize=10,
             labelPadding=8,
         ),
     )
 
 
-def _settlement_label(value: float, unit: str = "") -> str:
-    if pd.isna(value):
+def _bar_label(v: float, suffix: str = "") -> str:
+    if pd.isna(v):
         return ""
-    if abs(value) >= 1_000_000:
-        return f"{value / 1_000_000:+.1f}M{unit}"
-    if abs(value) >= 1_000:
-        return f"{value / 1_000:+.0f}k{unit}"
-    return f"{value:+.1f}{unit}"
+    av = abs(v)
+    if av >= 1_000_000:
+        return f"{v / 1_000_000:+.1f}M{suffix}"
+    if av >= 1_000:
+        return f"{v / 1_000:+.0f}k{suffix}"
+    return f"{v:+.1f}{suffix}"
 
 
-def settlement_bar_chart(
+def settlement_chart(
     df: pd.DataFrame,
-    y_col: str,
-    y_title: str,
+    ycol: str,
+    ytitle: str,
     granularity: str,
     title: str,
     height: int = 390,
-) -> alt.LayerChart:
+):
     data = df.copy()
-    data["bar_label"] = data[y_col].map(_settlement_label)
-    x = _period_x(granularity)
+    data["bar_lbl"] = data[ycol].map(_bar_label)
+    xenc = _x_encoding(granularity)
     base = alt.Chart(data)
 
+    zero = base.mark_rule(color="#adc5bc").encode(y=alt.datum(0))
+    bar_colour = alt.condition(
+        f"datum.{ycol} >= 0",
+        alt.value(GREEN),
+        alt.value(ORANGE),
+    )
+
     bar_kwargs = {
-        "cornerRadiusTopLeft": 5,
-        "cornerRadiusTopRight": 5,
-        "cornerRadiusBottomLeft": 5,
-        "cornerRadiusBottomRight": 5,
-        "opacity": .96,
+        "cornerRadiusTopLeft": 4,
+        "cornerRadiusTopRight": 4,
+        "cornerRadiusBottomLeft": 4,
+        "cornerRadiusBottomRight": 4,
+        "opacity": 1.0,
     }
     if granularity == "Monthly":
         bar_kwargs["size"] = 10
 
     bars = base.mark_bar(**bar_kwargs).encode(
-        x=x,
-        y=alt.Y(f"{y_col}:Q", title=y_title),
-        color=alt.condition(
-            f"datum.{y_col} >= 0",
-            alt.value(GREEN),
-            alt.value(ORANGE),
-        ),
+        x=xenc,
+        y=alt.Y(f"{ycol}:Q", title=ytitle),
+        color=bar_colour,
         tooltip=[
             alt.Tooltip("period:N", title="Period"),
-            alt.Tooltip(f"{y_col}:Q", title=y_title, format="+,.1f"),
+            alt.Tooltip("captured_hybrid:Q", title="Captured hybrid €/MWh", format=".1f"),
+            alt.Tooltip("fixed_price:Q", title="Fixed price €/MWh", format=".1f"),
+            alt.Tooltip("settlement_eur_mwh:Q", title="Settlement €/MWh", format="+.1f"),
+            alt.Tooltip("settlement_eur:Q", title="Settlement €", format=",.0f"),
         ],
     )
-    zero = base.mark_rule(color="#9eb9ad", strokeWidth=1).encode(y=alt.datum(0))
 
-    show_labels = granularity == "Annual"
-    layers: list[alt.Chart] = [bars, zero]
-    if show_labels:
-        labels_pos = (
-            base.transform_filter(f"datum.{y_col} >= 0")
-            .mark_text(dy=-8, color="#000000", fontWeight="bold", fontSize=11)
-            .encode(x=x, y=alt.Y(f"{y_col}:Q"), text="bar_label:N")
+    layers = [bars, zero]
+    if granularity == "Annual":
+        pos_labels = (
+            base.transform_filter(f"datum.{ycol} >= 0")
+            .mark_text(dy=-8, fontSize=11, fontWeight="bold", color="#000000")
+            .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N")
         )
-        labels_neg = (
-            base.transform_filter(f"datum.{y_col} < 0")
-            .mark_text(dy=13, color="#000000", fontWeight="bold", fontSize=11)
-            .encode(x=x, y=alt.Y(f"{y_col}:Q"), text="bar_label:N")
+        neg_labels = (
+            base.transform_filter(f"datum.{ycol} < 0")
+            .mark_text(dy=13, fontSize=11, fontWeight="bold", color="#000000")
+            .encode(x=xenc, y=alt.Y(f"{ycol}:Q"), text="bar_lbl:N")
         )
-        layers.extend([labels_pos, labels_neg])
+        layers.extend([pos_labels, neg_labels])
 
     return alt.layer(*layers).properties(
         height=height,
-        title=alt.TitleParams(title, anchor="start", color=INK, fontSize=15),
+        title=alt.TitleParams(title, anchor="start", fontSize=15, color=INK),
     )
 
 
-# -----------------------------------------------------------------------------
-# Workbook loaders
-# -----------------------------------------------------------------------------
-@st.cache_data(show_spinner="Loading Hybrid PPA monthly results…")
-def load_monthly_summary(path_str: str, mtime: float) -> pd.DataFrame:
-    _ = mtime
-    cols = [
-        "Year",
-        "month",
-        "Hybrid_Profile_MWh",
-        "Solar_Generation_MWh",
-        "Solar_Revenue_EUR",
-        "Hybrid_Revenue_EUR",
-        "Captured Solar (€/MWh)",
-        "Captured Hybrid (€/MWh)",
-    ]
-    df = pd.read_excel(path_str, sheet_name="monthly_summary", usecols=cols)
-    df = df[df["month"].astype(str).str.upper() != "TOTAL"].copy()
-    df["year"] = pd.to_numeric(df["Year"], errors="coerce")
-    df["date"] = pd.to_datetime(df["month"].astype(str) + "-01", errors="coerce")
-    df = df.dropna(subset=["year", "date"]).copy()
-    df["year"] = df["year"].astype(int)
+def market_vs_contract_chart(
+    df: pd.DataFrame,
+    granularity: str,
+    title: str,
+):
+    data = df.copy()
+    xenc = _x_encoding(granularity)
+    base = alt.Chart(data)
 
-    rename = {
-        "Hybrid_Profile_MWh": "hybrid_volume_mwh",
-        "Solar_Generation_MWh": "solar_generation_mwh",
-        "Solar_Revenue_EUR": "solar_revenue_eur",
-        "Hybrid_Revenue_EUR": "hybrid_revenue_eur",
-        "Captured Solar (€/MWh)": "captured_solar",
-        "Captured Hybrid (€/MWh)": "captured_hybrid",
+    bars = base.mark_bar(
+        cornerRadiusTopLeft=5,
+        cornerRadiusTopRight=5,
+        opacity=.88,
+    ).encode(
+        x=xenc,
+        y=alt.Y("captured_hybrid:Q", title="€/MWh"),
+        color=alt.value(GREEN),
+        tooltip=[
+            alt.Tooltip("period:N", title="Period"),
+            alt.Tooltip("captured_hybrid:Q", title="Captured hybrid €/MWh", format=".1f"),
+            alt.Tooltip("fixed_price:Q", title="Fixed Hybrid PPA €/MWh", format=".1f"),
+            alt.Tooltip("settlement_eur_mwh:Q", title="Settlement €/MWh", format="+.1f"),
+        ],
+    )
+
+    line = base.mark_line(
+        point={"filled": True, "size": 60},
+        strokeWidth=3,
+        color=ORANGE,
+    ).encode(
+        x=xenc,
+        y=alt.Y("fixed_price:Q", title="€/MWh"),
+    )
+
+    return alt.layer(bars, line).properties(
+        height=400,
+        title=alt.TitleParams(
+            title,
+            anchor="start",
+            fontSize=15,
+            color=INK,
+        ),
+    )
+
+
+# =============================================================================
+# DATA LOADERS
+# =============================================================================
+@st.cache_data(show_spinner="Loading historical Hybrid PPA values...")
+def load_historical(path_str: str, mtime: float) -> pd.DataFrame:
+    _ = mtime
+    raw = pd.read_csv(path_str)
+    required = {"period", "series", "value"}
+    missing = required.difference(raw.columns)
+    if missing:
+        raise ValueError(
+            "Historical CSV is missing columns: " + ", ".join(sorted(missing))
+        )
+
+    raw["date"] = pd.to_datetime(raw["period"], errors="coerce")
+    raw["value"] = pd.to_numeric(raw["value"], errors="coerce")
+    raw = raw.dropna(subset=["date", "series", "value"]).copy()
+
+    wanted = {
+        "Baseload": "baseload",
+        "Hybrid w/o demand": "captured_hybrid",
+        "PV uncurtailed captured price": "captured_solar",
     }
-    df = df.rename(columns=rename)
-    for col in rename.values():
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df[
+
+    raw = raw[raw["series"].isin(wanted)].copy()
+    wide = (
+        raw.pivot_table(
+            index="date",
+            columns="series",
+            values="value",
+            aggfunc="first",
+        )
+        .rename(columns=wanted)
+        .reset_index()
+    )
+
+    for col in ["baseload", "captured_hybrid", "captured_solar"]:
+        if col not in wide.columns:
+            wide[col] = np.nan
+
+    wide["year"] = wide["date"].dt.year.astype(int)
+    wide["month_num"] = wide["date"].dt.month.astype(int)
+    wide["period"] = wide["date"].dt.strftime("%Y-%m")
+    wide["data_source"] = "Historical outturn"
+    wide["curve_source"] = "Historical"
+    return wide[
         [
-            "year",
             "date",
-            "month",
-            "hybrid_volume_mwh",
-            "solar_generation_mwh",
-            "solar_revenue_eur",
-            "hybrid_revenue_eur",
+            "year",
+            "month_num",
+            "period",
             "captured_solar",
+            "baseload",
             "captured_hybrid",
+            "data_source",
+            "curve_source",
         ]
     ].sort_values("date")
 
 
-@st.cache_data(show_spinner="Loading hourly hybrid dispatch — first load may take a few seconds…")
-def load_dispatch(path_str: str, mtime: float) -> pd.DataFrame:
-    path = Path(path_str)
-    cache_path = path.with_name(f".{path.stem}_hybrid_dispatch.parquet")
-
-    if cache_path.exists() and cache_path.stat().st_mtime >= mtime:
-        try:
-            return pd.read_parquet(cache_path)
-        except Exception:
-            pass
-
+@st.cache_data(show_spinner="Loading Aurora Q2-26 Hybrid PPA curve...")
+def load_aurora(path_str: str, mtime: float) -> pd.DataFrame:
+    _ = mtime
     cols = [
-        "Date",
-        "Hour",
-        "omie_venta",
-        "generacion",
-        "g_to_grid",
-        "g_to_batt",
-        "grid_charge",
-        "batt_for_sell",
-        "soc",
-        "hybrid profile (MWh)",
-        "charge_mwh",
-        "discharge_mwh",
-        "timestamp",
+        "Year",
         "month",
+        "Captured Solar (€/MWh)",
+        "Baseload (€/MWh)",
+        "Captured Hybrid (€/MWh)",
     ]
-    df = pd.read_excel(path, sheet_name="dispatch", usecols=cols)
+    df = pd.read_excel(path_str, sheet_name="monthly_summary", usecols=cols)
+    df = df[df["month"].astype(str).str.upper() != "TOTAL"].copy()
 
-    df["date"] = _excel_datetime(df["Date"]).dt.normalize()
-    df["timestamp_dt"] = _excel_datetime(df["timestamp"])
-    bad_ts = df["timestamp_dt"].isna()
-    if bad_ts.any():
-        hour_num = pd.to_numeric(df.loc[bad_ts, "Hour"], errors="coerce").fillna(1)
-        df.loc[bad_ts, "timestamp_dt"] = (
-            df.loc[bad_ts, "date"] + pd.to_timedelta(hour_num - 1, unit="h")
-        )
+    df["date"] = pd.to_datetime(
+        df["month"].astype(str).str.slice(0, 7) + "-01",
+        errors="coerce",
+    )
+    df["year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df = df.dropna(subset=["date", "year"]).copy()
+    df["year"] = df["year"].astype(int)
+    df["month_num"] = df["date"].dt.month.astype(int)
 
-    numeric_cols = [
-        "Hour",
-        "omie_venta",
-        "generacion",
-        "g_to_grid",
-        "g_to_batt",
-        "grid_charge",
-        "batt_for_sell",
-        "soc",
-        "hybrid profile (MWh)",
-        "charge_mwh",
-        "discharge_mwh",
-    ]
-    for col in numeric_cols:
+    df = df.rename(
+        columns={
+            "Captured Solar (€/MWh)": "captured_solar",
+            "Baseload (€/MWh)": "baseload",
+            "Captured Hybrid (€/MWh)": "captured_hybrid",
+        }
+    )
+    for col in ["captured_solar", "baseload", "captured_hybrid"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["year"] = df["timestamp_dt"].dt.year.astype("Int64")
-    df["month_key"] = df["timestamp_dt"].dt.to_period("M").astype(str)
-    df = df.dropna(subset=["timestamp_dt", "date", "year", "omie_venta"]).copy()
-    df["year"] = df["year"].astype(int)
+    df["period"] = df["date"].dt.strftime("%Y-%m")
+    df["data_source"] = "Aurora Q2-26"
+    df["curve_source"] = "Aurora Q2-26"
 
-    out = df[
+    return df[
         [
             "date",
-            "timestamp_dt",
             "year",
-            "month_key",
-            "Hour",
-            "omie_venta",
-            "generacion",
-            "g_to_grid",
-            "g_to_batt",
-            "grid_charge",
-            "batt_for_sell",
-            "soc",
-            "hybrid profile (MWh)",
-            "charge_mwh",
-            "discharge_mwh",
+            "month_num",
+            "period",
+            "captured_solar",
+            "baseload",
+            "captured_hybrid",
+            "data_source",
+            "curve_source",
         ]
-    ].sort_values("timestamp_dt")
-
-    try:
-        out.to_parquet(cache_path, index=False)
-    except Exception:
-        pass
-    return out
+    ].sort_values("date")
 
 
-@st.cache_data(show_spinner="Loading daily BESS statistics…")
-def load_daily_stats(path_str: str, mtime: float) -> pd.DataFrame:
+@st.cache_data(show_spinner="Loading Baringa Q2-26 Hybrid PPA curve...")
+def load_baringa(path_str: str, mtime: float) -> pd.DataFrame:
     _ = mtime
-    cols = ["Date", "Year", "Revenue BESS (€)", "hybrid profile (MWh)"]
-    df = pd.read_excel(path_str, sheet_name="stats", usecols=cols)
-    df["date"] = _excel_datetime(df["Date"]).dt.normalize()
-    df["year"] = pd.to_numeric(df["Year"], errors="coerce")
-    df["bess_revenue_eur"] = pd.to_numeric(df["Revenue BESS (€)"], errors="coerce")
-    df["hybrid_volume_mwh"] = pd.to_numeric(df["hybrid profile (MWh)"], errors="coerce")
-    return df.dropna(subset=["date", "year"]).assign(year=lambda x: x["year"].astype(int))
 
-
-@st.cache_data(show_spinner=False)
-def monthly_baseload(dispatch: pd.DataFrame) -> pd.DataFrame:
-    return (
-        dispatch.groupby(["year", "month_key"], as_index=False)
-        .agg(baseload=("omie_venta", "mean"), hours=("omie_venta", "count"))
-        .rename(columns={"month_key": "month"})
+    # The Baringa workbook stores its monthly summary in columns T:W
+    # of the dispatch sheet:
+    # T = Year, U = Month, V = PV captured, W = Baseload, X = Hybrid captured.
+    raw = pd.read_excel(
+        path_str,
+        sheet_name="dispatch",
+        usecols="T:X",
     )
 
+    if raw.shape[1] < 5:
+        raise ValueError("Baringa workbook monthly summary T:X was not found.")
 
-# -----------------------------------------------------------------------------
-# Load and reconcile source data
-# -----------------------------------------------------------------------------
-data_path = resolve_data_file()
-if data_path is None:
-    st.error(
-        "Workbook `HPPA_wDEmand.xlsx` was not found. Upload it to the repository's "
-        "`data/` folder."
+    raw = raw.iloc[:, :5].copy()
+    raw.columns = [
+        "year",
+        "month_num",
+        "captured_solar",
+        "baseload",
+        "captured_hybrid",
+    ]
+
+    raw["year"] = pd.to_numeric(raw["year"], errors="coerce")
+    raw["month_num"] = pd.to_numeric(raw["month_num"], errors="coerce")
+    for col in ["captured_solar", "baseload", "captured_hybrid"]:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    raw = raw.dropna(
+        subset=["year", "month_num", "captured_hybrid"]
+    ).copy()
+    raw["year"] = raw["year"].astype(int)
+    raw["month_num"] = raw["month_num"].astype(int)
+    raw = raw[
+        raw["year"].between(2027, 2036)
+        & raw["month_num"].between(1, 12)
+    ].copy()
+
+    raw["date"] = pd.to_datetime(
+        dict(year=raw["year"], month=raw["month_num"], day=1)
     )
-    st.stop()
+    raw["period"] = raw["date"].dt.strftime("%Y-%m")
+    raw["data_source"] = "Baringa Q2-26"
+    raw["curve_source"] = "Baringa Q2-26"
 
-mtime = data_path.stat().st_mtime
-monthly = load_monthly_summary(str(data_path), mtime)
-dispatch = load_dispatch(str(data_path), mtime)
-stats = load_daily_stats(str(data_path), mtime)
+    return raw[
+        [
+            "date",
+            "year",
+            "month_num",
+            "period",
+            "captured_solar",
+            "baseload",
+            "captured_hybrid",
+            "data_source",
+            "curve_source",
+        ]
+    ].drop_duplicates(["year", "month_num"]).sort_values("date")
 
-base_m = monthly_baseload(dispatch)
-monthly = monthly.merge(base_m, on=["year", "month"], how="left", validate="one_to_one")
-monthly["hybrid_premium_vs_baseload"] = monthly["captured_hybrid"] - monthly["baseload"]
-monthly["hybrid_uplift_vs_solar"] = monthly["captured_hybrid"] - monthly["captured_solar"]
 
-if monthly.empty:
-    st.warning("No monthly hybrid results were found in the workbook.")
-    st.stop()
-
-MIN_YEAR = int(monthly["year"].min())
-MAX_YEAR = int(monthly["year"].max())
-
-# -----------------------------------------------------------------------------
-# Controls
-# -----------------------------------------------------------------------------
-st.markdown(
+def build_annual(monthly: pd.DataFrame) -> pd.DataFrame:
     """
-    <div class="hp-module">
-      <div>
-        <div class="hp-module-title">Hybrid PPA settlement configuration</div>
-        <div class="hp-module-sub">
-          Select the fixed price, project scale and a forward period of up to ten years.
-        </div>
-      </div>
-      <div class="hp-module-tag">Offtaker settlement view</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+    Annual settlement aggregation using the contracted settlement volume as weight.
+
+    This is intentional: the historical CSV contains prices but no historical
+    hybrid production volumes. The page therefore does not invent production
+    weights. It aggregates annual settlement using the user's contracted volume,
+    allocated by calendar days.
+    """
+    g = monthly.groupby("year", as_index=False)
+
+    annual = g.agg(
+        contracted_mwh=("contracted_mwh", "sum"),
+        settlement_eur=("settlement_eur", "sum"),
+        captured_solar_x_vol=("captured_solar_x_vol", "sum"),
+        baseload_x_vol=("baseload_x_vol", "sum"),
+        captured_hybrid_x_vol=("captured_hybrid_x_vol", "sum"),
+        months=("month_num", "nunique"),
+    )
+
+    denom = annual["contracted_mwh"].clip(lower=1e-9)
+    annual["captured_solar"] = annual["captured_solar_x_vol"] / denom
+    annual["baseload"] = annual["baseload_x_vol"] / denom
+    annual["captured_hybrid"] = annual["captured_hybrid_x_vol"] / denom
+    annual["settlement_eur_mwh"] = annual["settlement_eur"] / denom
+    annual["fixed_price"] = (
+        monthly.groupby("year")["fixed_price"].first().reindex(annual["year"]).to_numpy()
+    )
+    annual["period"] = annual["year"].astype(str)
+    annual["date"] = pd.to_datetime(annual["year"].astype(str) + "-01-01")
+    annual["hybrid_premium_vs_baseload"] = (
+        annual["captured_hybrid"] - annual["baseload"]
+    )
+    annual["hybrid_uplift_vs_solar"] = (
+        annual["captured_hybrid"] - annual["captured_solar"]
+    )
+    return annual
+
+
+# =============================================================================
+# LOAD DATA
+# =============================================================================
+missing_files = []
+if HIST_FILE is None:
+    missing_files.append("Historic values 2025-2026.csv")
+if AURORA_FILE is None:
+    missing_files.append("Aurora Q2-26 captured-price workbook")
+if BARINGA_FILE is None:
+    missing_files.append("Baringa Q2-26 captured-hybrid workbook")
+
+if missing_files:
+    st.error(
+        "Missing source file(s) in `data/`: "
+        + ", ".join(missing_files)
+        + ". The page accepts the uploaded filenames with or without (1)/(2) suffixes."
+    )
+    st.stop()
+
+try:
+    historical = load_historical(str(HIST_FILE), HIST_FILE.stat().st_mtime)
+    aurora = load_aurora(str(AURORA_FILE), AURORA_FILE.stat().st_mtime)
+    baringa = load_baringa(str(BARINGA_FILE), BARINGA_FILE.stat().st_mtime)
+except Exception as exc:
+    st.error(f"Could not load Hybrid PPA source data: {exc}")
+    st.stop()
+
+if historical.empty or aurora.empty or baringa.empty:
+    st.error("One or more Hybrid PPA source datasets are empty.")
+    st.stop()
+
+
+# =============================================================================
+# CONTROLS
+# =============================================================================
+module_banner(
+    "Hybrid PPA settlement configuration",
+    "Historical 2025-2026 plus selected forward captured-price curve for 2027-2036.",
+    "Solar + BESS",
 )
 
 with st.container(border=True):
-    c1, c2, c3, c4, c5 = st.columns([1.15, 1.0, 1.0, 1.0, 1.15])
+    c1, c2, c3, c4 = st.columns([1.25, 1.25, 1.15, 1.0])
+
     with c1:
+        forward_source = st.radio(
+            "Forward source (2027-2036)",
+            ["Aurora Q2-26", "Baringa Q2-26"],
+            horizontal=True,
+        )
+
+    with c2:
         fixed_price = st.slider(
             "Hybrid PPA fixed price (€/MWh)",
             min_value=0.0,
@@ -690,193 +876,196 @@ with st.container(border=True):
             value=62.0,
             step=0.5,
         )
-    with c2:
-        project_multiplier = st.number_input(
-            "Project scale vs source case",
-            min_value=0.1,
-            max_value=1000.0,
-            value=1.0,
-            step=0.5,
-            help="1.0 reproduces the workbook's normalized project. Cash settlements scale linearly.",
-        )
+
     with c3:
-        contracted_share = st.slider(
-            "Contracted hybrid volume",
-            min_value=10,
-            max_value=100,
-            value=100,
-            step=5,
-            format="%d%%",
+        annual_volume_gwh = st.number_input(
+            "Contracted Hybrid PPA volume (GWh/yr)",
+            min_value=1.0,
+            max_value=5000.0,
+            value=100.0,
+            step=10.0,
+            help=(
+                "Used only to convert €/MWh settlement into cash settlement. "
+                "Monthly volume is allocated in proportion to calendar days."
+            ),
         )
+
     with c4:
-        granularity = st.radio("View", ["Annual", "Monthly"], horizontal=True)
-    with c5:
-        start_options = list(range(MIN_YEAR, MAX_YEAR + 1))
-        default_start = MIN_YEAR
-        start_year = st.selectbox(
-            "Start year",
-            options=start_options,
-            index=start_options.index(default_start),
+        granularity = st.radio(
+            "View",
+            ["Annual", "Monthly"],
+            horizontal=True,
         )
 
-    max_tenor = min(10, MAX_YEAR - start_year + 1)
-    tenor_years = st.slider(
-        "Tenor (years)",
-        min_value=1,
-        max_value=max_tenor,
-        value=max_tenor,
-        step=1,
-        help="The source workbook currently covers 2027–2040. The page limits each selected view to ten years.",
-    )
+selected_forward = aurora.copy() if forward_source.startswith("Aurora") else baringa.copy()
 
-end_year = start_year + tenor_years - 1
-contracted_fraction = contracted_share / 100.0
+combined = pd.concat(
+    [
+        historical[historical["year"] <= 2026].copy(),
+        selected_forward[selected_forward["year"] >= 2027].copy(),
+    ],
+    ignore_index=True,
+).sort_values("date")
+
+MIN_YEAR = int(combined["year"].min())
+MAX_YEAR = int(combined["year"].max())
+
+year_range = st.slider(
+    "Settlement period",
+    min_value=MIN_YEAR,
+    max_value=MAX_YEAR,
+    value=(MIN_YEAR, MAX_YEAR),
+)
+
+monthly = combined[
+    combined["year"].between(year_range[0], year_range[1])
+].copy()
+
+if monthly.empty:
+    st.warning("No Hybrid PPA source values are available in the selected period.")
+    st.stop()
+
+# Contracted annual volume is allocated by calendar days.
+monthly["days_in_month"] = monthly["date"].dt.days_in_month.astype(float)
+monthly["days_in_year"] = np.where(
+    monthly["date"].dt.is_leap_year,
+    366.0,
+    365.0,
+)
+monthly["contracted_mwh"] = (
+    annual_volume_gwh
+    * 1000.0
+    * monthly["days_in_month"]
+    / monthly["days_in_year"]
+)
+
+monthly["fixed_price"] = fixed_price
+monthly["settlement_eur_mwh"] = monthly["captured_hybrid"] - fixed_price
+monthly["settlement_eur"] = (
+    monthly["settlement_eur_mwh"] * monthly["contracted_mwh"]
+)
+monthly["hybrid_premium_vs_baseload"] = (
+    monthly["captured_hybrid"] - monthly["baseload"]
+)
+monthly["hybrid_uplift_vs_solar"] = (
+    monthly["captured_hybrid"] - monthly["captured_solar"]
+)
+
+monthly["captured_solar_x_vol"] = (
+    monthly["captured_solar"] * monthly["contracted_mwh"]
+)
+monthly["baseload_x_vol"] = (
+    monthly["baseload"] * monthly["contracted_mwh"]
+)
+monthly["captured_hybrid_x_vol"] = (
+    monthly["captured_hybrid"] * monthly["contracted_mwh"]
+)
+
+annual = build_annual(monthly)
+view = annual.copy() if granularity == "Annual" else monthly.copy()
+
+price_grid(
+    [
+        price_card(
+            "Hybrid PPA fixed price",
+            f"{fixed_price:.1f}",
+            "€/MWh",
+            "Fixed contract price used for settlement.",
+        ),
+        price_card(
+            "Forward source",
+            forward_source.replace(" Q2-26", ""),
+            "",
+            "Historical 2025-2026 remains common to both forward cases.",
+        ),
+        price_card(
+            "Contracted volume",
+            f"{annual_volume_gwh:,.0f}",
+            "GWh/yr",
+            "Calendar-day shaped solely for cash-settlement conversion.",
+        ),
+    ]
+)
 
 st.markdown(
     f"""
-    <div class="hp-assumptions">
-      <div class="hp-assumption"><div class="a-label">Charging efficiency</div><div class="a-value">{ETA_CH:.1%}</div></div>
-      <div class="hp-assumption"><div class="a-label">Discharging efficiency</div><div class="a-value">{ETA_DIS:.1%}</div></div>
-      <div class="hp-assumption"><div class="a-label">Round-trip efficiency</div><div class="a-value">{RTE:.1%}</div></div>
-      <div class="hp-assumption"><div class="a-label">Cycling limit</div><div class="a-value">1 cycle/day</div></div>
-      <div class="hp-assumption"><div class="a-label">Battery duration</div><div class="a-value">4 hours</div></div>
-      <div class="hp-assumption"><div class="a-label">Depth of discharge</div><div class="a-value">100%</div></div>
+    <div class="nx-callout">
+      Forward configuration is <b>without grid demand / without grid charging</b>,
+      matching both uploaded 2027-2036 source workbooks. Historical hybrid values use
+      the <b>Hybrid w/o demand</b> series from the CSV.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-selected_monthly = monthly[
-    monthly["year"].between(start_year, end_year)
-].copy()
-if selected_monthly.empty:
-    st.warning("No source data is available for the selected period.")
-    st.stop()
 
-selected_monthly["contracted_volume_mwh"] = (
-    selected_monthly["hybrid_volume_mwh"] * project_multiplier * contracted_fraction
-)
-selected_monthly["settlement_eur_mwh"] = selected_monthly["captured_hybrid"] - fixed_price
-selected_monthly["settlement_eur"] = (
-    selected_monthly["settlement_eur_mwh"] * selected_monthly["contracted_volume_mwh"]
-)
-selected_monthly["fixed_revenue_eur"] = fixed_price * selected_monthly["contracted_volume_mwh"]
-selected_monthly["period"] = selected_monthly["date"].dt.strftime("%Y-%m")
+# =============================================================================
+# KPIs
+# =============================================================================
+total_contract_mwh = monthly["contracted_mwh"].sum()
+denom = max(total_contract_mwh, 1e-9)
 
-# Build annual values from revenues / volumes and hourly-weighted baseload.
-annual_source = selected_monthly.assign(
-    baseload_x_hours=selected_monthly["baseload"] * selected_monthly["hours"]
-)
-annual = (
-    annual_source.groupby("year", as_index=False)
-    .agg(
-        solar_revenue_eur=("solar_revenue_eur", "sum"),
-        hybrid_revenue_eur=("hybrid_revenue_eur", "sum"),
-        solar_generation_mwh=("solar_generation_mwh", "sum"),
-        hybrid_volume_mwh=("hybrid_volume_mwh", "sum"),
-        contracted_volume_mwh=("contracted_volume_mwh", "sum"),
-        settlement_eur=("settlement_eur", "sum"),
-        fixed_revenue_eur=("fixed_revenue_eur", "sum"),
-        baseload_x_hours=("baseload_x_hours", "sum"),
-        hours=("hours", "sum"),
-    )
-)
-annual["captured_solar"] = (
-    annual["solar_revenue_eur"] / annual["solar_generation_mwh"].clip(lower=1e-9)
-)
-annual["captured_hybrid"] = (
-    annual["hybrid_revenue_eur"] / annual["hybrid_volume_mwh"].clip(lower=1e-9)
-)
-annual["baseload"] = annual["baseload_x_hours"] / annual["hours"].clip(lower=1e-9)
-annual["year"] = annual["year"].astype(int)
-annual["hybrid_premium_vs_baseload"] = annual["captured_hybrid"] - annual["baseload"]
-annual["hybrid_uplift_vs_solar"] = annual["captured_hybrid"] - annual["captured_solar"]
-annual["settlement_eur_mwh"] = annual["captured_hybrid"] - fixed_price
-annual["period"] = annual["year"].astype(str)
-annual["date"] = pd.to_datetime(annual["year"].astype(str) + "-01-01")
-
-view = annual.copy() if granularity == "Annual" else selected_monthly.copy()
-
-# -----------------------------------------------------------------------------
-# KPI block
-# -----------------------------------------------------------------------------
 weighted_hybrid = (
-    selected_monthly["hybrid_revenue_eur"].sum()
-    / max(selected_monthly["hybrid_volume_mwh"].sum(), 1e-9)
+    monthly["captured_hybrid_x_vol"].sum() / denom
 )
-weighted_solar = (
-    selected_monthly["solar_revenue_eur"].sum()
-    / max(selected_monthly["solar_generation_mwh"].sum(), 1e-9)
-)
-weighted_baseload = (
-    (selected_monthly["baseload"] * selected_monthly["hours"]).sum()
-    / max(selected_monthly["hours"].sum(), 1e-9)
-)
-avg_settlement_mwh = weighted_hybrid - fixed_price
-cumulative_settlement = selected_monthly["settlement_eur"].sum()
-min_hybrid_premium = selected_monthly["hybrid_premium_vs_baseload"].min()
+weighted_baseload = monthly["baseload_x_vol"].sum() / denom
+weighted_solar = monthly["captured_solar_x_vol"].sum() / denom
+avg_settlement = monthly["settlement_eur"].sum() / denom
+cum_settlement = monthly["settlement_eur"].sum()
 
 k1, k2, k3, k4 = st.columns(4)
-kpi_card(
+kpi(
     k1,
-    "Average hybrid captured price",
+    "Avg settlement to buyer",
+    f"{avg_settlement:+.1f}",
+    "€/MWh",
+    f"{year_range[0]}-{year_range[1]} · contracted-volume weighted",
+    "pos" if avg_settlement >= 0 else "neg",
+)
+kpi(
+    k2,
+    "Cumulative settlement",
+    f"{cum_settlement / 1e6:+.2f}",
+    "M€",
+    f"{annual_volume_gwh:,.0f} GWh/yr contracted",
+    "pos" if cum_settlement >= 0 else "neg",
+)
+kpi(
+    k3,
+    "Avg captured hybrid",
     f"{weighted_hybrid:.1f}",
     "€/MWh",
-    f"{start_year}–{end_year} · volume-weighted",
-    "positive",
+    f"{forward_source} from 2027",
+    "blue",
 )
-kpi_card(
-    k2,
+kpi(
+    k4,
     "Premium vs baseload",
     f"{weighted_hybrid - weighted_baseload:+.1f}",
     "€/MWh",
-    f"Minimum monthly premium: {min_hybrid_premium:+.1f} €/MWh",
-    "blue",
-)
-kpi_card(
-    k3,
-    "Average settlement to buyer",
-    f"{avg_settlement_mwh:+.1f}",
-    "€/MWh",
-    f"Against a fixed price of {fixed_price:.1f} €/MWh",
-    "positive" if avg_settlement_mwh >= 0 else "negative",
-)
-kpi_card(
-    k4,
-    "Cumulative settlement",
-    f"{cumulative_settlement / 1e6:+.2f}",
-    "M€",
-    f"Scale {project_multiplier:g}× · {contracted_share}% contracted",
-    "positive" if cumulative_settlement >= 0 else "negative",
+    f"Solar capture {weighted_solar:.1f} €/MWh",
+    "gold",
 )
 
-# -----------------------------------------------------------------------------
-# Three-curve price comparison
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# MARKET PRICE COMPARISON
+# =============================================================================
 chart_heading(
     "Captured solar vs baseload vs captured hybrid",
-    "The shaded green band is the hybrid premium over baseload. Source results show the hybrid capture above baseload in every displayed period.",
+    "Historical values come from the 2025-2026 CSV. Forward values use the selected Q2-26 source.",
 )
 
 price_data = view.copy()
-price_data["hybrid_premium_vs_baseload"] = (
-    price_data["captured_hybrid"] - price_data["baseload"]
-)
-x = _period_x(granularity)
-base = alt.Chart(price_data)
-
-premium_band = base.mark_area(color=GREEN, opacity=.12).encode(
-    x=x,
-    y=alt.Y("baseload:Q", title="Price (€/MWh)"),
-    y2="captured_hybrid:Q",
-)
+x = _x_encoding(granularity)
 
 long_prices = price_data.melt(
-    id_vars=["period", "date", "year", "hybrid_premium_vs_baseload"],
+    id_vars=["period", "date", "year"],
     value_vars=["captured_solar", "baseload", "captured_hybrid"],
     var_name="series_key",
     value_name="price_eur_mwh",
 )
+
 series_labels = {
     "captured_solar": "Captured solar",
     "baseload": "Baseload",
@@ -884,114 +1073,72 @@ series_labels = {
 }
 long_prices["Series"] = long_prices["series_key"].map(series_labels)
 
-price_lines = alt.Chart(long_prices).mark_line(
-    strokeWidth=3,
-    point={"filled": True, "size": 50},
-).encode(
-    x=x,
-    y=alt.Y("price_eur_mwh:Q", title="Price (€/MWh)"),
-    color=alt.Color(
-        "Series:N",
-        scale=alt.Scale(
-            domain=["Captured solar", "Baseload", "Captured hybrid"],
-            range=[GOLD, BLUE, GREEN_DARK],
+price_lines = (
+    alt.Chart(long_prices)
+    .mark_line(strokeWidth=3, point={"filled": True, "size": 48})
+    .encode(
+        x=x,
+        y=alt.Y("price_eur_mwh:Q", title="Price (€/MWh)"),
+        color=alt.Color(
+            "Series:N",
+            scale=alt.Scale(
+                domain=["Captured solar", "Baseload", "Captured hybrid"],
+                range=[GOLD, BLUE, GREEN_DARK],
+            ),
+            legend=alt.Legend(title=None, orient="top"),
         ),
-    ),
-    strokeDash=alt.StrokeDash(
-        "Series:N",
-        scale=alt.Scale(
-            domain=["Captured solar", "Baseload", "Captured hybrid"],
-            range=[[2, 2], [6, 3], [1, 0]],
+        strokeDash=alt.StrokeDash(
+            "Series:N",
+            scale=alt.Scale(
+                domain=["Captured solar", "Baseload", "Captured hybrid"],
+                range=[[2, 2], [6, 3], [1, 0]],
+            ),
+            legend=None,
         ),
-        legend=None,
-    ),
-    tooltip=[
-        alt.Tooltip("period:N", title="Period"),
-        alt.Tooltip("Series:N"),
-        alt.Tooltip("price_eur_mwh:Q", title="€/MWh", format=".1f"),
-        alt.Tooltip(
-            "hybrid_premium_vs_baseload:Q",
-            title="Hybrid premium vs baseload",
-            format="+.1f",
-        ),
-    ],
-)
-
-price_chart = alt.layer(premium_band, price_lines).properties(
-    height=440,
-    title=alt.TitleParams(
-        "Hybrid reshaping moves solar output into higher-value hours",
-        anchor="start",
-        color=INK,
-        fontSize=15,
-    ),
-)
-st.altair_chart(style_chart(price_chart), use_container_width=True)
-
-if min_hybrid_premium <= 0:
-    st.warning(
-        "At least one source period does not show the hybrid capture above baseload. "
-        "The chart displays the workbook values without forcing or clipping the result."
+        tooltip=[
+            alt.Tooltip("period:N", title="Period"),
+            alt.Tooltip("Series:N"),
+            alt.Tooltip("price_eur_mwh:Q", title="€/MWh", format=".1f"),
+        ],
     )
-else:
-    st.markdown(
-        f"""
-        <div class="hp-callout">
-          Across the selected period, captured hybrid remains above baseload in every month.
-          The narrowest observed premium is <b>{min_hybrid_premium:+.1f} €/MWh</b>.
-        </div>
-        """,
-        unsafe_allow_html=True,
+    .properties(
+        height=430,
+        title=alt.TitleParams(
+            "Hybrid reshaping raises the captured value of the solar profile",
+            anchor="start",
+            fontSize=15,
+            color=INK,
+        ),
     )
+)
+st.altair_chart(style_chart(price_lines), use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Hybrid PPA settlement charts
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SETTLEMENT
+# =============================================================================
 chart_heading(
     "Hybrid captured price vs fixed Hybrid PPA price",
-    "Green line = captured hybrid market price. Orange dashed line = fixed contract price. The vertical difference drives the financial settlement.",
-)
-contract_data = view.copy()
-contract_data["fixed_price"] = fixed_price
-
-hybrid_line = alt.Chart(contract_data).mark_line(
-    color=GREEN_DARK,
-    strokeWidth=3.2,
-    point={"filled": True, "size": 55},
-).encode(
-    x=x,
-    y=alt.Y("captured_hybrid:Q", title="Price (€/MWh)"),
-    tooltip=[
-        alt.Tooltip("period:N", title="Period"),
-        alt.Tooltip("captured_hybrid:Q", title="Captured hybrid", format=".1f"),
-        alt.Tooltip("fixed_price:Q", title="Hybrid PPA price", format=".1f"),
-        alt.Tooltip("settlement_eur_mwh:Q", title="Settlement €/MWh", format="+.1f"),
-    ],
-)
-fixed_line = alt.Chart(contract_data).mark_line(
-    color=ORANGE,
-    strokeWidth=2.7,
-    strokeDash=[8, 5],
-).encode(x=x, y=alt.Y("fixed_price:Q"))
-
-contract_chart = alt.layer(hybrid_line, fixed_line).properties(
-    height=390,
-    title=alt.TitleParams(
-        f"Hybrid capture versus {fixed_price:.1f} €/MWh fixed price",
-        anchor="start",
-        color=INK,
-        fontSize=15,
-    ),
-)
-st.altair_chart(style_chart(contract_chart), use_container_width=True)
-
-chart_heading(
-    "Settlement in €/MWh",
-    "Positive bars represent a payment to the PPA buyer / offtaker; negative bars represent a payment by the buyer.",
+    "Green bars = captured hybrid market price. Orange line = fixed Hybrid PPA price.",
 )
 st.altair_chart(
     style_chart(
-        settlement_bar_chart(
+        market_vs_contract_chart(
+            view,
+            granularity,
+            "Hybrid market reference vs fixed Hybrid PPA price",
+        )
+    ),
+    use_container_width=True,
+)
+
+chart_heading(
+    "Settlement in €/MWh",
+    "Positive values = payment to the buyer / offtaker. Negative values = payment by the buyer.",
+)
+st.altair_chart(
+    style_chart(
+        settlement_chart(
             view,
             "settlement_eur_mwh",
             "Settlement to buyer (€/MWh)",
@@ -1004,311 +1151,178 @@ st.altair_chart(
 
 chart_heading(
     "Settlement in €",
-    "Cash settlement uses the workbook's hybrid exported profile, the selected project scale and the contracted-volume percentage.",
+    "Cash settlement based on the selected annual contracted volume, allocated monthly by calendar days.",
 )
 st.altair_chart(
     style_chart(
-        settlement_bar_chart(
+        settlement_chart(
             view,
             "settlement_eur",
             "Settlement to buyer (€)",
             granularity,
-            f"Hybrid PPA cash settlement · {project_multiplier:g}× source case · {contracted_share}% contracted",
-            height=350,
+            f"Hybrid PPA settlement in € · {annual_volume_gwh:,.0f} GWh/yr",
+            height=340,
         )
     ),
     use_container_width=True,
 )
 
-# -----------------------------------------------------------------------------
-# Operational day — hourly dispatch
-# -----------------------------------------------------------------------------
-st.markdown(
-    """
-    <div class="hp-module">
-      <div>
-        <div class="hp-module-title">Representative hybrid operating day</div>
-        <div class="hp-module-sub">
-          Hourly solar output, battery charging / discharging, hybrid export and day-ahead price.
-        </div>
-      </div>
-      <div class="hp-module-tag">Physical operations</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
-available_dispatch = dispatch[dispatch["year"].between(start_year, end_year)].copy()
-if available_dispatch.empty:
-    st.info("No hourly dispatch is available for the selected period.")
-else:
-    min_day = available_dispatch["date"].min().date()
-    max_day = available_dispatch["date"].max().date()
-
-    stats_period = stats[stats["year"].between(start_year, end_year)].copy()
-    if not stats_period.empty and stats_period["bess_revenue_eur"].notna().any():
-        default_ts = stats_period.loc[stats_period["bess_revenue_eur"].idxmax(), "date"]
-    else:
-        # Select the highest-price-range day when stats do not cover the selected years.
-        daily_range = (
-            available_dispatch.groupby("date")["omie_venta"]
-            .agg(lambda s: s.max() - s.min())
-        )
-        default_ts = daily_range.idxmax()
-
-    default_date = min(max(default_ts.date(), min_day), max_day)
-    op1, op2, op3 = st.columns([1.1, 1.1, 1.8])
-    with op1:
-        operating_day = st.date_input(
-            "Operational day",
-            value=default_date,
-            min_value=min_day,
-            max_value=max_day,
-        )
-    with op2:
-        day_options = st.radio(
-            "Display",
-            ["Price + physical dispatch", "Physical dispatch only"],
-            horizontal=False,
-        )
-    with op3:
-        st.markdown(
-            f"""
-            <div style="padding-top:27px;color:{MUTED};font-size:.87rem;line-height:1.45;">
-              Battery flow is shown as <b>positive when discharging</b> and
-              <b>negative when charging</b>. The orange line is the selected
-              Hybrid PPA price of <b>{fixed_price:.1f} €/MWh</b>.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    day = available_dispatch[
-        available_dispatch["date"] == pd.Timestamp(operating_day)
+# =============================================================================
+# OPTIONAL AURORA / BARINGA COMPARISON
+# =============================================================================
+with st.expander("Compare Aurora Q2-26 vs Baringa Q2-26 forward captured hybrid"):
+    comp = pd.concat(
+        [
+            aurora.assign(Provider="Aurora Q2-26"),
+            baringa.assign(Provider="Baringa Q2-26"),
+        ],
+        ignore_index=True,
+    )
+    comp = comp[
+        comp["year"].between(max(2027, year_range[0]), min(2036, year_range[1]))
     ].copy()
-    if day.empty:
-        st.warning("No hourly data is available for the selected day.")
+
+    if comp.empty:
+        st.info("The selected period contains no forward years.")
     else:
-        day["hour"] = pd.to_numeric(day["Hour"], errors="coerce")
-        day["battery_flow_mwh"] = (
-            day["discharge_mwh"].fillna(0) - day["charge_mwh"].fillna(0)
-        )
-        day["fixed_price"] = fixed_price
-        day["hybrid_export_mwh"] = day["hybrid profile (MWh)"].fillna(0)
-        day["solar_generation_mwh"] = day["generacion"].fillna(0)
-        day["flow_type"] = np.where(
-            day["battery_flow_mwh"] >= 0,
-            "Discharge",
-            "Charge",
-        )
-
-        hour_x = alt.X(
-            "hour:O",
-            title="Hour",
-            axis=alt.Axis(labelAngle=0, values=list(range(1, 25))),
-            sort=list(range(1, 25)),
-        )
-
-        price_layer = alt.Chart(day).mark_line(
-            color=BLUE,
-            strokeWidth=2.7,
-            point={"filled": True, "size": 38},
-        ).encode(
-            x=hour_x,
-            y=alt.Y("omie_venta:Q", title="Day-ahead price (€/MWh)"),
-            tooltip=[
-                alt.Tooltip("hour:O", title="Hour"),
-                alt.Tooltip("omie_venta:Q", title="DA price €/MWh", format=".1f"),
-                alt.Tooltip("solar_generation_mwh:Q", title="Solar MWh", format=".2f"),
-                alt.Tooltip("battery_flow_mwh:Q", title="Battery flow MWh", format="+.2f"),
-                alt.Tooltip("hybrid_export_mwh:Q", title="Hybrid export MWh", format="+.2f"),
-            ],
-        )
-        fixed_layer = alt.Chart(day).mark_line(
-            color=ORANGE,
-            strokeDash=[7, 5],
-            strokeWidth=2.1,
-        ).encode(x=hour_x, y=alt.Y("fixed_price:Q"))
-
-        solar_area = alt.Chart(day).mark_area(
-            color=GOLD,
-            opacity=.22,
-            line={"color": GOLD, "strokeWidth": 1.5},
-        ).encode(
-            x=hour_x,
-            y=alt.Y("solar_generation_mwh:Q", title="Energy flow (MWh)"),
-        )
-        flow_bars = alt.Chart(day).mark_bar(
-            size=14,
-            cornerRadiusTopLeft=3,
-            cornerRadiusTopRight=3,
-            cornerRadiusBottomLeft=3,
-            cornerRadiusBottomRight=3,
-        ).encode(
-            x=hour_x,
-            y=alt.Y("battery_flow_mwh:Q", title="Energy flow (MWh)"),
-            color=alt.Color(
-                "flow_type:N",
-                scale=alt.Scale(
-                    domain=["Charge", "Discharge"],
-                    range=[RED, GREEN],
+        comp_chart = (
+            alt.Chart(comp)
+            .mark_line(strokeWidth=3, point={"filled": True, "size": 45})
+            .encode(
+                x=alt.X(
+                    "date:T",
+                    title=None,
+                    axis=alt.Axis(
+                        format="%b %y",
+                        labelAngle=-45,
+                        labelOverlap="greedy",
+                    ),
                 ),
-                legend=alt.Legend(title=None, orient="top"),
-            ),
-            tooltip=[
-                alt.Tooltip("hour:O", title="Hour"),
-                alt.Tooltip("flow_type:N", title="Battery mode"),
-                alt.Tooltip("battery_flow_mwh:Q", title="Flow MWh", format="+.2f"),
-            ],
-        )
-        hybrid_line_day = alt.Chart(day).mark_line(
-            color=GREEN_DARK,
-            strokeWidth=2.7,
-            point={"filled": True, "size": 34},
-        ).encode(
-            x=hour_x,
-            y=alt.Y("hybrid_export_mwh:Q", title="Energy flow (MWh)"),
-            tooltip=[
-                alt.Tooltip("hour:O", title="Hour"),
-                alt.Tooltip("hybrid_export_mwh:Q", title="Hybrid export MWh", format="+.2f"),
-            ],
-        )
-        zero_flow = alt.Chart(pd.DataFrame({"zero": [0]})).mark_rule(
-            color="#a9bdb5",
-            strokeWidth=1,
-        ).encode(y="zero:Q")
-
-        physical_layer = alt.layer(solar_area, flow_bars, hybrid_line_day, zero_flow)
-        if day_options.startswith("Price"):
-            op_chart = alt.layer(
-                alt.layer(price_layer, fixed_layer),
-                physical_layer,
-            ).resolve_scale(y="independent")
-        else:
-            op_chart = physical_layer
-
-        op_chart = op_chart.properties(
-            height=460,
-            title=alt.TitleParams(
-                f"Hourly operation · {pd.Timestamp(operating_day).strftime('%d %b %Y')}",
-                anchor="start",
-                color=INK,
-                fontSize=15,
-                subtitle=[
-                    "Yellow area = solar generation · red/green bars = battery charge/discharge · dark-green line = hybrid export"
+                y=alt.Y(
+                    "captured_hybrid:Q",
+                    title="Captured hybrid (€/MWh)",
+                ),
+                color=alt.Color("Provider:N", legend=alt.Legend(title=None, orient="top")),
+                tooltip=[
+                    alt.Tooltip("period:N", title="Period"),
+                    alt.Tooltip("Provider:N"),
+                    alt.Tooltip(
+                        "captured_hybrid:Q",
+                        title="Captured hybrid €/MWh",
+                        format=".1f",
+                    ),
                 ],
-                subtitleColor=MUTED,
-                subtitleFontSize=11,
-            ),
+            )
+            .properties(height=370)
         )
-        st.altair_chart(style_chart(op_chart), use_container_width=True)
+        st.altair_chart(style_chart(comp_chart), use_container_width=True)
 
-        soc_chart = alt.Chart(day).mark_line(
-            color="#4d665d",
-            strokeDash=[6, 4],
-            strokeWidth=2.2,
-            point={"filled": True, "size": 28},
-        ).encode(
-            x=hour_x,
-            y=alt.Y(
-                "soc:Q",
-                title="State of charge (MWh)",
-                scale=alt.Scale(domain=[0, BESS_CAPACITY_MWH]),
-            ),
-            tooltip=[
-                alt.Tooltip("hour:O", title="Hour"),
-                alt.Tooltip("soc:Q", title="SoC MWh", format=".2f"),
-            ],
-        ).properties(height=125)
-        st.altair_chart(style_chart(soc_chart), use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Settlement table and export
-# -----------------------------------------------------------------------------
+# =============================================================================
+# TABLE / DOWNLOAD
+# =============================================================================
 with st.expander("Hybrid PPA settlement table"):
-    table = view.copy()
     table_cols = [
         "period",
         "captured_solar",
         "baseload",
         "captured_hybrid",
         "hybrid_premium_vs_baseload",
+        "fixed_price",
         "settlement_eur_mwh",
-        "contracted_volume_mwh",
+        "contracted_mwh",
         "settlement_eur",
     ]
-    table_out = table[table_cols].rename(
+    table_out = view[table_cols].rename(
         columns={
             "period": "Period",
             "captured_solar": "Captured solar €/MWh",
             "baseload": "Baseload €/MWh",
             "captured_hybrid": "Captured hybrid €/MWh",
             "hybrid_premium_vs_baseload": "Hybrid premium vs baseload €/MWh",
+            "fixed_price": "Fixed Hybrid PPA €/MWh",
             "settlement_eur_mwh": "Settlement to buyer €/MWh",
-            "contracted_volume_mwh": "Contracted hybrid volume MWh",
+            "contracted_mwh": "Contracted MWh",
             "settlement_eur": "Settlement to buyer €",
         }
     ).round(2)
-    st.dataframe(table_out, use_container_width=True, hide_index=True)
+
+    st.dataframe(
+        table_out,
+        use_container_width=True,
+        hide_index=True,
+    )
 
     csv_bytes = table_out.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Download selected settlement table (CSV)",
         data=csv_bytes,
-        file_name=f"hybrid_ppa_settlement_{start_year}_{end_year}_{granularity.lower()}.csv",
+        file_name=(
+            f"hybrid_ppa_{forward_source.lower().replace(' ', '_')}_"
+            f"{year_range[0]}_{year_range[1]}_{granularity.lower()}.csv"
+        ),
         mime="text/csv",
     )
 
-# -----------------------------------------------------------------------------
-# Methodology / data lineage
-# -----------------------------------------------------------------------------
-with st.expander("Methodology, settlement mechanics and data lineage"):
+
+# =============================================================================
+# DATA LINEAGE / METHODOLOGY
+# =============================================================================
+with st.expander("Where every number comes from"):
     st.markdown(
         f"""
-- **Source workbook:** `data/HPPA_wDEmand.xlsx`.
-- **Monthly / annual price curves:** solar and hybrid captured prices, revenues and
-  volumes are read from `monthly_summary`. Baseload is the arithmetic hourly average
-  of `omie_venta` from `dispatch`.
-- **Sheet 2 (`stats`):** daily BESS revenue and hybrid volume are used to identify a
-  representative high-value operating day within the selected period.
-- **Hybrid profile:** the workbook defines it as `g_to_grid - grid_charge + batt_for_sell`.
-- **Settlement:** `(captured hybrid price − Hybrid PPA fixed price) × contracted hybrid volume`.
-  Positive means a payment **to the buyer / offtaker**.
-- **Battery assumptions:** 1 MW / 4 MWh source case, 4-hour duration, 100% DoD,
-  maximum 1 cycle/day, charging efficiency {ETA_CH:.1%}, discharging efficiency
-  {ETA_DIS:.1%}, and RTE {RTE:.1%}. The workbook is undegraded unless its source
-  assumptions are changed.
-- **Project scale:** the cash settlement is multiplied by the selected scale factor;
-  price metrics in €/MWh are unaffected.
-- **Forward prices:** nominal prices from the workbook source case. Outputs are
-  indicative and pre-fees.
+- **Historical 2025-2026:** `{HIST_FILE.name}`. The page uses `Baseload`,
+  `PV uncurtailed captured price` and `Hybrid w/o demand`.
+- **Aurora forward 2027-2036:** `{AURORA_FILE.name}`. Monthly values are read
+  from `monthly_summary`: captured solar, baseload and captured hybrid.
+- **Baringa forward 2027-2036:** `{BARINGA_FILE.name}`. Monthly values are read
+  from the embedded summary in columns T:X of `dispatch`.
+- **Forward configuration:** both uploaded forward files are the **no-demand**
+  case, so historical values are matched to `Hybrid w/o demand`.
+- **Settlement:** `(captured hybrid price - fixed Hybrid PPA price) × contracted volume`.
+  Positive values mean payment **to the buyer / offtaker**.
+- **Cash-settlement volume:** the selected annual GWh is allocated by calendar days.
+  This is a contract-volume assumption, not an inferred plant-production profile.
+- **Annual view:** prices are weighted by the same contracted settlement volume.
+  This avoids inventing historical generation weights, which are not present in the CSV.
         """
     )
 
-# -----------------------------------------------------------------------------
-# Print / PDF
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# PRINT / PDF
+# =============================================================================
 st.markdown("---")
 st.markdown(
     """
-    <div class="hp-print-card">
+    <div class="nx-print-card">
       <div>
-        <div class="hp-print-title">Export the current Hybrid PPA view</div>
-        <div class="hp-print-sub">
-          Print or save as PDF using A4 landscape, minimum margins and background graphics enabled.
+        <div class="nx-print-title">Export page to PDF</div>
+        <div class="nx-print-subtitle">
+          Print or save the current Hybrid PPA settlement view as PDF.
+          Recommended format: <b>A4 landscape</b>, minimum margins and background graphics enabled.
         </div>
       </div>
-      <div class="hp-print-seal">NEXWELL POWER · HYBRID PPA</div>
+      <div class="nx-print-seal">NEXWELL POWER · HYBRID PPA</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
 components.html(
     """
     <button onclick="window.parent.print()" style="
-        width:100%; padding:14px 18px; border:0; border-radius:12px;
-        background:#0f6b47; color:white; font-weight:850; font-size:15px;
-        cursor:pointer; margin-top:10px;">
+        width:100%;
+        padding:14px 18px;
+        border:0;
+        border-radius:12px;
+        background:#0f6b47;
+        color:white;
+        font-weight:800;
+        font-size:15px;
+        cursor:pointer;
+        margin-top:10px;">
         Print / Save current page as PDF
     </button>
     """,
