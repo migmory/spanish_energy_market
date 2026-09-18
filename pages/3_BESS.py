@@ -16,6 +16,16 @@ import pulp
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from functools import lru_cache
+
+# Fast rolling solver: SciPy MILP uses HiGHS in-process, avoiding one
+# external CBC process per rolling hour.
+try:
+    from scipy.optimize import milp, LinearConstraint, Bounds
+    from scipy.sparse import lil_matrix, csr_matrix
+    SCIPY_MILP_AVAILABLE = True
+except Exception:
+    SCIPY_MILP_AVAILABLE = False
 
 
 st.set_page_config(page_title="BESS", layout="wide")
@@ -1387,6 +1397,396 @@ def build_dispatch_stats(dispatch: pd.DataFrame, eta_ch: float) -> pd.DataFrame:
     ]
 
 
+
+# =========================================================
+# FAST ROLLING 24H MILP
+# =========================================================
+# The Julia rolling implementation is light because it solves a very small
+# MILP in-process and uses only the charge/discharge binary. The implementation
+# below follows that approach:
+#   - SciPy MILP / HiGHS runs in-process.
+#   - One binary per hour: charging vs discharging.
+#   - No binary for import vs export in rolling mode, matching the Julia model.
+#   - POI import/export caps are kept as continuous constraints.
+#   - Rolling logic remains MPC: optimise 24h, apply first hour, advance 1h.
+#
+# The fixed-24h optimiser is left unchanged.
+
+@lru_cache(maxsize=128)
+def _rolling_fast_template(
+    n: int,
+    capacity_mwh: float,
+    power_mw: float,
+    eta_ch: float,
+    eta_dis: float,
+    cycle_limit_factor: float,
+    poi_mw: float,
+):
+    """Build and cache the sparse MILP matrix for one rolling-window size."""
+    offsets = {}
+    k = 0
+
+    continuous_names = [
+        "g_to_grid",
+        "g_to_batt",
+        "g_to_self",
+        "grid_charge",
+        "batt_for_load",
+        "batt_for_sell",
+        "grid_purchase",
+        "curtailment",
+    ]
+    for name in continuous_names:
+        offsets[name] = k
+        k += n
+
+    offsets["soc"] = k
+    k += n + 1
+
+    offsets["is_charging"] = k
+    k += n
+
+    n_vars = k
+
+    rows = []
+    lbs = []
+    ubs = []
+    generation_rows = []
+    load_rows = []
+
+    def add_row(coeffs, lb=-np.inf, ub=np.inf):
+        rows.append(coeffs)
+        lbs.append(lb)
+        ubs.append(ub)
+        return len(rows) - 1
+
+    for t in range(n):
+        # Charge / discharge exclusivity, one binary per hour.
+        add_row(
+            {
+                offsets["g_to_batt"] + t: 1.0,
+                offsets["grid_charge"] + t: 1.0,
+                offsets["is_charging"] + t: -power_mw,
+            },
+            ub=0.0,
+        )
+        add_row(
+            {
+                offsets["batt_for_load"] + t: 1.0,
+                offsets["batt_for_sell"] + t: 1.0,
+                offsets["is_charging"] + t: power_mw,
+            },
+            ub=power_mw,
+        )
+
+        # Keep the Streamlit POI limits without adding a second binary family.
+        add_row(
+            {
+                offsets["g_to_grid"] + t: 1.0,
+                offsets["batt_for_sell"] + t: 1.0,
+            },
+            ub=poi_mw,
+        )
+        add_row(
+            {
+                offsets["grid_purchase"] + t: 1.0,
+                offsets["grid_charge"] + t: 1.0,
+            },
+            ub=poi_mw,
+        )
+
+        # Generation balance. RHS is populated for each window.
+        generation_rows.append(
+            add_row(
+                {
+                    offsets["g_to_grid"] + t: 1.0,
+                    offsets["g_to_batt"] + t: 1.0,
+                    offsets["g_to_self"] + t: 1.0,
+                    offsets["curtailment"] + t: 1.0,
+                },
+                lb=0.0,
+                ub=0.0,
+            )
+        )
+
+        # Load balance. RHS is populated for each window.
+        load_rows.append(
+            add_row(
+                {
+                    offsets["g_to_self"] + t: 1.0,
+                    offsets["batt_for_load"] + t: 1.0,
+                    offsets["grid_purchase"] + t: 1.0,
+                },
+                lb=0.0,
+                ub=0.0,
+            )
+        )
+
+        # SOC dynamics:
+        # soc[t+1] = soc[t] + eta_ch*charge - discharge/eta_dis
+        add_row(
+            {
+                offsets["soc"] + t + 1: 1.0,
+                offsets["soc"] + t: -1.0,
+                offsets["g_to_batt"] + t: -eta_ch,
+                offsets["grid_charge"] + t: -eta_ch,
+                offsets["batt_for_load"] + t: 1.0 / eta_dis,
+                offsets["batt_for_sell"] + t: 1.0 / eta_dis,
+            },
+            lb=0.0,
+            ub=0.0,
+        )
+
+    # Rolling-window cycle constraint, intentionally matching the Julia logic.
+    charge_coeffs = {}
+    for t in range(n):
+        charge_coeffs[offsets["g_to_batt"] + t] = 1.0
+        charge_coeffs[offsets["grid_charge"] + t] = 1.0
+    add_row(
+        charge_coeffs,
+        ub=cycle_limit_factor * capacity_mwh / max(eta_ch, 1e-9),
+    )
+
+    discharge_vs_charge = {}
+    for t in range(n):
+        discharge_vs_charge[offsets["batt_for_load"] + t] = 1.0
+        discharge_vs_charge[offsets["batt_for_sell"] + t] = 1.0
+        discharge_vs_charge[offsets["g_to_batt"] + t] = -1.0
+        discharge_vs_charge[offsets["grid_charge"] + t] = -1.0
+    add_row(discharge_vs_charge, ub=0.0)
+
+    A = lil_matrix((len(rows), n_vars), dtype=float)
+    for i, coeffs in enumerate(rows):
+        for j, value in coeffs.items():
+            A[i, j] = value
+    A = csr_matrix(A)
+
+    integrality = np.zeros(n_vars, dtype=np.int8)
+    integrality[
+        offsets["is_charging"] : offsets["is_charging"] + n
+    ] = 1
+
+    return {
+        "offsets": offsets,
+        "n_vars": n_vars,
+        "A": A,
+        "lb_base": np.asarray(lbs, dtype=float),
+        "ub_base": np.asarray(ubs, dtype=float),
+        "generation_rows": np.asarray(generation_rows, dtype=int),
+        "load_rows": np.asarray(load_rows, dtype=int),
+        "integrality": integrality,
+    }
+
+
+def optimize_window_fast_milp(
+    df_win: pd.DataFrame,
+    capacity_mwh: float,
+    power_mw: float,
+    soc0: float,
+    eta_ch: float = 1.0,
+    eta_dis: float = 1.0,
+    cycle_limit_factor: float = 1.0,
+    poi_mw: float | None = None,
+) -> pd.DataFrame:
+    """Fast rolling-window solve using SciPy/HiGHS in-process."""
+    if not SCIPY_MILP_AVAILABLE:
+        raise RuntimeError("SciPy MILP is not available.")
+
+    df_win = df_win.sort_values("timestamp").reset_index(drop=True).copy()
+    n = len(df_win)
+    if n == 0:
+        return pd.DataFrame()
+
+    omie_sell = df_win["omie_venta"].astype(float).to_numpy()
+    omie_buy = df_win["omie_compra"].astype(float).to_numpy()
+    gen = df_win["generacion"].astype(float).to_numpy()
+    load = df_win["consumo"].astype(float).to_numpy()
+
+    max_power = float(power_mw)
+    max_grid_flow = max(float(poi_mw if poi_mw is not None else power_mw), 1e-9)
+
+    template = _rolling_fast_template(
+        int(n),
+        float(capacity_mwh),
+        float(max_power),
+        float(eta_ch),
+        float(eta_dis),
+        float(cycle_limit_factor),
+        float(max_grid_flow),
+    )
+    offsets = template["offsets"]
+    n_vars = template["n_vars"]
+
+    # Objective: SciPy minimises, so use the negative of the revenue objective.
+    c = np.zeros(n_vars, dtype=float)
+    c[offsets["g_to_grid"] : offsets["g_to_grid"] + n] = -omie_sell
+    c[offsets["batt_for_sell"] : offsets["batt_for_sell"] + n] = -omie_sell
+    c[offsets["grid_purchase"] : offsets["grid_purchase"] + n] = omie_buy
+
+    # Match the Julia rolling implementation.
+    c[offsets["grid_charge"] : offsets["grid_charge"] + n] = (
+        omie_buy / max(eta_ch, 1e-9)
+    )
+
+    # Feasibility safeguard for PV above POI/BESS capability.
+    c[offsets["curtailment"] : offsets["curtailment"] + n] = 10_000.0
+
+    constraint_lb = template["lb_base"].copy()
+    constraint_ub = template["ub_base"].copy()
+
+    constraint_lb[template["generation_rows"]] = gen
+    constraint_ub[template["generation_rows"]] = gen
+    constraint_lb[template["load_rows"]] = load
+    constraint_ub[template["load_rows"]] = load
+
+    lower = np.zeros(n_vars, dtype=float)
+    upper = np.full(n_vars, np.inf, dtype=float)
+
+    # SOC is bounded physically, with initial SOC fixed to the rolling state.
+    soc_slice = slice(offsets["soc"], offsets["soc"] + n + 1)
+    upper[soc_slice] = capacity_mwh
+    lower[offsets["soc"]] = soc0
+    upper[offsets["soc"]] = soc0
+
+    # Binary charge/discharge variables.
+    charging_slice = slice(
+        offsets["is_charging"],
+        offsets["is_charging"] + n,
+    )
+    upper[charging_slice] = 1.0
+
+    result = milp(
+        c=c,
+        integrality=template["integrality"],
+        bounds=Bounds(lower, upper),
+        constraints=LinearConstraint(
+            template["A"],
+            constraint_lb,
+            constraint_ub,
+        ),
+        options={
+            "disp": False,
+            "presolve": True,
+        },
+    )
+
+    if not result.success or result.x is None:
+        first_ts = str(df_win["timestamp"].iloc[0])
+        raise RuntimeError(
+            f"Fast rolling MILP failed from {first_ts}: {result.message}"
+        )
+
+    x = result.x
+
+    def values(name):
+        start = offsets[name]
+        return x[start : start + n]
+
+    soc_values = x[offsets["soc"] + 1 : offsets["soc"] + n + 1]
+
+    res = pd.DataFrame(
+        {
+            "Date": df_win["dia"].values,
+            "Hour": df_win["hora"].values,
+            "omie_venta": omie_sell,
+            "omie_compra": omie_buy,
+            "generacion": gen,
+            "consumo": load,
+            "g_to_grid": values("g_to_grid"),
+            "g_to_batt": values("g_to_batt"),
+            "g_to_self": values("g_to_self"),
+            "grid_charge": values("grid_charge"),
+            "batt_for_load": values("batt_for_load"),
+            "batt_for_sell": values("batt_for_sell"),
+            "grid_purchase": values("grid_purchase"),
+            "curtailment": values("curtailment"),
+            "poi_limit_mw": np.full(n, max_grid_flow),
+            "soc": soc_values,
+        }
+    )
+
+    res["Revenue BESS (€)"] = (
+        -res["g_to_batt"] * res["omie_venta"]
+        -res["grid_charge"] * res["omie_compra"]
+        +res["batt_for_sell"] * res["omie_venta"]
+    )
+    res["hybrid profile (MWh)"] = (
+        res["g_to_grid"] - res["grid_charge"] + res["batt_for_sell"]
+    )
+    res["charge_mwh"] = res["g_to_batt"] + res["grid_charge"]
+    res["discharge_mwh"] = res["batt_for_sell"]
+
+    return res
+
+
+def simulate_rolling_24h_fast(
+    df_year: pd.DataFrame,
+    capacity_mwh: float,
+    power_mw: float,
+    eta_ch: float = 1.0,
+    eta_dis: float = 1.0,
+    cycle_limit_factor: float = 1.0,
+    horizon: int = 24,
+    poi_mw: float | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fast MPC rolling 24h: solve, apply first hour, update SOC, repeat."""
+    df_year = df_year.sort_values("timestamp").reset_index(drop=True).copy()
+    if df_year.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    soc_now = 0.0
+    applied_rows = []
+    n_rows = len(df_year)
+
+    # Updating Streamlit on every single hour is itself expensive.
+    # Refresh the progress indicator only periodically.
+    progress = st.progress(0.0, text="Rolling 24h optimisation...")
+    progress_step = max(1, n_rows // 100)
+
+    try:
+        for start_idx in range(n_rows):
+            end_idx = min(start_idx + horizon, n_rows)
+            df_win = df_year.iloc[start_idx:end_idx].copy()
+
+            res_win = optimize_window_fast_milp(
+                df_win=df_win,
+                capacity_mwh=capacity_mwh,
+                power_mw=power_mw,
+                soc0=soc_now,
+                eta_ch=eta_ch,
+                eta_dis=eta_dis,
+                cycle_limit_factor=cycle_limit_factor,
+                poi_mw=poi_mw,
+            )
+
+            if res_win.empty:
+                continue
+
+            applied = res_win.iloc[[0]].copy()
+            soc_now = float(applied["soc"].iloc[0])
+            applied_rows.append(applied)
+
+            if (
+                start_idx % progress_step == 0
+                or start_idx == n_rows - 1
+            ):
+                pct = min((start_idx + 1) / n_rows, 1.0)
+                progress.progress(
+                    pct,
+                    text=f"Rolling 24h optimisation: {start_idx + 1:,}/{n_rows:,} hours",
+                )
+    finally:
+        progress.empty()
+
+    dispatch = (
+        pd.concat(applied_rows, ignore_index=True)
+        if applied_rows
+        else pd.DataFrame()
+    )
+    stats = build_dispatch_stats(dispatch, eta_ch=eta_ch)
+    return dispatch, stats
+
+
 def optimize_window_pulp(
     df_win: pd.DataFrame,
     capacity_mwh: float,
@@ -1577,16 +1977,30 @@ def run_optimization(
         year_soh = float(soh_map.get(year, 1.0))
 
         if optimization_method == "rolling_24h":
-            year_dispatch, year_stats = simulate_rolling_24h_pulp(
-                df_year=df_year,
-                capacity_mwh=year_capacity,
-                power_mw=power_mw,
-                eta_ch=eta_ch,
-                eta_dis=eta_dis,
-                cycle_limit_factor=cycle_limit_factor,
-                horizon=24,
-                poi_mw=poi_mw,
-            )
+            if SCIPY_MILP_AVAILABLE:
+                year_dispatch, year_stats = simulate_rolling_24h_fast(
+                    df_year=df_year,
+                    capacity_mwh=year_capacity,
+                    power_mw=power_mw,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    cycle_limit_factor=cycle_limit_factor,
+                    horizon=24,
+                    poi_mw=poi_mw,
+                )
+            else:
+                # Fallback only. This path is substantially slower because PuLP/CBC
+                # launches an external solver process for every rolling hour.
+                year_dispatch, year_stats = simulate_rolling_24h_pulp(
+                    df_year=df_year,
+                    capacity_mwh=year_capacity,
+                    power_mw=power_mw,
+                    eta_ch=eta_ch,
+                    eta_dis=eta_dis,
+                    cycle_limit_factor=cycle_limit_factor,
+                    horizon=24,
+                    poi_mw=poi_mw,
+                )
             if not year_dispatch.empty:
                 year_dispatch["Year"] = year
                 year_dispatch["effective_capacity_mwh"] = year_capacity
@@ -2246,7 +2660,12 @@ with right:
         )
 
     st.markdown("### Optimisation method")
-    st.info("The BESS tab can run either Fixed 24h window or Rolling 24h window. All embedded TB4 / revenue BESS calculations in other report pages remain on the Fixed 24h window by default.")
+    st.info(
+        "The BESS tab can run either Fixed 24h window or Rolling 24h window. "
+        "Rolling uses an in-process HiGHS MILP through SciPy when available, "
+        "with one charge/discharge binary per hour, following the lightweight Julia MPC approach. "
+        "All embedded TB4 / revenue BESS calculations in other report pages remain on the Fixed 24h window by default."
+    )
 
     st.markdown("### Scenario rules")
     if mode == "Standalone BESS":
