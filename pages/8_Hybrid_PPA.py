@@ -372,15 +372,18 @@ def resolve_data_file(
 
 HIST_FILE = resolve_data_file(
     [
+        "Hybrid captured Historic values 2025-2026.csv",
+        "Hybrid captured Historic values 2025-2026.xlsx",
         "Historic values 2025-2026.csv",
         "Historic values 2025-2026(2).csv",
     ],
     ["historic", "2025", "2026"],
-    {".csv"},
+    {".csv", ".xlsx", ".xls"},
 )
 
 AURORA_FILE = resolve_data_file(
     [
+        "Hybrid captured aurora q2-26 capt_price_no_demand_2027-2036.xlsx",
         "aurora q2-26 capt_price_no_demand_2027-2036.xlsx",
         "aurora q2-26 capt_price_no_demand_2027-2036(1).xlsx",
     ],
@@ -390,6 +393,7 @@ AURORA_FILE = resolve_data_file(
 
 BARINGA_FILE = resolve_data_file(
     [
+        "Hybrid captured baringa q2-26 captured hybrid_no demand_2027-2036.xlsx",
         "baringa q2-26 captured hybrid_no demand_2027-2036.xlsx",
         "baringa q2-26 captured hybrid_no demand_2027-2036(2).xlsx",
     ],
@@ -430,17 +434,19 @@ def module_banner(title: str, subtitle: str, tag: str):
 
 
 def price_card(label: str, value: str, unit: str, foot: str) -> str:
-    return f"""
-    <div class="nx-price-card">
-      <div class="nx-price-label">{label}</div>
-      <div class="nx-price-value">{value}<span class="unit">{unit}</span></div>
-      <div class="nx-price-foot">{foot}</div>
-    </div>
-    """
+    # Compact HTML avoids Streamlit Markdown treating indented cards as code blocks.
+    return (
+        f'<div class="nx-price-card">'
+        f'<div class="nx-price-label">{label}</div>'
+        f'<div class="nx-price-value">{value}<span class="unit">{unit}</span></div>'
+        f'<div class="nx-price-foot">{foot}</div>'
+        f'</div>'
+    )
 
 
 def price_grid(cards: list[str]):
-    st.markdown("<div class='nx-price-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+    html = '<div class="nx-price-grid">' + ''.join(cards) + '</div>'
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def chart_heading(title: str, subtitle: str = ""):
@@ -611,7 +617,11 @@ def market_vs_contract_chart(
 @st.cache_data(show_spinner="Loading historical Hybrid PPA values...")
 def load_historical(path_str: str, mtime: float) -> pd.DataFrame:
     _ = mtime
-    raw = pd.read_csv(path_str)
+    path = Path(path_str)
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        raw = pd.read_excel(path)
+    else:
+        raw = pd.read_csv(path)
     required = {"period", "series", "value"}
     missing = required.difference(raw.columns)
     if missing:
@@ -892,9 +902,13 @@ with st.container(border=True):
 
     with c4:
         granularity = st.radio(
-            "View",
+            "Settlement frequency",
             ["Annual", "Monthly"],
             horizontal=True,
+            help=(
+                "Annual aggregates the selected period by year. "
+                "Monthly settles each calendar month independently."
+            ),
         )
 
 selected_forward = aurora.copy() if forward_source.startswith("Aurora") else baringa.copy()
@@ -924,6 +938,26 @@ monthly = combined[
 if monthly.empty:
     st.warning("No Hybrid PPA source values are available in the selected period.")
     st.stop()
+
+# In Monthly mode the user can either review / settle every month in the
+# selected year range, or isolate one specific settlement month.
+selected_month_key = "All months"
+if granularity == "Monthly":
+    month_options = ["All months"] + monthly["period"].dropna().astype(str).drop_duplicates().tolist()
+    selected_month_key = st.selectbox(
+        "Monthly settlement period",
+        options=month_options,
+        index=0,
+        help=(
+            "Choose 'All months' to see the full monthly settlement series, "
+            "or select one YYYY-MM period to settle and review that month only."
+        ),
+    )
+    if selected_month_key != "All months":
+        monthly = monthly[monthly["period"] == selected_month_key].copy()
+        if monthly.empty:
+            st.warning("No data is available for the selected settlement month.")
+            st.stop()
 
 # Contracted annual volume is allocated by calendar days.
 monthly["days_in_month"] = monthly["date"].dt.days_in_month.astype(float)
@@ -992,7 +1026,18 @@ st.markdown(
     <div class="nx-callout">
       Forward configuration is <b>without grid demand / without grid charging</b>,
       matching both uploaded 2027-2036 source workbooks. Historical hybrid values use
-      the <b>Hybrid w/o demand</b> series from the CSV.
+      the <b>Hybrid w/o demand</b> series from the historical file.
+      <br><br>
+      <b>Settlement frequency:</b> {
+          "each calendar month is settled independently"
+          if granularity == "Monthly"
+          else "monthly settlements are aggregated into annual values"
+      }.
+      {
+          f" Selected month: <b>{selected_month_key}</b>."
+          if granularity == "Monthly" and selected_month_key != "All months"
+          else ""
+      }
     </div>
     """,
     unsafe_allow_html=True,
@@ -1019,7 +1064,11 @@ kpi(
     "Avg settlement to buyer",
     f"{avg_settlement:+.1f}",
     "€/MWh",
-    f"{year_range[0]}-{year_range[1]} · contracted-volume weighted",
+    (
+        f"{selected_month_key} · monthly settlement"
+        if granularity == "Monthly" and selected_month_key != "All months"
+        else f"{year_range[0]}-{year_range[1]} · contracted-volume weighted"
+    ),
     "pos" if avg_settlement >= 0 else "neg",
 )
 kpi(
@@ -1027,7 +1076,11 @@ kpi(
     "Cumulative settlement",
     f"{cum_settlement / 1e6:+.2f}",
     "M€",
-    f"{annual_volume_gwh:,.0f} GWh/yr contracted",
+    (
+        f"{monthly['contracted_mwh'].sum()/1000:,.2f} GWh settled in {selected_month_key}"
+        if granularity == "Monthly" and selected_month_key != "All months"
+        else f"{annual_volume_gwh:,.0f} GWh/yr contracted"
+    ),
     "pos" if cum_settlement >= 0 else "neg",
 )
 kpi(
@@ -1223,6 +1276,11 @@ with st.expander("Compare Aurora Q2-26 vs Baringa Q2-26 forward captured hybrid"
 # TABLE / DOWNLOAD
 # =============================================================================
 with st.expander("Hybrid PPA settlement table"):
+    if granularity == "Monthly":
+        st.caption(
+            "Monthly settlement = (captured hybrid price - fixed Hybrid PPA price) "
+            "× contracted MWh for that calendar month."
+        )
     table_cols = [
         "period",
         "captured_solar",
@@ -1282,6 +1340,9 @@ with st.expander("Where every number comes from"):
   case, so historical values are matched to `Hybrid w/o demand`.
 - **Settlement:** `(captured hybrid price - fixed Hybrid PPA price) × contracted volume`.
   Positive values mean payment **to the buyer / offtaker**.
+- **Monthly settlement:** when Monthly is selected, the formula is applied independently
+  to each calendar month using that month's captured hybrid price and contracted MWh.
+  A single YYYY-MM period can also be selected and reviewed on its own.
 - **Cash-settlement volume:** the selected annual GWh is allocated by calendar days.
   This is a contract-volume assumption, not an inferred plant-production profile.
 - **Annual view:** prices are weighted by the same contracted settlement volume.
