@@ -5,7 +5,7 @@ python-dotenv
 openpyxl
 matplotlib
 vl-convert-python
-pulp==3.3.2
+pulp[cbc]==4.0.0
 plotly
 paramiko
 lxml
