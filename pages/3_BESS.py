@@ -1278,15 +1278,21 @@ def optimize_day_pulp(
     )
 
     # PuLP 4.0: CBC is provided by the optional ``cbc`` extra and is called
-    # through COIN_CMD. solve() now returns an LpSolveStats object.
-    solver = pulp.COIN_CMD(msg=False)
+    # through COIN_CMD. A GapLimit status can still contain a perfectly valid
+    # feasible incumbent. PuLP 4 separates the stop reason from whether a
+    # solution exists, so reject the solve only when CBC returned no solution.
+    # Setting both gaps to zero asks CBC to prove optimality where numerically
+    # possible, while the has_solution check keeps the app robust to tiny
+    # numerical gap stops.
+    solver = pulp.COIN_CMD(msg=False, gapRel=0.0, gapAbs=0.0)
     solve_stats = model.solve(solver)
     solver_status = solve_stats.status_str
-    if solve_stats.status != pulp.LpSolveStatus.Optimal:
+    if not solve_stats.has_solution:
         day_label = str(df_day["dia"].iloc[0]) if n else "unknown day"
         raise RuntimeError(
             f"CBC optimisation failed for {day_label}: {solver_status}. "
-            f"Check POI MW, BESS MW/MWh, demand and other constraints."
+            f"No feasible solution was returned. Check POI MW, BESS MW/MWh, "
+            f"demand and other constraints."
         )
 
     def vals(var_dict):
@@ -1864,16 +1870,19 @@ def optimize_window_pulp(
         for t in range(n)
     )
 
-    # PuLP 4.0: CBC is provided by the optional ``cbc`` extra and is called
-    # through COIN_CMD. solve() now returns an LpSolveStats object.
-    solver = pulp.COIN_CMD(msg=False)
+    # PuLP 4.0: the stop reason and the existence of a feasible solution are
+    # separate. GapLimit is not an optimisation failure when CBC returned a
+    # feasible incumbent. Ask for zero explicit MIP gaps, and only fail when
+    # no feasible solution was returned.
+    solver = pulp.COIN_CMD(msg=False, gapRel=0.0, gapAbs=0.0)
     solve_stats = model.solve(solver)
     solver_status = solve_stats.status_str
-    if solve_stats.status != pulp.LpSolveStatus.Optimal:
+    if not solve_stats.has_solution:
         first_ts = str(df_win["timestamp"].iloc[0]) if n else "unknown timestamp"
         raise RuntimeError(
             f"CBC rolling optimisation failed from {first_ts}: {solver_status}. "
-            f"Check POI MW, BESS MW/MWh, demand and other constraints."
+            f"No feasible solution was returned. Check POI MW, BESS MW/MWh, "
+            f"demand and other constraints."
         )
 
     def vals(var_dict):
