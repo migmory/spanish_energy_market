@@ -1225,17 +1225,18 @@ def optimize_day_pulp(
 
     model = pulp.LpProblem("bess_daily_optimization", pulp.LpMaximize)
 
-    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
-    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
-    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
-    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
-    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
-    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
-    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
-    curtailment = pulp.LpVariable.dicts("curtailment", range(n), lowBound=0)
-    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
-    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
-    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
+    # PuLP 4.0: variables belong to the LpProblem and must be created through it.
+    g_to_grid = model.add_variable_dicts("g_to_grid", range(n), lowBound=0)
+    g_to_batt = model.add_variable_dicts("g_to_batt", range(n), lowBound=0)
+    g_to_self = model.add_variable_dicts("g_to_self", range(n), lowBound=0)
+    grid_charge = model.add_variable_dicts("grid_charge", range(n), lowBound=0)
+    batt_for_load = model.add_variable_dicts("batt_for_load", range(n), lowBound=0)
+    batt_for_sell = model.add_variable_dicts("batt_for_sell", range(n), lowBound=0)
+    grid_purchase = model.add_variable_dicts("grid_purchase", range(n), lowBound=0)
+    curtailment = model.add_variable_dicts("curtailment", range(n), lowBound=0)
+    soc = model.add_variable_dicts("soc", range(n + 1), lowBound=0)
+    is_charging = model.add_variable_dicts("is_charging", range(n), cat="Binary")
+    is_export = model.add_variable_dicts("is_export", range(n), cat="Binary")
 
     model += soc[0] == 0.0
     model += soc[n] == 0.0
@@ -1276,10 +1277,12 @@ def optimize_day_pulp(
         for t in range(n)
     )
 
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    model.solve(solver)
-    solver_status = pulp.LpStatus.get(model.status, str(model.status))
-    if solver_status != "Optimal":
+    # PuLP 4.0: CBC is provided by the optional ``cbc`` extra and is called
+    # through COIN_CMD. solve() now returns an LpSolveStats object.
+    solver = pulp.COIN_CMD(msg=False)
+    solve_stats = model.solve(solver)
+    solver_status = solve_stats.status_str
+    if solve_stats.status != pulp.LpSolveStatus.Optimal:
         day_label = str(df_day["dia"].iloc[0]) if n else "unknown day"
         raise RuntimeError(
             f"CBC optimisation failed for {day_label}: {solver_status}. "
@@ -1814,17 +1817,18 @@ def optimize_window_pulp(
 
     model = pulp.LpProblem("bess_rolling_24h_window", pulp.LpMaximize)
 
-    g_to_grid = pulp.LpVariable.dicts("g_to_grid", range(n), lowBound=0)
-    g_to_batt = pulp.LpVariable.dicts("g_to_batt", range(n), lowBound=0)
-    g_to_self = pulp.LpVariable.dicts("g_to_self", range(n), lowBound=0)
-    grid_charge = pulp.LpVariable.dicts("grid_charge", range(n), lowBound=0)
-    batt_for_load = pulp.LpVariable.dicts("batt_for_load", range(n), lowBound=0)
-    batt_for_sell = pulp.LpVariable.dicts("batt_for_sell", range(n), lowBound=0)
-    grid_purchase = pulp.LpVariable.dicts("grid_purchase", range(n), lowBound=0)
-    curtailment = pulp.LpVariable.dicts("curtailment", range(n), lowBound=0)
-    soc = pulp.LpVariable.dicts("soc", range(n + 1), lowBound=0)
-    is_charging = pulp.LpVariable.dicts("is_charging", range(n), cat="Binary")
-    is_export = pulp.LpVariable.dicts("is_export", range(n), cat="Binary")
+    # PuLP 4.0: variables belong to the LpProblem and must be created through it.
+    g_to_grid = model.add_variable_dicts("g_to_grid", range(n), lowBound=0)
+    g_to_batt = model.add_variable_dicts("g_to_batt", range(n), lowBound=0)
+    g_to_self = model.add_variable_dicts("g_to_self", range(n), lowBound=0)
+    grid_charge = model.add_variable_dicts("grid_charge", range(n), lowBound=0)
+    batt_for_load = model.add_variable_dicts("batt_for_load", range(n), lowBound=0)
+    batt_for_sell = model.add_variable_dicts("batt_for_sell", range(n), lowBound=0)
+    grid_purchase = model.add_variable_dicts("grid_purchase", range(n), lowBound=0)
+    curtailment = model.add_variable_dicts("curtailment", range(n), lowBound=0)
+    soc = model.add_variable_dicts("soc", range(n + 1), lowBound=0)
+    is_charging = model.add_variable_dicts("is_charging", range(n), cat="Binary")
+    is_export = model.add_variable_dicts("is_export", range(n), cat="Binary")
 
     model += soc[0] == float(soc0)
 
@@ -1860,10 +1864,12 @@ def optimize_window_pulp(
         for t in range(n)
     )
 
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    model.solve(solver)
-    solver_status = pulp.LpStatus.get(model.status, str(model.status))
-    if solver_status != "Optimal":
+    # PuLP 4.0: CBC is provided by the optional ``cbc`` extra and is called
+    # through COIN_CMD. solve() now returns an LpSolveStats object.
+    solver = pulp.COIN_CMD(msg=False)
+    solve_stats = model.solve(solver)
+    solver_status = solve_stats.status_str
+    if solve_stats.status != pulp.LpSolveStatus.Optimal:
         first_ts = str(df_win["timestamp"].iloc[0]) if n else "unknown timestamp"
         raise RuntimeError(
             f"CBC rolling optimisation failed from {first_ts}: {solver_status}. "
