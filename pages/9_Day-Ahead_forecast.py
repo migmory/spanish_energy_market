@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -559,13 +561,37 @@ SPAIN_TEMPERATURE_POINTS = [
 # =========================================================
 # V17: data integrity, fixed-run weather and model utilities
 # =========================================================
-FORECAST_ENGINE_VERSION = "v17_1_regime_validation"
+FORECAST_ENGINE_VERSION = "v17_2_cow_fix"
 OPEN_METEO_SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 FIXED_WEATHER_MODEL = "ecmwf_ifs"
 PRICE_RECENCY_HALF_LIFE_DAYS = 90.0
 PRICE_MODEL_ITERATIONS = 240
 PRICE_CALIBRATION_DAYS = 28
 PRICE_VALIDATION_DAYS = 28
+
+
+def _v17_failure_details(exc: Exception, stage: str) -> dict:
+    """Return diagnostics without dumping local variables or API credentials."""
+    stack = "".join(traceback.TracebackException.from_exception(
+        exc, capture_locals=False,
+    ).format())
+    message = str(exc)
+    for name in ("ESIOS_TOKEN", "ESIOS_API_TOKEN"):
+        secret = os.getenv(name, "").strip()
+        if secret:
+            stack = stack.replace(secret, "[REDACTED]")
+            message = message.replace(secret, "[REDACTED]")
+    return {
+        "engine": FORECAST_ENGINE_VERSION,
+        "stage": stage,
+        "exception": type(exc).__name__,
+        "message": message,
+        "python": sys.version.split()[0],
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+        "streamlit": getattr(st, "__version__", "unknown"),
+        "traceback": stack,
+    }
 
 
 def _v17_numeric(frame: pd.DataFrame, column: str, default=np.nan) -> pd.Series:
@@ -734,7 +760,12 @@ def _v17_generation_candidates(technology, frame, prediction):
         anchor = _v17_numeric(frame, "weather_adjusted_d1_mwh")
     else:
         anchor = raw_anchor
-    anchor = anchor.fillna(pd.Series(model, index=frame.index)).to_numpy()
+    # This array is changed below. With pandas Copy-on-Write, to_numpy()
+    # can return a read-only view even after fillna(). Own a writable copy;
+    # do not disable Copy-on-Write or modify shared pandas memory.
+    anchor = anchor.fillna(pd.Series(model, index=frame.index)).to_numpy(
+        dtype=float, copy=True,
+    )
     if technology == "Solar PV":
         dark = _v17_numeric(frame, "shortwave_radiation").fillna(np.inf).to_numpy() <= 2.0
         model[dark] = 0.0
@@ -5966,8 +5997,8 @@ def build_bess_schedule_table(
 # =========================================================
 # YTD DAILY WALK-FORWARD BACKTEST
 # =========================================================
-YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v17_1"
-YTD_BACKTEST_CHECKPOINT_VERSION = "v17_1_regime_validation"
+YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v17_2"
+YTD_BACKTEST_CHECKPOINT_VERSION = "v17_2_cow_fix"
 
 
 def _safe_ratio(
@@ -6920,6 +6951,7 @@ else:
 # NEXT-DAY DEMAND FORECAST
 # =========================================================
 section_header("Step 1 - Day-ahead peninsular demand forecast")
+st.caption(f"Forecast engine: {FORECAST_ENGINE_VERSION}")
 
 st.caption(
     "Weather uses a fixed 00 UTC D-1 model run, not the latest live run. "
@@ -7017,13 +7049,15 @@ if st.button(
     type="primary",
     use_container_width=True,
 ):
+    forecast_stage = "Input validation"
     try:
-        st.session_state.pop("day_ahead_result_v17_1_regime_validation", None)
+        st.session_state.pop("day_ahead_result_v17_2_cow_fix", None)
         if not forecast_generation_technologies:
             raise ValueError(
                 "Select at least one PBF generation technology."
             )
 
+        forecast_stage = "Step 1/3: demand forecast"
         with st.spinner(
             "Step 1/3 - training tomorrow's demand forecast..."
         ):
@@ -7036,6 +7070,7 @@ if st.button(
 
         forecast_for_market = demand_result["forecast"].copy()
 
+        forecast_stage = "Official REE demand reference"
         ree_demand_result = load_ree_official_demand_forecast(
             forecast_target_day,
             token,
@@ -7080,6 +7115,7 @@ if st.button(
                 "Previous week + recent trend - orange"
             )
 
+        forecast_stage = "Step 2/3: PBF generation and thermal gap"
         with st.spinner(
             "Step 2/3 - forecasting PBF generation and thermal gap..."
         ):
@@ -7093,6 +7129,7 @@ if st.button(
                 token,
             )
 
+        forecast_stage = "Step 3/3: DA price forecast"
         with st.spinner(
             "Step 3/3 - forecasting tomorrow's DA spot-price curve..."
         ):
@@ -7104,13 +7141,14 @@ if st.button(
             )
 
         # Loaded only after the forecast has been produced to prevent leakage.
+        forecast_stage = "Post-forecast realised-price comparison"
         realised_prices = load_esios_price_history(
             forecast_target_day,
             forecast_target_day,
             token,
         )
 
-        st.session_state["day_ahead_result_v17_1_regime_validation"] = {
+        st.session_state["day_ahead_result_v17_2_cow_fix"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -7129,9 +7167,16 @@ if st.button(
         }
 
     except Exception as exc:
-        st.error(f"Day-ahead forecast failed: {exc}")
+        details = _v17_failure_details(exc, forecast_stage)
+        st.error(
+            f"Day-ahead forecast failed during {forecast_stage}: "
+            f"{details['exception']}: {details['message']}"
+        )
+        with st.expander("Technical error details", expanded=True):
+            st.write({k: v for k, v in details.items() if k != "traceback"})
+            st.code(details["traceback"], language="text")
 
-forecast_result = st.session_state.get("day_ahead_result_v17_1_regime_validation")
+forecast_result = st.session_state.get("day_ahead_result_v17_2_cow_fix")
 if forecast_result:
     if forecast_result.get("target_day") != forecast_target_day:
         st.info(f"Showing the last successful forecast for {forecast_result.get('target_day')}. Press Generate to run the selected date.")
