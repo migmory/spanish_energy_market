@@ -557,6 +557,397 @@ SPAIN_TEMPERATURE_POINTS = [
 
 
 # =========================================================
+# V17: data integrity, fixed-run weather and model utilities
+# =========================================================
+FORECAST_ENGINE_VERSION = "v17_1_regime_validation"
+OPEN_METEO_SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
+FIXED_WEATHER_MODEL = "ecmwf_ifs"
+PRICE_RECENCY_HALF_LIFE_DAYS = 90.0
+PRICE_MODEL_ITERATIONS = 240
+PRICE_CALIBRATION_DAYS = 28
+PRICE_VALIDATION_DAYS = 28
+
+
+def _v17_numeric(frame: pd.DataFrame, column: str, default=np.nan) -> pd.Series:
+    value = frame[column] if column in frame else pd.Series(default, index=frame.index)
+    return pd.to_numeric(value, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def _v17_day_grid(target_day: date) -> pd.DataFrame:
+    """This hourly prototype deliberately refuses ambiguous DST delivery days."""
+    start = pd.Timestamp(target_day, tz="Europe/Madrid")
+    end = pd.Timestamp(target_day + timedelta(days=1), tz="Europe/Madrid")
+    grid = pd.date_range(start, end, freq="h", inclusive="left")
+    if len(grid) != 24:
+        raise ValueError(
+            "This 24-hour prototype cannot safely process a 23/25-hour DST day. "
+            "Use a UTC-indexed 15-minute model for that delivery date."
+        )
+    return pd.DataFrame({"datetime": grid.tz_localize(None)})
+
+
+def _v17_sample_weights(frame: pd.DataFrame, half_life: float = 90.0) -> np.ndarray:
+    timestamps = pd.to_datetime(frame["datetime"])
+    age = (timestamps.max() - timestamps).dt.total_seconds().to_numpy() / 86400.0
+    return np.maximum(np.exp2(-age / half_life), 0.015)
+
+
+def _v17_model(loss: str = "absolute_error", iterations: int = 240):
+    return HistGradientBoostingRegressor(
+        loss=loss, learning_rate=0.055, max_iter=iterations,
+        max_leaf_nodes=25, min_samples_leaf=24,
+        l2_regularization=6.0, early_stopping=False, random_state=42,
+    )
+
+
+def _v17_fit(model, x, y, weights=None):
+    # Keep cloud CPU usage bounded; no random hold-out early stopping.
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=2):
+        if weights is None:
+            model.fit(x, y)
+        else:
+            model.fit(x, y, sample_weight=weights)
+    return model
+
+
+def _v17_predict(model, x):
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=2):
+        return model.predict(x)
+
+
+def _v17_weighted_quantile(values, quantiles, weights):
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    valid = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    if not valid.any():
+        return np.full(len(np.atleast_1d(quantiles)), np.nan)
+    v, w = v[valid], w[valid]
+    order = np.argsort(v)
+    v, w = v[order], w[order]
+    cdf = (np.cumsum(w) - 0.5 * w) / w.sum()
+    return np.interp(quantiles, cdf, v, left=v[0], right=v[-1])
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v17_fixed_weather_payload(target_day: date, points_tuple: tuple, variables: tuple):
+    """00 UTC D-1 run, not the latest run and not a rolling 24-hour lead series.
+
+    Model initialisation is not publication time. The selected run normally has
+    ample time to publish before a D-1 11:00 Madrid decision point, but historical
+    actual publication timestamps still require an external vintage archive.
+    No fallback to later/live weather is allowed if this run is missing.
+    """
+    _v17_day_grid(target_day)
+    run_day = target_day - timedelta(days=1)
+    params = {
+        "latitude": ",".join(str(point[0]) for point in points_tuple),
+        "longitude": ",".join(str(point[1]) for point in points_tuple),
+        "hourly": ",".join(variables),
+        "models": FIXED_WEATHER_MODEL,
+        "run": f"{run_day.isoformat()}T00:00",
+        "timezone": "Europe/Madrid",
+        "forecast_days": 3,
+    }
+    errors = []
+    for attempt in range(2):
+        try:
+            response = requests.get(OPEN_METEO_SINGLE_RUNS_URL, params=params, timeout=(15, 120))
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("error"):
+                raise ValueError(str(payload.get("reason", "Weather API error")))
+            return payload
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(str(exc)[:200])
+            if attempt == 0:
+                sleep(1.0)
+    raise ValueError(
+        f"Fixed {FIXED_WEATHER_MODEL} run {run_day} 00 UTC unavailable. "
+        "No later-run weather has been substituted. " + " | ".join(errors)
+    )
+
+
+def _v17_impute(train: pd.DataFrame, target: pd.DataFrame, features: list[str]):
+    """Fit imputation on training only. Preserve missingness indicators upstream."""
+    x = train.reindex(columns=features).apply(pd.to_numeric, errors="coerce")
+    z = target.reindex(columns=features).apply(pd.to_numeric, errors="coerce")
+    x = x.replace([np.inf, -np.inf], np.nan)
+    z = z.replace([np.inf, -np.inf], np.nan)
+    observed_columns = x.columns[x.notna().any(axis=0)]
+    medians = pd.Series(0.0, index=x.columns)
+    medians.loc[observed_columns] = x[observed_columns].median()
+    return x.fillna(medians), z.fillna(medians)
+
+
+def _v17_generation_features(frame: pd.DataFrame) -> list[str]:
+    regional = [c for c in frame.columns if c.startswith("wx_")]
+    extra = [
+        "radiation_spatial_std", "radiation_spatial_max", "wind_spatial_std",
+        "wind_cube_mean", "radiation_lag_1d", "wind_lag_1d",
+        "gen_lag_1d_available", "weather_adjusted_d1_mwh",
+    ]
+    return list(dict.fromkeys(GENERATION_FEATURES + regional + extra))
+
+
+def _v17_generation_anchor_features(frame: pd.DataFrame, technology: str,
+                                    weather_lookup: dict, wind_lookup: dict) -> pd.DataFrame:
+    out = frame.copy()
+    out["gen_lag_1d_available"] = _v17_numeric(out, "gen_lag_1d").notna().astype(int)
+    out["radiation_lag_1d"] = [
+        weather_lookup.get((d - timedelta(days=1), int(h)), np.nan)
+        for d, h in zip(out["date"], out["hour"])
+    ]
+    out["wind_lag_1d"] = [
+        wind_lookup.get((d - timedelta(days=1), int(h)), np.nan)
+        for d, h in zip(out["date"], out["hour"])
+    ]
+    if "run_d1_radiation" in out:
+        out["radiation_lag_1d"] = _v17_numeric(out, "run_d1_radiation").combine_first(out["radiation_lag_1d"])
+    if "run_d1_wind" in out:
+        out["wind_lag_1d"] = _v17_numeric(out, "run_d1_wind").combine_first(out["wind_lag_1d"])
+    anchor = _v17_numeric(out, "gen_lag_1d")
+    if technology == "Solar PV":
+        current = _v17_numeric(out, "shortwave_radiation")
+        old = _v17_numeric(out, "radiation_lag_1d")
+        ratio = (current / old.where(old > 30)).clip(0.0, 3.0)
+        adjusted = anchor * ratio
+        adjusted = adjusted.where(current > 2, 0.0)
+    elif technology == "Wind":
+        current = _v17_numeric(out, "wind_speed_100m")
+        old = _v17_numeric(out, "wind_lag_1d")
+        # Proxy only; spatial wind variables let the learned model improve it.
+        ratio = ((current / old.where(old > 3)) ** 2).clip(0.0, 3.0)
+        adjusted = anchor * ratio
+    else:
+        adjusted = anchor
+    out["weather_adjusted_d1_mwh"] = adjusted
+    return out
+
+
+def _v17_generation_candidates(technology, frame, prediction):
+    model = np.maximum(np.asarray(prediction, dtype=float), 0.0)
+    raw_anchor = _v17_numeric(frame, "gen_lag_1d")
+    if technology in {"Solar PV", "Wind"}:
+        # Do not copy yesterday's solar/wind shape when today's weather changed.
+        anchor = _v17_numeric(frame, "weather_adjusted_d1_mwh")
+    else:
+        anchor = raw_anchor
+    anchor = anchor.fillna(pd.Series(model, index=frame.index)).to_numpy()
+    if technology == "Solar PV":
+        dark = _v17_numeric(frame, "shortwave_radiation").fillna(np.inf).to_numpy() <= 2.0
+        model[dark] = 0.0
+        anchor[dark] = 0.0
+    return model, np.maximum(anchor, 0.0)
+
+
+def _v17_choose_generation_weight(technology, truth, model, anchor):
+    default = float(GENERATION_D1_BLEND_WEIGHTS.get(technology, 0.2))
+    if len(truth) < 24 * 5:
+        return default
+    weights = [0.0, 0.15, 0.30, 0.50, 0.75, 1.0]
+    y = np.asarray(truth, float)
+    errors = [np.mean(np.abs(y - ((1 - w) * model + w * anchor))) for w in weights]
+    best = int(np.argmin(errors))
+    return float(weights[best])
+
+
+def _v17_bridge_pbf_demand(target_day: date, physical_forecast: pd.DataFrame,
+                          pbf_history: pd.DataFrame, physical_history: pd.DataFrame):
+    """Learn the additive PBF-minus-physical perimeter difference through D-2.
+
+    This is a statistical perimeter bridge, not an explicit forecast of exports,
+    pumping or all market acquisition components. No component is added twice.
+    """
+    target = physical_forecast.copy()
+    target["hour"] = pd.to_datetime(target["datetime"]).dt.hour
+    cutoff = target_day - timedelta(days=2)
+    hist = pbf_history.merge(physical_history, on="datetime", how="inner")
+    hist["date"] = pd.to_datetime(hist["datetime"]).dt.date
+    hist = hist[(hist["date"] <= cutoff) &
+                (hist["date"] >= target_day - timedelta(days=120))].copy()
+    hist["hour"] = pd.to_datetime(hist["datetime"]).dt.hour
+    hist["dow"] = pd.to_datetime(hist["datetime"]).dt.dayofweek
+    hist["offset"] = _v17_numeric(hist, "pbf_demand_mwh") - _v17_numeric(hist, "demand_mw")
+    hist = hist.dropna(subset=["offset"])
+    if hist["date"].nunique() < 14:
+        raise ValueError("Fewer than 14 paired days to calibrate the PBF demand perimeter; not mixing physical demand with yesterday's PBF.")
+    weekday = pd.Timestamp(target_day).dayofweek
+    output, counts = [], []
+    for hour in target["hour"]:
+        candidates = hist[hist["hour"] == int(hour)].copy()
+        same_dow = candidates[candidates["dow"] == weekday]
+        if len(same_dow) >= 5:
+            candidates = same_dow
+        else:
+            same_type = candidates[(candidates["dow"] >= 5) == (weekday >= 5)]
+            if len(same_type) >= 5:
+                candidates = same_type
+        if candidates.empty:
+            raise ValueError(f"No valid PBF perimeter observations at hour {hour}.")
+        age = candidates["date"].map(lambda d: (target_day - d).days).to_numpy()
+        w = np.exp2(-age / 30.0)
+        output.append(float(_v17_weighted_quantile(candidates["offset"], [0.5], w)[0]))
+        counts.append(len(candidates))
+    target["pbf_perimeter_offset_mwh"] = output
+    target["pbf_perimeter_observations"] = counts
+    target["pbf_demand_forecast_mwh"] = (
+        target["selected_demand_mw"] + target["pbf_perimeter_offset_mwh"]
+    ).clip(lower=0.0)
+    target["pbf_perimeter_method"] = "Physical forecast + recent weekday/hour PBF offset (through D-2)"
+    return target
+
+PRICE_COMPONENTS_V17 = [
+    "pbf_demand_mwh", "bilateral_sales_mwh", "da_demand_mwh", "non_thermal_mwh",
+    "solar_pv_mwh", "wind_mwh", "nuclear_mwh", "solar_thermal_mwh",
+    "run_of_river_mwh", "other_renewables_mwh",
+]
+PRICE_EXTRA_FEATURES_V17 = [
+    "negative_gap_mwh", "gap_signed_log", "gap_daily_mean", "gap_daily_min",
+    "gap_daily_max", "gap_midday_mean", "gap_evening_mean", "gap_solar_vs_evening",
+    "gap_ramp_forward", "gap_ramp_backward", "gap_daily_rank", "solar_share",
+    "wind_share", "bilateral_share", "net_supply_share", "price_previous_day_mean",
+    "price_previous_day_solar_mean", "price_previous_day_evening_mean",
+    "price_anchor_available", "is_solar_block",
+] + PRICE_COMPONENTS_V17 + [f"{c}_available" for c in PRICE_COMPONENTS_V17]
+
+
+def _v17_price_feature_columns(frame):
+    return list(dict.fromkeys(PRICE_FEATURES + PRICE_EXTRA_FEATURES_V17))
+
+
+def _v17_fundamental_columns(frame):
+    # Deliberately exclude all lagged prices and the price anchor. This candidate
+    # can respond to a regime change instead of copying yesterday's price shape.
+    all_features = _v17_price_feature_columns(frame)
+    return [c for c in all_features if not (c.startswith("price_") or c == "same_hour_price_4w")]
+
+
+def _v17_price_objective(frame, truth, prediction):
+    y, p = np.asarray(truth, float), np.asarray(prediction, float)
+    hourly_mae = float(np.mean(np.abs(p - y)))
+    solar = frame["hour"].between(10, 17).to_numpy()
+    solar_mae = float(np.mean(np.abs(p[solar] - y[solar]))) if solar.any() else hourly_mae
+    temp = pd.DataFrame({"date": frame["date"].to_numpy(), "y": y, "p": p})
+    daily = temp.groupby("date")[["y", "p"]].mean()
+    baseload = float(np.mean(np.abs(daily["p"] - daily["y"])))
+    spread_errors = []
+    for _, day in temp.groupby("date"):
+        if len(day) >= 23:
+            spread_errors.append(abs(forecast_tb4(day["p"]) - forecast_tb4(day["y"])))
+    tb4 = float(np.mean(spread_errors)) if spread_errors else 0.0
+    return hourly_mae + 0.25 * solar_mae + 0.15 * baseload + 0.15 * tb4
+
+
+def _v17_select_price_weights(frame, predictions: pd.DataFrame):
+    """Sparse convex selection using only earlier labels; vectorised for cloud CPU."""
+    count = len(predictions.columns)
+    candidates = list(np.eye(count))
+    for i in range(count):
+        for j in range(i + 1, count):
+            for w in (0.25, 0.5, 0.75):
+                c = np.zeros(count)
+                c[i], c[j] = w, 1 - w
+                candidates.append(c)
+    candidate_weights = np.asarray(candidates)
+    all_predictions = predictions.to_numpy(float) @ candidate_weights.T
+    y = frame["price_eur_mwh"].to_numpy(float)
+    error = np.abs(all_predictions - y[:, None])
+    solar = frame["hour"].between(10, 17).to_numpy()
+    score = error.mean(axis=0)
+    score += .25 * (error[solar].mean(axis=0) if solar.any() else error.mean(axis=0))
+    base_errors, spread_errors = [], []
+    dates = frame["date"].to_numpy()
+    for day in pd.unique(dates):
+        select = dates == day
+        daily_prediction, daily_y = all_predictions[select], y[select]
+        base_errors.append(np.abs(daily_prediction.mean(axis=0) - daily_y.mean()))
+        if len(daily_y) >= 23:
+            sorted_p = np.sort(daily_prediction, axis=0)
+            sorted_y = np.sort(daily_y)
+            spreads = sorted_p[-4:].mean(axis=0) - sorted_p[:4].mean(axis=0)
+            real_spread = sorted_y[-4:].mean() - sorted_y[:4].mean()
+            spread_errors.append(np.abs(spreads - real_spread))
+    if base_errors:
+        score += .15 * np.mean(base_errors, axis=0)
+    if spread_errors:
+        score += .15 * np.mean(spread_errors, axis=0)
+    return candidate_weights[int(np.argmin(score))]
+
+
+def _v17_candidate_price_forecasts(train, target):
+    candidates = pd.DataFrame(index=target.index)
+    empirical = empirical_similar_gap_price_reference(train, target, max_candidates=40)
+    candidates["Similar-gap"] = empirical["conditional_price_median_eur_mwh"].to_numpy()
+    candidates["Anchor"] = target["price_anchor"].to_numpy()
+    if SKLEARN_AVAILABLE and len(train) >= 24 * 60:
+        features = _v17_price_feature_columns(train)
+        x, z = _v17_impute(train, target, features)
+        w = _v17_sample_weights(train, PRICE_RECENCY_HALF_LIFE_DAYS)
+        direct = _v17_fit(_v17_model(iterations=PRICE_MODEL_ITERATIONS), x, train["price_eur_mwh"], w)
+        candidates["Direct-price ML"] = _v17_predict(direct, z)
+        residual = _v17_fit(_v17_model(iterations=PRICE_MODEL_ITERATIONS), x,
+                           train["price_eur_mwh"] - train["price_anchor"], w)
+        candidates["Residual ML"] = target["price_anchor"].to_numpy() + _v17_predict(residual, z)
+        features = _v17_fundamental_columns(train)
+        x, z = _v17_impute(train, target, features)
+        fundamental = _v17_fit(_v17_model(iterations=PRICE_MODEL_ITERATIONS), x, train["price_eur_mwh"], w)
+        candidates["Fundamentals ML"] = _v17_predict(fundamental, z)
+    if not np.isfinite(candidates.to_numpy()).all():
+        raise ValueError("Non-finite candidate prices. Check input/anchor completeness.")
+    return candidates, empirical
+
+
+def build_post_clearing_gap_diagnostic(target_day: date, technologies: list[str],
+                                      forecast_gap: pd.DataFrame, price_forecast: pd.DataFrame,
+                                      token: str) -> pd.DataFrame:
+    """Ex-post diagnosis ONLY. Never called by a forecasting/training function.
+
+    'Observed' below means the published target-day PBF programme, not physical
+    metered generation. These outcomes must not be used to improve that day's
+    claimed ex-ante forecast.
+    """
+    observed_gen = load_forecast_pbf_history(target_day, target_day, tuple(technologies), token)
+    observed_demand = load_pbf_demand_history(target_day, target_day, token)
+    observed_bilateral = load_total_bilateral_sales_history(target_day, target_day, token)
+    if observed_gen.empty or observed_demand.empty or observed_bilateral.empty:
+        raise ValueError("Target-day PBF components have not all been published.")
+    actual = build_previous_day_calibration(target_day + timedelta(days=1), technologies,
+                                           observed_gen, observed_demand, observed_bilateral)
+    if actual.empty:
+        raise ValueError("No complete target-day PBF balance is available.")
+    mapping = {
+        "pbf_demand_mwh": "observed_pbf_demand_mwh", "bilateral_sales_mwh": "observed_bilateral_mwh",
+        "non_thermal_net_mwh": "observed_non_thermal_mwh", "actual_thermal_gap_mwh": "observed_pbf_gap_mwh",
+    }
+    actual_keep = actual[["datetime", *mapping, *[t for t in technologies if t in actual]]].copy()
+    actual_keep = actual_keep.rename(columns={**mapping, **{t: f"observed_{t}" for t in technologies}})
+    out = forecast_gap.merge(actual_keep, on="datetime", how="inner")
+    out["demand_contribution_to_gap_error_mw"] = out["pbf_demand_forecast_mwh"] - out["observed_pbf_demand_mwh"]
+    out["bilateral_contribution_to_gap_error_mw"] = -(out["bilateral_sales_forecast_mwh"] - out["observed_bilateral_mwh"])
+    out["generation_contribution_to_gap_error_mw"] = -(out["non_thermal_forecast_mwh"] - out["observed_non_thermal_mwh"])
+    out["gap_error_mw"] = out["thermal_gap_forecast_mwh"] - out["observed_pbf_gap_mwh"]
+    reconstructed = (out["demand_contribution_to_gap_error_mw"] + out["bilateral_contribution_to_gap_error_mw"]
+                     + out["generation_contribution_to_gap_error_mw"])
+    out["gap_reconciliation_error_mw"] = out["gap_error_mw"] - reconstructed
+    for tech in technologies:
+        if tech in out and f"observed_{tech}" in out:
+            out[f"forecast_minus_observed_{tech}_mw"] = out[tech] - out[f"observed_{tech}"]
+    price_columns = [c for c in ["datetime", "forecast_price_eur_mwh", "raw_model_price_eur_mwh", "fundamental_price_eur_mwh"] if c in price_forecast]
+    out = out.merge(price_forecast[price_columns], on="datetime", how="left")
+    actual_prices = load_esios_price_history(target_day, target_day, token)
+    if not actual_prices.empty:
+        out = out.merge(actual_prices.rename(columns={"price_eur_mwh": "cleared_price_eur_mwh"}), on="datetime", how="left")
+        out["price_error_eur_mwh"] = out["forecast_price_eur_mwh"] - out["cleared_price_eur_mwh"]
+    first = ["datetime", "thermal_gap_forecast_mwh", "observed_pbf_gap_mwh", "gap_error_mw",
+             "demand_contribution_to_gap_error_mw", "bilateral_contribution_to_gap_error_mw",
+             "generation_contribution_to_gap_error_mw", "forecast_price_eur_mwh", "cleared_price_eur_mwh", "price_error_eur_mwh"]
+    columns = [c for c in first if c in out] + [c for c in out if c not in first]
+    return out[columns].sort_values("datetime").reset_index(drop=True)
+
+
+# =========================================================
 # DISPLAY HELPERS
 # =========================================================
 def section_header(title: str) -> None:
@@ -633,7 +1024,7 @@ def esios_headers(token: str) -> dict:
 
 
 # =========================================================
-# DAILY DEMAND — REData
+# DAILY DEMAND - REData
 # =========================================================
 def parse_redata_included(payload: dict) -> pd.DataFrame:
     rows = []
@@ -741,7 +1132,7 @@ def load_daily_peninsular_demand(
 
 
 # =========================================================
-# DAILY TEMPERATURE — OPEN-METEO
+# DAILY TEMPERATURE - OPEN-METEO
 # =========================================================
 @st.cache_data(show_spinner=False, ttl=86400)
 def load_spain_daily_temperature(
@@ -998,7 +1389,7 @@ def load_ree_official_demand_forecast(
             if official["ree_forecast_mw"].notna().sum() >= 23:
                 return {
                     "forecast": official,
-                    "source": "ESIOS indicator 1775 — REE D+1 forecast",
+                    "source": "ESIOS indicator 1775 - REE D+1 forecast",
                     "available": True,
                     "error": "",
                 }
@@ -1065,7 +1456,7 @@ def load_ree_official_demand_forecast(
                     return {
                         "forecast": official,
                         "source": (
-                            "REData demanda-tiempo-real — "
+                            "REData demanda-tiempo-real - "
                             "official REE forecast"
                         ),
                         "available": True,
@@ -1169,92 +1560,16 @@ def load_hourly_temperature_history(start_day: date, end_day: date, mode: str) -
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def load_hourly_temperature_forecast(
-    target_day: date,
-    mode: str,
-) -> pd.DataFrame:
-    """
-    Weather input available at the day-ahead decision point.
-
-    Historical/today targets use Open-Meteo Previous Runs
-    temperature_2m_previous_day1. Tomorrow uses the latest live forecast.
-    """
+def load_hourly_temperature_forecast(target_day: date, mode: str) -> pd.DataFrame:
     points = _temperature_points(mode)
-
-    common = {
-        "latitude": ",".join(
-            str(point["latitude"])
-            for point in points
-        ),
-        "longitude": ",".join(
-            str(point["longitude"])
-            for point in points
-        ),
-        "timezone": "Europe/Madrid",
-    }
-
-    if target_day <= date.today():
-        source_variable = "temperature_2m_previous_day1"
-        params = {
-            **common,
-            "start_date": target_day.isoformat(),
-            "end_date": target_day.isoformat(),
-            "hourly": source_variable,
-        }
-        endpoint = OPEN_METEO_PREVIOUS_RUNS_URL
-    else:
-        source_variable = "temperature_2m"
-        params = {
-            **common,
-            "hourly": source_variable,
-            "forecast_days": min(
-                max(
-                    (target_day - date.today()).days + 1,
-                    1,
-                ),
-                16,
-            ),
-        }
-        endpoint = OPEN_METEO_FORECAST_URL
-
-    response = requests.get(
-        endpoint,
-        params=params,
-        timeout=120,
+    payload = _v17_fixed_weather_payload(
+        target_day, tuple((p["latitude"], p["longitude"]) for p in points),
+        ("temperature_2m",),
     )
-    response.raise_for_status()
-
-    out = _weighted_hourly_temperature(
-        response.json(),
-        points,
-        source_variable=source_variable,
-    )
-    out = out[
-        out["datetime"].dt.date == target_day
-    ].copy()
-
-    expected = pd.DataFrame(
-        {
-            "datetime": pd.date_range(
-                start=pd.Timestamp(target_day),
-                periods=24,
-                freq="h",
-            )
-        }
-    )
-    out = (
-        expected.merge(out, on="datetime", how="left")
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
-    out["temperature_c"] = (
-        pd.to_numeric(
-            out["temperature_c"],
-            errors="coerce",
-        )
-        .interpolate(limit_direction="both")
-    )
-
+    out = _weighted_hourly_temperature(payload, points)
+    out = _v17_day_grid(target_day).merge(out, on="datetime", how="left")
+    if out["temperature_c"].notna().sum() != 24:
+        raise ValueError("Fixed-run temperature forecast has missing target hours.")
     return out
 
 
@@ -1358,17 +1673,17 @@ FORECAST_FEATURES = [
 
 
 def forecast_metrics(actual, predicted) -> dict:
-    actual = np.asarray(actual, dtype=float)
-    predicted = np.asarray(predicted, dtype=float)
+    actual, predicted = np.asarray(actual, float), np.asarray(predicted, float)
     valid = np.isfinite(actual) & np.isfinite(predicted)
-    actual, predicted = actual[valid], predicted[valid]
-    if len(actual) == 0:
+    y, p = actual[valid], predicted[valid]
+    if not len(y):
         return {"mae": np.nan, "rmse": np.nan, "mape": np.nan}
-    error = actual - predicted
+    error = p - y
+    nonzero = np.abs(y) > 1e-6
     return {
         "mae": float(np.mean(np.abs(error))),
         "rmse": float(np.sqrt(np.mean(error ** 2))),
-        "mape": float(np.mean(np.abs(error / actual)) * 100),
+        "mape": float(np.mean(np.abs(error[nonzero] / y[nonzero])) * 100) if nonzero.any() else np.nan,
     }
 
 
@@ -1394,7 +1709,7 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
     history_start = history_end - timedelta(days=lookback_days)
 
     demand = load_hourly_peninsular_demand(history_start, history_end)
-    weather = load_hourly_temperature_history(history_start, history_end, temperature_mode)
+    weather = load_hourly_temperature_history(history_start, target_day - timedelta(days=6), temperature_mode)
     target_weather = load_hourly_temperature_forecast(target_day, temperature_mode)
     if demand.empty or weather.empty or target_weather.empty:
         raise ValueError("Hourly demand or weather data is unavailable.")
@@ -1431,17 +1746,17 @@ def generate_day_ahead_forecast(target_day: date, lookback_days: int, temperatur
     if SKLEARN_AVAILABLE:
         validation_model = HistGradientBoostingRegressor(
             loss="absolute_error", learning_rate=0.055, max_iter=300,
-            max_leaf_nodes=31, min_samples_leaf=30, l2_regularization=8, random_state=42,
+            max_leaf_nodes=31, min_samples_leaf=30, l2_regularization=8, early_stopping=False, random_state=42,
         )
-        validation_model.fit(train[FORECAST_FEATURES], train["demand_mw"])
-        validation_prediction = validation_model.predict(validation[FORECAST_FEATURES])
+        _v17_fit(validation_model, train[FORECAST_FEATURES], train["demand_mw"])
+        validation_prediction = _v17_predict(validation_model, validation[FORECAST_FEATURES])
 
         final_model = HistGradientBoostingRegressor(
             loss="absolute_error", learning_rate=0.055, max_iter=300,
-            max_leaf_nodes=31, min_samples_leaf=30, l2_regularization=8, random_state=42,
+            max_leaf_nodes=31, min_samples_leaf=30, l2_regularization=8, early_stopping=False, random_state=42,
         )
-        final_model.fit(model_data[FORECAST_FEATURES], model_data["demand_mw"])
-        target_prediction = final_model.predict(target_data[FORECAST_FEATURES])
+        _v17_fit(final_model, model_data[FORECAST_FEATURES], model_data["demand_mw"])
+        target_prediction = _v17_predict(final_model, target_data[FORECAST_FEATURES])
         model_name = "Histogram gradient boosting"
     else:
         validation_prediction = similar_day_prediction(train, validation)
@@ -1726,7 +2041,7 @@ def build_backtest_chart(backtest: pd.DataFrame):
 
 
 # =========================================================
-# PBF DAILY MIX — ESIOS
+# PBF DAILY MIX - ESIOS
 # =========================================================
 def parse_esios_values(payload: dict) -> pd.DataFrame:
     values = payload.get("indicator", {}).get("values", []) or []
@@ -1848,6 +2163,9 @@ def fetch_one_pbf_indicator_hourly(
 
                 parsed = parse_esios_values(response.json())
                 if not parsed.empty:
+                    chunk_lower = start_local.tz_localize(None)
+                    chunk_upper = end_local.tz_localize(None)
+                    parsed = parsed[(parsed["datetime"] >= chunk_lower) & (parsed["datetime"] < chunk_upper)]
                     frames.append(parsed)
                 break
 
@@ -2314,116 +2632,63 @@ def build_pbf_average_chart(summary: pd.DataFrame):
 
 
 # =========================================================
-# STEP 2 — FORECAST PBF GENERATION AND THERMAL GAP
+# STEP 2 - FORECAST PBF GENERATION AND THERMAL GAP
 # =========================================================
-def _weighted_generation_weather(
-    payload,
-    variable_suffix: str = "",
-) -> pd.DataFrame:
-    """
-    Geographically average live variables or archived variables ending in
-    _previous_day1. Returned columns keep the canonical variable names.
+def _weighted_generation_weather(payload, variable_suffix: str = "") -> pd.DataFrame:
+    """Preserve point-level weather and aggregate diagnostics for both train/target.
+
+    Open-Meteo shortwave radiation is a preceding-hour mean. Shift it to the
+    starting timestamp of the corresponding market energy interval.
     """
     if isinstance(payload, dict):
         payload = [payload]
-
-    frames = []
+    frames, regional = [], []
     for idx, item in enumerate(payload):
         if idx >= len(GENERATION_WEATHER_POINTS):
-            continue
-
+            break
         hourly = item.get("hourly", {}) or {}
         times = hourly.get("time", []) or []
         if not times:
             continue
-
-        frame = pd.DataFrame(
-            {
-                "datetime": pd.to_datetime(
-                    times,
-                    errors="coerce",
-                )
-            }
-        )
-
+        frame = pd.DataFrame({"datetime": pd.to_datetime(times, errors="coerce")})
         for variable in GENERATION_WEATHER_VARIABLES:
-            source_variable = (
-                f"{variable}{variable_suffix}"
-            )
-            values = hourly.get(source_variable, []) or []
-            frame[variable] = (
-                pd.to_numeric(
-                    pd.Series(values),
-                    errors="coerce",
-                )
-                if len(values) == len(times)
-                else np.nan
-            )
-
-        frame["weight"] = float(
-            GENERATION_WEATHER_POINTS[idx]["weight"]
-        )
+            values = hourly.get(f"{variable}{variable_suffix}", []) or []
+            frame[variable] = pd.to_numeric(pd.Series(values), errors="coerce") if len(values) == len(times) else np.nan
+        frame = frame.sort_values("datetime").reset_index(drop=True)
+        frame["shortwave_radiation"] = frame["shortwave_radiation"].shift(-1)
+        point = GENERATION_WEATHER_POINTS[idx]
+        frame["weight"] = float(point["weight"])
+        frame["point"] = idx
+        frame["wind_cube"] = frame["wind_speed_100m"].clip(lower=0) ** 3
         frames.append(frame)
-
+        reg = frame[["datetime", "shortwave_radiation", "cloud_cover", "wind_speed_100m"]].copy()
+        reg = reg.rename(columns={
+            "shortwave_radiation": f"wx_p{idx:02d}_radiation",
+            "cloud_cover": f"wx_p{idx:02d}_cloud",
+            "wind_speed_100m": f"wx_p{idx:02d}_wind",
+        })
+        regional.append(reg)
     if not frames:
-        return pd.DataFrame(
-            columns=[
-                "datetime",
-                *GENERATION_WEATHER_VARIABLES,
-            ]
-        )
-
+        return pd.DataFrame(columns=["datetime"] + GENERATION_WEATHER_VARIABLES)
     long = pd.concat(frames, ignore_index=True)
-    result = None
-
-    for variable in GENERATION_WEATHER_VARIABLES:
-        temp = long[
-            ["datetime", "weight", variable]
-        ].dropna(
-            subset=["datetime", variable]
-        ).copy()
-
-        if temp.empty:
-            continue
-
-        temp["weighted"] = (
-            temp[variable] * temp["weight"]
-        )
-        temp = (
-            temp.groupby("datetime", as_index=False)
-            .agg(
-                weighted=("weighted", "sum"),
-                available_weight=("weight", "sum"),
-            )
-        )
-        temp[variable] = (
-            temp["weighted"]
-            / temp["available_weight"]
-        )
-        temp = temp[["datetime", variable]]
-
-        result = (
-            temp
-            if result is None
-            else result.merge(
-                temp,
-                on="datetime",
-                how="outer",
-            )
-        )
-
-    if result is None:
-        return pd.DataFrame(
-            columns=[
-                "datetime",
-                *GENERATION_WEATHER_VARIABLES,
-            ]
-        )
-
-    return (
-        result.sort_values("datetime")
-        .reset_index(drop=True)
+    result = pd.DataFrame({"datetime": sorted(long["datetime"].dropna().unique())})
+    for variable in GENERATION_WEATHER_VARIABLES + ["wind_cube"]:
+        valid = long.dropna(subset=[variable]).copy()
+        valid["weighted"] = valid[variable] * valid["weight"]
+        agg = valid.groupby("datetime").agg(total=("weighted", "sum"), weight=("weight", "sum"))
+        column = "wind_cube_mean" if variable == "wind_cube" else variable
+        agg[column] = agg["total"] / agg["weight"]
+        result = result.merge(agg[[column]], on="datetime", how="left")
+    spread = long.groupby("datetime").agg(
+        radiation_spatial_std=("shortwave_radiation", "std"),
+        radiation_spatial_max=("shortwave_radiation", "max"),
+        wind_spatial_std=("wind_speed_100m", "std"),
     )
+    result = result.merge(spread, on="datetime", how="left")
+    for reg in regional:
+        reg = reg.groupby("datetime", as_index=False).mean(numeric_only=True)
+        result = result.merge(reg, on="datetime", how="left")
+    return result.sort_values("datetime").reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -2462,101 +2727,22 @@ def load_generation_weather_history(
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def load_generation_weather_forecast(
-    target_day: date,
-) -> pd.DataFrame:
-    """
-    Retrieve the weather information available at D-1.
-
-    Historical/today targets use Open-Meteo Previous Runs variables ending
-    in _previous_day1. Tomorrow uses the current live Best Match forecast.
-    """
-    common = {
-        "latitude": ",".join(
-            str(point["latitude"])
-            for point in GENERATION_WEATHER_POINTS
-        ),
-        "longitude": ",".join(
-            str(point["longitude"])
-            for point in GENERATION_WEATHER_POINTS
-        ),
-        "timezone": "Europe/Madrid",
-    }
-
-    if target_day <= date.today():
-        variable_suffix = "_previous_day1"
-        hourly_variables = [
-            f"{variable}{variable_suffix}"
-            for variable in GENERATION_WEATHER_VARIABLES
-        ]
-        params = {
-            **common,
-            "start_date": target_day.isoformat(),
-            "end_date": target_day.isoformat(),
-            "hourly": ",".join(hourly_variables),
-        }
-        endpoint = OPEN_METEO_PREVIOUS_RUNS_URL
-    else:
-        variable_suffix = ""
-        params = {
-            **common,
-            "hourly": ",".join(
-                GENERATION_WEATHER_VARIABLES
-            ),
-            "forecast_days": min(
-                max(
-                    (target_day - date.today()).days + 1,
-                    1,
-                ),
-                16,
-            ),
-        }
-        endpoint = OPEN_METEO_FORECAST_URL
-
-    response = requests.get(
-        endpoint,
-        params=params,
-        timeout=120,
+def load_generation_weather_forecast(target_day: date) -> pd.DataFrame:
+    payload = _v17_fixed_weather_payload(
+        target_day,
+        tuple((p["latitude"], p["longitude"]) for p in GENERATION_WEATHER_POINTS),
+        tuple(GENERATION_WEATHER_VARIABLES),
     )
-    response.raise_for_status()
-
-    forecast = _weighted_generation_weather(
-        response.json(),
-        variable_suffix=variable_suffix,
-    )
-    forecast = forecast[
-        forecast["datetime"].dt.date == target_day
-    ].copy()
-
-    expected = pd.DataFrame(
-        {
-            "datetime": pd.date_range(
-                start=pd.Timestamp(target_day),
-                periods=24,
-                freq="h",
-            )
-        }
-    )
-    forecast = (
-        expected.merge(
-            forecast,
-            on="datetime",
-            how="left",
-        )
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
-
-    for variable in GENERATION_WEATHER_VARIABLES:
-        if variable not in forecast.columns:
-            forecast[variable] = np.nan
-
-        forecast[variable] = pd.to_numeric(
-            forecast[variable],
-            errors="coerce",
-        ).interpolate(limit_direction="both")
-
-    return forecast
+    weather = _weighted_generation_weather(payload)
+    out = _v17_day_grid(target_day).merge(weather, on="datetime", how="left")
+    prior = weather[pd.to_datetime(weather["datetime"]).dt.date == target_day - timedelta(days=1)].copy()
+    prior["hour"] = pd.to_datetime(prior["datetime"]).dt.hour
+    out["run_d1_radiation"] = out["datetime"].dt.hour.map(prior.groupby("hour")["shortwave_radiation"].mean())
+    out["run_d1_wind"] = out["datetime"].dt.hour.map(prior.groupby("hour")["wind_speed_100m"].mean())
+    for column in GENERATION_WEATHER_VARIABLES:
+        if column not in out or out[column].notna().sum() != 24:
+            raise ValueError(f"Fixed-run {column} forecast has missing target hours; no silent climatology substitution.")
+    return out
 
 
 def _market_calendar(frame: pd.DataFrame) -> pd.DataFrame:
@@ -2645,40 +2831,18 @@ def _hourly_lookup(
     return lookup
 
 
-def _generation_lags(
-    frame: pd.DataFrame,
-    lookup: dict,
-) -> pd.DataFrame:
+def _generation_lags(frame: pd.DataFrame, lookup: dict) -> pd.DataFrame:
     out = frame.copy()
-
-    for lag in [2, 3, 7, 9, 10, 14, 21, 28]:
+    # Critical fix: D-1 was requested by the model/anchor but never generated.
+    for lag in [1, 2, 3, 7, 9, 10, 14, 21, 28]:
         out[f"gen_lag_{lag}d"] = [
-            lookup.get(
-                (d - timedelta(days=lag), int(h)),
-                np.nan,
-            )
+            lookup.get((d - timedelta(days=lag), int(h)), np.nan)
             for d, h in zip(out["date"], out["hour"])
         ]
-
-    out["gen_change_d2_d9"] = (
-        out["gen_lag_2d"] - out["gen_lag_9d"]
-    )
-    out["gen_change_d3_d10"] = (
-        out["gen_lag_3d"] - out["gen_lag_10d"]
-    )
-    out["gen_adjusted_d7"] = (
-        out["gen_lag_7d"]
-        + 0.65 * out["gen_change_d2_d9"]
-        + 0.35 * out["gen_change_d3_d10"]
-    )
-    out["gen_same_hour_4w"] = out[
-        [
-            "gen_lag_7d",
-            "gen_lag_14d",
-            "gen_lag_21d",
-            "gen_lag_28d",
-        ]
-    ].mean(axis=1)
+    out["gen_change_d2_d9"] = out["gen_lag_2d"] - out["gen_lag_9d"]
+    out["gen_change_d3_d10"] = out["gen_lag_3d"] - out["gen_lag_10d"]
+    out["gen_adjusted_d7"] = out["gen_lag_7d"] + 0.65 * out["gen_change_d2_d9"] + 0.35 * out["gen_change_d3_d10"]
+    out["gen_same_hour_4w"] = out[["gen_lag_7d", "gen_lag_14d", "gen_lag_21d", "gen_lag_28d"]].mean(axis=1)
     return out
 
 
@@ -2763,6 +2927,8 @@ def load_forecast_pbf_history(
                 )
             )
         else:
+            if bilateral_ids:
+                raise ValueError(f"Missing configured bilateral series for {technology}.")
             bilateral = gross[["datetime"]].copy()
             bilateral["bilateral_energy_mwh"] = 0.0
 
@@ -2776,7 +2942,6 @@ def load_forecast_pbf_history(
                 out["bilateral_energy_mwh"],
                 errors="coerce",
             )
-            .fillna(0.0)
             .clip(lower=0.0)
         )
         out["gross_energy_mwh"] = pd.to_numeric(
@@ -3191,693 +3356,168 @@ def build_previous_day_calibration(
     return out.sort_values("datetime").reset_index(drop=True)
 
 
-def _generation_fallback(
-    technology: str,
-    target: pd.DataFrame,
-) -> np.ndarray:
-    recent_anchor = (
-        0.60 * target["gen_lag_1d"]
-        + 0.40 * target["gen_adjusted_d7"]
-    )
-    prediction = (
-        recent_anchor
-        .fillna(target["gen_lag_1d"])
-        .fillna(target["gen_adjusted_d7"])
-        .fillna(target["gen_same_hour_4w"])
-        .fillna(target["gen_lag_2d"])
-        .fillna(0.0)
-        .to_numpy(dtype=float)
-    )
-
-    if technology in {"Solar PV", "Solar thermal"}:
-        radiation = (
-            target["shortwave_radiation"]
-            .fillna(0)
-            .to_numpy(dtype=float)
-        )
-        prediction = np.where(
-            radiation <= 2,
-            0,
-            prediction,
-        )
-
-    return np.maximum(prediction, 0)
 
 
-def _complete_generation_model_inputs(
-    model_data: pd.DataFrame,
-    target_data: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, int]:
-    """Complete model features without dropping target hours.
-
-    Priority for missing target values:
-    1. same-hour median from the training history;
-    2. global training median;
-    3. zero only when the feature is unavailable throughout history.
-
-    HistGradientBoosting can technically accept NaNs, but explicit imputation
-    keeps the fallback model and post-processing deterministic as well.
-    """
-    train = model_data.copy()
-    target = target_data.copy()
-    imputed_cells = 0
-
-    # Reconstruct the lag family before generic imputation. This preserves the
-    # most recent physical generation pattern whenever an isolated ESIOS hour
-    # is missing.
-    lag_columns = [
-        "gen_lag_2d", "gen_lag_3d", "gen_lag_7d",
-        "gen_lag_9d", "gen_lag_10d", "gen_lag_14d",
-        "gen_lag_21d", "gen_lag_28d",
-    ]
-    available_lags = [c for c in lag_columns if c in target.columns]
-    if available_lags:
-        target_lag_mean = target[available_lags].mean(axis=1)
-        for column in available_lags:
-            missing_before = int(target[column].isna().sum())
-            target[column] = target[column].fillna(target_lag_mean)
-            imputed_cells += missing_before - int(target[column].isna().sum())
-
-    if "gen_same_hour_4w" in target.columns:
-        recent_mean = target[
-            [
-                c for c in [
-                    "gen_lag_7d", "gen_lag_14d",
-                    "gen_lag_21d", "gen_lag_28d",
-                ]
-                if c in target.columns
-            ]
-        ].mean(axis=1)
-        missing_before = int(target["gen_same_hour_4w"].isna().sum())
-        target["gen_same_hour_4w"] = target[
-            "gen_same_hour_4w"
-        ].fillna(recent_mean)
-        imputed_cells += missing_before - int(
-            target["gen_same_hour_4w"].isna().sum()
-        )
-
-    for column in ["gen_change_d2_d9", "gen_change_d3_d10"]:
-        if column in target.columns:
-            missing_before = int(target[column].isna().sum())
-            target[column] = target[column].fillna(0.0)
-            imputed_cells += missing_before
-
-    if "gen_adjusted_d7" in target.columns:
-        reconstructed = (
-            target.get("gen_lag_7d", pd.Series(index=target.index, dtype=float))
-            + 0.65 * target.get(
-                "gen_change_d2_d9",
-                pd.Series(0.0, index=target.index),
-            )
-            + 0.35 * target.get(
-                "gen_change_d3_d10",
-                pd.Series(0.0, index=target.index),
-            )
-        )
-        missing_before = int(target["gen_adjusted_d7"].isna().sum())
-        target["gen_adjusted_d7"] = target[
-            "gen_adjusted_d7"
-        ].fillna(reconstructed)
-        imputed_cells += missing_before - int(
-            target["gen_adjusted_d7"].isna().sum()
-        )
-
-    for feature in GENERATION_FEATURES:
-        if feature not in train.columns:
-            train[feature] = np.nan
-        if feature not in target.columns:
-            target[feature] = np.nan
-
-        train[feature] = pd.to_numeric(train[feature], errors="coerce")
-        target[feature] = pd.to_numeric(target[feature], errors="coerce")
-
-        # Same-hour medians are especially important for radiation, wind and
-        # generation lags because a single daily median would flatten profiles.
-        hourly_median = train.groupby("hour")[feature].median()
-        hourly_fill = target["hour"].map(hourly_median)
-
-        missing_before = int(target[feature].isna().sum())
-        target[feature] = target[feature].fillna(hourly_fill)
-
-        global_median = train[feature].median()
-        if pd.isna(global_median):
-            global_median = 0.0
-
-        target[feature] = target[feature].fillna(float(global_median))
-        train[feature] = train[feature].fillna(float(global_median))
-        imputed_cells += missing_before
-
-    return train, target, imputed_cells
 
 
-def forecast_pbf_technology(
-    technology: str,
-    history: pd.DataFrame,
-    weather_history: pd.DataFrame,
-    target_weather: pd.DataFrame,
-) -> tuple[pd.DataFrame, dict]:
-    technology_history = history[
-        history["technology"] == technology
-    ][["datetime", "energy_mwh"]].copy()
-
-    lookup = _hourly_lookup(
-        technology_history,
-        "energy_mwh",
-    )
-
-    training = technology_history.merge(
-        weather_history,
-        on="datetime",
-        how="inner",
-    )
-    training = _market_calendar(training)
-    training = _generation_weather_features(training)
-    training = _generation_lags(training, lookup)
-
-    target = _market_calendar(target_weather.copy())
-    target = _generation_weather_features(target)
-    target = _generation_lags(target, lookup)
-
-    # Keep every valid generation observation. Missing explanatory variables
-    # are completed below instead of discarding the entire hour.
-    model_data = training.dropna(
-        subset=["energy_mwh", "datetime", "hour"]
-    ).copy()
-    target_data = target.dropna(
-        subset=["datetime", "hour"]
-    ).copy()
-
-    model_data, target_data, imputed_cells = (
-        _complete_generation_model_inputs(
-            model_data,
-            target_data,
-        )
-    )
-
-    if len(target_data) < 23:
-        raise ValueError(
-            f"Only {len(target_data)} target hours are available for "
-            f"{technology}; expected at least 23."
-        )
-
+def forecast_pbf_technology(technology: str, history: pd.DataFrame,
+                            weather_history: pd.DataFrame, target_weather: pd.DataFrame):
+    technology_history = history.loc[history["technology"] == technology, ["datetime", "energy_mwh"]].copy()
+    technology_history = technology_history.sort_values("datetime")
+    target_date = pd.to_datetime(target_weather["datetime"]).dt.date.min()
+    # Defence in depth: even a caller supplying target/future observations is filtered.
+    technology_history = technology_history[pd.to_datetime(technology_history["datetime"]).dt.date < target_date]
+    history_weather = weather_history[pd.to_datetime(weather_history["datetime"]).dt.date < target_date].copy()
+    lookup = _hourly_lookup(technology_history, "energy_mwh")
+    radiation_lookup = _hourly_lookup(history_weather, "shortwave_radiation")
+    wind_lookup = _hourly_lookup(history_weather, "wind_speed_100m")
+    training = technology_history.merge(history_weather, on="datetime", how="inner")
+    training = _generation_lags(_generation_weather_features(_market_calendar(training)), lookup)
+    target = _generation_lags(_generation_weather_features(_market_calendar(target_weather)), lookup)
+    training = _v17_generation_anchor_features(training, technology, radiation_lookup, wind_lookup)
+    target = _v17_generation_anchor_features(target, technology, radiation_lookup, wind_lookup)
+    training = training.dropna(subset=["energy_mwh", "datetime"]).sort_values("datetime").reset_index(drop=True)
+    target = target.sort_values("datetime").reset_index(drop=True)
+    if len(target) != 24:
+        raise ValueError(f"Expected 24 complete target hours for {technology}.")
+    # Raw D-1 remains untouched; imputation is only used inside model matrices.
+    if target["gen_lag_1d"].notna().sum() == 0 and len(training) < 24 * 30:
+        raise ValueError(f"No usable history or D-1 programme for {technology}.")
+    features = _v17_generation_features(training)
     stats = {"mae": np.nan, "mape": np.nan}
-    model_name = "Lag/weather fallback"
-
-    if SKLEARN_AVAILABLE and len(model_data) >= 24 * 120:
-        validation_start = (
-            model_data["date_ts"].max()
-            - pd.Timedelta(days=27)
-        )
-        train = model_data[
-            model_data["date_ts"] < validation_start
-        ]
-        validation = model_data[
-            model_data["date_ts"] >= validation_start
-        ]
-
-        if not train.empty and not validation.empty:
-            validation_model = HistGradientBoostingRegressor(
-                loss="absolute_error",
-                learning_rate=0.055,
-                max_iter=260,
-                max_leaf_nodes=25,
-                min_samples_leaf=24,
-                l2_regularization=6,
-                random_state=42,
-            )
-            validation_model.fit(
-                train[GENERATION_FEATURES],
-                train["energy_mwh"],
-            )
-            validation_prediction = (
-                validation_model.predict(
-                    validation[GENERATION_FEATURES]
-                )
-            )
-            stats = forecast_metrics(
-                validation["energy_mwh"],
-                validation_prediction,
-            )
-
-            final_model = HistGradientBoostingRegressor(
-                loss="absolute_error",
-                learning_rate=0.055,
-                max_iter=260,
-                max_leaf_nodes=25,
-                min_samples_leaf=24,
-                l2_regularization=6,
-                random_state=42,
-            )
-            final_model.fit(
-                model_data[GENERATION_FEATURES],
-                model_data["energy_mwh"],
-            )
-            prediction = final_model.predict(
-                target_data[GENERATION_FEATURES]
-            )
-            model_name = "Gradient boosting"
-        else:
-            prediction = _generation_fallback(
-                technology,
-                target_data,
-            )
+    weight = float(GENERATION_D1_BLEND_WEIGHTS.get(technology, 0.20))
+    model_name = "Available-lag fallback"
+    if SKLEARN_AVAILABLE and len(training) >= 24 * 120:
+        dates = sorted(training["date"].unique())
+        cal_start, val_start = dates[-28], dates[-14]
+        train = training[training["date"] < cal_start]
+        calibration = training[(training["date"] >= cal_start) & (training["date"] < val_start)]
+        validation = training[training["date"] >= val_start]
+        x, z = _v17_impute(train, pd.concat([calibration, validation]), features)
+        model = _v17_fit(_v17_model(iterations=220), x, train["energy_mwh"], _v17_sample_weights(train))
+        preds = _v17_predict(model, z)
+        cm, ca = _v17_generation_candidates(technology, calibration, preds[:len(calibration)])
+        weight = _v17_choose_generation_weight(technology, calibration["energy_mwh"], cm, ca)
+        vm, va = _v17_generation_candidates(technology, validation, preds[len(calibration):])
+        stats = forecast_metrics(validation["energy_mwh"], (1 - weight) * vm + weight * va)
+        # The weight was chosen before this 14-day validation, not on its outcomes.
+        x, z = _v17_impute(training, target, features)
+        final_model = _v17_fit(_v17_model(iterations=240), x, training["energy_mwh"], _v17_sample_weights(training))
+        prediction = _v17_predict(final_model, z)
+        model_name = "Spatial-weather boosting + calibrated D-1 anchor"
     else:
-        prediction = _generation_fallback(
-            technology,
-            target_data,
-        )
-
-    prediction = np.maximum(prediction, 0)
-
-    if technology in {"Solar PV", "Solar thermal"}:
-        radiation = target_data[
-            "shortwave_radiation"
-        ].fillna(0).to_numpy(dtype=float)
-        prediction = np.where(
-            radiation <= 2,
-            0,
-            prediction,
-        )
-
-    recent_cap = model_data["energy_mwh"].tail(
-        24 * 90
-    ).quantile(0.998)
-    if pd.notna(recent_cap) and recent_cap > 0:
-        prediction = np.minimum(
-            prediction,
-            float(recent_cap) * 1.12,
-        )
-
-    output = target_data[
-        [
-            "datetime",
-            "date",
-            "hour",
-            "shortwave_radiation",
-            "wind_speed_100m",
-            "gen_lag_1d",
-            "gen_lag_2d",
-            "gen_lag_7d",
-            "gen_adjusted_d7",
-        ]
-    ].copy()
+        reference = target[["gen_lag_1d", "gen_lag_2d", "gen_lag_7d", "gen_same_hour_4w"]].bfill(axis=1).iloc[:, 0]
+        hourly = training.groupby("hour")["energy_mwh"].median()
+        prediction = reference.fillna(target["hour"].map(hourly)).to_numpy(float)
+        if not np.isfinite(prediction).all():
+            raise ValueError(f"Unfilled generation forecast for {technology}; refusing fabricated zeros.")
+    model_values, anchor = _v17_generation_candidates(technology, target, prediction)
+    final = (1 - weight) * model_values + weight * anchor
+    # A historical output quantile is not an installed-capacity limit. No cap to
+    # 90-day output is imposed; alert on extrapolation rather than deleting it.
+    output = target[["datetime", "date", "hour", "shortwave_radiation", "wind_speed_100m",
+                     "gen_lag_1d", "gen_lag_2d", "gen_lag_7d", "gen_adjusted_d7",
+                     "gen_lag_1d_available", "weather_adjusted_d1_mwh"]].copy()
     output["technology"] = technology
-    output["model_net_forecast_mwh"] = prediction
-
-    # D-1 non-bilateral PBF is the latest programme available without target
-    # leakage. Stable technologies receive a stronger D-1 anchor.
-    d1_anchor = pd.to_numeric(
-        output["gen_lag_1d"],
-        errors="coerce",
-    )
-    d1_blend_weight = float(
-        GENERATION_D1_BLEND_WEIGHTS.get(
-            technology,
-            D1_GENERATION_BLEND_WEIGHT,
-        )
-    )
-
-    output["forecast_mwh"] = (
-        (1.0 - d1_blend_weight)
-        * output["model_net_forecast_mwh"]
-        + d1_blend_weight
-        * d1_anchor.fillna(output["model_net_forecast_mwh"])
-    ).clip(lower=0.0)
-
+    output["model_net_forecast_mwh"] = model_values
+    output["anchor_used_mwh"] = anchor
+    output["anchor_weight"] = weight
+    output["forecast_mwh"] = np.maximum(final, 0.0)
+    output["generation_above_historical_max"] = final > float(training["energy_mwh"].max()) if len(training) else False
     return output, {
-        "Technology": technology,
-        "PBF perimeter": "Non-bilateral generation exposed to DA",
-        "Model": model_name,
-        "D-1 blend weight": d1_blend_weight,
-        "D-1 average (MW)": (
-            float(d1_anchor.mean())
-            if d1_anchor.notna().any()
-            else np.nan
-        ),
-        "Forecast average (MW)": float(
-            output["forecast_mwh"].mean()
-        ),
-        "Target feature values imputed": int(imputed_cells),
-        "Backtest MAE (MW)": stats.get("mae"),
-        "Backtest MAPE (%)": stats.get("mape"),
+        "Technology": technology, "PBF perimeter": "Non-bilateral PBF generation",
+        "Model": model_name, "D-1 blend weight": weight,
+        "D-1 available hours": int(target["gen_lag_1d_available"].sum()),
+        "D-1 average (MW)": float(target["gen_lag_1d"].mean()),
+        "Forecast average (MW)": float(output["forecast_mwh"].mean()),
+        "Validation MAE (MW)": stats["mae"], "Validation MAPE (%)": stats["mape"],
+        "Validation scope": "14-day holdout; historical weather, not full operational weather uncertainty",
     }
 
 
-def generate_thermal_gap_forecast(
-    target_day: date,
-    lookback_days: int,
-    selected_demand: pd.DataFrame,
-    technologies: list[str],
-    token: str,
-) -> dict:
-    # Demand model uses completed realised demand through D-2. PBF generation,
-    # bilateral programmes and PBF demand for D-1 are already known and are
-    # therefore included as calibration / lag information.
-    pbf_history_end = target_day - timedelta(days=1)
-    history_start = (
-        target_day
-        - timedelta(days=int(lookback_days))
-        - timedelta(days=2)
-    )
-
-    pbf_history = load_forecast_pbf_history(
-        history_start,
-        pbf_history_end,
-        tuple(technologies),
-        token,
-    )
-    pbf_demand_history = load_pbf_demand_history(
-        history_start,
-        pbf_history_end,
-        token,
-    )
-    bilateral_sales_history = load_total_bilateral_sales_history(
-        history_start,
-        pbf_history_end,
-        token,
-    )
-    weather_history = load_generation_weather_history(
-        history_start,
-        target_day - timedelta(days=2),
-    )
-    target_weather = load_generation_weather_forecast(
-        target_day,
-    )
-
-    if pbf_history.empty:
-        raise ValueError("No historical non-bilateral PBF generation data.")
-    if pbf_demand_history.empty:
-        raise ValueError("No historical total PBF demand data.")
-    if bilateral_sales_history.empty:
-        raise ValueError(
-            "No historical total bilateral PBF sales data "
-            "(ESIOS indicator 10235)."
-        )
-    if weather_history.empty or target_weather.empty:
-        raise ValueError("Generation weather data unavailable.")
-
-    d1_calibration = build_previous_day_calibration(
-        target_day,
-        technologies,
-        pbf_history,
-        pbf_demand_history,
-        bilateral_sales_history,
-    )
-
-    bilateral_sales_forecast = forecast_total_bilateral_sales(
-        target_day,
-        bilateral_sales_history,
-    )
-
-    forecast_frames = []
-    stats_rows = []
-
+def generate_thermal_gap_forecast(target_day: date, lookback_days: int,
+                                  selected_demand: pd.DataFrame, technologies: list[str], token: str) -> dict:
+    _v17_day_grid(target_day)
+    history_start = target_day - timedelta(days=int(lookback_days) + 2)
+    end = target_day - timedelta(days=1)
+    pbf = load_forecast_pbf_history(history_start, end, tuple(technologies), token)
+    demand_hist = load_pbf_demand_history(history_start, end, token)
+    bilateral_hist = load_total_bilateral_sales_history(history_start, end, token)
+    weather = load_generation_weather_history(history_start, target_day - timedelta(days=6))
+    target_weather = load_generation_weather_forecast(target_day)
+    for name, data in [("PBF", pbf), ("PBF demand", demand_hist), ("bilaterals", bilateral_hist), ("weather", weather)]:
+        if data is None or data.empty:
+            raise ValueError(f"Missing {name} history.")
+    pbf = pbf[pd.to_datetime(pbf["datetime"]).dt.date < target_day].copy()
+    demand_hist = demand_hist[pd.to_datetime(demand_hist["datetime"]).dt.date < target_day].copy()
+    bilateral_hist = bilateral_hist[pd.to_datetime(bilateral_hist["datetime"]).dt.date < target_day].copy()
+    calibration = build_previous_day_calibration(target_day, technologies, pbf, demand_hist, bilateral_hist)
+    bilateral_forecast = forecast_total_bilateral_sales(target_day, bilateral_hist)
+    frames, rows = [], []
     for technology in technologies:
-        if pbf_history[
-            pbf_history["technology"] == technology
-        ].empty:
-            stats_rows.append(
-                {
-                    "Technology": technology,
-                    "PBF perimeter": "Non-bilateral generation exposed to DA",
-                    "Model": "No ESIOS non-bilateral PBF history",
-                    "D-1 blend weight": np.nan,
-                    "D-1 average (MW)": np.nan,
-                    "Forecast average (MW)": np.nan,
-                    "Target feature values imputed": np.nan,
-                    "Backtest MAE (MW)": np.nan,
-                    "Backtest MAPE (%)": np.nan,
-                }
-            )
-            continue
-
-        forecast, stats = forecast_pbf_technology(
-            technology,
-            pbf_history,
-            weather_history,
-            target_weather,
-        )
-        forecast_frames.append(forecast)
-        stats_rows.append(stats)
-
-    if not forecast_frames:
-        raise ValueError(
-            "No non-bilateral PBF generation forecast could be produced."
-        )
-
-    generation_long = pd.concat(
-        forecast_frames,
-        ignore_index=True,
-    )
-
-    generation_wide = (
-        generation_long.pivot_table(
-            index=["datetime", "date", "hour"],
-            columns="technology",
-            values="forecast_mwh",
-            aggfunc="sum",
-        )
-        .reset_index()
-        .sort_values("datetime")
-    )
-    generation_wide.columns.name = None
-
-    structural_technologies = [
-        tech
-        for tech in technologies
-        if tech != "Hydro UGH"
-        and tech in generation_wide.columns
-    ]
-    generation_wide["non_thermal_forecast_mwh"] = (
-        generation_wide[structural_technologies].sum(axis=1)
-    )
-
-    # Flexible hydro is retained as a separate diagnostic, not deducted from
-    # the structural thermal gap.
-    generation_wide["hydro_ugh_forecast_mwh"] = (
-        pd.to_numeric(
-            generation_wide["Hydro UGH"],
-            errors="coerce",
-        ).fillna(0.0)
-        if "Hydro UGH" in generation_wide.columns
-        else 0.0
-    )
-
-    demand = selected_demand[
-        ["datetime", "selected_demand_mw"]
-    ].copy()
-    demand["datetime"] = pd.to_datetime(
-        demand["datetime"],
-        errors="coerce",
-    ).dt.floor("h")
-    demand["hour"] = demand["datetime"].dt.hour
-
-    forecast = (
-        generation_wide.merge(
-            demand,
-            on=["datetime", "hour"],
-            how="inner",
-        )
-        .merge(
-            bilateral_sales_forecast[
-                [
-                    "datetime",
-                    "bilateral_sales_forecast_mwh",
-                    "bilateral_lag_1d",
-                    "bilateral_lag_7d",
-                ]
-            ],
-            on="datetime",
-            how="left",
-        )
-    )
-
-    # Align the selected total-demand model to the latest known total-PBF
-    # demand perimeter.
-    if not d1_calibration.empty:
-        d1_demand = d1_calibration[
-            ["hour", "pbf_demand_mwh"]
-        ].drop_duplicates("hour")
-        forecast = forecast.merge(
-            d1_demand.rename(
-                columns={
-                    "pbf_demand_mwh": "d1_pbf_demand_mwh"
-                }
-            ),
-            on="hour",
-            how="left",
-        )
-    else:
-        forecast["d1_pbf_demand_mwh"] = np.nan
-
-    forecast["pbf_demand_forecast_mwh"] = (
-        (1.0 - D1_DEMAND_BLEND_WEIGHT)
-        * forecast["selected_demand_mw"]
-        + D1_DEMAND_BLEND_WEIGHT
-        * forecast["d1_pbf_demand_mwh"].fillna(
-            forecast["selected_demand_mw"]
-        )
-    )
-
-    # Remove physical bilateral acquisitions from total PBF demand. Indicator
-    # 10235 is total bilateral sales; at system level the physical acquisition
-    # side is equal. Cap the forecast defensively to avoid negative DA demand.
-    forecast["bilateral_sales_forecast_mwh"] = (
-        pd.to_numeric(
-            forecast["bilateral_sales_forecast_mwh"],
-            errors="coerce",
-        )
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-    forecast["bilateral_sales_forecast_mwh"] = np.minimum(
-        forecast["bilateral_sales_forecast_mwh"],
-        0.95 * forecast["pbf_demand_forecast_mwh"].clip(lower=0.0),
-    )
-
-    forecast["da_demand_forecast_mwh"] = (
-        forecast["pbf_demand_forecast_mwh"]
-        - forecast["bilateral_sales_forecast_mwh"]
-    ).clip(lower=0.0)
-
-    forecast["da_demand_share_of_total_pct"] = np.where(
-        forecast["pbf_demand_forecast_mwh"] > 0,
-        100.0
-        * forecast["da_demand_forecast_mwh"]
-        / forecast["pbf_demand_forecast_mwh"],
-        np.nan,
-    )
-
-    # Explicit confirmation for diagnostics/exports: the model does not add or
-    # subtract a fixed self-consumption capacity or generation profile.
+        if pbf[pbf["technology"] == technology].empty:
+            raise ValueError(f"Missing {technology} history. It cannot be silently omitted from the gap.")
+        forecast, stats = forecast_pbf_technology(technology, pbf, weather, target_weather)
+        frames.append(forecast)
+        rows.append(stats)
+    generation = pd.concat(frames, ignore_index=True)
+    wide = generation.pivot(index="datetime", columns="technology", values="forecast_mwh").reset_index()
+    wide.columns.name = None
+    structural = [t for t in technologies if t != "Hydro UGH"]
+    wide["non_thermal_forecast_mwh"] = wide[structural].sum(axis=1, min_count=len(structural))
+    wide["hydro_ugh_forecast_mwh"] = _v17_numeric(wide, "Hydro UGH", 0.0)
+    physical_history = load_hourly_peninsular_demand(target_day - timedelta(days=120), target_day - timedelta(days=2))
+    bridge = _v17_bridge_pbf_demand(target_day, selected_demand, demand_hist, physical_history)
+    forecast = wide.merge(bridge, on="datetime", how="inner")
+    forecast = forecast.merge(bilateral_forecast[["datetime", "bilateral_sales_forecast_mwh", "bilateral_lag_1d", "bilateral_lag_7d"]], on="datetime", how="left")
+    forecast["date"] = pd.to_datetime(forecast["datetime"]).dt.date
+    forecast["hour"] = pd.to_datetime(forecast["datetime"]).dt.hour
+    if forecast[["non_thermal_forecast_mwh", "bilateral_sales_forecast_mwh", "pbf_demand_forecast_mwh"]].isna().any().any():
+        raise ValueError("Incomplete target gap components; not substituting missing values with zeros.")
+    if (forecast["bilateral_sales_forecast_mwh"] > forecast["pbf_demand_forecast_mwh"]).any():
+        raise ValueError("Forecast bilaterals exceed total PBF demand. Review source units/perimeters; no artificial 95% cap applied.")
+    forecast["da_demand_forecast_mwh"] = forecast["pbf_demand_forecast_mwh"] - forecast["bilateral_sales_forecast_mwh"]
+    forecast["thermal_gap_forecast_mwh"] = forecast["da_demand_forecast_mwh"] - forecast["non_thermal_forecast_mwh"]
+    forecast["residual_gap_after_hydro_ugh_mwh"] = forecast["thermal_gap_forecast_mwh"] - forecast["hydro_ugh_forecast_mwh"]
+    forecast["da_demand_share_of_total_pct"] = 100 * forecast["da_demand_forecast_mwh"] / forecast["pbf_demand_forecast_mwh"].replace(0, np.nan)
     forecast["explicit_self_consumption_adjustment_mwh"] = 0.0
-
-    # Price-relevant DA structural thermal gap:
-    # residual DA demand minus non-bilateral low-MC generation.
-    # Hydro UGH remains dispatchable and is not deducted.
-    forecast["thermal_gap_forecast_mwh"] = (
-        forecast["da_demand_forecast_mwh"]
-        - forecast["non_thermal_forecast_mwh"]
-    )
-    forecast["residual_gap_after_hydro_ugh_mwh"] = (
-        forecast["thermal_gap_forecast_mwh"]
-        - forecast["hydro_ugh_forecast_mwh"]
-    )
-
-    if not d1_calibration.empty:
-        d1_reference = d1_calibration[
-            [
-                "hour",
-                "pbf_demand_mwh",
-                "bilateral_sales_mwh",
-                "da_demand_mwh",
-                "actual_thermal_gap_mwh",
-                "non_thermal_net_mwh",
-                "calibration_source",
-            ]
-        ].drop_duplicates("hour")
-        forecast = forecast.merge(
-            d1_reference.rename(
-                columns={
-                    "pbf_demand_mwh": "d1_total_pbf_demand_mwh",
-                    "bilateral_sales_mwh": (
-                        "d1_bilateral_sales_mwh"
-                    ),
-                    "da_demand_mwh": "d1_da_demand_mwh",
-                    "actual_thermal_gap_mwh": (
-                        "d1_actual_thermal_gap_mwh"
-                    ),
-                    "non_thermal_net_mwh": (
-                        "d1_non_thermal_net_mwh"
-                    ),
-                }
-            ),
-            on="hour",
-            how="left",
-        )
-    else:
-        forecast["d1_total_pbf_demand_mwh"] = np.nan
-        forecast["d1_bilateral_sales_mwh"] = np.nan
-        forecast["d1_da_demand_mwh"] = np.nan
-        forecast["d1_actual_thermal_gap_mwh"] = np.nan
-        forecast["d1_non_thermal_net_mwh"] = np.nan
-        forecast["calibration_source"] = "No D-1 DA-perimeter calibration"
-
-    # Historical price training uses the same PBF-demand / NET-generation
-    # perimeter as the target forecast.
-    pbf_history_wide = (
-        pbf_history.pivot_table(
-            index="datetime",
-            columns="technology",
-            values="energy_mwh",
-            aggfunc="sum",
-        )
-        .reset_index()
-    )
-    pbf_history_wide.columns.name = None
-    historical_structural_techs = [
-        tech
-        for tech in technologies
-        if tech != "Hydro UGH"
-        and tech in pbf_history_wide.columns
-    ]
-    pbf_history_wide["non_thermal_mwh"] = (
-        pbf_history_wide[
-            historical_structural_techs
-        ].sum(axis=1)
-    )
-    pbf_history_wide["hydro_ugh_mwh"] = (
-        pd.to_numeric(
-            pbf_history_wide["Hydro UGH"],
-            errors="coerce",
-        ).fillna(0.0)
-        if "Hydro UGH" in pbf_history_wide.columns
-        else 0.0
-    )
-
-    historical = (
-        pbf_demand_history.merge(
-            bilateral_sales_history,
-            on="datetime",
-            how="inner",
-        )
-        .merge(
-            pbf_history_wide[
-                [
-                    "datetime",
-                    "non_thermal_mwh",
-                    "hydro_ugh_mwh",
-                ]
-            ],
-            on="datetime",
-            how="inner",
-        )
-    )
-    historical["da_demand_mwh"] = (
-        historical["pbf_demand_mwh"]
-        - historical["bilateral_sales_mwh"]
-    ).clip(lower=0.0)
-    historical["thermal_gap_mwh"] = (
-        historical["da_demand_mwh"]
-        - historical["non_thermal_mwh"]
-    )
-
-    return {
-        "forecast": forecast.sort_values(
-            "datetime"
-        ).reset_index(drop=True),
-        "generation_long": generation_long.sort_values(
-            ["datetime", "technology"]
-        ).reset_index(drop=True),
-        "generation_stats": pd.DataFrame(stats_rows),
-        "historical": historical.sort_values(
-            "datetime"
-        ).reset_index(drop=True),
-        "d1_calibration": d1_calibration,
-        "bilateral_sales_forecast": bilateral_sales_forecast,
-        "bilateral_sales_history": bilateral_sales_history,
-        "gap_perimeter": DA_GAP_PERIMETER,
+    ref_columns = {
+        "pbf_demand_mwh": "d1_total_pbf_demand_mwh", "bilateral_sales_mwh": "d1_bilateral_sales_mwh",
+        "da_demand_mwh": "d1_da_demand_mwh", "actual_thermal_gap_mwh": "d1_actual_thermal_gap_mwh",
+        "non_thermal_net_mwh": "d1_non_thermal_net_mwh",
     }
+    if not calibration.empty:
+        reference = calibration[["hour", *ref_columns, "calibration_source"]].drop_duplicates("hour").rename(columns=ref_columns)
+        forecast = forecast.merge(reference, on="hour", how="left")
+    else:
+        for column in ref_columns.values():
+            forecast[column] = np.nan
+        forecast["calibration_source"] = "D-1 reference unavailable"
+    forecast["d1_pbf_demand_mwh"] = forecast["d1_total_pbf_demand_mwh"]
+    hist_wide = pbf.pivot_table(index="datetime", columns="technology", values="energy_mwh", aggfunc="sum").reindex(columns=technologies)
+    hist_wide["non_thermal_mwh"] = hist_wide[structural].sum(axis=1, min_count=len(structural))
+    hist_wide["hydro_ugh_mwh"] = _v17_numeric(hist_wide, "Hydro UGH", 0.0)
+    historical = demand_hist.merge(bilateral_hist, on="datetime", how="inner").merge(hist_wide.reset_index(), on="datetime", how="inner")
+    historical["da_demand_mwh"] = historical["pbf_demand_mwh"] - historical["bilateral_sales_mwh"]
+    historical["thermal_gap_mwh"] = historical["da_demand_mwh"] - historical["non_thermal_mwh"]
+    historical = historical.dropna(subset=["thermal_gap_mwh"])
+    component_map = {"Solar PV": "solar_pv_mwh", "Wind": "wind_mwh", "Nuclear": "nuclear_mwh",
+                     "Solar thermal": "solar_thermal_mwh", "Run-of-river": "run_of_river_mwh", "Other renewables": "other_renewables_mwh"}
+    for tech, name in component_map.items():
+        if tech in structural:
+            historical[name] = historical[tech]
+            forecast[name] = forecast[tech]
+    # Canonical same-perimeter component fields consumed by the price engine.
+    for source, name in {"pbf_demand_forecast_mwh": "pbf_demand_mwh", "bilateral_sales_forecast_mwh": "bilateral_sales_mwh",
+                         "da_demand_forecast_mwh": "da_demand_mwh", "non_thermal_forecast_mwh": "non_thermal_mwh"}.items():
+        forecast[name] = forecast[source]
+    forecast["weather_run_utc"] = f"{end}T00:00Z"
+    forecast["engine_version"] = FORECAST_ENGINE_VERSION
+    return {"forecast": forecast.sort_values("datetime").reset_index(drop=True),
+            "generation_long": generation.sort_values(["datetime", "technology"]),
+            "generation_stats": pd.DataFrame(rows), "historical": historical.sort_values("datetime").reset_index(drop=True),
+            "d1_calibration": calibration, "bilateral_sales_forecast": bilateral_forecast,
+            "bilateral_sales_history": bilateral_hist, "gap_perimeter": DA_GAP_PERIMETER}
 
 
 def build_generation_forecast_chart(
@@ -4130,7 +3770,7 @@ def build_thermal_gap_forecast_chart(
 
 
 # =========================================================
-# MIBGAS GDAES D+1 — DAILY GAS INPUT
+# MIBGAS GDAES D+1 - DAILY GAS INPUT
 # =========================================================
 def _mibgas_normalize_column(column) -> str:
     if pd.isna(column):
@@ -4167,19 +3807,19 @@ def _mibgas_normalize_column(column) -> str:
 def _mibgas_to_number(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
-
-    cleaned = (
-        series.astype(str)
-        .str.strip()
-        .str.replace("€", "", regex=False)
-        .str.replace(" ", "", regex=False)
-        .str.replace("\xa0", "", regex=False)
-    )
-    cleaned = (
-        cleaned.str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
+    def parse(value):
+        if pd.isna(value):
+            return np.nan
+        text = str(value).strip().replace("€", "").replace("\xa0", "").replace(" ", "")
+        if "," in text and "." in text:
+            if text.rfind(",") > text.rfind("."):
+                text = text.replace(".", "").replace(",", ".")
+            else:
+                text = text.replace(",", "")
+        elif "," in text:
+            text = text.replace(",", ".")
+        return pd.to_numeric(text, errors="coerce")
+    return series.map(parse)
 
 
 def _mibgas_first_column(
@@ -4621,7 +4261,7 @@ def add_mibgas_features(
 
 
 # =========================================================
-# STEP 3 — FORECAST DA SPOT PRICE
+# STEP 3 - FORECAST DA SPOT PRICE
 # =========================================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_esios_price_history(
@@ -4667,6 +4307,9 @@ def load_esios_price_history(
                 response.raise_for_status()
                 parsed = parse_esios_values(response.json())
                 if not parsed.empty:
+                    chunk_lower = start_local.tz_localize(None)
+                    chunk_upper = end_local.tz_localize(None)
+                    parsed = parsed[(parsed["datetime"] >= chunk_lower) & (parsed["datetime"] < chunk_upper)]
                     frames.append(parsed)
                 break
             except requests.RequestException:
@@ -4699,76 +4342,63 @@ def load_esios_price_history(
     )
 
 
-def _price_features(
-    frame: pd.DataFrame,
-    price_lookup: dict,
-    gap_lookup: dict,
-    gas_price_lookup: dict,
-) -> pd.DataFrame:
-    out = _market_calendar(frame)
-
+def _price_features(frame: pd.DataFrame, price_lookup: dict, gap_lookup: dict,
+                    gas_price_lookup: dict) -> pd.DataFrame:
+    out = _market_calendar(frame).sort_values("datetime").reset_index(drop=True)
     for lag in [1, 2, 7, 14, 21, 28]:
-        out[f"price_lag_{lag}d"] = [
-            price_lookup.get(
-                (d - timedelta(days=lag), int(h)),
-                np.nan,
-            )
-            for d, h in zip(out["date"], out["hour"])
-        ]
-
+        out[f"price_lag_{lag}d"] = [price_lookup.get((d - timedelta(days=lag), int(h)), np.nan)
+                                       for d, h in zip(out["date"], out["hour"])]
     for lag in [1, 2, 7]:
-        out[f"gap_lag_{lag}d"] = [
-            gap_lookup.get(
-                (d - timedelta(days=lag), int(h)),
-                np.nan,
-            )
-            for d, h in zip(out["date"], out["hour"])
-        ]
-
-    out["price_lag_1d"] = out["price_lag_1d"].fillna(
-        out["price_lag_2d"]
-    )
-    out["gap_lag_1d"] = out["gap_lag_1d"].fillna(
-        out["gap_lag_2d"]
-    )
-
-    out["same_hour_price_4w"] = out[
-        [
-            "price_lag_7d",
-            "price_lag_14d",
-            "price_lag_21d",
-            "price_lag_28d",
-        ]
-    ].median(axis=1)
-
-    out["price_anchor"] = (
-        0.45 * out["price_lag_7d"]
-        + 0.35 * out["price_lag_1d"]
-        + 0.20 * out["same_hour_price_4w"]
-    )
-    out["price_anchor"] = out["price_anchor"].fillna(
-        0.65 * out["price_lag_7d"]
-        + 0.35 * out["same_hour_price_4w"]
-    )
-
-    out["positive_gap"] = out[
-        "thermal_gap_mwh"
-    ].clip(lower=0)
-    out["gap_sq_scaled"] = (
-        out["positive_gap"] / 10_000
-    ) ** 2
-    out["gap_change_d1"] = (
-        out["thermal_gap_mwh"] - out["gap_lag_1d"]
-    )
-    out["gap_change_d7"] = (
-        out["thermal_gap_mwh"] - out["gap_lag_7d"]
-    )
-
-    out = add_mibgas_features(
-        out,
-        gas_price_lookup,
-    )
-    return out
+        out[f"gap_lag_{lag}d"] = [gap_lookup.get((d - timedelta(days=lag), int(h)), np.nan)
+                                     for d, h in zip(out["date"], out["hour"])]
+    out["price_lag_1d"] = out["price_lag_1d"].fillna(out["price_lag_2d"])
+    out["gap_lag_1d"] = out["gap_lag_1d"].fillna(out["gap_lag_2d"])
+    weekly = out[["price_lag_7d", "price_lag_14d", "price_lag_21d", "price_lag_28d"]]
+    available_week = weekly.notna().any(axis=1)
+    out["same_hour_price_4w"] = np.nan
+    out.loc[available_week, "same_hour_price_4w"] = weekly.loc[available_week].median(axis=1)
+    anchor_values = out[["price_lag_7d", "price_lag_1d", "same_hour_price_4w"]]
+    weights = np.array([0.45, 0.35, 0.20])
+    denominator = anchor_values.notna().to_numpy() @ weights
+    out["price_anchor"] = (anchor_values.fillna(0).to_numpy() @ weights) / np.where(denominator > 0, denominator, np.nan)
+    out["price_anchor_available"] = (denominator > 0).astype(int)
+    gap = _v17_numeric(out, "thermal_gap_mwh")
+    out["positive_gap"] = gap.clip(lower=0)
+    out["negative_gap_mwh"] = gap.clip(upper=0)
+    out["gap_signed_log"] = np.sign(gap) * np.log1p(gap.abs() / 1000.0)
+    out["gap_sq_scaled"] = (out["positive_gap"] / 10000.0) ** 2
+    out["gap_change_d1"] = gap - out["gap_lag_1d"]
+    out["gap_change_d7"] = gap - out["gap_lag_7d"]
+    # Whole-day *forecast* geometry is available at the target decision point.
+    # During module validation these are observed historical PBF gaps, so that
+    # validation is explicitly conditional, not a full operational backtest.
+    for stat in ["mean", "min", "max"]:
+        out[f"gap_daily_{stat}"] = out.groupby("date")["thermal_gap_mwh"].transform(stat)
+    solar = out["hour"].between(10, 17)
+    evening = out["hour"].between(18, 22)
+    out["is_solar_block"] = solar.astype(int)
+    out["gap_midday_mean"] = out["date"].map(out[solar].groupby("date")["thermal_gap_mwh"].mean())
+    out["gap_evening_mean"] = out["date"].map(out[evening].groupby("date")["thermal_gap_mwh"].mean())
+    out["gap_solar_vs_evening"] = out["gap_evening_mean"] - out["gap_midday_mean"]
+    out["gap_ramp_forward"] = out.groupby("date")["thermal_gap_mwh"].shift(-1) - gap
+    out["gap_ramp_backward"] = gap - out.groupby("date")["thermal_gap_mwh"].shift(1)
+    out["gap_daily_rank"] = out.groupby("date")["thermal_gap_mwh"].rank(pct=True)
+    for c in PRICE_COMPONENTS_V17:
+        out[c] = _v17_numeric(out, c)
+        out[f"{c}_available"] = out[c].notna().astype(int)
+    base = out["pbf_demand_mwh"].where(out["pbf_demand_mwh"] > 0)
+    out["solar_share"] = out["solar_pv_mwh"] / base
+    out["wind_share"] = out["wind_mwh"] / base
+    out["bilateral_share"] = out["bilateral_sales_mwh"] / base
+    out["net_supply_share"] = out["non_thermal_mwh"] / base
+    for name, hours in [("mean", range(24)), ("solar_mean", range(10, 18)), ("evening_mean", range(18, 23))]:
+        lookup = {}
+        for day in out["date"].unique():
+            vals = [price_lookup.get((day - timedelta(days=1), int(h)), np.nan) for h in hours]
+            valid = np.asarray(vals, float)
+            lookup[day] = float(np.nanmean(valid)) if np.isfinite(valid).any() else np.nan
+        out[f"price_previous_day_{name}"] = out["date"].map(lookup)
+    return add_mibgas_features(out, gas_price_lookup)
 
 
 PRICE_FEATURES = [
@@ -4791,1311 +4421,192 @@ PRICE_FEATURES = [
 
 
 
-def empirical_similar_gap_price_reference(
-    historical_data: pd.DataFrame,
-    target_data: pd.DataFrame,
-    max_candidates: int = 120,
-) -> pd.DataFrame:
-    """
-    Build an empirical price reference for each target hour using historical
-    observations with a similar thermal gap and nearby hour of day.
-
-    This avoids the incorrect structural assumption that a negative thermal gap
-    must imply an exact 0 EUR/MWh price. The historical sample captures other
-    balancing mechanisms that are not fully represented in the simplified gap:
-    exports, pumping, storage charging, curtailment and market constraints.
-    """
-    required = {
-        "thermal_gap_mwh",
-        "price_eur_mwh",
-        "hour",
-        "is_weekend",
-    }
-    if historical_data is None or historical_data.empty:
-        return pd.DataFrame(index=target_data.index)
-
-    history = historical_data.copy()
-    missing = required.difference(history.columns)
-    if missing:
-        return pd.DataFrame(index=target_data.index)
-
-    history["thermal_gap_mwh"] = pd.to_numeric(
-        history["thermal_gap_mwh"],
-        errors="coerce",
-    )
-    history["price_eur_mwh"] = pd.to_numeric(
-        history["price_eur_mwh"],
-        errors="coerce",
-    )
-    history = history.dropna(
-        subset=["thermal_gap_mwh", "price_eur_mwh", "hour"]
-    ).copy()
-
+def empirical_similar_gap_price_reference(historical_data: pd.DataFrame, target_data: pd.DataFrame,
+                                         max_candidates: int = 40) -> pd.DataFrame:
+    history = historical_data.dropna(subset=["thermal_gap_mwh", "price_eur_mwh", "datetime"]).copy()
     if history.empty:
-        return pd.DataFrame(index=target_data.index)
-
-    gap_scale = max(
-        float(history["thermal_gap_mwh"].std()),
-        2_500.0,
-    )
-
-    output_rows = []
-
-    for row in target_data.itertuples():
-        target_gap = float(row.thermal_gap_mwh)
-        target_hour = int(row.hour)
-        target_weekend = int(row.is_weekend)
-        target_holiday = int(getattr(row, "is_holiday", 0))
-        target_month = int(getattr(row, "month", 1))
-
-        # First preserve the target day type. Holidays are compared with other
-        # holidays where enough observations exist; otherwise weekend/weekday
-        # status is retained.
-        if target_holiday:
-            holiday_candidates = history[
-                history["is_holiday"] == 1
-            ].copy()
-            candidates = (
-                holiday_candidates
-                if len(holiday_candidates) >= 35
-                else history[
-                    history["is_weekend"] == target_weekend
-                ].copy()
-            )
-        else:
-            candidates = history[
-                (history["is_weekend"] == target_weekend)
-                & (history["is_holiday"] == 0)
-            ].copy()
-
-        if len(candidates) < 50:
-            candidates = history[
-                history["is_weekend"] == target_weekend
-            ].copy()
-        if len(candidates) < 50:
-            candidates = history.copy()
-
-        month_distance = (
-            candidates["month"] - target_month
-        ).abs()
-        candidates["month_distance"] = np.minimum(
-            month_distance,
-            12 - month_distance,
-        )
-
-        # Prefer the same season. December low-gap hours should not be matched
-        # predominantly with May-August solar-surplus observations.
-        same_season = candidates[
-            candidates["month_distance"] <= 1
-        ].copy()
-        if len(same_season) >= 45:
-            candidates = same_season
-        else:
-            nearby_season = candidates[
-                candidates["month_distance"] <= 2
-            ].copy()
-            if len(nearby_season) >= 45:
-                candidates = nearby_season
-
-        hour_distance = (
-            candidates["hour"] - target_hour
-        ).abs()
-        candidates["hour_distance"] = np.minimum(
-            hour_distance,
-            24 - hour_distance,
-        )
-        candidates["gap_distance"] = (
-            candidates["thermal_gap_mwh"] - target_gap
-        ).abs()
-
-        # Prefer observations within +/-2 hours. Relax automatically when
-        # the sample is too small.
-        local = candidates[
-            candidates["hour_distance"] <= 2
-        ].copy()
-        if len(local) >= 30:
-            candidates = local
-
-        candidates["distance_score"] = (
-            candidates["gap_distance"] / gap_scale
-            + candidates["hour_distance"] / 3.0
-            + candidates["month_distance"] / 2.0
-        )
-
-        # Where available, prefer historical observations with a similar D-1
-        # MIBGAS level. A 10 €/MWh gas difference has roughly the same distance
-        # weight as one unit of the thermal-gap scale.
-        if (
-            "mibgas_d1_eur_mwh" in candidates.columns
-            and hasattr(row, "mibgas_d1_eur_mwh")
-            and float(getattr(row, "mibgas_data_available", 0)) > 0
-        ):
-            target_gas = float(row.mibgas_d1_eur_mwh)
-            candidates["gas_distance"] = (
-                pd.to_numeric(
-                    candidates["mibgas_d1_eur_mwh"],
-                    errors="coerce",
-                )
-                - target_gas
-            ).abs()
-            candidates["distance_score"] = (
-                candidates["distance_score"]
-                + candidates["gas_distance"].fillna(0.0) / 10.0
-            )
-        candidates = candidates.nsmallest(
-            max_candidates,
-            "distance_score",
-        )
-
-        if candidates.empty:
-            output_rows.append(
-                {
-                    "conditional_price_median_eur_mwh": np.nan,
-                    "conditional_price_p25_eur_mwh": np.nan,
-                    "conditional_price_p75_eur_mwh": np.nan,
-                    "probability_price_le_zero_pct": np.nan,
-                    "probability_price_below_5_pct": np.nan,
-                    "similar_gap_observations": 0,
-                }
-            )
-            continue
-
-        prices = candidates["price_eur_mwh"]
-
-        output_rows.append(
-            {
-                "conditional_price_median_eur_mwh": float(
-                    prices.median()
-                ),
-                "conditional_price_p25_eur_mwh": float(
-                    prices.quantile(0.25)
-                ),
-                "conditional_price_p75_eur_mwh": float(
-                    prices.quantile(0.75)
-                ),
-                "probability_price_le_zero_pct": float(
-                    (prices <= 0.0).mean() * 100.0
-                ),
-                "probability_price_below_5_pct": float(
-                    (prices <= 5.0).mean() * 100.0
-                ),
-                "similar_gap_observations": int(len(prices)),
-            }
-        )
-
-    result = pd.DataFrame(
-        output_rows,
-        index=target_data.index,
-    )
-    return result
-
-
-def blend_model_with_empirical_low_gap_reference(
-    raw_prediction,
-    model_data: pd.DataFrame,
-    target_data: pd.DataFrame,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Blend the model forecast with an empirical similar-gap price reference.
-
-    The empirical weight rises only when the forecast gap is unusually low
-    relative to history. There is no hard zero-price override.
-    """
-    empirical = empirical_similar_gap_price_reference(
-        model_data,
-        target_data,
-    )
-
-    raw = np.maximum(
-        np.asarray(raw_prediction, dtype=float),
-        0.0,
-    )
-
-    if empirical.empty:
-        return raw, empirical
-
-    historical_gap = pd.to_numeric(
-        model_data["thermal_gap_mwh"],
-        errors="coerce",
-    ).dropna()
-
-    if historical_gap.empty:
-        empirical["low_gap_blend_weight"] = 0.0
-        return raw, empirical
-
-    low_gap_threshold = float(
-        historical_gap.quantile(0.15)
-    )
-    extreme_low_gap = float(
-        historical_gap.quantile(0.01)
-    )
-
-    denominator = max(
-        low_gap_threshold - extreme_low_gap,
-        1_000.0,
-    )
-
-    severity = np.clip(
-        (
-            low_gap_threshold
-            - target_data["thermal_gap_mwh"].to_numpy(dtype=float)
-        )
-        / denominator,
-        0.0,
-        1.0,
-    )
-
-    # Normal hours remain mostly model-driven. Very low-gap hours receive up
-    # to 65% empirical calibration. Candidate selection is now seasonal, so a
-    # winter low-gap hour is not pulled toward a summer zero-price regime.
-    blend_weight = 0.08 + 0.57 * severity
-
-    empirical_median = pd.to_numeric(
-        empirical["conditional_price_median_eur_mwh"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    valid_empirical = np.isfinite(empirical_median)
-    blend_weight = np.where(
-        valid_empirical,
-        blend_weight,
-        0.0,
-    )
-    empirical_median = np.where(
-        valid_empirical,
-        np.maximum(empirical_median, 0.0),
-        raw,
-    )
-
-    blended = (
-        (1.0 - blend_weight) * raw
-        + blend_weight * empirical_median
-    )
-
-    empirical["low_gap_blend_weight"] = (
-        blend_weight * 100.0
-    )
-    empirical["historical_low_gap_threshold_mw"] = (
-        low_gap_threshold
-    )
-
-    return np.maximum(blended, 0.0), empirical
-
-
-
-def recent_price_guardrails(
-    raw_prediction,
-    target_data: pd.DataFrame,
-    empirical_reference: pd.DataFrame | None,
-    hourly_bias_correction: pd.Series | None = None,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Prevent the residual price model from moving too far away from all recent
-    hourly references without a sufficiently strong thermal-gap justification.
-
-    The model is still allowed to exceed D-1 / D-7 when tomorrow's thermal gap
-    is materially higher, but otherwise the positive residual is shrunk and
-    capped by a recent-price envelope.
-    """
-    target = target_data.copy()
-    raw = np.asarray(raw_prediction, dtype=float)
-
-    anchor = pd.to_numeric(
-        target["price_anchor"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    # Correct systematic recent hourly bias estimated out of sample.
-    if hourly_bias_correction is not None and len(hourly_bias_correction):
-        bias = (
-            target["hour"]
-            .map(hourly_bias_correction)
-            .fillna(0.0)
-            .clip(lower=-15.0, upper=15.0)
-            .to_numpy(dtype=float)
-        )
-        raw = raw - 0.65 * bias
-    else:
-        bias = np.zeros(len(target), dtype=float)
-
-    model_residual = raw - anchor
-
-    gap_reference = pd.concat(
-        [
-            pd.to_numeric(target["gap_lag_1d"], errors="coerce"),
-            pd.to_numeric(target["gap_lag_7d"], errors="coerce"),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    gap_shock = (
-        pd.to_numeric(target["thermal_gap_mwh"], errors="coerce")
-        - gap_reference
-    ).fillna(0.0).to_numpy(dtype=float)
-
-    # Only a clear positive thermal-gap shock should justify a material uplift
-    # above all recent price references.
-    shock_strength = np.clip(gap_shock / 4_000.0, 0.0, 1.0)
-
-    hours = target["hour"].to_numpy(dtype=int)
-    evening_or_night = (hours >= 18) | (hours <= 6)
-
-    # Preserve more of the modelled evening residual. The previous setting
-    # systematically flattened the 19:00-22:00 ramp and understated TB4.
-    positive_shrink = np.where(
-        evening_or_night,
-        0.45 + 0.45 * shock_strength,
-        0.52 + 0.38 * shock_strength,
-    )
-    negative_shrink = np.where(
-        evening_or_night,
-        0.72,
-        0.82,
-    )
-
-    residual_shrink = np.where(
-        model_residual >= 0,
-        positive_shrink,
-        negative_shrink,
-    )
-
-    shrunk = anchor + residual_shrink * model_residual
-
-    reference_frame = pd.DataFrame(
-        {
-            "price_lag_1d": pd.to_numeric(
-                target["price_lag_1d"],
-                errors="coerce",
-            ),
-            "price_lag_7d": pd.to_numeric(
-                target["price_lag_7d"],
-                errors="coerce",
-            ),
-            "same_hour_price_4w": pd.to_numeric(
-                target["same_hour_price_4w"],
-                errors="coerce",
-            ),
-            "price_anchor": pd.to_numeric(
-                target["price_anchor"],
-                errors="coerce",
-            ),
-        },
-        index=target.index,
-    )
-
-    if (
-        empirical_reference is not None
-        and not empirical_reference.empty
-        and "conditional_price_p75_eur_mwh" in empirical_reference.columns
-    ):
-        reference_frame["similar_gap_p75"] = pd.to_numeric(
-            empirical_reference["conditional_price_p75_eur_mwh"],
-            errors="coerce",
-        ).to_numpy()
-
-    recent_upper = reference_frame.max(axis=1, skipna=True).to_numpy(
-        dtype=float
-    )
-    recent_lower = reference_frame.min(axis=1, skipna=True).to_numpy(
-        dtype=float
-    )
-
-    # Allow a clearer evening scarcity premium when tomorrow's residual gap is
-    # genuinely higher than D-1/D-7. The former allowance capped valid peaks.
-    gap_uplift_allowance = np.clip(
-        np.maximum(gap_shock, 0.0) * 0.0045,
-        0.0,
-        32.0,
-    )
-
-    # A higher D-1 MIBGAS price can justify a higher CCGT-linked electricity
-    # price even when the thermal-gap shape is unchanged. The allowance uses a
-    # conservative 1.8x heat-rate proxy and is capped to avoid overreaction.
-    gas_change_vs_7d = pd.to_numeric(
-        target.get(
-            "mibgas_change_vs_7d_eur_mwh",
-            pd.Series(0.0, index=target.index),
-        ),
-        errors="coerce",
-    ).fillna(0.0).to_numpy(dtype=float)
-    gas_uplift_allowance = np.clip(
-        np.maximum(gas_change_vs_7d, 0.0) * 1.8,
-        0.0,
-        20.0,
-    )
-
-    base_buffer = np.where(evening_or_night, 9.0, 7.0)
-    upper_guardrail = (
-        recent_upper
-        + base_buffer
-        + gap_uplift_allowance
-        + gas_uplift_allowance
-    )
-
-    # Do not over-constrain downward moves. The lower guardrail is deliberately
-    # loose and exists only to avoid pathological model output.
-    lower_guardrail = np.maximum(
-        0.0,
-        recent_lower - np.where(evening_or_night, 20.0, 30.0),
-    )
-
-    guarded = np.clip(
-        shrunk,
-        lower_guardrail,
-        upper_guardrail,
-    )
-
-    diagnostics = pd.DataFrame(
-        {
-            "hourly_bias_correction_eur_mwh": bias,
-            "model_residual_before_guardrail_eur_mwh": model_residual,
-            "residual_shrink_factor": residual_shrink,
-            "gap_shock_vs_recent_mw": gap_shock,
-            "gap_uplift_allowance_eur_mwh": gap_uplift_allowance,
-            "gas_uplift_allowance_eur_mwh": gas_uplift_allowance,
-            "recent_reference_upper_eur_mwh": recent_upper,
-            "recent_reference_lower_eur_mwh": recent_lower,
-            "price_upper_guardrail_eur_mwh": upper_guardrail,
-            "price_lower_guardrail_eur_mwh": lower_guardrail,
-            "guardrail_reduction_eur_mwh": np.maximum(
-                shrunk - guarded,
-                0.0,
-            ),
-            "guardrail_increase_eur_mwh": np.maximum(
-                guarded - shrunk,
-                0.0,
-            ),
-            "guardrail_applied": np.abs(guarded - shrunk) > 1e-6,
-        },
-        index=target.index,
-    )
-
-    return np.maximum(guarded, 0.0), diagnostics
-
-
-
-def apply_negative_gap_soft_calibration(
-    forecast_prices,
-    target_data: pd.DataFrame,
-    empirical_reference: pd.DataFrame | None = None,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Apply a soft, dynamic cap in negative thermal-gap hours.
-
-    A negative simplified gap is a strong low-price signal, but it does not
-    imply an exact zero price. Exports, pumping, storage charging, curtailment,
-    technical constraints and other market effects can support positive prices.
-
-    The cap therefore depends on:
-      - the depth of the negative gap;
-      - recent same-hour price references;
-      - the empirical distribution of prices observed at similar gaps.
-
-    There is no forced zero-price floor or override. The model can still
-    forecast zero when its historical and market inputs support that outcome.
-    """
-    prices = np.maximum(
-        np.asarray(forecast_prices, dtype=float),
-        0.0,
-    )
-
-    gap = pd.to_numeric(
-        target_data["thermal_gap_mwh"],
-        errors="coerce",
-    ).fillna(0.0).to_numpy(dtype=float)
-
-    negative_mask = gap < 0.0
-    negative_gap_abs = np.maximum(-gap, 0.0)
-
-    reference_frame = pd.DataFrame(
-        {
-            "price_anchor": pd.to_numeric(
-                target_data.get(
-                    "price_anchor",
-                    pd.Series(np.nan, index=target_data.index),
-                ),
-                errors="coerce",
-            ),
-            "price_lag_1d": pd.to_numeric(
-                target_data.get(
-                    "price_lag_1d",
-                    pd.Series(np.nan, index=target_data.index),
-                ),
-                errors="coerce",
-            ),
-            "price_lag_7d": pd.to_numeric(
-                target_data.get(
-                    "price_lag_7d",
-                    pd.Series(np.nan, index=target_data.index),
-                ),
-                errors="coerce",
-            ),
-            "same_hour_price_4w": pd.to_numeric(
-                target_data.get(
-                    "same_hour_price_4w",
-                    pd.Series(np.nan, index=target_data.index),
-                ),
-                errors="coerce",
-            ),
-        },
-        index=target_data.index,
-    )
-
-    empirical_p25 = pd.Series(
-        np.nan,
-        index=target_data.index,
-        dtype=float,
-    )
-    empirical_p75 = pd.Series(
-        np.nan,
-        index=target_data.index,
-        dtype=float,
-    )
-
-    if empirical_reference is not None and not empirical_reference.empty:
-        if "conditional_price_p25_eur_mwh" in empirical_reference.columns:
-            empirical_p25 = pd.to_numeric(
-                empirical_reference[
-                    "conditional_price_p25_eur_mwh"
-                ],
-                errors="coerce",
-            ).set_axis(target_data.index)
-
-        if "conditional_price_p75_eur_mwh" in empirical_reference.columns:
-            empirical_p75 = pd.to_numeric(
-                empirical_reference[
-                    "conditional_price_p75_eur_mwh"
-                ],
-                errors="coerce",
-            ).set_axis(target_data.index)
-
-        if "conditional_price_median_eur_mwh" in empirical_reference.columns:
-            reference_frame["similar_gap_median"] = pd.to_numeric(
-                empirical_reference[
-                    "conditional_price_median_eur_mwh"
-                ],
-                errors="coerce",
-            ).set_axis(target_data.index)
-
-    # Median is more robust than taking the minimum recent reference. A single
-    # anomalous zero-price day should not automatically force tomorrow to zero.
-    recent_reference = (
-        reference_frame.median(axis=1, skipna=True)
-        .fillna(pd.Series(prices, index=target_data.index))
-        .clip(lower=0.0)
-        .to_numpy(dtype=float)
-    )
-
-    # Compression rises gradually and reaches maximum only from about -5 GW.
-    # A mildly negative gap should not create an artificial winter collapse.
-    severity = np.clip(
-        negative_gap_abs / 5_000.0,
-        0.0,
-        1.0,
-    )
-
-    # At maximum severity retain half of the recent/seasonal reference plus a
-    # 10 EUR/MWh buffer. Extreme summer surplus can still produce low prices,
-    # while winter gaps do not automatically collapse to 40 EUR/MWh.
-    soft_cap = (
-        10.0
-        + recent_reference
-        * (1.0 - 0.50 * severity)
-    )
-
-    # Do not push the cap below the seasonal similar-gap P25. The former P75
-    # floor was counterproductive: it prevented summer midday prices from
-    # falling sufficiently and produced a poor July capture/spread fit.
-    empirical_p25_values = empirical_p25.to_numpy(dtype=float)
-
-    soft_cap = np.where(
-        np.isfinite(empirical_p25_values),
-        np.maximum(soft_cap, empirical_p25_values),
-        soft_cap,
-    )
-    soft_cap = np.maximum(soft_cap, 10.0)
-
-    calibrated = prices.copy()
-    calibrated[negative_mask] = np.minimum(
-        prices[negative_mask],
-        soft_cap[negative_mask],
-    )
-
-    diagnostics = pd.DataFrame(
-        {
-            "negative_gap_soft_cap_eur_mwh": np.where(
-                negative_mask,
-                soft_cap,
-                np.nan,
-            ),
-            "negative_gap_reference_price_eur_mwh": np.where(
-                negative_mask,
-                recent_reference,
-                np.nan,
-            ),
-            "negative_gap_severity_pct": np.where(
-                negative_mask,
-                severity * 100.0,
-                0.0,
-            ),
-            "negative_gap_absolute_mw": np.where(
-                negative_mask,
-                negative_gap_abs,
-                0.0,
-            ),
-            "negative_gap_price_before_calibration_eur_mwh": prices,
-            "negative_gap_price_compression_eur_mwh": np.where(
-                negative_mask,
-                np.maximum(prices - calibrated, 0.0),
-                0.0,
-            ),
-            "negative_gap_soft_cap_applied": (
-                negative_mask
-                & (calibrated < prices - 1e-9)
-            ),
-        },
-        index=target_data.index,
-    )
-
-    return np.maximum(calibrated, 0.0), diagnostics
-
-
-def apply_seasonal_intraday_shape_calibration(
-    forecast_prices,
-    historical_data: pd.DataFrame,
-    target_data: pd.DataFrame,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Calibrate the 24-hour shape using historical days from the same season and
-    day type, while preserving the forecast daily price level.
-
-    This addresses two recurrent shape errors:
-      - excessive winter midday collapses;
-      - summer evening peaks that are too flat and solar troughs that are too
-        shallow.
-
-    Historical prices are normalised by each day's baseload before taking the
-    median hourly shape, so the calibration changes the curve shape rather than
-    mechanically copying an old price level.
-    """
-    raw = np.maximum(
-        np.asarray(forecast_prices, dtype=float),
-        0.0,
-    )
-    diagnostics = pd.DataFrame(
-        index=target_data.index,
-    )
-
-    if historical_data is None or historical_data.empty:
-        diagnostics["seasonal_shape_applied"] = False
-        return raw, diagnostics
-
-    history = historical_data.copy()
-    required = {
-        "date",
-        "hour",
-        "month",
-        "is_weekend",
-        "is_holiday",
-        "price_eur_mwh",
-    }
-    if required.difference(history.columns):
-        diagnostics["seasonal_shape_applied"] = False
-        return raw, diagnostics
-
-    target_month = int(target_data["month"].iloc[0])
-    target_weekend = int(target_data["is_weekend"].iloc[0])
-    target_holiday = int(target_data["is_holiday"].iloc[0])
-
-    month_distance = (
-        history["month"] - target_month
-    ).abs()
-    history["month_distance"] = np.minimum(
-        month_distance,
-        12 - month_distance,
-    )
-
-    if target_holiday:
-        candidates = history[
-            (history["is_holiday"] == 1)
-            & (history["month_distance"] <= 2)
-        ].copy()
-    else:
-        candidates = history[
-            (history["is_holiday"] == 0)
-            & (history["is_weekend"] == target_weekend)
-            & (history["month_distance"] <= 1)
-        ].copy()
-
-    candidate_days = candidates["date"].nunique()
-    if candidate_days < 8:
-        candidates = history[
-            (history["is_weekend"] == target_weekend)
-            & (history["month_distance"] <= 2)
-        ].copy()
-        candidate_days = candidates["date"].nunique()
-
-    if candidate_days < 6:
-        diagnostics["seasonal_shape_applied"] = False
-        diagnostics["seasonal_shape_candidate_days"] = candidate_days
-        return raw, diagnostics
-
-    candidates["price_eur_mwh"] = pd.to_numeric(
-        candidates["price_eur_mwh"],
-        errors="coerce",
-    )
-    daily_baseload = (
-        candidates.groupby("date")["price_eur_mwh"]
-        .mean()
-        .rename("daily_baseload")
-    )
-    candidates = candidates.merge(
-        daily_baseload,
-        on="date",
-        how="left",
-    )
-    candidates = candidates[
-        candidates["daily_baseload"] > 5.0
-    ].copy()
-    candidates["normalised_shape"] = (
-        candidates["price_eur_mwh"]
-        / candidates["daily_baseload"]
-    ).clip(lower=0.0, upper=3.5)
-
-    hourly_shape = (
-        candidates.groupby("hour")["normalised_shape"]
-        .median()
-        .reindex(range(24))
-        .interpolate(limit_direction="both")
-    )
-
-    if hourly_shape.notna().sum() < 23:
-        diagnostics["seasonal_shape_applied"] = False
-        diagnostics["seasonal_shape_candidate_days"] = candidate_days
-        return raw, diagnostics
-
-    target_hours = target_data["hour"].to_numpy(dtype=int)
-    shape_factor = hourly_shape.reindex(
-        target_hours
-    ).to_numpy(dtype=float)
-
-    # Preserve the modelled baseload. Only the intraday profile is calibrated.
-    forecast_baseload = float(np.mean(raw))
-    shape_reference = np.maximum(
-        forecast_baseload * shape_factor,
-        0.0,
-    )
-
-    winter = target_month in {11, 12, 1, 2}
-    summer = target_month in {6, 7, 8}
-    base_weight = 0.48 if winter else (0.45 if summer else 0.32)
-    if target_holiday:
-        base_weight = min(base_weight + 0.07, 0.55)
-
-    # Preserve extreme negative-gap signals: seasonal shape should not erase a
-    # genuinely exceptional surplus hour.
-    negative_gap = np.maximum(
-        -pd.to_numeric(
-            target_data["thermal_gap_mwh"],
-            errors="coerce",
-        ).fillna(0.0).to_numpy(dtype=float),
-        0.0,
-    )
-    gap_severity = np.clip(
-        negative_gap / 6_000.0,
-        0.0,
-        1.0,
-    )
-    effective_weight = base_weight * (
-        1.0 - 0.55 * gap_severity
-    )
-
-    correction = shape_reference - raw
-    # Avoid one calibration step creating unrealistic jumps.
-    correction = np.clip(correction, -45.0, 45.0)
-    calibrated = raw + effective_weight * correction
-    calibrated = np.maximum(calibrated, 0.0)
-
-    diagnostics["seasonal_shape_reference_eur_mwh"] = shape_reference
-    diagnostics["seasonal_shape_factor"] = shape_factor
-    diagnostics["seasonal_shape_weight_pct"] = effective_weight * 100.0
-    diagnostics["seasonal_shape_correction_eur_mwh"] = (
-        calibrated - raw
-    )
-    diagnostics["seasonal_shape_candidate_days"] = candidate_days
-    diagnostics["seasonal_shape_applied"] = (
-        np.abs(calibrated - raw) > 1e-6
-    )
-
-    return calibrated, diagnostics
-
-
-def generate_price_forecast(
-    target_day: date,
-    historical_gap: pd.DataFrame,
-    forecast_gap: pd.DataFrame,
-    token: str,
-) -> dict:
-    historical = historical_gap[
-        ["datetime", "thermal_gap_mwh"]
-    ].copy()
-    prices = load_esios_price_history(
-        historical["datetime"].min().date(),
-        target_day - timedelta(days=1),
-        token,
-    )
+        raise ValueError("No complete comparable gap/price observations.")
+    cols = ["thermal_gap_mwh", "gap_daily_mean", "gap_midday_mean", "gap_solar_vs_evening",
+            "pbf_demand_mwh", "solar_pv_mwh", "wind_mwh", "nuclear_mwh",
+            "mibgas_d1_eur_mwh", "hour_sin", "hour_cos", "doy_sin", "doy_cos", "is_weekend"]
+    cols = [c for c in cols if c in history and c in target_data and history[c].notna().any()]
+    matrix = history[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    scale = np.nanquantile(matrix, .75, axis=0) - np.nanquantile(matrix, .25, axis=0)
+    minimum_scale = np.array([1500.0 if c.endswith("mwh") or c.startswith("gap_") else (8.0 if c == "mibgas_d1_eur_mwh" else .5) for c in cols])
+    scale = np.maximum(np.nan_to_num(scale, nan=1.0), minimum_scale)
+    importance = np.array([3.0 if c == "thermal_gap_mwh" else (0.5 if c.startswith("doy_") else 1.0) for c in cols])
+    prices = history["price_eur_mwh"].to_numpy(float)
+    dates = pd.to_datetime(history["datetime"]).dt.normalize().to_numpy(dtype="datetime64[D]")
+    rows = []
+    for _, target in target_data.iterrows():
+        day = np.datetime64(pd.Timestamp(target["datetime"]).date(), "D")
+        age = (day - dates).astype(int)
+        valid_history = (age >= 1) & (age <= 550)
+        x = pd.to_numeric(target[cols], errors="coerce").to_numpy(float)
+        known = np.isfinite(matrix) & np.isfinite(x)
+        component = np.where(known, ((matrix - x) / scale) ** 2, 0.0)
+        normalizer = (known * importance).sum(axis=1)
+        distance = (component * importance).sum(axis=1) / np.maximum(normalizer, 1e-9)
+        # Missing gas is not a real zero-priced gas observation.
+        if "mibgas_data_available" in history and float(target.get("mibgas_data_available", 0)) > 0:
+            distance += (history["mibgas_data_available"].to_numpy() == 0) * .5
+        distance += age.clip(min=0) / 365.0 * .12
+        distance[~valid_history | (normalizer == 0)] = np.inf
+        ids = np.flatnonzero(np.isfinite(distance))
+        if not len(ids):
+            raise ValueError("No strictly earlier analogue observations.")
+        k = min(int(max_candidates), len(ids))
+        ids = ids[np.argpartition(distance[ids], k - 1)[:k]]
+        d = np.sqrt(distance[ids])
+        w = np.exp(-2.5 * (d - d.min())) * np.exp2(-age[ids] / 120.0)
+        q = _v17_weighted_quantile(prices[ids], [.10, .25, .5, .75, .90], w)
+        rows.append({
+            "conditional_price_p10_eur_mwh": q[0], "conditional_price_p25_eur_mwh": q[1],
+            "conditional_price_median_eur_mwh": q[2], "conditional_price_p75_eur_mwh": q[3],
+            "conditional_price_p90_eur_mwh": q[4],
+            "probability_price_le_zero_pct": float(np.average(prices[ids] <= 0, weights=w) * 100),
+            "probability_price_below_5_pct": float(np.average(prices[ids] <= 5, weights=w) * 100),
+            "similar_gap_observations": k,
+            "similar_gap_effective_observations": float(w.sum() ** 2 / np.sum(w ** 2)),
+            "closest_analogue_distance": float(d.min()),
+        })
+    return pd.DataFrame(rows, index=target_data.index)
+
+
+
+
+
+
+
+
+
+
+
+
+def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
+                            forecast_gap: pd.DataFrame, token: str) -> dict:
+    _v17_day_grid(target_day)
+    historical = historical_gap.copy()
+    historical["datetime"] = pd.to_datetime(historical["datetime"])
+    historical = historical[historical["datetime"].dt.date < target_day].copy()
+    prices = load_esios_price_history(historical["datetime"].min().date(), target_day - timedelta(days=1), token)
+    prices = prices[pd.to_datetime(prices["datetime"]).dt.date < target_day].copy()
     if prices.empty:
-        raise ValueError("No spot-price history returned by ESIOS.")
-
-    gas_actuals, gas_data_message = load_mibgas_gdaes_actuals()
-    gas_price_lookup, gas_source_lookup = build_mibgas_daily_lookup(
-        gas_actuals,
-        historical["datetime"].min().date() - timedelta(days=35),
-        target_day - timedelta(days=1),
-    )
-
-    training = historical.merge(
-        prices,
-        on="datetime",
-        how="inner",
-    )
-    training["date"] = training["datetime"].dt.date
-    training["hour"] = training["datetime"].dt.hour
-
-    price_frame = prices.copy()
-    price_frame["date"] = price_frame["datetime"].dt.date
-    price_frame["hour"] = price_frame["datetime"].dt.hour
-    price_lookup = {
-        (r.date, int(r.hour)): float(r.price_eur_mwh)
-        for r in price_frame.itertuples(index=False)
-        if pd.notna(r.price_eur_mwh)
-    }
-
-    gap_frame = historical.copy()
-    gap_frame["date"] = gap_frame["datetime"].dt.date
-    gap_frame["hour"] = gap_frame["datetime"].dt.hour
-    gap_lookup = {
-        (r.date, int(r.hour)): float(r.thermal_gap_mwh)
-        for r in gap_frame.itertuples(index=False)
-        if pd.notna(r.thermal_gap_mwh)
-    }
-
-    training = _price_features(
-        training,
-        price_lookup,
-        gap_lookup,
-        gas_price_lookup,
-    )
-    training["price_residual"] = (
-        training["price_eur_mwh"]
-        - training["price_anchor"]
-    )
-
-    target = forecast_gap[
-        ["datetime", "thermal_gap_forecast_mwh"]
-    ].rename(
-        columns={
-            "thermal_gap_forecast_mwh": "thermal_gap_mwh"
-        }
-    )
-    target = _price_features(
-        target,
-        price_lookup,
-        gap_lookup,
-        gas_price_lookup,
-    )
-
-    model_data = training.dropna(
-        subset=["price_eur_mwh", "price_residual"] + PRICE_FEATURES
-    ).copy()
-    target_data = target.dropna(
-        subset=PRICE_FEATURES
-    ).copy()
-
-    if len(model_data) < 24 * 120:
-        raise ValueError("Insufficient complete price history.")
-    if len(target_data) < 23:
-        raise ValueError("Incomplete target price anchors.")
-
-    validation_start = (
-        model_data["date_ts"].max()
-        - pd.Timedelta(days=41)
-    )
-    train = model_data[
-        model_data["date_ts"] < validation_start
-    ]
-    validation = model_data[
-        model_data["date_ts"] >= validation_start
-    ]
-
-    if (
-        SKLEARN_AVAILABLE
-        and not train.empty
-        and not validation.empty
-    ):
-        validation_model = HistGradientBoostingRegressor(
-            loss="absolute_error",
-            learning_rate=0.05,
-            max_iter=320,
-            max_leaf_nodes=27,
-            min_samples_leaf=28,
-            l2_regularization=10,
-            random_state=42,
-        )
-        validation_model.fit(
-            train[PRICE_FEATURES],
-            train["price_residual"],
-        )
-        validation_raw = (
-            validation["price_anchor"].to_numpy()
-            + validation_model.predict(
-                validation[PRICE_FEATURES]
-            )
-        )
-
-        final_model = HistGradientBoostingRegressor(
-            loss="absolute_error",
-            learning_rate=0.05,
-            max_iter=320,
-            max_leaf_nodes=27,
-            min_samples_leaf=28,
-            l2_regularization=10,
-            random_state=42,
-        )
-        final_model.fit(
-            model_data[PRICE_FEATURES],
-            model_data["price_residual"],
-        )
-        target_raw = (
-            target_data["price_anchor"].to_numpy()
-            + final_model.predict(
-                target_data[PRICE_FEATURES]
-            )
-        )
-        model_name = (
-            "Thermal-gap residual model around D-1 / D-7 anchor"
-        )
-    else:
-        validation_raw = validation[
-            "price_anchor"
-        ].to_numpy()
-        target_raw = target_data[
-            "price_anchor"
-        ].to_numpy()
-        model_name = "D-1 / D-7 anchor fallback"
-
-    # Estimate systematic recent hourly model bias from the chronological
-    # validation period. Positive values mean the model overpredicted.
-    validation_error = pd.Series(
-        validation_raw - validation["price_eur_mwh"].to_numpy(dtype=float),
-        index=validation.index,
-    )
-    hourly_bias_correction = (
-        pd.DataFrame(
-            {
-                "hour": validation["hour"].to_numpy(),
-                "error": validation_error.to_numpy(),
-            }
-        )
-        .groupby("hour")["error"]
-        .median()
-    )
-
-    # First calibrate against historically similar thermal-gap observations.
-    validation_empirical_blend, validation_empirical = (
-        blend_model_with_empirical_low_gap_reference(
-            validation_raw,
-            train if not train.empty else model_data,
-            validation,
-        )
-    )
-    target_empirical_blend, target_empirical = (
-        blend_model_with_empirical_low_gap_reference(
-            target_raw,
-            model_data,
-            target_data,
-        )
-    )
-
-    # Then constrain unjustified deviations from D-1, D-7 and the recent
-    # same-hour profile. This specifically controls evening/night overshoots.
-    validation_final, validation_guardrails = recent_price_guardrails(
-        validation_empirical_blend,
-        validation,
-        validation_empirical,
-        hourly_bias_correction=None,
-    )
-    target_final, target_guardrails = recent_price_guardrails(
-        target_empirical_blend,
-        target_data,
-        target_empirical,
-        hourly_bias_correction=hourly_bias_correction,
-    )
-
-    # A negative gap is a strong low-price signal, but not an automatic
-    # zero-price condition. Apply a soft dynamic cap after the main model,
-    # empirical blend and recent-reference guardrails.
-    validation_final, validation_negative_gap = (
-        apply_negative_gap_soft_calibration(
-            validation_final,
-            validation,
-            validation_empirical,
-        )
-    )
-    target_final, target_negative_gap = (
-        apply_negative_gap_soft_calibration(
-            target_final,
-            target_data,
-            target_empirical,
-        )
-    )
-
-    # Finally calibrate the 24-hour shape using comparable seasonal days.
-    # This preserves the target baseload while correcting excessive winter
-    # troughs and flattened summer evening ramps.
-    validation_final, validation_seasonal_shape = (
-        apply_seasonal_intraday_shape_calibration(
-            validation_final,
-            train if not train.empty else model_data,
-            validation,
-        )
-    )
-    target_final, target_seasonal_shape = (
-        apply_seasonal_intraday_shape_calibration(
-            target_final,
-            model_data,
-            target_data,
-        )
-    )
-
-    cap = model_data["price_eur_mwh"].quantile(0.997)
-    if pd.notna(cap):
-        target_final = np.minimum(
-            target_final,
-            max(float(cap) * 1.20, 250),
-        )
-
-    output = target_data[
-        [
-            "datetime",
-            "date",
-            "hour",
-            "thermal_gap_mwh",
-            "price_anchor",
-            "price_lag_1d",
-            "price_lag_7d",
-            "same_hour_price_4w",
-            "mibgas_d1_eur_mwh",
-            "mibgas_d2_eur_mwh",
-            "mibgas_d7_eur_mwh",
-            "mibgas_7d_avg_eur_mwh",
-            "mibgas_change_d1_eur_mwh",
-            "mibgas_change_vs_7d_eur_mwh",
-            "mibgas_data_available",
-            "mibgas_x_positive_gap",
-        ]
-    ].copy()
-    output["forecast_price_eur_mwh"] = target_final
-    output["raw_model_price_eur_mwh"] = target_raw
-    output["negative_thermal_gap_flag"] = (
-        output["thermal_gap_mwh"] <= 0
-    )
-
-    if target_empirical is not None and not target_empirical.empty:
-        for column in target_empirical.columns:
-            output[column] = target_empirical[column].to_numpy()
-
-    if target_guardrails is not None and not target_guardrails.empty:
-        for column in target_guardrails.columns:
-            output[column] = target_guardrails[column].to_numpy()
-
-    if (
-        target_negative_gap is not None
-        and not target_negative_gap.empty
-    ):
-        for column in target_negative_gap.columns:
-            output[column] = (
-                target_negative_gap[column].to_numpy()
-            )
-
-    if (
-        target_seasonal_shape is not None
-        and not target_seasonal_shape.empty
-    ):
-        for column in target_seasonal_shape.columns:
-            output[column] = (
-                target_seasonal_shape[column].to_numpy()
-            )
-
+        raise ValueError("No strictly earlier spot-price history.")
+    gas_actuals, gas_message = load_mibgas_gdaes_actuals()
+    gas_lookup, gas_source = build_mibgas_daily_lookup(gas_actuals,
+        historical["datetime"].min().date() - timedelta(days=35), target_day - timedelta(days=1))
+    price_lookup = _hourly_lookup(prices, "price_eur_mwh")
+    gap_lookup = _hourly_lookup(historical, "thermal_gap_mwh")
+    training = _price_features(historical.merge(prices, on="datetime", how="inner"), price_lookup, gap_lookup, gas_lookup)
+    target_frame = forecast_gap.copy()
+    target_frame["thermal_gap_mwh"] = target_frame["thermal_gap_forecast_mwh"]
+    target = _price_features(target_frame, price_lookup, gap_lookup, gas_lookup)
+    training = training.dropna(subset=["price_eur_mwh", "price_anchor", "thermal_gap_mwh"]).reset_index(drop=True)
+    target = target.reset_index(drop=True)
+    if len(training) < 24 * 120:
+        raise ValueError("Fewer than 120 complete days for the conditional price model.")
+    if len(target) != 24 or target[["price_anchor", "thermal_gap_mwh"]].isna().any().any():
+        raise ValueError("Incomplete target price anchors or gaps.")
+    dates = sorted(training["date"].unique())
+    cal_start = dates[-(PRICE_CALIBRATION_DAYS + PRICE_VALIDATION_DAYS)]
+    val_start = dates[-PRICE_VALIDATION_DAYS]
+    before_cal = training[training["date"] < cal_start].reset_index(drop=True)
+    calibration = training[(training["date"] >= cal_start) & (training["date"] < val_start)].reset_index(drop=True)
+    validation = training[training["date"] >= val_start].reset_index(drop=True)
+    calibration_candidates, _ = _v17_candidate_price_forecasts(before_cal, calibration)
+    before_val = training[training["date"] < val_start].reset_index(drop=True)
+    validation_candidates, _ = _v17_candidate_price_forecasts(before_val, validation)
+    candidate_names = calibration_candidates.columns.tolist()
+    validation_candidates = validation_candidates[candidate_names]
+    pool_frame, pool_candidates = calibration.copy(), calibration_candidates.copy()
+    validation_prediction = pd.Series(index=validation.index, dtype=float)
+    # Prequential meta-selection: each validation day's weights see only earlier
+    # dates. The base estimators are frozen at the start of the validation block.
+    for day in sorted(validation["date"].unique()):
+        mask = validation["date"] == day
+        cutoff = day - timedelta(days=PRICE_CALIBRATION_DAYS)
+        use = (pool_frame["date"] < day) & (pool_frame["date"] >= cutoff)
+        weights = _v17_select_price_weights(pool_frame.loc[use].reset_index(drop=True), pool_candidates.loc[use].reset_index(drop=True))
+        validation_prediction.loc[mask] = validation_candidates.loc[mask].to_numpy() @ weights
+        pool_frame = pd.concat([pool_frame, validation.loc[mask]], ignore_index=True)
+        pool_candidates = pd.concat([pool_candidates, validation_candidates.loc[mask]], ignore_index=True)
+    use = pool_frame["date"] >= target_day - timedelta(days=PRICE_CALIBRATION_DAYS + 2)
+    if use.sum() < 24 * 7:
+        use = pd.Series(True, index=pool_frame.index)
+    weights = _v17_select_price_weights(pool_frame.loc[use].reset_index(drop=True), pool_candidates.loc[use].reset_index(drop=True))
+    target_candidates, empirical = _v17_candidate_price_forecasts(training, target)
+    target_candidates = target_candidates[candidate_names]
+    final = target_candidates.to_numpy() @ weights
+    if not np.isfinite(final).all():
+        raise ValueError("Price model produced non-finite outputs.")
+    output_columns = ["datetime", "date", "hour", "thermal_gap_mwh", "price_anchor", "price_lag_1d", "price_lag_7d", "same_hour_price_4w",
+                      "mibgas_d1_eur_mwh", "mibgas_d2_eur_mwh", "mibgas_d7_eur_mwh", "mibgas_7d_avg_eur_mwh",
+                      "mibgas_change_d1_eur_mwh", "mibgas_change_vs_7d_eur_mwh", "mibgas_data_available", "mibgas_x_positive_gap"]
+    output = target[output_columns].copy()
+    output["forecast_price_eur_mwh"] = final
+    output["raw_model_price_eur_mwh"] = target_candidates.get("Direct-price ML", target_candidates["Similar-gap"]).to_numpy()
+    output["fundamental_price_eur_mwh"] = target_candidates.get("Fundamentals ML", target_candidates["Similar-gap"]).to_numpy()
+    output["residual_model_price_eur_mwh"] = target_candidates.get("Residual ML", target_candidates["Anchor"]).to_numpy()
+    output["negative_thermal_gap_flag"] = output["thermal_gap_mwh"] < 0
+    output["guardrail_applied"] = False  # retained for old exporters, no price guardrails used
+    output["price_upper_guardrail_eur_mwh"] = np.nan
+    output["engine_version"] = FORECAST_ENGINE_VERSION
+    for c in empirical:
+        output[c] = empirical[c].to_numpy()
+    errors = validation["price_eur_mwh"].to_numpy() - validation_prediction.to_numpy()
+    residuals = pd.DataFrame({"hour": validation["hour"], "error": errors})
+    hourly = residuals.groupby("hour")["error"].quantile([.10, .90]).unstack()
+    output["conditional_error_p10_eur_mwh"] = output["hour"].map(hourly[.10]).fillna(np.quantile(errors, .10))
+    output["conditional_error_p90_eur_mwh"] = output["hour"].map(hourly[.90]).fillna(np.quantile(errors, .90))
+    output["forecast_p10_eur_mwh"] = final + output["conditional_error_p10_eur_mwh"]
+    output["forecast_p90_eur_mwh"] = final + output["conditional_error_p90_eur_mwh"]
+    # Enclose the point forecast. These are indicative conditional residual bands,
+    # not calibrated probabilities for the full demand/weather forecasting chain.
+    output["forecast_p10_eur_mwh"] = np.minimum(output["forecast_p10_eur_mwh"], final)
+    output["forecast_p90_eur_mwh"] = np.maximum(output["forecast_p90_eur_mwh"], final)
+    score_rows = []
+    for name, weight in zip(candidate_names, weights):
+        score_rows.append({"Candidate": name, "Final weight (%)": 100 * float(weight),
+            "Conditional validation MAE (EUR/MWh)": float(np.mean(np.abs(validation_candidates[name].to_numpy() - validation["price_eur_mwh"].to_numpy()))),
+            "Target baseload (EUR/MWh)": float(target_candidates[name].mean()),
+            "Target TB4 (EUR/MWh)": forecast_tb4(target_candidates[name])})
+    vbacktest = validation[["datetime", "date", "hour", "price_eur_mwh"]].copy()
+    vbacktest["model_forecast_price_eur_mwh"] = validation_prediction.to_numpy()
+    gas_available = int(target["mibgas_data_available"].max()) > 0
     return {
-        "forecast": output.sort_values(
-            "datetime"
-        ).reset_index(drop=True),
-        "model_stats": forecast_metrics(
-            validation["price_eur_mwh"],
-            validation_final,
-        ),
-        "anchor_stats": forecast_metrics(
-            validation["price_eur_mwh"],
-            validation["price_anchor"],
-        ),
-        "model_name": (
-            model_name
-            + " + MIBGAS GDAES D-1"
-            if int(target_data["mibgas_data_available"].max()) > 0
-            else model_name + " (MIBGAS unavailable)"
-        ),
-        "training_rows": len(model_data),
-        "gas_data_message": gas_data_message,
-        "gas_delivery_day_used": target_day - timedelta(days=1),
-        "gas_price_d1_eur_mwh": (
-            float(target_data["mibgas_d1_eur_mwh"].iloc[0])
-            if int(target_data["mibgas_data_available"].max()) > 0
-            else np.nan
-        ),
-        "gas_price_7d_avg_eur_mwh": (
-            float(target_data["mibgas_7d_avg_eur_mwh"].iloc[0])
-            if int(target_data["mibgas_data_available"].max()) > 0
-            else np.nan
-        ),
-        "gas_price_change_d1_eur_mwh": (
-            float(target_data["mibgas_change_d1_eur_mwh"].iloc[0])
-            if int(target_data["mibgas_data_available"].max()) > 0
-            else np.nan
-        ),
-        "gas_source": gas_source_lookup.get(
-            target_day - timedelta(days=1),
-            "Unavailable",
-        ),
+        "forecast": output, "model_stats": forecast_metrics(validation["price_eur_mwh"], validation_prediction),
+        "anchor_stats": forecast_metrics(validation["price_eur_mwh"], validation["price_anchor"]),
+        "model_name": "V17 chronological sparse ensemble: direct, fundamental, residual and gap analogues",
+        "training_rows": len(training), "candidate_scores": pd.DataFrame(score_rows),
+        "conditional_validation": vbacktest,
+        "validation_scope": "Conditional on historical observed PBF components; Step 6 is the operational chain backtest. Source publication vintages are not fully audited.",
+        "gas_data_message": gas_message, "gas_delivery_day_used": target_day - timedelta(days=1),
+        "gas_price_d1_eur_mwh": float(target["mibgas_d1_eur_mwh"].iloc[0]) if gas_available else np.nan,
+        "gas_price_7d_avg_eur_mwh": float(target["mibgas_7d_avg_eur_mwh"].iloc[0]) if gas_available else np.nan,
+        "gas_price_change_d1_eur_mwh": float(target["mibgas_change_d1_eur_mwh"].iloc[0]) if gas_available else np.nan,
+        "gas_source": gas_source.get(target_day - timedelta(days=1), "Unavailable"),
     }
 
 
-def build_price_forecast_chart(
-    price_forecast: pd.DataFrame,
-):
-    long = pd.concat(
-        [
-            price_forecast[
-                ["datetime", "forecast_price_eur_mwh"]
-            ]
-            .rename(
-                columns={
-                    "forecast_price_eur_mwh": "price"
-                }
-            )
-            .assign(series="DA price forecast"),
-            price_forecast[
-                ["datetime", "price_lag_1d"]
-            ]
-            .rename(columns={"price_lag_1d": "price"})
-            .assign(series="Previous day"),
-            price_forecast[
-                ["datetime", "price_lag_7d"]
-            ]
-            .rename(columns={"price_lag_7d": "price"})
-            .assign(series="Same weekday previous week"),
-            price_forecast[
-                ["datetime", "price_anchor"]
-            ]
-            .rename(columns={"price_anchor": "price"})
-            .assign(series="Absolute-price anchor"),
-            price_forecast[
-                ["datetime", "conditional_price_median_eur_mwh"]
-            ]
-            .rename(
-                columns={
-                    "conditional_price_median_eur_mwh": "price"
-                }
-            )
-            .assign(series="Historical similar-gap median"),
-            price_forecast[
-                ["datetime", "price_upper_guardrail_eur_mwh"]
-            ]
-            .rename(
-                columns={
-                    "price_upper_guardrail_eur_mwh": "price"
-                }
-            )
-            .assign(series="Dynamic upper guardrail"),
-        ],
-        ignore_index=True,
+def build_price_forecast_chart(price_forecast: pd.DataFrame):
+    specs = {"forecast_price_eur_mwh": "Final forecast", "fundamental_price_eur_mwh": "Fundamentals model",
+             "conditional_price_median_eur_mwh": "Similar-gap median", "price_anchor": "Price anchor",
+             "price_lag_1d": "Previous day", "price_lag_7d": "Same weekday previous week"}
+    frames = [price_forecast[["datetime", c]].rename(columns={c: "price"}).assign(series=label)
+              for c, label in specs.items() if c in price_forecast]
+    plot = pd.concat(frames, ignore_index=True)
+    lines = alt.Chart(plot).mark_line(point=True, strokeWidth=2.7).encode(
+        x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
+        y=alt.Y("price:Q", title="Price (EUR/MWh)", scale=alt.Scale(zero=False)),
+        color=alt.Color("series:N", title="Price series", scale=alt.Scale(
+            domain=list(specs.values()), range=["#111827", "#0F766E", "#A855F7", "#64748B", "#F97316", "#60A5FA"])),
+        strokeDash=alt.StrokeDash("series:N", legend=None),
+        tooltip=[alt.Tooltip("datetime:T", format="%d-%m-%Y %H:%M"), "series:N", alt.Tooltip("price:Q", format=",.2f")],
     )
-
-    domain = [
-        "DA price forecast",
-        "Previous day",
-        "Same weekday previous week",
-        "Absolute-price anchor",
-        "Historical similar-gap median",
-        "Dynamic upper guardrail",
-    ]
-
-    chart = (
-        alt.Chart(long)
-        .mark_line(point=True, strokeWidth=3)
-        .encode(
-            x=alt.X(
-                "datetime:T",
-                title=None,
-                axis=alt.Axis(format="%H:%M", labelAngle=0),
-            ),
-            y=alt.Y(
-                "price:Q",
-                title="Price (€/MWh)",
-                scale=alt.Scale(zero=True),
-            ),
-            color=alt.Color(
-                "series:N",
-                title="Price series",
-                scale=alt.Scale(
-                    domain=domain,
-                    range=[
-                        "#111827",
-                        "#F97316",
-                        "#60A5FA",
-                        "#64748B",
-                        "#A855F7",
-                        "#DC2626",
-                    ],
-                ),
-                legend=alt.Legend(
-                    orient="top",
-                    direction="horizontal",
-                    columns=3,
-                    labelLimit=320,
-                ),
-            ),
-            strokeDash=alt.StrokeDash(
-                "series:N",
-                legend=None,
-                scale=alt.Scale(
-                    domain=domain,
-                    range=[
-                        [1, 0],
-                        [5, 3],
-                        [2, 2],
-                        [8, 3],
-                        [3, 2],
-                        [10, 4],
-                    ],
-                ),
-            ),
-            tooltip=[
-                alt.Tooltip(
-                    "datetime:T",
-                    title="Hour",
-                    format="%d-%m-%Y %H:%M",
-                ),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip(
-                    "price:Q",
-                    title="€/MWh",
-                    format=",.2f",
-                ),
-            ],
-        )
-    )
-    return configure_chart(chart, height=340)
+    band = alt.Chart(price_forecast).mark_area(opacity=.12, color=CORP_GREEN).encode(
+        x="datetime:T", y="forecast_p10_eur_mwh:Q", y2="forecast_p90_eur_mwh:Q")
+    return configure_chart(alt.layer(band, lines), height=350)
 
 
 def forecast_tb4(prices: pd.Series) -> float:
@@ -6323,7 +4834,7 @@ def build_forecast_vs_real_price_chart(
 
 
 # =========================================================
-# STEP 5 — BESS VALUE OF THE PRICE FORECAST
+# STEP 5 - BESS VALUE OF THE PRICE FORECAST
 # =========================================================
 BESS_POWER_MW = 1.0
 BESS_ENERGY_MWH = 4.0
@@ -6636,7 +5147,7 @@ def settle_bess_schedule_on_actual_prices(
 
 
 BESS_PRICE_CURVE_BENCHMARKS = {
-    "Final forecast — black": "forecast_price_eur_mwh",
+    "Final forecast - black": "forecast_price_eur_mwh",
     "Previous day": "price_lag_1d",
     "Previous week": "price_lag_7d",
     "Price anchor": "price_anchor",
@@ -6644,7 +5155,7 @@ BESS_PRICE_CURVE_BENCHMARKS = {
 }
 
 BESS_PRICE_CURVE_SHORT_LABELS = {
-    "Final forecast — black": "Final forecast",
+    "Final forecast - black": "Final forecast",
     "Previous day": "D-1",
     "Previous week": "D-7",
     "Price anchor": "Price anchor",
@@ -6652,7 +5163,7 @@ BESS_PRICE_CURVE_SHORT_LABELS = {
 }
 
 BESS_PRICE_CURVE_SLUGS = {
-    "Final forecast — black": "final_forecast",
+    "Final forecast - black": "final_forecast",
     "Previous day": "previous_day",
     "Previous week": "previous_week",
     "Price anchor": "price_anchor",
@@ -7201,7 +5712,7 @@ def build_bess_dispatch_comparison_chart(
                             actual_lookup.loc[timestamp]
                         ),
                         "strategy_action": (
-                            f"{strategy} — {action}"
+                            f"{strategy} - {action}"
                         ),
                     }
                 )
@@ -7212,10 +5723,10 @@ def build_bess_dispatch_comparison_chart(
         return configure_chart(lines, height=380)
 
     marker_domain = [
-        "Real-price optimum — Charge",
-        "Real-price optimum — Discharge",
-        "Forecast-selected — Charge",
-        "Forecast-selected — Discharge",
+        "Real-price optimum - Charge",
+        "Real-price optimum - Discharge",
+        "Forecast-selected - Charge",
+        "Forecast-selected - Discharge",
     ]
 
     markers = (
@@ -7455,8 +5966,8 @@ def build_bess_schedule_table(
 # =========================================================
 # YTD DAILY WALK-FORWARD BACKTEST
 # =========================================================
-YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v16_2"
-YTD_BACKTEST_CHECKPOINT_VERSION = "v16_2"
+YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v17_1"
+YTD_BACKTEST_CHECKPOINT_VERSION = "v17_1_regime_validation"
 
 
 def _safe_ratio(
@@ -7490,6 +6001,7 @@ def run_one_walk_forward_backtest_day(
     demand_source: str,
     technologies_tuple: tuple[str, ...],
     _token: str,
+    engine_version: str = FORECAST_ENGINE_VERSION,
 ) -> dict:
     """
     Recreate one complete operational D-1 forecast and settle it against the
@@ -8230,7 +6742,7 @@ def build_monthly_bess_revenue_chart(
 # =========================================================
 # APP
 # =========================================================
-st.title("Demand, PBF thermal gap and DA price — forecast test")
+st.title("Demand, PBF thermal gap and DA price - forecast test")
 
 st.caption(
     "Daily peninsular electricity demand from REData, historical temperature "
@@ -8407,14 +6919,13 @@ else:
 # =========================================================
 # NEXT-DAY DEMAND FORECAST
 # =========================================================
-section_header("Step 1 — Day-ahead peninsular demand forecast")
+section_header("Step 1 - Day-ahead peninsular demand forecast")
 
 st.caption(
-    "Select tomorrow for a live forecast or any historical date from 2024 "
-    "for an operational backtest. Historical runs use the weather forecast "
-    "issued 24 hours before the selected day; demand is cut off at D-2, "
-    "PBF and prices at D-1, so realised target-day information is not used "
-    "until the Step 4 comparison."
+    "Weather uses a fixed 00 UTC D-1 model run, not the latest live run. "
+    "Demand history ends at D-2, PBF and price labels at D-1. Historical "
+    "publication/revision timestamps of the market series are not fully audited. "
+    "The target-day clearing price is used only for subsequent evaluation."
 )
 
 fc1, fc2, fc3, fc4 = st.columns([1.0, 1.0, 1.1, 1.35])
@@ -8422,7 +6933,7 @@ with fc1:
     forecast_target_day = st.date_input(
         "Forecast target day",
         value=date.today() + timedelta(days=1),
-        min_value=date(2024, 2, 1),
+        min_value=date(2024, 3, 15),
         max_value=date.today() + timedelta(days=1),
         help=(
             "Choose a historical date to recreate the forecast as if the "
@@ -8455,9 +6966,9 @@ with fc4:
     downstream_demand_source = st.selectbox(
         "Demand used for thermal gap",
         [
-            "Model forecast — dark green",
-            "REE official D+1 forecast — bright green",
-            "Previous week + recent trend — orange",
+            "Model forecast - dark green",
+            "REE official D+1 forecast - bright green",
+            "Previous week + recent trend - orange",
         ],
         index=0,
         key="forecast_downstream_demand_source",
@@ -8478,11 +6989,7 @@ forecast_generation_technologies = st.multiselect(
 
 forecast_as_of_day = forecast_target_day - timedelta(days=1)
 forecast_is_historical = forecast_target_day <= date.today()
-weather_input_label = (
-    "Archived D-1 forecast (_previous_day1)"
-    if forecast_is_historical
-    else "Live Open-Meteo Best Match"
-)
+weather_input_label = f"Fixed {FIXED_WEATHER_MODEL} run: {forecast_as_of_day} 00 UTC"
 
 st.markdown(
     f"""
@@ -8511,13 +7018,14 @@ if st.button(
     use_container_width=True,
 ):
     try:
+        st.session_state.pop("day_ahead_result_v17_1_regime_validation", None)
         if not forecast_generation_technologies:
             raise ValueError(
                 "Select at least one PBF generation technology."
             )
 
         with st.spinner(
-            "Step 1/3 — training tomorrow's demand forecast..."
+            "Step 1/3 - training tomorrow's demand forecast..."
         ):
             demand_result = generate_day_ahead_forecast(
                 forecast_target_day,
@@ -8543,7 +7051,7 @@ if st.button(
             forecast_for_market["selected_demand_mw"] = (
                 forecast_for_market["forecast_mw"]
             )
-            demand_source_label = "Model forecast — dark green"
+            demand_source_label = "Model forecast - dark green"
         elif downstream_demand_source.startswith("REE"):
             if (
                 not ree_demand_result["available"]
@@ -8560,7 +7068,7 @@ if st.button(
                 forecast_for_market["ree_forecast_mw"]
             )
             demand_source_label = (
-                "REE official D+1 forecast — bright green"
+                "REE official D+1 forecast - bright green"
             )
         else:
             forecast_for_market["selected_demand_mw"] = (
@@ -8569,11 +7077,11 @@ if st.button(
                 ]
             )
             demand_source_label = (
-                "Previous week + recent trend — orange"
+                "Previous week + recent trend - orange"
             )
 
         with st.spinner(
-            "Step 2/3 — forecasting PBF generation and thermal gap..."
+            "Step 2/3 - forecasting PBF generation and thermal gap..."
         ):
             thermal_result = generate_thermal_gap_forecast(
                 forecast_target_day,
@@ -8586,7 +7094,7 @@ if st.button(
             )
 
         with st.spinner(
-            "Step 3/3 — forecasting tomorrow's DA spot-price curve..."
+            "Step 3/3 - forecasting tomorrow's DA spot-price curve..."
         ):
             price_result = generate_price_forecast(
                 forecast_target_day,
@@ -8602,7 +7110,7 @@ if st.button(
             token,
         )
 
-        st.session_state["day_ahead_result_v16_7_seasonal_price_shape"] = {
+        st.session_state["day_ahead_result_v17_1_regime_validation"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -8623,8 +7131,10 @@ if st.button(
     except Exception as exc:
         st.error(f"Day-ahead forecast failed: {exc}")
 
-forecast_result = st.session_state.get("day_ahead_result_v16_7_seasonal_price_shape")
+forecast_result = st.session_state.get("day_ahead_result_v17_1_regime_validation")
 if forecast_result:
+    if forecast_result.get("target_day") != forecast_target_day:
+        st.info(f"Showing the last successful forecast for {forecast_result.get('target_day')}. Press Generate to run the selected date.")
     forecast_df = forecast_result["forecast"]
     peak = forecast_df.loc[forecast_df["forecast_mw"].idxmax()]
     minimum = forecast_df.loc[forecast_df["forecast_mw"].idxmin()]
@@ -8736,11 +7246,11 @@ if forecast_result:
     price_result = forecast_result.get("price_result")
 
     # =====================================================
-    # STEP 2 — PBF generation and forecast thermal gap
+    # STEP 2 - PBF generation and forecast thermal gap
     # =====================================================
     if thermal_result is not None:
         section_header(
-            "Step 2 — Forecast PBF generation and thermal gap"
+            "Step 2 - Forecast PBF generation and thermal gap"
         )
 
         thermal_forecast = thermal_result["forecast"]
@@ -8754,7 +7264,9 @@ if forecast_result:
             "and price model use the dashed green DA-residual demand, not the "
             "solid total-demand line. No fixed 8.7/9 GW self-consumption "
             "plant is added to or deducted from this gap; the explicit "
-            "self-consumption adjustment is 0 MW. Base total-demand source: "
+            "self-consumption adjustment is 0 MW. PBF demand is the physical "
+            "forecast plus a weekday/hour historical perimeter offset, not a "
+            "blend with yesterday's PBF level. Base physical-demand source: "
             f"{forecast_result.get('demand_source_label', 'Model forecast')}."
         )
 
@@ -8801,12 +7313,12 @@ if forecast_result:
                 f"{thermal_forecast['da_demand_share_of_total_pct'].mean():,.1f}%"
                 if "da_demand_share_of_total_pct"
                 in thermal_forecast.columns
-                else "—"
+                else "-"
             ),
             help=(
                 "Share of total PBF demand remaining after deducting the "
                 "bilateral programme. This explains why DA residual demand "
-                "can be materially below physical system demand."
+                "can be substantially below physical system demand."
             ),
         )
         tg8.metric(
@@ -8815,7 +7327,7 @@ if forecast_result:
                 f"{thermal_forecast['hydro_ugh_forecast_mwh'].mean():,.0f} MW"
                 if "hydro_ugh_forecast_mwh"
                 in thermal_forecast.columns
-                else "—"
+                else "-"
             ),
             help=(
                 "Non-bilateral Hydro UGH is shown separately because it is "
@@ -8849,7 +7361,7 @@ if forecast_result:
 
             st.info(
                 "D-1 calibration check: during solar hours the supplied "
-                f"DA-residual thermal gap remained positive, with a minimum of "
+                f"DA-residual thermal gap had a minimum of "
                 f"{d1_min_gap:,.0f} MW"
                 + (
                     f", while the minimum DA price was "
@@ -8857,7 +7369,7 @@ if forecast_result:
                     if pd.notna(d1_min_price)
                     else "."
                 )
-                + " This profile is now used as the latest calibration anchor."
+                + " This is a diagnostic reference, not a constraint on tomorrow's prices."
             )
 
         st.caption(
@@ -8888,11 +7400,11 @@ if forecast_result:
             )
 
     # =====================================================
-    # STEP 3 — forecast DA spot price
+    # STEP 3 - forecast DA spot price
     # =====================================================
     if price_result is not None:
         section_header(
-            "Step 3 — Forecast day-ahead spot prices"
+            "Step 3 - Forecast day-ahead spot prices"
         )
 
         price_forecast = price_result["forecast"]
@@ -8931,7 +7443,7 @@ if forecast_result:
             (
                 f"{negative_gap_average_price:,.2f} €/MWh"
                 if negative_gap_hours > 0
-                else "—"
+                else "-"
             ),
             delta=(
                 f"{negative_gap_hours} h"
@@ -8945,8 +7457,8 @@ if forecast_result:
             f"{forecast_tb4(forecast_prices):,.2f} €/MWh",
         )
         p6.metric(
-            "Guardrail-limited hours",
-            f"{int(price_forecast['guardrail_applied'].sum())} h",
+            "Forecast hours <= 5 EUR/MWh",
+            f"{int((price_forecast['forecast_price_eur_mwh'] <= 5.0).sum())} h",
         )
 
         gas_price_d1 = price_result.get(
@@ -9003,26 +7515,20 @@ if forecast_result:
 
         st.caption(
             f"Price model: {price_result['model_name']}. "
-            f"Backtest MAPE: {price_result['model_stats']['mape']:,.2f}% "
-            f"versus {price_result['anchor_stats']['mape']:,.2f}% for the "
-            "unadjusted price anchor. Absolute values are anchored in the "
-            "previous day, the same weekday one week earlier and the recent "
-            "same-hour profile. Similar-gap observations are filtered by "
-            "season and day type, preventing winter hours from being calibrated "
-            "against summer solar-surplus regimes. A negative gap applies only "
-            "a soft dynamic cap, and a final normalised seasonal shape "
-            "calibration preserves baseload while correcting winter troughs "
-            "and summer evening ramps. No negative gap is automatically forced "
-            "to zero. "
-            "Positive model residuals are also shrunk—especially "
-            "during evening and night hours—and cannot exceed all recent "
-            "references by a material amount unless the forecast thermal gap "
-            "is clearly higher than D-1 and D-7. The red dashed line shows the "
-            "dynamic upper guardrail. The model also uses the MIBGAS "
-            "GDAES_D+1 Reference Price for gas delivery D-1, its recent "
-            "changes and a gas × thermal-gap interaction. "
-            f"Gas source: {price_result.get('gas_source', 'Unavailable')}."
+            f"Conditional validation MAE: {price_result['model_stats']['mae']:,.2f} EUR/MWh "
+            f"versus {price_result['anchor_stats']['mae']:,.2f} for the anchor. "
+            "Candidate weights are selected using earlier, out-of-sample predictions. "
+            "No seasonal shape, zero-price floor or negative-gap cap is imposed. "
+            "The shaded band is indicative conditional residual P10-P90, not a "
+            "fully calibrated interval including input-forecast uncertainty. "
+            f"{price_result.get('validation_scope', '')}"
         )
+        with st.expander("V17 candidate weights and conditional validation"):
+            st.dataframe(price_result.get("candidate_scores", pd.DataFrame()), use_container_width=True, hide_index=True)
+            validation_export = price_result.get("conditional_validation", pd.DataFrame())
+            st.download_button("Download conditional price validation CSV", validation_export.to_csv(index=False).encode("utf-8"),
+                               file_name="v17_conditional_price_validation.csv", mime="text/csv")
+
 
         st.caption(
             price_result.get(
@@ -9032,7 +7538,7 @@ if forecast_result:
         )
 
         # =================================================
-        # STEP 4 — compare against realised prices
+        # STEP 4 - compare against realised prices
         # =================================================
         realised_prices = forecast_result.get(
             "realised_prices",
@@ -9064,7 +7570,7 @@ if forecast_result:
 
             if not comparison.empty:
                 section_header(
-                    "Step 4 — Forecast versus realised DA prices"
+                    "Step 4 - Forecast versus realised DA prices"
                 )
 
                 real_metrics = price_realization_metrics(
@@ -9113,10 +7619,10 @@ if forecast_result:
                     )
 
                 st.caption(
-                    "The forecast was generated using only information "
-                    f"available by {forecast_result.get('as_of_day'):%d/%m/%Y}. "
-                    "Realised target-day prices are loaded afterwards and are "
-                    "used exclusively for this comparison."
+                    f"Forecast reference date: {forecast_result.get('as_of_day'):%d/%m/%Y}. "
+                    "Market training labels exclude the delivery date; weather uses the fixed 00 UTC D-1 run. "
+                    "Source publication vintages are not fully audited. Target-day clearing prices are "
+                    "loaded separately for evaluation, even when the market has already cleared."
                 )
 
                 with st.expander(
@@ -9143,10 +7649,10 @@ if forecast_result:
 
 
                 # =============================================
-                # STEP 5 — BESS revenue value of the forecast
+                # STEP 5 - BESS revenue value of the forecast
                 # =============================================
                 section_header(
-                    "Step 5 — BESS revenue captured by the price forecast"
+                    "Step 5 - BESS revenue captured by the price forecast"
                 )
 
                 actual_perfect_schedule = (
@@ -9295,7 +7801,7 @@ if forecast_result:
                         (
                             f"{revenue_capture:,.1f}%"
                             if pd.notna(revenue_capture)
-                            else "—"
+                            else "-"
                         ),
                         delta=(
                             f"{-opportunity_loss:,.2f} "
@@ -9330,8 +7836,8 @@ if forecast_result:
                             "Each curve independently selects its four "
                             "charge hours and four later discharge hours. "
                             "Every schedule is then settled against the same "
-                            "real OMIE prices. The dynamic upper guardrail is "
-                            "not included because it is a cap, not a forecast."
+                            "real OMIE prices. The hourly TB4 benchmark and chronological "
+                            "BESS schedule are different metrics."
                         )
 
                         benchmark_display_order = [
@@ -9654,7 +8160,7 @@ if forecast_result:
                     )
         else:
             section_header(
-                "Step 4 — Forecast versus realised DA prices"
+                "Step 4 - Forecast versus realised DA prices"
             )
             st.info(
                 "Real DA prices are not available yet for the selected "
@@ -9662,51 +8168,9 @@ if forecast_result:
                 "publishes them and the forecast is rerun."
             )
 
-        requested_price_output_columns = [
-            "datetime",
-            "forecast_price_eur_mwh",
-            "price_anchor",
-            "price_lag_1d",
-            "price_lag_7d",
-            "mibgas_d1_eur_mwh",
-            "mibgas_d2_eur_mwh",
-            "mibgas_d7_eur_mwh",
-            "mibgas_7d_avg_eur_mwh",
-            "mibgas_change_d1_eur_mwh",
-            "mibgas_change_vs_7d_eur_mwh",
-            "mibgas_data_available",
-            "mibgas_x_positive_gap",
-            "negative_thermal_gap_flag",
-            "conditional_price_median_eur_mwh",
-            "conditional_price_p25_eur_mwh",
-            "conditional_price_p75_eur_mwh",
-            "probability_price_le_zero_pct",
-            "probability_price_below_5_pct",
-            "low_gap_blend_weight",
-            "similar_gap_observations",
-            "hourly_bias_correction_eur_mwh",
-            "model_residual_before_guardrail_eur_mwh",
-            "residual_shrink_factor",
-            "gap_shock_vs_recent_mw",
-            "gap_uplift_allowance_eur_mwh",
-            "gas_uplift_allowance_eur_mwh",
-            "recent_reference_upper_eur_mwh",
-            "price_upper_guardrail_eur_mwh",
-            "guardrail_reduction_eur_mwh",
-            "guardrail_applied",
-            "negative_gap_soft_cap_eur_mwh",
-            "negative_gap_reference_price_eur_mwh",
-            "negative_gap_severity_pct",
-            "negative_gap_absolute_mw",
-            "negative_gap_price_before_calibration_eur_mwh",
-            "negative_gap_price_compression_eur_mwh",
-            "negative_gap_soft_cap_applied",
-            "seasonal_shape_reference_eur_mwh",
-            "seasonal_shape_factor",
-            "seasonal_shape_weight_pct",
-            "seasonal_shape_correction_eur_mwh",
-            "seasonal_shape_candidate_days",
-            "seasonal_shape_applied",
+        requested_price_output_columns = ["datetime"] + [
+            c for c in price_forecast.columns
+            if c not in {"datetime", "date", "hour", "thermal_gap_mwh", "engine_version"}
         ]
 
         available_price_output_columns = [
@@ -9733,11 +8197,31 @@ if forecast_result:
             .reset_index()
         )
         generation_export.columns.name = None
-        complete_output = complete_output.merge(
-            generation_export,
-            on="datetime",
-            how="left",
-        )
+        missing_generation_columns = [c for c in generation_export if c == "datetime" or c not in complete_output]
+        complete_output = complete_output.merge(generation_export[missing_generation_columns], on="datetime", how="left")
+
+        with st.expander("V17 post-clearing gap diagnosis (not an ex-ante input)"):
+            st.caption(
+                "Compares the forecast with the published target-day PBF, not metered physical generation. "
+                "Positive contributions mean the component made the forecast gap too high. "
+                "These target-day outcomes are never fed back into the forecast."
+            )
+            diagnostic_key = f"v17_gap_diagnostic_{forecast_result.get('target_day')}_{'|'.join(forecast_result.get('generation_technologies', []))}"
+            if st.button("Load post-clearing PBF diagnosis", key="v17_load_gap_diagnosis"):
+                try:
+                    with st.spinner("Loading published target-day PBF for ex-post diagnosis only..."):
+                        diagnostic = build_post_clearing_gap_diagnostic(
+                            forecast_result.get("target_day"), forecast_result.get("generation_technologies", []),
+                            thermal_forecast, price_forecast, token,
+                        )
+                        st.session_state[diagnostic_key] = diagnostic
+                except Exception as exc:
+                    st.warning(f"Post-clearing diagnosis unavailable: {exc}")
+            diagnostic = st.session_state.get(diagnostic_key)
+            if diagnostic is not None:
+                st.dataframe(diagnostic, use_container_width=True, hide_index=True)
+                st.download_button("Download ex-post gap diagnosis CSV", diagnostic.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"ex_post_gap_diagnostic_{forecast_result.get('target_day')}.csv", mime="text/csv")
 
         with st.expander(
             "Complete hourly demand → PBF → thermal gap → price output"
@@ -9897,7 +8381,7 @@ else:
 # YTD DAILY WALK-FORWARD BACKTEST UI
 # =========================================================
 section_header(
-    "Step 6 — 2026 YTD daily walk-forward forecast backtest"
+    "Step 6 - 2026 YTD daily walk-forward forecast backtest"
 )
 
 st.caption(
@@ -9916,10 +8400,10 @@ with yt1:
     ytd_start_day = st.date_input(
         "Walk-forward start",
         value=date(2026, 1, 1),
-        min_value=date(2024, 2, 1),
+        min_value=date(2024, 3, 15),
         max_value=max(
             date.today() - timedelta(days=1),
-            date(2024, 2, 1),
+            date(2024, 3, 15),
         ),
         key="ytd_walk_forward_start",
     )
@@ -9995,8 +8479,8 @@ with yc3:
     ytd_demand_source = st.selectbox(
         "YTD demand curve",
         [
-            "Model forecast — green",
-            "Previous week + recent trend — orange",
+            "Model forecast - green",
+            "Previous week + recent trend - orange",
         ],
         index=0,
         key="ytd_walk_forward_demand_source",
@@ -10065,6 +8549,8 @@ if load_checkpoint and checkpoint_upload is not None:
                 uploaded_checkpoint
             )
         )
+        if "checkpoint_version" not in uploaded_checkpoint or not uploaded_checkpoint["checkpoint_version"].eq(YTD_BACKTEST_CHECKPOINT_VERSION).all():
+            raise ValueError("This checkpoint uses another engine version. Do not combine V16 and V17 results.")
         st.session_state[
             YTD_BACKTEST_STATE_KEY
         ] = uploaded_checkpoint
@@ -10376,7 +8862,7 @@ if not ytd_results.empty:
             (
                 f"{aggregate_capture:,.1f}%"
                 if pd.notna(aggregate_capture)
-                else "—"
+                else "-"
             ),
         )
         yr5.metric(
