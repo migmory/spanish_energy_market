@@ -845,7 +845,10 @@ PRICE_EXTRA_FEATURES_V17 = [
 
 
 def _v17_price_feature_columns(frame):
-    return list(dict.fromkeys(PRICE_FEATURES + PRICE_EXTRA_FEATURES_V17))
+    base = PRICE_FEATURES + PRICE_EXTRA_FEATURES_V17
+    # V18 fundamentals only when they carry information in this frame.
+    v18 = [c for c in V18_FEATURES if c in frame and pd.to_numeric(frame[c], errors="coerce").notna().any()]
+    return list(dict.fromkeys(base + v18))
 
 
 def _v17_fundamental_columns(frame):
@@ -925,6 +928,22 @@ def _v17_candidate_price_forecasts(train, target):
         x, z = _v17_impute(train, target, features)
         fundamental = _v17_fit(_v17_model(iterations=PRICE_MODEL_ITERATIONS), x, train["price_eur_mwh"], w)
         candidates["Fundamentals ML"] = _v17_predict(fundamental, z)
+        # V18: same fundamentals on an asinh-scaled target. Squared loss in asinh
+        # space tracks the level of normal hours without being dragged by spikes
+        # or by the zero/negative solar block.
+        forward, inverse = _v18_asinh_scale(train["price_eur_mwh"].to_numpy(float))
+        features = _v17_price_feature_columns(train)
+        x, z = _v17_impute(train, target, features)
+        asinh_model = _v17_fit(_v17_model(loss="squared_error", iterations=PRICE_MODEL_ITERATIONS),
+                               x, forward(train["price_eur_mwh"]), w)
+        candidates["Asinh ML"] = inverse(_v17_predict(asinh_model, z))
+    if len(train) >= 24 * V18_LEAR_MIN_DAYS:
+        lear_features = [c for c in _v17_price_feature_columns(train)
+                         if c not in {"hour", "hour_sin", "hour_cos", "is_solar_block"}]
+        try:
+            candidates["LEAR"] = _v18_lear_forecast(train, target, lear_features)
+        except Exception:
+            candidates["LEAR"] = candidates["Anchor"].to_numpy()
     if not np.isfinite(candidates.to_numpy()).all():
         raise ValueError("Non-finite candidate prices. Check input/anchor completeness.")
     return candidates, empirical
@@ -976,6 +995,230 @@ def build_post_clearing_gap_diagnostic(target_day: date, technologies: list[str]
              "generation_contribution_to_gap_error_mw", "forecast_price_eur_mwh", "cleared_price_eur_mwh", "price_error_eur_mwh"]
     columns = [c for c in first if c in out] + [c for c in out if c not in first]
     return out[columns].sort_values("datetime").reset_index(drop=True)
+
+
+# =========================================================
+# V18: ex-ante fundamentals, carbon, LEAR and bias correction
+# =========================================================
+# Why: the V17 price model explains price with a thermal gap built from PBF
+# programmes. PBF solar/wind are *post-auction* and are curtailed when the
+# price is <= 0, so in history the gap partly depends on the price itself, and
+# at forecast time the gap comes from a different (forecast) source. V18 adds
+# REE's sealed D+1 forecasts, which are ex-ante in history AND at forecast time
+# (published ~10:50 D-1, never revised), so train and target see the same thing.
+FORECAST_ENGINE_VERSION = "v18_ree_d1_carbon_lear"
+
+# ESIOS "Previsión diaria D+1" series (sealed D-1, no post-publication revision).
+# 1775 demand is already used above. Check 1777/1779 once in ESIOS: if either
+# returns empty the model keeps running with an availability flag = 0.
+REE_D1_WIND_FORECAST_INDICATOR_ID = 1777
+REE_D1_PV_FORECAST_INDICATOR_ID = 1779
+
+# EUA settlement prices from a local file you maintain (ICE/EEX daily settle),
+# placed in the same data/ folder as the MIBGAS files. Columns: date, price.
+EUA_LOCAL_FILE_PATTERNS = ["EUA_*.csv", "EUA_*.xlsx"]
+CCGT_EFFICIENCY = 0.55          # MWh_e / MWh_th
+CCGT_EMISSION_FACTOR = 0.37     # tCO2 / MWh_e
+
+V18_BIAS_WINDOW_DAYS = 14
+V18_LEAR_MIN_DAYS = 90
+
+V18_FEATURES = [
+    "ree_d1_demand_mw", "ree_d1_wind_mw", "ree_d1_pv_mw", "ree_d1_residual_mw",
+    "ree_d1_residual_daily_mean", "ree_d1_residual_daily_min",
+    "ree_d1_residual_daily_max", "ree_d1_residual_rank",
+    "ree_d1_residual_change_d1", "ree_d1_renewable_share", "ree_d1_available",
+    "eua_d1_eur_t", "eua_available", "ccgt_srmc_eur_mwh",
+    "ccgt_srmc_x_residual",
+]
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v18_fetch_esios_hourly_average(indicator_id: int, start_day: date,
+                                    end_day: date, _token: str) -> pd.DataFrame:
+    """Hourly average MW of one ESIOS indicator, chunked like the PBF loader."""
+    frames, chunk_start = [], start_day
+    while chunk_start <= end_day:
+        chunk_end = min(end_day, chunk_start + timedelta(days=13))
+        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
+        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
+        params = {
+            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_trunc": "hour",
+            "time_agg": "average",
+        }
+        for attempt in range(3):
+            try:
+                response = requests.get(f"{ESIOS_API_BASE}/{indicator_id}",
+                                        headers=esios_headers(_token),
+                                        params=params, timeout=(15, 120))
+                response.raise_for_status()
+                parsed = parse_esios_values(response.json())
+                if not parsed.empty:
+                    lower, upper = start_local.tz_localize(None), end_local.tz_localize(None)
+                    frames.append(parsed[(parsed["datetime"] >= lower) & (parsed["datetime"] < upper)])
+                break
+            except requests.RequestException:
+                sleep(1.5 * (attempt + 1))
+        chunk_start = chunk_end + timedelta(days=1)
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value"])
+    out = pd.concat(frames, ignore_index=True)
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return (out.dropna(subset=["datetime", "value"])
+            .groupby("datetime", as_index=False)["value"].mean()
+            .sort_values("datetime").reset_index(drop=True))
+
+
+def load_ree_d1_fundamentals(start_day: date, end_day: date, token: str) -> pd.DataFrame:
+    """REE sealed D+1 demand, wind and PV forecasts, hourly MW (ex-ante)."""
+    series = {
+        "ree_d1_demand_mw": REE_D1_DEMAND_FORECAST_INDICATOR_ID,
+        "ree_d1_wind_mw": REE_D1_WIND_FORECAST_INDICATOR_ID,
+        "ree_d1_pv_mw": REE_D1_PV_FORECAST_INDICATOR_ID,
+    }
+    grid = pd.DataFrame({"datetime": pd.date_range(pd.Timestamp(start_day),
+                                                   pd.Timestamp(end_day + timedelta(days=1)),
+                                                   freq="h", inclusive="left")})
+    for column, indicator in series.items():
+        try:
+            data = _v18_fetch_esios_hourly_average(indicator, start_day, end_day, token)
+        except Exception:
+            data = pd.DataFrame(columns=["datetime", "value"])
+        grid = grid.merge(data.rename(columns={"value": column}), on="datetime", how="left")
+    return grid
+
+
+def _v18_find_eua_file() -> Path | None:
+    for directory in _mibgas_data_directories():
+        for pattern in EUA_LOCAL_FILE_PATTERNS:
+            matches = sorted(directory.glob(pattern)) if directory.exists() else []
+            if matches:
+                return matches[-1]
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_eua_daily_lookup() -> tuple[dict, str]:
+    """{settlement date: EUA EUR/t}. Missing file = empty lookup, never an error."""
+    path = _v18_find_eua_file()
+    if path is None:
+        return {}, "EUA file not found (data/EUA_*.csv or .xlsx) - carbon features off"
+    try:
+        raw = pd.read_excel(path) if path.suffix.lower() == ".xlsx" else pd.read_csv(path)
+        columns = {c: str(c).strip().lower() for c in raw.columns}
+        raw = raw.rename(columns=columns)
+        date_col = next(c for c in raw.columns if "date" in c or "fecha" in c)
+        price_col = next(c for c in raw.columns if c != date_col and
+                         pd.to_numeric(raw[c], errors="coerce").notna().mean() > 0.8)
+        frame = pd.DataFrame({
+            "date": pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True).dt.date,
+            "price": pd.to_numeric(raw[price_col], errors="coerce"),
+        }).dropna()
+        return dict(zip(frame["date"], frame["price"])), f"EUA from {path.name}"
+    except Exception as exc:
+        return {}, f"EUA file unreadable ({type(exc).__name__}) - carbon features off"
+
+
+def _v18_last_settle(lookup: dict, delivery_day: date, max_back: int = 5) -> float:
+    """Latest settle strictly before delivery day D (known before the D-1 auction)."""
+    for lag in range(1, max_back + 1):
+        value = lookup.get(delivery_day - timedelta(days=lag))
+        if value is not None and np.isfinite(value):
+            return float(value)
+    return np.nan
+
+
+def _v18_add_fundamental_features(frame: pd.DataFrame, eua_lookup: dict,
+                                  ree_daily_mean: dict | None = None) -> pd.DataFrame:
+    """Derived REE D+1 and carbon features. Expects REE columns already merged."""
+    out = frame.copy()
+    for column in ["ree_d1_demand_mw", "ree_d1_wind_mw", "ree_d1_pv_mw"]:
+        out[column] = _v17_numeric(out, column)
+    out["ree_d1_residual_mw"] = (out["ree_d1_demand_mw"] - out["ree_d1_wind_mw"].fillna(0)
+                                 - out["ree_d1_pv_mw"].fillna(0))
+    out.loc[out["ree_d1_demand_mw"].isna(), "ree_d1_residual_mw"] = np.nan
+    out["ree_d1_available"] = out["ree_d1_residual_mw"].notna().astype(int)
+    grouped = out.groupby("date")["ree_d1_residual_mw"]
+    out["ree_d1_residual_daily_mean"] = grouped.transform("mean")
+    out["ree_d1_residual_daily_min"] = grouped.transform("min")
+    out["ree_d1_residual_daily_max"] = grouped.transform("max")
+    out["ree_d1_residual_rank"] = grouped.rank(pct=True)
+    # Previous-day residual comes from the full REE series, so the one-day
+    # target frame gets the same value history would have had.
+    daily_mean = ree_daily_mean if ree_daily_mean is not None else (
+        out.groupby("date")["ree_d1_residual_mw"].mean().to_dict())
+    out["ree_d1_residual_change_d1"] = out["ree_d1_residual_daily_mean"] - out["date"].map(
+        lambda d: daily_mean.get(d - timedelta(days=1), np.nan))
+    demand = out["ree_d1_demand_mw"].where(out["ree_d1_demand_mw"] > 0)
+    out["ree_d1_renewable_share"] = (out["ree_d1_wind_mw"] + out["ree_d1_pv_mw"]) / demand
+    out["eua_d1_eur_t"] = out["date"].map(lambda d: _v18_last_settle(eua_lookup, d))
+    out["eua_available"] = out["eua_d1_eur_t"].notna().astype(int)
+    gas = _v17_numeric(out, "mibgas_d1_eur_mwh").where(_v17_numeric(out, "mibgas_data_available") > 0)
+    out["ccgt_srmc_eur_mwh"] = gas / CCGT_EFFICIENCY + CCGT_EMISSION_FACTOR * out["eua_d1_eur_t"].fillna(0)
+    out["ccgt_srmc_x_residual"] = out["ccgt_srmc_eur_mwh"] * out["ree_d1_residual_mw"].clip(lower=0) / 10_000.0
+    return out
+
+
+def _v18_asinh_scale(y: np.ndarray):
+    """epftoolbox-style variance stabilising transform for spiky/negative prices."""
+    median = float(np.nanmedian(y))
+    mad = float(np.nanmedian(np.abs(y - median))) * 1.4826
+    mad = mad if mad > 1e-6 else 1.0
+    forward = lambda v: np.arcsinh((np.asarray(v, float) - median) / mad)
+    inverse = lambda z: np.sinh(np.asarray(z, float)) * mad + median
+    return forward, inverse
+
+
+def _v18_lear_forecast(train: pd.DataFrame, target: pd.DataFrame, features: list[str]) -> np.ndarray:
+    """LEAR: one LASSO per delivery hour on asinh prices (Lago et al. benchmark)."""
+    from sklearn.linear_model import LassoLarsIC
+    from sklearn.preprocessing import StandardScaler
+    x_all, z_all = _v17_impute(train, target, features)
+    forward, inverse = _v18_asinh_scale(train["price_eur_mwh"].to_numpy(float))
+    prediction = np.full(len(target), np.nan)
+    for hour in range(24):
+        tr = (train["hour"] == hour).to_numpy()
+        te = (target["hour"] == hour).to_numpy()
+        if not te.any():
+            continue
+        if tr.sum() < 30:
+            prediction[te] = np.nanmedian(train.loc[tr, "price_eur_mwh"]) if tr.any() else np.nan
+            continue
+        scaler = StandardScaler().fit(x_all[tr])
+        model = LassoLarsIC(criterion="aic", max_iter=500)
+        model.fit(np.nan_to_num(scaler.transform(x_all[tr])), forward(train.loc[tr, "price_eur_mwh"]))
+        prediction[te] = inverse(model.predict(np.nan_to_num(scaler.transform(z_all[te]))))
+    return prediction
+
+
+def _v18_hourly_bias(validation: pd.DataFrame, prediction: np.ndarray,
+                     before_day: date, window_days: int = V18_BIAS_WINDOW_DAYS) -> pd.Series:
+    """Median signed error by hour over the last window of strictly earlier days."""
+    frame = pd.DataFrame({"date": validation["date"].to_numpy(), "hour": validation["hour"].to_numpy(),
+                          "error": validation["price_eur_mwh"].to_numpy(float) - np.asarray(prediction, float)})
+    frame = frame[(frame["date"] < before_day) & (frame["date"] >= before_day - timedelta(days=window_days))]
+    if frame["date"].nunique() < 5:
+        return pd.Series(0.0, index=range(24))
+    return frame.groupby("hour")["error"].median().reindex(range(24)).fillna(0.0)
+
+
+def _v18_choose_bias_shrink(validation: pd.DataFrame, prediction: np.ndarray) -> float:
+    """Pick the shrink (0 = off) that minimised prequential MAE on validation."""
+    y = validation["price_eur_mwh"].to_numpy(float)
+    base = np.asarray(prediction, float)
+    best_shrink, best_mae = 0.0, float(np.mean(np.abs(y - base)))
+    for shrink in (0.25, 0.5, 0.75, 1.0):
+        corrected = base.copy()
+        for day in sorted(validation["date"].unique()):
+            mask = (validation["date"] == day).to_numpy()
+            bias = _v18_hourly_bias(validation, prediction, day)
+            corrected[mask] = base[mask] + shrink * validation.loc[mask, "hour"].map(bias).to_numpy()
+        mae = float(np.mean(np.abs(y - corrected)))
+        if mae < best_mae - 0.05:
+            best_shrink, best_mae = shrink, mae
+    return best_shrink
 
 
 # =========================================================
@@ -4529,10 +4772,23 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
         historical["datetime"].min().date() - timedelta(days=35), target_day - timedelta(days=1))
     price_lookup = _hourly_lookup(prices, "price_eur_mwh")
     gap_lookup = _hourly_lookup(historical, "thermal_gap_mwh")
+    # V18: ex-ante REE D+1 fundamentals for history and target, plus carbon.
+    ree_d1 = load_ree_d1_fundamentals(historical["datetime"].min().date(), target_day, token)
+    eua_lookup, eua_message = load_eua_daily_lookup()
+    ree_residual = (ree_d1["ree_d1_demand_mw"] - ree_d1["ree_d1_wind_mw"].fillna(0)
+                    - ree_d1["ree_d1_pv_mw"].fillna(0)).where(ree_d1["ree_d1_demand_mw"].notna())
+    ree_daily_mean = ree_residual.groupby(ree_d1["datetime"].dt.date).mean().dropna().to_dict()
+    historical = historical.drop(columns=[c for c in ree_d1 if c != "datetime" and c in historical]).merge(
+        ree_d1, on="datetime", how="left")
     training = _price_features(historical.merge(prices, on="datetime", how="inner"), price_lookup, gap_lookup, gas_lookup)
+    training = _v18_add_fundamental_features(training, eua_lookup, ree_daily_mean)
     target_frame = forecast_gap.copy()
     target_frame["thermal_gap_mwh"] = target_frame["thermal_gap_forecast_mwh"]
+    target_frame["datetime"] = pd.to_datetime(target_frame["datetime"])
+    target_frame = target_frame.drop(columns=[c for c in ree_d1 if c != "datetime" and c in target_frame]).merge(
+        ree_d1, on="datetime", how="left")
     target = _price_features(target_frame, price_lookup, gap_lookup, gas_lookup)
+    target = _v18_add_fundamental_features(target, eua_lookup, ree_daily_mean)
     training = training.dropna(subset=["price_eur_mwh", "price_anchor", "thermal_gap_mwh"]).reset_index(drop=True)
     target = target.reset_index(drop=True)
     if len(training) < 24 * 120:
@@ -4569,6 +4825,20 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     target_candidates, empirical = _v17_candidate_price_forecasts(training, target)
     target_candidates = target_candidates[candidate_names]
     final = target_candidates.to_numpy() @ weights
+    # V18: prequential hourly bias correction. The shrink is chosen on the
+    # validation block (0 = off if it does not reduce MAE), then applied with
+    # the median hourly error of the last V18_BIAS_WINDOW_DAYS before D.
+    raw_validation = validation_prediction.to_numpy(float)
+    bias_shrink = _v18_choose_bias_shrink(validation, raw_validation)
+    if bias_shrink > 0:
+        corrected = raw_validation.copy()
+        for day in sorted(validation["date"].unique()):
+            mask = (validation["date"] == day).to_numpy()
+            day_bias = _v18_hourly_bias(validation, raw_validation, day)
+            corrected[mask] += bias_shrink * validation.loc[mask, "hour"].map(day_bias).to_numpy()
+        validation_prediction = pd.Series(corrected, index=validation.index)
+        target_bias = _v18_hourly_bias(validation, raw_validation, target_day)
+        final = final + bias_shrink * target["hour"].map(target_bias).to_numpy()
     if not np.isfinite(final).all():
         raise ValueError("Price model produced non-finite outputs.")
     output_columns = ["datetime", "date", "hour", "thermal_gap_mwh", "price_anchor", "price_lag_1d", "price_lag_7d", "same_hour_price_4w",
@@ -4617,6 +4887,9 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
         "gas_price_7d_avg_eur_mwh": float(target["mibgas_7d_avg_eur_mwh"].iloc[0]) if gas_available else np.nan,
         "gas_price_change_d1_eur_mwh": float(target["mibgas_change_d1_eur_mwh"].iloc[0]) if gas_available else np.nan,
         "gas_source": gas_source.get(target_day - timedelta(days=1), "Unavailable"),
+        "bias_correction_shrink": bias_shrink,
+        "ree_d1_available": bool(target["ree_d1_available"].min() > 0),
+        "eua_message": eua_message,
     }
 
 
