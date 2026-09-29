@@ -1006,7 +1006,7 @@ def build_post_clearing_gap_diagnostic(target_day: date, technologies: list[str]
 # at forecast time the gap comes from a different (forecast) source. V18 adds
 # REE's sealed D+1 forecasts, which are ex-ante in history AND at forecast time
 # (published ~10:50 D-1, never revised), so train and target see the same thing.
-FORECAST_ENGINE_VERSION = "v18_ree_d1_carbon_lear"
+FORECAST_ENGINE_VERSION = "v18_1_daytype_anchor_bias"
 
 # ESIOS "Previsión diaria D+1" series (sealed D-1, no post-publication revision).
 # 1775 demand is already used above. Check 1777/1779 once in ESIOS: if either
@@ -1020,7 +1020,8 @@ EUA_LOCAL_FILE_PATTERNS = ["EUA_*.csv", "EUA_*.xlsx"]
 CCGT_EFFICIENCY = 0.55          # MWh_e / MWh_th
 CCGT_EMISSION_FACTOR = 0.37     # tCO2 / MWh_e
 
-V18_BIAS_WINDOW_DAYS = 14
+V18_BIAS_WINDOW_DAYS = 21   # per day type: ~15 workdays or ~6 off-days
+V18_BIAS_MIN_DAYS = 3
 V18_LEAR_MIN_DAYS = 90
 
 V18_FEATURES = [
@@ -1029,8 +1030,31 @@ V18_FEATURES = [
     "ree_d1_residual_daily_max", "ree_d1_residual_rank",
     "ree_d1_residual_change_d1", "ree_d1_renewable_share", "ree_d1_available",
     "eua_d1_eur_t", "eua_available", "ccgt_srmc_eur_mwh",
-    "ccgt_srmc_x_residual",
+    "ccgt_srmc_x_residual", "price_lag_same_type", "price_same_type_solar_mean",
 ]
+
+
+def _v18_is_offday(day: date, holidays_set: set) -> bool:
+    return day.weekday() >= 5 or day in holidays_set
+
+
+def _v18_same_type_day(day: date, holidays_set: set):
+    """Most recent earlier day of the same type, looking back at most 7 days.
+
+    Working day -> last working day (Monday -> Friday).
+    Saturday -> previous Saturday. Sunday/holiday -> last Sunday or holiday.
+    """
+    if day.weekday() == 5 and day not in holidays_set:
+        return day - timedelta(days=7)
+    offday = _v18_is_offday(day, holidays_set)
+    for lag in range(1, 8):
+        candidate = day - timedelta(days=lag)
+        if offday:
+            if candidate.weekday() == 6 or candidate in holidays_set:
+                return candidate
+        elif not _v18_is_offday(candidate, holidays_set):
+            return candidate
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -1193,29 +1217,48 @@ def _v18_lear_forecast(train: pd.DataFrame, target: pd.DataFrame, features: list
     return prediction
 
 
-def _v18_hourly_bias(validation: pd.DataFrame, prediction: np.ndarray,
-                     before_day: date, window_days: int = V18_BIAS_WINDOW_DAYS) -> pd.Series:
-    """Median signed error by hour over the last window of strictly earlier days."""
+def _v18_day_types(frame: pd.DataFrame) -> np.ndarray:
+    """'offday' for weekends and national holidays, else 'workday'."""
+    weekend = _v17_numeric(frame, "is_weekend", 0).fillna(0).to_numpy() > 0
+    holiday = _v17_numeric(frame, "is_holiday", 0).fillna(0).to_numpy() > 0
+    return np.where(weekend | holiday, "offday", "workday")
+
+
+def _v18_hourly_bias(validation: pd.DataFrame, prediction: np.ndarray, before_day: date,
+                     day_type: str, window_days: int = V18_BIAS_WINDOW_DAYS) -> pd.Series:
+    """Median signed error by hour over earlier days of the SAME day type.
+
+    Mixing types hid the workday solar-hour bias (about -35 EUR/MWh in Sept
+    2026) behind near-zero weekend errors.
+    """
     frame = pd.DataFrame({"date": validation["date"].to_numpy(), "hour": validation["hour"].to_numpy(),
+                          "type": _v18_day_types(validation),
                           "error": validation["price_eur_mwh"].to_numpy(float) - np.asarray(prediction, float)})
-    frame = frame[(frame["date"] < before_day) & (frame["date"] >= before_day - timedelta(days=window_days))]
-    if frame["date"].nunique() < 5:
+    frame = frame[(frame["date"] < before_day) & (frame["type"] == day_type)
+                  & (frame["date"] >= before_day - timedelta(days=window_days))]
+    if frame["date"].nunique() < V18_BIAS_MIN_DAYS:
         return pd.Series(0.0, index=range(24))
     return frame.groupby("hour")["error"].median().reindex(range(24)).fillna(0.0)
+
+
+def _v18_bias_corrected(validation: pd.DataFrame, prediction: np.ndarray, shrink: float) -> np.ndarray:
+    """Prequential correction: each day only sees earlier days' errors."""
+    base = np.asarray(prediction, float)
+    corrected = base.copy()
+    types = _v18_day_types(validation)
+    for day in sorted(validation["date"].unique()):
+        mask = (validation["date"] == day).to_numpy()
+        bias = _v18_hourly_bias(validation, base, day, types[mask][0])
+        corrected[mask] = base[mask] + shrink * validation.loc[mask, "hour"].map(bias).to_numpy()
+    return corrected
 
 
 def _v18_choose_bias_shrink(validation: pd.DataFrame, prediction: np.ndarray) -> float:
     """Pick the shrink (0 = off) that minimised prequential MAE on validation."""
     y = validation["price_eur_mwh"].to_numpy(float)
-    base = np.asarray(prediction, float)
-    best_shrink, best_mae = 0.0, float(np.mean(np.abs(y - base)))
+    best_shrink, best_mae = 0.0, float(np.mean(np.abs(y - np.asarray(prediction, float))))
     for shrink in (0.25, 0.5, 0.75, 1.0):
-        corrected = base.copy()
-        for day in sorted(validation["date"].unique()):
-            mask = (validation["date"] == day).to_numpy()
-            bias = _v18_hourly_bias(validation, prediction, day)
-            corrected[mask] = base[mask] + shrink * validation.loc[mask, "hour"].map(bias).to_numpy()
-        mae = float(np.mean(np.abs(y - corrected)))
+        mae = float(np.mean(np.abs(y - _v18_bias_corrected(validation, prediction, shrink))))
         if mae < best_mae - 0.05:
             best_shrink, best_mae = shrink, mae
     return best_shrink
@@ -4631,7 +4674,24 @@ def _price_features(frame: pd.DataFrame, price_lookup: dict, gap_lookup: dict,
     available_week = weekly.notna().any(axis=1)
     out["same_hour_price_4w"] = np.nan
     out.loc[available_week, "same_hour_price_4w"] = weekly.loc[available_week].median(axis=1)
-    anchor_values = out[["price_lag_7d", "price_lag_1d", "same_hour_price_4w"]]
+    # V18.1: the short-lag term of the anchor uses the most recent day of the
+    # SAME day type. A Monday used to lean 35% on Sunday, whose solar valley is
+    # structurally deeper; it now uses Friday (or the last working day).
+    years = sorted({d.year for d in out["date"]} | {(d - timedelta(days=8)).year for d in out["date"]})
+    holidays_set = national_holidays(years)
+    out["price_lag_same_type"] = [
+        price_lookup.get((_v18_same_type_day(d, holidays_set), int(h)), np.nan)
+        if _v18_same_type_day(d, holidays_set) is not None else np.nan
+        for d, h in zip(out["date"], out["hour"])
+    ]
+    out["price_lag_same_type"] = out["price_lag_same_type"].fillna(out["price_lag_1d"])
+    same_type_solar = {}
+    for day in out["date"].unique():
+        ref = _v18_same_type_day(day, holidays_set)
+        vals = np.asarray([price_lookup.get((ref, h), np.nan) for h in range(10, 18)], float) if ref else np.array([np.nan])
+        same_type_solar[day] = float(np.nanmean(vals)) if np.isfinite(vals).any() else np.nan
+    out["price_same_type_solar_mean"] = out["date"].map(same_type_solar)
+    anchor_values = out[["price_lag_7d", "price_lag_same_type", "same_hour_price_4w"]]
     weights = np.array([0.45, 0.35, 0.20])
     denominator = anchor_values.notna().to_numpy() @ weights
     out["price_anchor"] = (anchor_values.fillna(0).to_numpy() @ weights) / np.where(denominator > 0, denominator, np.nan)
@@ -4827,17 +4887,15 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     final = target_candidates.to_numpy() @ weights
     # V18: prequential hourly bias correction. The shrink is chosen on the
     # validation block (0 = off if it does not reduce MAE), then applied with
-    # the median hourly error of the last V18_BIAS_WINDOW_DAYS before D.
+    # the median hourly error of earlier days of the same day type (workday or
+    # weekend/holiday) within the last V18_BIAS_WINDOW_DAYS before D.
     raw_validation = validation_prediction.to_numpy(float)
     bias_shrink = _v18_choose_bias_shrink(validation, raw_validation)
     if bias_shrink > 0:
-        corrected = raw_validation.copy()
-        for day in sorted(validation["date"].unique()):
-            mask = (validation["date"] == day).to_numpy()
-            day_bias = _v18_hourly_bias(validation, raw_validation, day)
-            corrected[mask] += bias_shrink * validation.loc[mask, "hour"].map(day_bias).to_numpy()
-        validation_prediction = pd.Series(corrected, index=validation.index)
-        target_bias = _v18_hourly_bias(validation, raw_validation, target_day)
+        validation_prediction = pd.Series(_v18_bias_corrected(validation, raw_validation, bias_shrink),
+                                          index=validation.index)
+        target_type = _v18_day_types(target)[0]
+        target_bias = _v18_hourly_bias(validation, raw_validation, target_day, target_type)
         final = final + bias_shrink * target["hour"].map(target_bias).to_numpy()
     if not np.isfinite(final).all():
         raise ValueError("Price model produced non-finite outputs.")
