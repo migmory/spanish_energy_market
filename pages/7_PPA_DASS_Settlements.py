@@ -1,11 +1,5 @@
-# V18 update, 29 September 2026.
-# Based on the full existing Streamlit page and its v17.2 fixes.
-# Main changes: gross/residual PBF reconciliation; past-only adaptive generation
-# ensemble; fixed-run weather replay; clear full diagnostics and independent caches.
-# No observed target-day generation or prices are used to produce its forecast.
-# Historical publication/revision vintages are NOT fully audited.
+import json
 import os
-import hashlib
 import re
 import sys
 import traceback
@@ -167,7 +161,7 @@ PBF_DEMAND_INDICATOR_ID = 10141
 PBF_TOTAL_BILATERAL_SALES_INDICATOR_ID = 10235
 
 DA_GAP_PERIMETER = (
-    "PBF demand minus gross structural generation minus residual bilaterals, reconciled to the DA/net representation"
+    "DA residual demand minus non-bilateral low-marginal-cost PBF generation"
 )
 
 # No fixed 8.7/9 GW self-consumption plant is added to, or deducted from, the
@@ -568,7 +562,7 @@ SPAIN_TEMPERATURE_POINTS = [
 # =========================================================
 # V17: data integrity, fixed-run weather and model utilities
 # =========================================================
-FORECAST_ENGINE_VERSION = "v18_gross_reconciled_adaptive"
+FORECAST_ENGINE_VERSION = "v17_2_cow_fix"
 OPEN_METEO_SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 FIXED_WEATHER_MODEL = "ecmwf_ifs"
 PRICE_RECENCY_HALF_LIFE_DAYS = 90.0
@@ -837,22 +831,25 @@ def _v17_bridge_pbf_demand(target_day: date, physical_forecast: pd.DataFrame,
     return target
 
 PRICE_COMPONENTS_V17 = [
-    "pbf_demand_mwh", "effective_demand_mwh", "residual_bilateral_mwh", "gross_non_thermal_mwh",
-    "gross_solar_pv_mwh", "gross_wind_mwh", "gross_nuclear_mwh", "gross_solar_thermal_mwh",
-    "gross_run_of_river_mwh", "gross_other_renewables_mwh",
+    "pbf_demand_mwh", "bilateral_sales_mwh", "da_demand_mwh", "non_thermal_mwh",
+    "solar_pv_mwh", "wind_mwh", "nuclear_mwh", "solar_thermal_mwh",
+    "run_of_river_mwh", "other_renewables_mwh",
 ]
 PRICE_EXTRA_FEATURES_V17 = [
     "negative_gap_mwh", "gap_signed_log", "gap_daily_mean", "gap_daily_min",
     "gap_daily_max", "gap_midday_mean", "gap_evening_mean", "gap_solar_vs_evening",
     "gap_ramp_forward", "gap_ramp_backward", "gap_daily_rank", "solar_share",
-    "wind_share", "bilateral_share", "gross_supply_share", "price_previous_day_mean",
+    "wind_share", "bilateral_share", "net_supply_share", "price_previous_day_mean",
     "price_previous_day_solar_mean", "price_previous_day_evening_mean",
     "price_anchor_available", "is_solar_block",
 ] + PRICE_COMPONENTS_V17 + [f"{c}_available" for c in PRICE_COMPONENTS_V17]
 
 
 def _v17_price_feature_columns(frame):
-    return list(dict.fromkeys(PRICE_FEATURES + PRICE_EXTRA_FEATURES_V17))
+    base = PRICE_FEATURES + PRICE_EXTRA_FEATURES_V17
+    # V18 fundamentals only when they carry information in this frame.
+    v18 = [c for c in V18_FEATURES if c in frame and pd.to_numeric(frame[c], errors="coerce").notna().any()]
+    return list(dict.fromkeys(base + v18))
 
 
 def _v17_fundamental_columns(frame):
@@ -932,6 +929,25 @@ def _v17_candidate_price_forecasts(train, target):
         x, z = _v17_impute(train, target, features)
         fundamental = _v17_fit(_v17_model(iterations=PRICE_MODEL_ITERATIONS), x, train["price_eur_mwh"], w)
         candidates["Fundamentals ML"] = _v17_predict(fundamental, z)
+        # V18: same fundamentals on an asinh-scaled target. Squared loss in asinh
+        # space tracks the level of normal hours without being dragged by spikes
+        # or by the zero/negative solar block.
+        forward, inverse = _v18_asinh_scale(train["price_eur_mwh"].to_numpy(float))
+        features = _v17_price_feature_columns(train)
+        x, z = _v17_impute(train, target, features)
+        asinh_model = _v17_fit(_v17_model(loss="squared_error", iterations=PRICE_MODEL_ITERATIONS),
+                               x, forward(train["price_eur_mwh"]), w)
+        candidates["Asinh ML"] = inverse(_v17_predict(asinh_model, z))
+    if len(train) >= 24 * V18_LEAR_MIN_DAYS:
+        lear_features = [c for c in _v17_price_feature_columns(train)
+                         if c not in {"hour", "hour_sin", "hour_cos", "is_solar_block"}]
+        try:
+            lear = np.asarray(_v18_lear_forecast(train, target, lear_features), dtype=float)
+            # V18.2: an hour LEAR cannot price falls back to the anchor instead of
+            # failing the whole delivery day.
+            candidates["LEAR"] = np.where(np.isfinite(lear), lear, candidates["Anchor"].to_numpy(float))
+        except Exception:
+            candidates["LEAR"] = candidates["Anchor"].to_numpy()
     if not np.isfinite(candidates.to_numpy()).all():
         raise ValueError("Non-finite candidate prices. Check input/anchor completeness.")
     return candidates, empirical
@@ -940,46 +956,653 @@ def _v17_candidate_price_forecasts(train, target):
 def build_post_clearing_gap_diagnostic(target_day: date, technologies: list[str],
                                       forecast_gap: pd.DataFrame, price_forecast: pd.DataFrame,
                                       token: str) -> pd.DataFrame:
-    """Ex-post evaluation only, never called by an ex-ante forecasting function."""
-    gen = load_forecast_pbf_history(target_day, target_day, tuple(technologies), token)
-    demand = load_pbf_demand_history(target_day, target_day, token)
-    bil = load_total_bilateral_sales_history(target_day, target_day, token)
-    if gen.empty or demand.empty or bil.empty:
-        raise ValueError("Target-day PBF components have not all been published")
-    actual = _v18_history_balance(gen, demand, bil, technologies)
-    mapping = {"thermal_gap_mwh": "observed_pbf_gap_mwh", "pbf_demand_mwh": "observed_pbf_demand_mwh",
-               "bilateral_sales_mwh": "observed_bilateral_mwh", "non_thermal_mwh": "observed_non_thermal_mwh",
-               "gross_non_thermal_mwh": "observed_gross_non_thermal_mwh", "residual_bilateral_mwh": "observed_residual_bilateral_mwh"}
-    for t in technologies:
-        slug = V18_COMPONENT_NAMES[t]
-        mapping[t] = f"observed_{t}"
-        mapping[f"gross_{slug}_mwh"] = f"observed_gross_{slug}_mwh"
-        mapping[f"bilateral_{slug}_mwh"] = f"observed_bilateral_{slug}_mwh"
-    out = forecast_gap.merge(actual[["datetime", *mapping]].rename(columns=mapping), on="datetime", how="inner", validate="one_to_one")
-    out["gap_error_mw"] = out["thermal_gap_forecast_mwh"] - out["observed_pbf_gap_mwh"]
+    """Ex-post diagnosis ONLY. Never called by a forecasting/training function.
+
+    'Observed' below means the published target-day PBF programme, not physical
+    metered generation. These outcomes must not be used to improve that day's
+    claimed ex-ante forecast.
+    """
+    observed_gen = load_forecast_pbf_history(target_day, target_day, tuple(technologies), token)
+    observed_demand = load_pbf_demand_history(target_day, target_day, token)
+    observed_bilateral = load_total_bilateral_sales_history(target_day, target_day, token)
+    if observed_gen.empty or observed_demand.empty or observed_bilateral.empty:
+        raise ValueError("Target-day PBF components have not all been published.")
+    actual = build_previous_day_calibration(target_day + timedelta(days=1), technologies,
+                                           observed_gen, observed_demand, observed_bilateral)
+    if actual.empty:
+        raise ValueError("No complete target-day PBF balance is available.")
+    mapping = {
+        "pbf_demand_mwh": "observed_pbf_demand_mwh", "bilateral_sales_mwh": "observed_bilateral_mwh",
+        "non_thermal_net_mwh": "observed_non_thermal_mwh", "actual_thermal_gap_mwh": "observed_pbf_gap_mwh",
+    }
+    actual_keep = actual[["datetime", *mapping, *[t for t in technologies if t in actual]]].copy()
+    actual_keep = actual_keep.rename(columns={**mapping, **{t: f"observed_{t}" for t in technologies}})
+    out = forecast_gap.merge(actual_keep, on="datetime", how="inner")
     out["demand_contribution_to_gap_error_mw"] = out["pbf_demand_forecast_mwh"] - out["observed_pbf_demand_mwh"]
-    out["residual_bilateral_contribution_to_gap_error_mw"] = -(out["residual_bilateral_forecast_mwh"] - out["observed_residual_bilateral_mwh"])
-    out["gross_generation_contribution_to_gap_error_mw"] = -(out["gross_non_thermal_forecast_mwh"] - out["observed_gross_non_thermal_mwh"])
-    # Retain the old decomposition alongside the algebraically identical new one.
     out["bilateral_contribution_to_gap_error_mw"] = -(out["bilateral_sales_forecast_mwh"] - out["observed_bilateral_mwh"])
     out["generation_contribution_to_gap_error_mw"] = -(out["non_thermal_forecast_mwh"] - out["observed_non_thermal_mwh"])
-    out["gap_reconciliation_error_mw"] = out["gap_error_mw"] - (out["demand_contribution_to_gap_error_mw"] + out["residual_bilateral_contribution_to_gap_error_mw"] + out["gross_generation_contribution_to_gap_error_mw"])
-    for t in technologies:
-        slug = V18_COMPONENT_NAMES[t]
-        out[f"forecast_minus_observed_{t}_mw"] = out[t] - out[f"observed_{t}"]
-        out[f"gross_error_{slug}_mw"] = out[f"gross_{slug}_mwh"] - out[f"observed_gross_{slug}_mwh"]
-        out[f"bilateral_error_{slug}_mw"] = out[f"bilateral_{slug}_mwh"] - out[f"observed_bilateral_{slug}_mwh"]
-    cols = [c for c in price_forecast if c == "datetime" or (c.endswith("eur_mwh") and c not in out)]
-    out = out.merge(price_forecast[cols], on="datetime", how="left", validate="one_to_one")
-    prices = load_esios_price_history(target_day, target_day, token)
-    if not prices.empty:
-        out = out.merge(prices.rename(columns={"price_eur_mwh": "cleared_price_eur_mwh"}), on="datetime", how="left")
+    out["gap_error_mw"] = out["thermal_gap_forecast_mwh"] - out["observed_pbf_gap_mwh"]
+    reconstructed = (out["demand_contribution_to_gap_error_mw"] + out["bilateral_contribution_to_gap_error_mw"]
+                     + out["generation_contribution_to_gap_error_mw"])
+    out["gap_reconciliation_error_mw"] = out["gap_error_mw"] - reconstructed
+    for tech in technologies:
+        if tech in out and f"observed_{tech}" in out:
+            out[f"forecast_minus_observed_{tech}_mw"] = out[tech] - out[f"observed_{tech}"]
+    price_columns = [c for c in ["datetime", "forecast_price_eur_mwh", "raw_model_price_eur_mwh", "fundamental_price_eur_mwh"] if c in price_forecast]
+    out = out.merge(price_forecast[price_columns], on="datetime", how="left")
+    actual_prices = load_esios_price_history(target_day, target_day, token)
+    if not actual_prices.empty:
+        out = out.merge(actual_prices.rename(columns={"price_eur_mwh": "cleared_price_eur_mwh"}), on="datetime", how="left")
         out["price_error_eur_mwh"] = out["forecast_price_eur_mwh"] - out["cleared_price_eur_mwh"]
     first = ["datetime", "thermal_gap_forecast_mwh", "observed_pbf_gap_mwh", "gap_error_mw",
-             "demand_contribution_to_gap_error_mw", "residual_bilateral_contribution_to_gap_error_mw",
-             "gross_generation_contribution_to_gap_error_mw", "gap_reconciliation_error_mw",
-             "forecast_price_eur_mwh", "cleared_price_eur_mwh", "price_error_eur_mwh"]
-    return out[[c for c in first if c in out] + [c for c in out if c not in first]].sort_values("datetime")
+             "demand_contribution_to_gap_error_mw", "bilateral_contribution_to_gap_error_mw",
+             "generation_contribution_to_gap_error_mw", "forecast_price_eur_mwh", "cleared_price_eur_mwh", "price_error_eur_mwh"]
+    columns = [c for c in first if c in out] + [c for c in out if c not in first]
+    return out[columns].sort_values("datetime").reset_index(drop=True)
+
+
+# =========================================================
+# V18: ex-ante fundamentals, carbon, LEAR and bias correction
+# =========================================================
+# Why: the V17 price model explains price with a thermal gap built from PBF
+# programmes. PBF solar/wind are *post-auction* and are curtailed when the
+# price is <= 0, so in history the gap partly depends on the price itself, and
+# at forecast time the gap comes from a different (forecast) source. V18 adds
+# REE's sealed D+1 forecasts, which are ex-ante in history AND at forecast time
+# (published ~10:50 D-1, never revised), so train and target see the same thing.
+FORECAST_ENGINE_VERSION = "v18_1_daytype_anchor_bias"
+
+# ESIOS "Previsión diaria D+1" series (sealed D-1, no post-publication revision).
+# 1775 demand is already used above. Check 1777/1779 once in ESIOS: if either
+# returns empty the model keeps running with an availability flag = 0.
+REE_D1_WIND_FORECAST_INDICATOR_ID = 1777
+REE_D1_PV_FORECAST_INDICATOR_ID = 1779
+
+# EUA settlement prices from a local file you maintain (ICE/EEX daily settle),
+# placed in the same data/ folder as the MIBGAS files. Columns: date, price.
+EUA_LOCAL_FILE_PATTERNS = ["EUA_*.csv", "EUA_*.xlsx"]
+CCGT_EFFICIENCY = 0.55          # MWh_e / MWh_th
+CCGT_EMISSION_FACTOR = 0.37     # tCO2 / MWh_e
+
+V18_BIAS_WINDOW_DAYS = 21   # per day type: ~15 workdays or ~6 off-days
+V18_BIAS_MIN_DAYS = 3
+V18_LEAR_MIN_DAYS = 90
+
+V18_FEATURES = [
+    "ree_d1_demand_mw", "ree_d1_wind_mw", "ree_d1_pv_mw", "ree_d1_residual_mw",
+    "ree_d1_residual_daily_mean", "ree_d1_residual_daily_min",
+    "ree_d1_residual_daily_max", "ree_d1_residual_rank",
+    "ree_d1_residual_change_d1", "ree_d1_renewable_share", "ree_d1_available",
+    "eua_d1_eur_t", "eua_available", "ccgt_srmc_eur_mwh",
+    "ccgt_srmc_x_residual", "price_lag_same_type", "price_same_type_solar_mean",
+]
+
+
+def _v18_is_offday(day: date, holidays_set: set) -> bool:
+    return day.weekday() >= 5 or day in holidays_set
+
+
+def _v18_same_type_day(day: date, holidays_set: set):
+    """Most recent earlier day of the same type, looking back at most 7 days.
+
+    Working day -> last working day (Monday -> Friday).
+    Saturday -> previous Saturday. Sunday/holiday -> last Sunday or holiday.
+    """
+    if day.weekday() == 5 and day not in holidays_set:
+        return day - timedelta(days=7)
+    offday = _v18_is_offday(day, holidays_set)
+    for lag in range(1, 8):
+        candidate = day - timedelta(days=lag)
+        if offday:
+            if candidate.weekday() == 6 or candidate in holidays_set:
+                return candidate
+        elif not _v18_is_offday(candidate, holidays_set):
+            return candidate
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=16)
+def _v18_fetch_esios_hourly_average(indicator_id: int, start_day: date,
+                                    end_day: date, _token: str) -> pd.DataFrame:
+    """Hourly average MW of one ESIOS indicator (V18.2: fixed-grid block cache)."""
+    out = esios_hourly_history(indicator_id, start_day, end_day, "average", _token)
+    if out.empty:
+        return pd.DataFrame(columns=["datetime", "value"])
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return (out.dropna(subset=["datetime", "value"])
+            .groupby("datetime", as_index=False)["value"].mean()
+            .sort_values("datetime").reset_index(drop=True))
+
+
+def load_ree_d1_fundamentals(start_day: date, end_day: date, token: str) -> pd.DataFrame:
+    """REE sealed D+1 demand, wind and PV forecasts, hourly MW (ex-ante)."""
+    series = {
+        "ree_d1_demand_mw": REE_D1_DEMAND_FORECAST_INDICATOR_ID,
+        "ree_d1_wind_mw": REE_D1_WIND_FORECAST_INDICATOR_ID,
+        "ree_d1_pv_mw": REE_D1_PV_FORECAST_INDICATOR_ID,
+    }
+    grid = pd.DataFrame({"datetime": pd.date_range(pd.Timestamp(start_day),
+                                                   pd.Timestamp(end_day + timedelta(days=1)),
+                                                   freq="h", inclusive="left")})
+    for column, indicator in series.items():
+        try:
+            data = _v18_fetch_esios_hourly_average(indicator, start_day, end_day, token)
+        except Exception:
+            data = pd.DataFrame(columns=["datetime", "value"])
+        grid = grid.merge(data.rename(columns={"value": column}), on="datetime", how="left")
+    return grid
+
+
+def _v18_find_eua_file() -> Path | None:
+    for directory in _mibgas_data_directories():
+        for pattern in EUA_LOCAL_FILE_PATTERNS:
+            matches = sorted(directory.glob(pattern)) if directory.exists() else []
+            if matches:
+                return matches[-1]
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_eua_daily_lookup() -> tuple[dict, str]:
+    """{settlement date: EUA EUR/t}. Missing file = empty lookup, never an error."""
+    path = _v18_find_eua_file()
+    if path is None:
+        return {}, "EUA file not found (data/EUA_*.csv or .xlsx) - carbon features off"
+    try:
+        raw = pd.read_excel(path) if path.suffix.lower() == ".xlsx" else pd.read_csv(path)
+        columns = {c: str(c).strip().lower() for c in raw.columns}
+        raw = raw.rename(columns=columns)
+        date_col = next(c for c in raw.columns if "date" in c or "fecha" in c)
+        price_col = next(c for c in raw.columns if c != date_col and
+                         pd.to_numeric(raw[c], errors="coerce").notna().mean() > 0.8)
+        frame = pd.DataFrame({
+            "date": pd.to_datetime(raw[date_col], errors="coerce", dayfirst=True).dt.date,
+            "price": pd.to_numeric(raw[price_col], errors="coerce"),
+        }).dropna()
+        return dict(zip(frame["date"], frame["price"])), f"EUA from {path.name}"
+    except Exception as exc:
+        return {}, f"EUA file unreadable ({type(exc).__name__}) - carbon features off"
+
+
+def _v18_last_settle(lookup: dict, delivery_day: date, max_back: int = 5) -> float:
+    """Latest settle strictly before delivery day D (known before the D-1 auction)."""
+    for lag in range(1, max_back + 1):
+        value = lookup.get(delivery_day - timedelta(days=lag))
+        if value is not None and np.isfinite(value):
+            return float(value)
+    return np.nan
+
+
+def _v18_add_fundamental_features(frame: pd.DataFrame, eua_lookup: dict,
+                                  ree_daily_mean: dict | None = None) -> pd.DataFrame:
+    """Derived REE D+1 and carbon features. Expects REE columns already merged."""
+    out = frame.copy()
+    for column in ["ree_d1_demand_mw", "ree_d1_wind_mw", "ree_d1_pv_mw"]:
+        out[column] = _v17_numeric(out, column)
+    out["ree_d1_residual_mw"] = (out["ree_d1_demand_mw"] - out["ree_d1_wind_mw"].fillna(0)
+                                 - out["ree_d1_pv_mw"].fillna(0))
+    out.loc[out["ree_d1_demand_mw"].isna(), "ree_d1_residual_mw"] = np.nan
+    out["ree_d1_available"] = out["ree_d1_residual_mw"].notna().astype(int)
+    grouped = out.groupby("date")["ree_d1_residual_mw"]
+    out["ree_d1_residual_daily_mean"] = grouped.transform("mean")
+    out["ree_d1_residual_daily_min"] = grouped.transform("min")
+    out["ree_d1_residual_daily_max"] = grouped.transform("max")
+    out["ree_d1_residual_rank"] = grouped.rank(pct=True)
+    # Previous-day residual comes from the full REE series, so the one-day
+    # target frame gets the same value history would have had.
+    daily_mean = ree_daily_mean if ree_daily_mean is not None else (
+        out.groupby("date")["ree_d1_residual_mw"].mean().to_dict())
+    out["ree_d1_residual_change_d1"] = out["ree_d1_residual_daily_mean"] - out["date"].map(
+        lambda d: daily_mean.get(d - timedelta(days=1), np.nan))
+    demand = out["ree_d1_demand_mw"].where(out["ree_d1_demand_mw"] > 0)
+    out["ree_d1_renewable_share"] = (out["ree_d1_wind_mw"] + out["ree_d1_pv_mw"]) / demand
+    out["eua_d1_eur_t"] = out["date"].map(lambda d: _v18_last_settle(eua_lookup, d))
+    out["eua_available"] = out["eua_d1_eur_t"].notna().astype(int)
+    gas = _v17_numeric(out, "mibgas_d1_eur_mwh").where(_v17_numeric(out, "mibgas_data_available") > 0)
+    out["ccgt_srmc_eur_mwh"] = gas / CCGT_EFFICIENCY + CCGT_EMISSION_FACTOR * out["eua_d1_eur_t"].fillna(0)
+    out["ccgt_srmc_x_residual"] = out["ccgt_srmc_eur_mwh"] * out["ree_d1_residual_mw"].clip(lower=0) / 10_000.0
+    return out
+
+
+def _v18_asinh_scale(y: np.ndarray):
+    """epftoolbox-style variance stabilising transform for spiky/negative prices."""
+    median = float(np.nanmedian(y))
+    mad = float(np.nanmedian(np.abs(y - median))) * 1.4826
+    mad = mad if mad > 1e-6 else 1.0
+    forward = lambda v: np.arcsinh((np.asarray(v, float) - median) / mad)
+    inverse = lambda z: np.sinh(np.asarray(z, float)) * mad + median
+    return forward, inverse
+
+
+def _v18_lear_forecast(train: pd.DataFrame, target: pd.DataFrame, features: list[str]) -> np.ndarray:
+    """LEAR: one LASSO per delivery hour on asinh prices (Lago et al. benchmark)."""
+    from sklearn.linear_model import LassoLarsIC
+    from sklearn.preprocessing import StandardScaler
+    x_all, z_all = _v17_impute(train, target, features)
+    forward, inverse = _v18_asinh_scale(train["price_eur_mwh"].to_numpy(float))
+    prediction = np.full(len(target), np.nan)
+    for hour in range(24):
+        tr = (train["hour"] == hour).to_numpy()
+        te = (target["hour"] == hour).to_numpy()
+        if not te.any():
+            continue
+        if tr.sum() < 30:
+            prediction[te] = np.nanmedian(train.loc[tr, "price_eur_mwh"]) if tr.any() else np.nan
+            continue
+        scaler = StandardScaler().fit(x_all[tr])
+        model = LassoLarsIC(criterion="aic", max_iter=500)
+        z_train = forward(train.loc[tr, "price_eur_mwh"])
+        model.fit(np.nan_to_num(scaler.transform(x_all[tr])), z_train)
+        z_pred = model.predict(np.nan_to_num(scaler.transform(z_all[te])))
+        # V18.2: a linear model can extrapolate far outside the asinh range seen
+        # in training, and sinh() then overflows to inf ("Non-finite candidate
+        # prices" failures). Keep the prediction within the training range plus
+        # a generous margin before inverting.
+        z_low, z_high = float(np.nanmin(z_train)) - 1.0, float(np.nanmax(z_train)) + 1.0
+        prediction[te] = inverse(np.clip(z_pred, z_low, z_high))
+    return prediction
+
+
+def _v18_day_types(frame: pd.DataFrame) -> np.ndarray:
+    """'offday' for weekends and national holidays, else 'workday'."""
+    weekend = _v17_numeric(frame, "is_weekend", 0).fillna(0).to_numpy() > 0
+    holiday = _v17_numeric(frame, "is_holiday", 0).fillna(0).to_numpy() > 0
+    return np.where(weekend | holiday, "offday", "workday")
+
+
+def _v18_hourly_bias(validation: pd.DataFrame, prediction: np.ndarray, before_day: date,
+                     day_type: str, window_days: int = V18_BIAS_WINDOW_DAYS) -> pd.Series:
+    """Median signed error by hour over earlier days of the SAME day type.
+
+    Mixing types hid the workday solar-hour bias (about -35 EUR/MWh in Sept
+    2026) behind near-zero weekend errors.
+    """
+    frame = pd.DataFrame({"date": validation["date"].to_numpy(), "hour": validation["hour"].to_numpy(),
+                          "type": _v18_day_types(validation),
+                          "error": validation["price_eur_mwh"].to_numpy(float) - np.asarray(prediction, float)})
+    frame = frame[(frame["date"] < before_day) & (frame["type"] == day_type)
+                  & (frame["date"] >= before_day - timedelta(days=window_days))]
+    if frame["date"].nunique() < V18_BIAS_MIN_DAYS:
+        return pd.Series(0.0, index=range(24))
+    return frame.groupby("hour")["error"].median().reindex(range(24)).fillna(0.0)
+
+
+def _v18_bias_corrected(validation: pd.DataFrame, prediction: np.ndarray, shrink: float) -> np.ndarray:
+    """Prequential correction: each day only sees earlier days' errors."""
+    base = np.asarray(prediction, float)
+    corrected = base.copy()
+    types = _v18_day_types(validation)
+    for day in sorted(validation["date"].unique()):
+        mask = (validation["date"] == day).to_numpy()
+        bias = _v18_hourly_bias(validation, base, day, types[mask][0])
+        corrected[mask] = base[mask] + shrink * validation.loc[mask, "hour"].map(bias).to_numpy()
+    return corrected
+
+
+def _v18_choose_bias_shrink(validation: pd.DataFrame, prediction: np.ndarray) -> float:
+    """Pick the shrink (0 = off) that minimised prequential MAE on validation."""
+    y = validation["price_eur_mwh"].to_numpy(float)
+    best_shrink, best_mae = 0.0, float(np.mean(np.abs(y - np.asarray(prediction, float))))
+    for shrink in (0.25, 0.5, 0.75, 1.0):
+        mae = float(np.mean(np.abs(y - _v18_bias_corrected(validation, prediction, shrink))))
+        if mae < best_mae - 0.05:
+            best_shrink, best_mae = shrink, mae
+    return best_shrink
+
+
+# =========================================================
+# V18.2: operational price post-processing (level and floor)
+# =========================================================
+# Both corrections are applied AFTER the V18 model. The raw model, its weights
+# and its caches are untouched, so the YTD backtest reports raw and adjusted
+# results from the same run.
+#
+# 1) D-1 level correction. In the Jan-Feb 2026 walk-forward about three
+#    quarters of the hourly MAE was a wrong daily level, and that level error
+#    was persistent (lag-1 autocorrelation ~0.6). When the forecast for D is
+#    made on D-1, the auction for D-1 has already cleared, so yesterday's
+#    error of the full operational chain is known:
+#        error(D-1)     = raw forecast baseload(D-1) - realised baseload(D-1)
+#        adjusted(D, h) = raw(D, h) - lambda * error(D-1)
+#    The shift is identical for all hours, so it never changes the BESS
+#    charge/discharge selection; it only moves the level. The V18 hourly bias
+#    correction cannot see this error because its validation block uses
+#    observed PBF gaps instead of the forecast gap.
+# 2) Price floor. The model has no lower bound and produced negative
+#    baseloads in Feb-2026 while realised prices stayed positive. The default
+#    soft floor is the 1st percentile of realised hourly prices in the 365
+#    days before D. Values below it are compressed (slope 0.10) rather than
+#    clipped, so the hourly order used by the BESS optimiser is preserved.
+PRICE_POSTPROCESSING_VERSION = "v18_2_level_floor"
+LEVEL_CORRECTION_DEFAULT_LAMBDA = 0.5
+PRICE_FLOOR_QUANTILE = 0.01
+PRICE_FLOOR_LOOKBACK_DAYS = 365
+PRICE_SOFT_FLOOR_SLOPE = 0.10
+PRICE_FLOOR_MODES = [
+    "Soft floor at the 1st percentile of the last 365 days",
+    "Hard floor at 0 EUR/MWh",
+    "Off",
+]
+
+
+def _v182_price_floor_reference(prices: pd.DataFrame, target_day: date) -> float:
+    """1st percentile of realised hourly prices in the 365 days before D."""
+    if prices is None or prices.empty or "price_eur_mwh" not in prices:
+        return np.nan
+    days = pd.to_datetime(prices["datetime"], errors="coerce").dt.date
+    window = (days < target_day) & (days >= target_day - timedelta(days=PRICE_FLOOR_LOOKBACK_DAYS))
+    values = pd.to_numeric(prices.loc[window, "price_eur_mwh"], errors="coerce").dropna()
+    if len(values) < 24 * 60:
+        return np.nan
+    return float(values.quantile(PRICE_FLOOR_QUANTILE))
+
+
+def _v182_floor_spec(floor_mode: str, floor_reference: float) -> tuple[str, float]:
+    """Translate the UI floor choice into ("soft"|"hard"|"off", value)."""
+    reference = pd.to_numeric(floor_reference, errors="coerce")
+    if floor_mode == PRICE_FLOOR_MODES[0]:
+        return ("soft", float(reference)) if pd.notna(reference) else ("off", np.nan)
+    if floor_mode == PRICE_FLOOR_MODES[1]:
+        return "hard", 0.0
+    return "off", np.nan
+
+
+def postprocess_price_curve(values, level_shift: float = 0.0, floor_kind: str = "off",
+                            floor_value: float = np.nan) -> np.ndarray:
+    """Subtract the D-1 level shift, then apply the floor (monotonic in input)."""
+    shift = float(level_shift) if pd.notna(level_shift) else 0.0
+    adjusted = np.asarray(values, dtype=float) - shift
+    if floor_kind == "soft" and pd.notna(floor_value):
+        adjusted = np.where(adjusted < floor_value,
+                            floor_value + PRICE_SOFT_FLOOR_SLOPE * (adjusted - floor_value), adjusted)
+    elif floor_kind == "hard" and pd.notna(floor_value):
+        adjusted = np.maximum(adjusted, floor_value)
+    return adjusted
+
+
+def apply_price_postprocessing(price_result: dict, level_shift: float, floor_mode: str,
+                               details: dict | None = None) -> dict:
+    """Return a copy of price_result whose final curve is post-processed.
+
+    The raw V18 curve is kept in raw_final_forecast_eur_mwh. Steps 3-5 read
+    forecast_price_eur_mwh, so they all use the adjusted curve.
+    """
+    result = dict(price_result)
+    forecast = price_result["forecast"].copy()
+    floor_kind, floor_value = _v182_floor_spec(
+        floor_mode, price_result.get("price_floor_reference_eur_mwh", np.nan))
+    raw = pd.to_numeric(forecast["forecast_price_eur_mwh"], errors="coerce").to_numpy(float)
+    adjusted = postprocess_price_curve(raw, level_shift, floor_kind, floor_value)
+    forecast["raw_final_forecast_eur_mwh"] = raw
+    forecast["forecast_price_eur_mwh"] = adjusted
+    for column in ["forecast_p10_eur_mwh", "forecast_p90_eur_mwh"]:
+        if column in forecast:
+            forecast[column] = postprocess_price_curve(
+                pd.to_numeric(forecast[column], errors="coerce"), level_shift, floor_kind, floor_value)
+    forecast["level_correction_eur_mwh"] = -float(level_shift)
+    forecast["price_floor_eur_mwh"] = floor_value if floor_kind != "off" else np.nan
+    result["forecast"] = forecast
+    result["postprocessing"] = {
+        **(details or {}),
+        "version": PRICE_POSTPROCESSING_VERSION,
+        "level_shift_eur_mwh": float(level_shift),
+        "floor_mode": floor_mode,
+        "floor_kind": floor_kind,
+        "floor_value_eur_mwh": floor_value,
+        "hours_below_floor": int(np.sum(raw - float(level_shift) < floor_value)) if floor_kind != "off" else 0,
+        "raw_baseload_eur_mwh": float(np.nanmean(raw)),
+        "adjusted_baseload_eur_mwh": float(np.nanmean(adjusted)),
+    }
+    return result
+
+
+def _canonical_demand_source(label: str) -> str:
+    """One label per demand curve, so Step 1 and Step 6 share cached days."""
+    text = str(label)
+    if text.startswith("Model"):
+        return "Model forecast"
+    if text.startswith("REE"):
+        return "REE official D+1 forecast"
+    return "Previous week + recent trend"
+
+
+def previous_day_operational_error(target_day: date, lookback_days: int, temperature_mode: str,
+                                   trend_alpha: float, demand_source: str,
+                                   technologies: list[str], token: str) -> dict:
+    """Raw error of yesterday's full operational forecast (known on D-1).
+
+    Re-uses a Step 6 walk-forward row computed with identical settings when one
+    is in the session; otherwise yesterday's forecast is recreated (cached).
+    """
+    previous_day = target_day - timedelta(days=1)
+    canonical = _canonical_demand_source(demand_source)
+    technologies_text = " | ".join(technologies)
+    stored = normalize_walk_forward_results(st.session_state.get(YTD_BACKTEST_STATE_KEY, pd.DataFrame()))
+
+    def _column(frame: pd.DataFrame, name: str) -> pd.Series:
+        return frame[name] if name in frame else pd.Series(np.nan, index=frame.index)
+
+    if not stored.empty:
+        match = stored[
+            (stored["target_day"] == previous_day)
+            & (stored["status"] == "ok")
+            & (_column(stored, "demand_source").astype(str) == canonical)
+            & (pd.to_numeric(_column(stored, "lookback_days"), errors="coerce") == int(lookback_days))
+            & (_column(stored, "temperature_mode").astype(str) == str(temperature_mode))
+            & ((pd.to_numeric(_column(stored, "trend_alpha"), errors="coerce") - float(trend_alpha)).abs() < 1e-9)
+            & (_column(stored, "technologies").astype(str) == technologies_text)
+        ]
+        if not match.empty:
+            row = match.iloc[-1]
+            forecast_baseload = float(row["forecast_baseload_eur_mwh"])
+            actual_baseload = float(row["actual_baseload_eur_mwh"])
+            if np.isfinite(forecast_baseload) and np.isfinite(actual_baseload):
+                return {
+                    "previous_day": previous_day,
+                    "previous_day_error_eur_mwh": forecast_baseload - actual_baseload,
+                    "previous_day_forecast_baseload_eur_mwh": forecast_baseload,
+                    "previous_day_actual_baseload_eur_mwh": actual_baseload,
+                    "source": "Step 6 walk-forward row for D-1",
+                }
+    row = run_one_walk_forward_backtest_day(
+        target_day=previous_day,
+        lookback_days=int(lookback_days),
+        temperature_mode=temperature_mode,
+        trend_alpha=float(trend_alpha),
+        demand_source=canonical,
+        technologies_tuple=tuple(technologies),
+        _token=token,
+    )
+    return {
+        "previous_day": previous_day,
+        "previous_day_error_eur_mwh": float(row["forecast_baseload_eur_mwh"]) - float(row["actual_baseload_eur_mwh"]),
+        "previous_day_forecast_baseload_eur_mwh": float(row["forecast_baseload_eur_mwh"]),
+        "previous_day_actual_baseload_eur_mwh": float(row["actual_baseload_eur_mwh"]),
+        "source": "Recreated D-1 operational forecast",
+    }
+
+
+# =========================================================
+# V18.2: fixed-grid history cache (same data, far fewer API calls)
+# =========================================================
+# Every walk-forward day used to download its whole 550-day history again
+# (roughly 700 ESIOS requests plus REData and Open-Meteo), because each day
+# asks for a window shifted by one day and the cache key changed. History is
+# now fetched in fixed calendar blocks that are identical for every target
+# day. A block that ended at least HISTORY_CLOSED_LAG_DAYS ago is final and is
+# cached for a week; the most recent block is refreshed every 30 minutes. The
+# requested window is cut out of the blocks afterwards, so nothing after the
+# requested end date ever reaches a model.
+HISTORY_GRID_ANCHOR = date(2020, 1, 6)  # a Monday
+ESIOS_BLOCK_DAYS = 14
+REDATA_BLOCK_DAYS = 7
+HISTORY_CLOSED_LAG_DAYS = 3
+ARCHIVE_CLOSED_LAG_DAYS = 10
+
+
+def _fixed_blocks(start_day: date, end_day: date, block_days: int) -> list[tuple[date, date]]:
+    """Fixed [start, end] blocks of block_days days covering start..end."""
+    if start_day > end_day:
+        return []
+    offset = (start_day - HISTORY_GRID_ANCHOR).days // block_days
+    block_start = HISTORY_GRID_ANCHOR + timedelta(days=offset * block_days)
+    blocks = []
+    while block_start <= end_day:
+        block_end = block_start + timedelta(days=block_days - 1)
+        blocks.append((block_start, block_end))
+        block_start = block_end + timedelta(days=1)
+    return blocks
+
+
+def _month_blocks(start_day: date, end_day: date) -> list[tuple[date, date]]:
+    """Calendar-month blocks covering start..end."""
+    blocks = []
+    month_start = start_day.replace(day=1)
+    while month_start <= end_day:
+        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        blocks.append((month_start, next_month - timedelta(days=1)))
+        month_start = next_month
+    return blocks
+
+
+def _block_is_closed(block_end: date, lag_days: int) -> bool:
+    return block_end <= date.today() - timedelta(days=lag_days)
+
+
+def _esios_block_request(indicator_id: int, block_start: date, block_end: date,
+                         time_agg: str, token: str) -> pd.DataFrame:
+    """One ESIOS request for one fixed block. Raises after three failed tries,
+    so a failure is never cached as an empty block."""
+    start_local = pd.Timestamp(block_start, tz="Europe/Madrid")
+    end_local = pd.Timestamp(block_end + timedelta(days=1), tz="Europe/Madrid")
+    params = {
+        "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time_trunc": "hour",
+        "time_agg": time_agg,
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(f"{ESIOS_API_BASE}/{indicator_id}", headers=esios_headers(token),
+                                    params=params, timeout=(15, 120))
+            response.raise_for_status()
+            parsed = parse_esios_values(response.json())
+            if parsed.empty:
+                return pd.DataFrame(columns=["datetime", "value"])
+            lower, upper = start_local.tz_localize(None), end_local.tz_localize(None)
+            parsed = parsed[(parsed["datetime"] >= lower) & (parsed["datetime"] < upper)]
+            return parsed[["datetime", "value"]].reset_index(drop=True)
+        except requests.RequestException as exc:
+            last_error = exc
+            sleep(1.5 * (attempt + 1))
+    raise RuntimeError(
+        f"ESIOS indicator {indicator_id} {block_start}..{block_end} unavailable after 3 attempts "
+        f"({type(last_error).__name__})."
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=7 * 86400, max_entries=20000)
+def _esios_closed_block(indicator_id: int, block_start: date, block_end: date,
+                        time_agg: str, _token: str) -> pd.DataFrame:
+    return _esios_block_request(indicator_id, block_start, block_end, time_agg, _token)
+
+
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=2000)
+def _esios_recent_block(indicator_id: int, block_start: date, block_end: date,
+                        time_agg: str, _token: str) -> pd.DataFrame:
+    return _esios_block_request(indicator_id, block_start, block_end, time_agg, _token)
+
+
+def esios_hourly_history(indicator_id: int, start_day: date, end_day: date,
+                         time_agg: str, token: str) -> pd.DataFrame:
+    """Hourly ESIOS values (datetime, value) for start_day..end_day."""
+    frames = []
+    for block_start, block_end in _fixed_blocks(start_day, end_day, ESIOS_BLOCK_DAYS):
+        loader = (_esios_closed_block if _block_is_closed(block_end, HISTORY_CLOSED_LAG_DAYS)
+                  else _esios_recent_block)
+        try:
+            block = loader(int(indicator_id), block_start, block_end, str(time_agg), token)
+        except Exception:
+            # Same behaviour as before: a block that still fails after three
+            # attempts is skipped. Exceptions are not cached, so it is retried
+            # on the next call.
+            continue
+        if block is not None and not block.empty:
+            frames.append(block)
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value"])
+    out = pd.concat(frames, ignore_index=True)
+    lower, upper = pd.Timestamp(start_day), pd.Timestamp(end_day + timedelta(days=1))
+    return out[(out["datetime"] >= lower) & (out["datetime"] < upper)].reset_index(drop=True)
+
+
+def _archive_block_request(points: tuple, variables: tuple, model: str,
+                           block_start: date, block_end: date) -> list:
+    """One Open-Meteo archive request; keeps only the hourly arrays."""
+    params = {
+        "latitude": ",".join(str(point[0]) for point in points),
+        "longitude": ",".join(str(point[1]) for point in points),
+        "start_date": block_start.isoformat(),
+        "end_date": block_end.isoformat(),
+        "hourly": ",".join(variables),
+        "timezone": "Europe/Madrid",
+        "models": model,
+    }
+    response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=180)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict):
+        payload = [payload]
+    return [
+        {"hourly": {key: list((item.get("hourly", {}) or {}).get(key, []) or [])
+                    for key in ("time", *variables)}}
+        for item in payload
+    ]
+
+
+@st.cache_data(show_spinner=False, ttl=7 * 86400, max_entries=2000)
+def _archive_closed_block(points: tuple, variables: tuple, model: str,
+                          block_start: date, block_end: date) -> list:
+    return _archive_block_request(points, variables, model, block_start, block_end)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
+def _archive_recent_block(points: tuple, variables: tuple, model: str,
+                          block_start: date, block_end: date) -> list:
+    return _archive_block_request(points, variables, model, block_start, block_end)
+
+
+def open_meteo_archive_payload(points: tuple, variables: tuple, model: str,
+                               start_day: date, end_day: date) -> list:
+    """Payload equivalent to ONE archive request for start_day..end_day.
+
+    Complete past months are cached; per point, the arrays of all months are
+    concatenated and cut to the requested dates, so downstream processing
+    (including the radiation shift) sees exactly the series a single request
+    would have returned.
+    """
+    combined = [{"hourly": {key: [] for key in ("time", *variables)}} for _ in points]
+    for block_start, block_end in _month_blocks(start_day, end_day):
+        if _block_is_closed(block_end, ARCHIVE_CLOSED_LAG_DAYS):
+            part = _archive_closed_block(points, variables, model, block_start, block_end)
+        else:
+            part = _archive_recent_block(points, variables, model, block_start, min(block_end, end_day))
+        for index, item in enumerate(part[:len(points)]):
+            hourly = item["hourly"]
+            times = hourly.get("time", [])
+            for key in ("time", *variables):
+                values = hourly.get(key, [])
+                if key != "time" and len(values) != len(times):
+                    values = [None] * len(times)
+                combined[index]["hourly"][key].extend(values)
+    lower, upper = f"{start_day.isoformat()}T00:00", f"{end_day.isoformat()}T23:59"
+    for item in combined:
+        hourly = item["hourly"]
+        keep = [i for i, stamp in enumerate(hourly["time"]) if lower <= str(stamp) <= upper]
+        for key in list(hourly):
+            hourly[key] = [hourly[key][i] for i in keep]
+    return combined
 
 
 # =========================================================
@@ -1314,18 +1937,30 @@ def _fetch_hourly_demand_chunk(start_day: date, end_day: date) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=7 * 86400, max_entries=5000)
+def _redata_demand_closed_block(block_start: date, block_end: date) -> pd.DataFrame:
+    return _fetch_hourly_demand_chunk(block_start, block_end)
+
+
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=500)
+def _redata_demand_recent_block(block_start: date, block_end: date) -> pd.DataFrame:
+    return _fetch_hourly_demand_chunk(block_start, block_end)
+
+
+def _redata_demand_block(block_start: date, block_end: date) -> pd.DataFrame:
+    if _block_is_closed(block_end, HISTORY_CLOSED_LAG_DAYS):
+        return _redata_demand_closed_block(block_start, block_end)
+    return _redata_demand_recent_block(block_start, block_end)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=16)
 def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFrame:
-    chunks = []
-    current = start_day
-    while current <= end_day:
-        chunk_end = min(end_day, current + timedelta(days=6))
-        chunks.append((current, chunk_end))
-        current = chunk_end + timedelta(days=1)
+    # V18.2: fixed 7-day blocks shared by every target day (see history cache).
+    chunks = _fixed_blocks(start_day, end_day, REDATA_BLOCK_DAYS)
 
     frames = []
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(_fetch_hourly_demand_chunk, s, e): (s, e) for s, e in chunks}
+        futures = {executor.submit(_redata_demand_block, s, e): (s, e) for s, e in chunks}
         for future in as_completed(futures):
             try:
                 frame = future.result()
@@ -1340,6 +1975,8 @@ def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFram
     out = pd.concat(frames, ignore_index=True)
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
     out["demand_mw"] = pd.to_numeric(out["demand_mw"], errors="coerce")
+    out = out[(out["datetime"] >= pd.Timestamp(start_day))
+              & (out["datetime"] < pd.Timestamp(end_day + timedelta(days=1)))]
     return (
         out.dropna(subset=["datetime", "demand_mw"])
         .groupby("datetime", as_index=False)["demand_mw"].mean()
@@ -1574,24 +2211,18 @@ def _temperature_points(mode: str) -> list[dict]:
     return SPAIN_TEMPERATURE_POINTS
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=8)
 def load_hourly_temperature_history(start_day: date, end_day: date, mode: str) -> pd.DataFrame:
     points = _temperature_points(mode)
     safe_end = min(end_day, date.today() - timedelta(days=5))
     if start_day > safe_end:
         return pd.DataFrame(columns=["datetime", "temperature_c"])
-    params = {
-        "latitude": ",".join(str(p["latitude"]) for p in points),
-        "longitude": ",".join(str(p["longitude"]) for p in points),
-        "start_date": start_day.isoformat(),
-        "end_date": safe_end.isoformat(),
-        "hourly": "temperature_2m",
-        "timezone": "Europe/Madrid",
-        "models": "era5_land",
-    }
-    response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=180)
-    response.raise_for_status()
-    return _weighted_hourly_temperature(response.json(), points)
+    # V18.2: monthly archive blocks shared by every target day.
+    payload = open_meteo_archive_payload(
+        tuple((p["latitude"], p["longitude"]) for p in points),
+        ("temperature_2m",), "era5_land", start_day, safe_end,
+    )
+    return _weighted_hourly_temperature(payload, points)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -1708,16 +2339,18 @@ FORECAST_FEATURES = [
 
 
 def forecast_metrics(actual, predicted) -> dict:
-    actual = np.asarray(actual, dtype=float)
-    predicted = np.asarray(predicted, dtype=float)
+    actual, predicted = np.asarray(actual, float), np.asarray(predicted, float)
     valid = np.isfinite(actual) & np.isfinite(predicted)
-    actual, predicted = actual[valid], predicted[valid]
-    if not len(actual):
+    y, p = actual[valid], predicted[valid]
+    if not len(y):
         return {"mae": np.nan, "rmse": np.nan, "mape": np.nan}
-    error = predicted - actual
-    nonzero = np.abs(actual) > 1e-9
-    return {"mae": float(np.mean(np.abs(error))), "rmse": float(np.sqrt(np.mean(error**2))),
-            "mape": float(np.mean(np.abs(error[nonzero] / actual[nonzero])) * 100) if nonzero.any() else np.nan}
+    error = p - y
+    nonzero = np.abs(y) > 1e-6
+    return {
+        "mae": float(np.mean(np.abs(error))),
+        "rmse": float(np.sqrt(np.mean(error ** 2))),
+        "mape": float(np.mean(np.abs(error[nonzero] / y[nonzero])) * 100) if nonzero.any() else np.nan,
+    }
 
 
 def similar_day_prediction(history: pd.DataFrame, target: pd.DataFrame) -> np.ndarray:
@@ -2160,57 +2793,12 @@ def fetch_one_pbf_indicator_hourly(
 
     time_agg=sum ensures that, after the quarter-hour market transition, the
     four quarter-hour programmed-energy values are summed into the hourly MWh.
+    V18.2: history comes from the fixed-grid block cache.
     """
-    frames = []
-    chunk_start = start_day
-
-    while chunk_start <= end_day:
-        chunk_end = min(end_day, chunk_start + timedelta(days=13))
-
-        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
-        end_local = pd.Timestamp(
-            chunk_end + timedelta(days=1),
-            tz="Europe/Madrid",
-        )
-
-        params = {
-            "start_date": start_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "end_date": end_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "time_trunc": "hour",
-            "time_agg": "sum",
-        }
-
-        for attempt in range(3):
-            try:
-                response = requests.get(
-                    f"{ESIOS_API_BASE}/{indicator_id}",
-                    headers=esios_headers(token),
-                    params=params,
-                    timeout=(15, 120),
-                )
-                response.raise_for_status()
-
-                parsed = parse_esios_values(response.json())
-                if not parsed.empty:
-                    chunk_lower = start_local.tz_localize(None)
-                    chunk_upper = end_local.tz_localize(None)
-                    parsed = parsed[(parsed["datetime"] >= chunk_lower) & (parsed["datetime"] < chunk_upper)]
-                    frames.append(parsed)
-                break
-
-            except requests.RequestException:
-                sleep(1.5 * (attempt + 1))
-
-        chunk_start = chunk_end + timedelta(days=1)
-
-    if not frames:
+    out = esios_hourly_history(indicator_id, start_day, end_day, "sum", token)
+    if out.empty:
         return pd.DataFrame(columns=["datetime", "energy_mwh"])
 
-    out = pd.concat(frames, ignore_index=True)
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     out = out.dropna(subset=["datetime", "value"])
@@ -2724,7 +3312,7 @@ def _weighted_generation_weather(payload, variable_suffix: str = "") -> pd.DataF
     return result.sort_values("datetime").reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=8)
 def load_generation_weather_history(
     start_day: date,
     end_day: date,
@@ -2735,28 +3323,14 @@ def load_generation_weather_history(
             columns=["datetime"] + GENERATION_WEATHER_VARIABLES
         )
 
-    params = {
-        "latitude": ",".join(
-            str(point["latitude"])
-            for point in GENERATION_WEATHER_POINTS
-        ),
-        "longitude": ",".join(
-            str(point["longitude"])
-            for point in GENERATION_WEATHER_POINTS
-        ),
-        "start_date": start_day.isoformat(),
-        "end_date": safe_end.isoformat(),
-        "hourly": ",".join(GENERATION_WEATHER_VARIABLES),
-        "timezone": "Europe/Madrid",
-        "models": "era5",
-    }
-    response = requests.get(
-        OPEN_METEO_ARCHIVE_URL,
-        params=params,
-        timeout=180,
+    # V18.2: monthly archive blocks shared by every target day. The combined
+    # payload is identical to one request, so the radiation shift in
+    # _weighted_generation_weather behaves exactly as before.
+    payload = open_meteo_archive_payload(
+        tuple((point["latitude"], point["longitude"]) for point in GENERATION_WEATHER_POINTS),
+        tuple(GENERATION_WEATHER_VARIABLES), "era5", start_day, safe_end,
     )
-    response.raise_for_status()
-    return _weighted_generation_weather(response.json())
+    return _weighted_generation_weather(payload)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -2895,50 +3469,172 @@ GENERATION_FEATURES = [
 ]
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_forecast_pbf_history(start_day: date, end_day: date,
-                             technologies_tuple: tuple[str, ...], _token: str) -> pd.DataFrame:
-    """Fetch every configured gross/bilateral component; unknown is not zero."""
-    def combine(ids):
-        if not ids:
-            return None
-        columns = []
-        for indicator in ids:
-            f = fetch_one_pbf_indicator_hourly(indicator, start_day, end_day, _token)
-            if f.empty:
-                raise ValueError(f"Configured indicator {indicator} unavailable")
-            columns.append(f.set_index("datetime")["energy_mwh"].rename(str(indicator)))
-        joined = pd.concat(columns, axis=1)
-        return joined.sum(axis=1, min_count=len(columns))
-    def fetch(technology):
-        g = combine(FORECAST_NON_THERMAL_INDICATORS[technology])
-        b = combine(FORECAST_BILATERAL_INDICATORS.get(technology, []))
-        out = pd.DataFrame({"gross_energy_mwh": g})
-        out["bilateral_energy_mwh"] = b if b is not None else 0.0
-        out["energy_mwh"] = out["gross_energy_mwh"] - out["bilateral_energy_mwh"]
-        out["net_to_gross_ratio"] = out["energy_mwh"] / out["gross_energy_mwh"].replace(0, np.nan)
-        out["technology"] = technology
-        out.index.name = "datetime"
-        return out.reset_index()
-    frames, errors = [], []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        pending = {executor.submit(fetch, t): t for t in technologies_tuple}
-        for f in as_completed(pending):
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
+def load_forecast_pbf_history(
+    start_day: date,
+    end_day: date,
+    technologies_tuple: tuple[str, ...],
+    _token: str,
+) -> pd.DataFrame:
+    """
+    Load the non-bilateral PBF programme by technology:
+
+        generation exposed to DA = total PBF - bilateral PBF
+
+    This is the low-marginal-cost generation volume that remains exposed to
+    the day-ahead auction. Consistency requires deducting total bilateral sales
+    from PBF demand as well; that adjustment is made separately below.
+    """
+    results = []
+
+    def _fetch_technology(technology: str) -> pd.DataFrame:
+        gross = load_one_pbf_technology_hourly(
+            technology=technology,
+            indicator_ids=FORECAST_NON_THERMAL_INDICATORS[technology],
+            start_day=start_day,
+            end_day=end_day,
+            token=_token,
+        )
+        if gross.empty:
+            return pd.DataFrame()
+
+        gross = gross.rename(
+            columns={"energy_mwh": "gross_energy_mwh"}
+        )[["datetime", "technology", "gross_energy_mwh"]]
+
+        bilateral_ids = FORECAST_BILATERAL_INDICATORS.get(
+            technology,
+            [],
+        )
+        bilateral_frames = []
+        for indicator_id in bilateral_ids:
+            frame = fetch_one_pbf_indicator_hourly(
+                indicator_id=indicator_id,
+                start_day=start_day,
+                end_day=end_day,
+                token=_token,
+            )
+            if not frame.empty:
+                bilateral_frames.append(frame)
+
+        if bilateral_frames:
+            bilateral = pd.concat(
+                bilateral_frames,
+                ignore_index=True,
+            )
+            bilateral = (
+                bilateral.groupby("datetime", as_index=False)[
+                    "energy_mwh"
+                ]
+                .sum()
+                .rename(
+                    columns={
+                        "energy_mwh": "bilateral_energy_mwh"
+                    }
+                )
+            )
+        else:
+            if bilateral_ids:
+                raise ValueError(f"Missing configured bilateral series for {technology}.")
+            bilateral = gross[["datetime"]].copy()
+            bilateral["bilateral_energy_mwh"] = 0.0
+
+        out = gross.merge(
+            bilateral,
+            on="datetime",
+            how="left",
+        )
+        out["bilateral_energy_mwh"] = (
+            pd.to_numeric(
+                out["bilateral_energy_mwh"],
+                errors="coerce",
+            )
+            .clip(lower=0.0)
+        )
+        out["gross_energy_mwh"] = pd.to_numeric(
+            out["gross_energy_mwh"],
+            errors="coerce",
+        )
+        out["energy_mwh"] = (
+            out["gross_energy_mwh"]
+            - out["bilateral_energy_mwh"]
+        ).clip(lower=0.0)
+        out["net_to_gross_ratio"] = (
+            out["energy_mwh"]
+            / out["gross_energy_mwh"].replace(0, np.nan)
+        ).clip(lower=0.0, upper=1.10)
+
+        return out[
+            [
+                "datetime",
+                "technology",
+                "energy_mwh",
+                "gross_energy_mwh",
+                "bilateral_energy_mwh",
+                "net_to_gross_ratio",
+            ]
+        ]
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            executor.submit(
+                _fetch_technology,
+                technology,
+            ): technology
+            for technology in technologies_tuple
+        }
+        for future in as_completed(futures):
             try:
-                frames.append(f.result())
-            except Exception as exc:
-                errors.append(f"{pending[f]}: {exc}")
-    if errors:
-        raise ValueError("Incomplete configured PBF sources: " + "; ".join(errors))
-    if not frames:
-        return pd.DataFrame(columns=["datetime", "technology", "energy_mwh", "gross_energy_mwh", "bilateral_energy_mwh", "net_to_gross_ratio"])
-    out = pd.concat(frames, ignore_index=True)
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    out = out.loc[(out["datetime"].dt.date >= start_day) & (out["datetime"].dt.date <= end_day)]
-    return out.sort_values(["datetime", "technology"]).drop_duplicates(["datetime", "technology"], keep="last").reset_index(drop=True)
+                frame = future.result()
+            except Exception:
+                frame = pd.DataFrame()
+            if frame is not None and not frame.empty:
+                results.append(frame)
+
+    if not results:
+        return pd.DataFrame(
+            columns=[
+                "datetime",
+                "technology",
+                "energy_mwh",
+                "gross_energy_mwh",
+                "bilateral_energy_mwh",
+                "net_to_gross_ratio",
+            ]
+        )
+
+    history = pd.concat(results, ignore_index=True)
+    history["datetime"] = pd.to_datetime(
+        history["datetime"],
+        errors="coerce",
+    ).dt.floor("h")
+
+    numeric_columns = [
+        "energy_mwh",
+        "gross_energy_mwh",
+        "bilateral_energy_mwh",
+        "net_to_gross_ratio",
+    ]
+    for column in numeric_columns:
+        history[column] = pd.to_numeric(
+            history[column],
+            errors="coerce",
+        )
+
+    return (
+        history.dropna(
+            subset=["datetime", "technology", "energy_mwh"]
+        )
+        .sort_values(["datetime", "technology"])
+        .drop_duplicates(
+            subset=["datetime", "technology"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
 def load_pbf_demand_history(
     start_day: date,
     end_day: date,
@@ -2965,7 +3661,7 @@ def load_pbf_demand_history(
     )
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
 def load_total_bilateral_sales_history(
     start_day: date,
     end_day: date,
@@ -3271,522 +3967,164 @@ def build_previous_day_calibration(
 
 
 
-# =========================================================
-# V18: reconciled gross-generation balance and adaptive forecasts
-# =========================================================
-# Hyperparameters are general settings, not fitted to 28/29 September outcomes.
-V18_GENERATION_OOS_DAYS = 28
-V18_GENERATION_BLOCK_DAYS = 14
-V18_WEATHER_CALIBRATION_DAYS = 28
-V18_MIN_FIXED_WEATHER_DAYS = 7
-V18_RECONCILIATION_TOLERANCE_MWH = 1e-5
-V18_COMPONENT_NAMES = {
-    "Solar PV": "solar_pv", "Wind": "wind", "Nuclear": "nuclear",
-    "Solar thermal": "solar_thermal", "Run-of-river": "run_of_river",
-    "Other renewables": "other_renewables", "Hydro UGH": "hydro_ugh",
-}
-
-
-def _v18_before(frame: pd.DataFrame, day: date) -> pd.DataFrame:
-    """A delivery-date cut-off, not a claim about publication/revision vintages."""
-    out = frame.copy()
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    return out.loc[out["datetime"].dt.date < day].sort_values("datetime").reset_index(drop=True)
-
-
-@st.cache_data(show_spinner=False, ttl=86400)
-def load_v18_recent_fixed_generation_weather(target_day: date, days: int = 28) -> dict:
-    """Replay prior delivery days using their own fixed 00 UTC D-1 run.
-
-    Shared by all technologies. Failure never falls back to later/live weather.
-    Missing replay dates are explicitly reported; the older reanalysis remains
-    useful for fitting but is NOT called forecast-weather validation.
-    """
-    frames, failures = [], []
-    dates = [target_day - timedelta(days=i) for i in range(int(days), 0, -1)]
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        pending = {executor.submit(load_generation_weather_forecast, d): d for d in dates}
-        for future in as_completed(pending):
-            d = pending[future]
-            try:
-                frame = future.result().copy()
-                if len(frame) != 24 or not (pd.to_datetime(frame["datetime"]).dt.date == d).all():
-                    raise ValueError("Incomplete or wrong-date fixed weather run")
-                frame["weather_is_fixed_run"] = 1
-                frame["weather_run_utc"] = f"{d - timedelta(days=1)}T00:00Z"
-                frames.append(frame)
-            except Exception as exc:
-                failures.append({"delivery_day": d.isoformat(), "error": str(exc)[:180]})
-    data = pd.concat(frames, ignore_index=True).sort_values("datetime") if frames else pd.DataFrame()
-    return {"weather": data, "requested_days": len(dates), "loaded_days": len(frames),
-            "failures": sorted(failures, key=lambda r: r["delivery_day"])}
-
-
-def _v18_prepare_generation_frames(technology, history, weather_history, target_weather):
-    target_day = pd.to_datetime(target_weather["datetime"]).dt.date.min()
-    h = _v18_before(history.loc[history["technology"] == technology], target_day)
-    if "gross_energy_mwh" not in h:
-        raise ValueError(f"{technology}: gross PBF history is required in V18; net data cannot substitute it.")
-    h["energy_mwh"] = _v17_numeric(h, "gross_energy_mwh")
-    h = h.dropna(subset=["energy_mwh"])
-    h = h.loc[h["energy_mwh"] >= 0, ["datetime", "energy_mwh"]].drop_duplicates("datetime")
-    if h.empty:
-        raise ValueError(f"No valid gross PBF observations for {technology}")
-    wx = _v18_before(weather_history, target_day).drop_duplicates("datetime", keep="last")
-    lookup = _hourly_lookup(h, "energy_mwh")
-    rad_lookup = _hourly_lookup(wx, "shortwave_radiation")
-    wind_lookup = _hourly_lookup(wx, "wind_speed_100m")
-    weather_dependent = technology in {"Solar PV", "Wind", "Solar thermal"}
-    # Stable gross programmes should retain the latest D-1 labels even when
-    # reanalysis is delayed. Do not train nuclear on bilateral-net market shares.
-    train = h.merge(wx, on="datetime", how="inner" if weather_dependent else "left")
-    frames = []
-    for f in [train, target_weather.copy()]:
-        f = _generation_lags(_generation_weather_features(_market_calendar(f)), lookup)
-        f = _v17_generation_anchor_features(f, technology, rad_lookup, wind_lookup)
-        current = _v17_numeric(f, "shortwave_radiation")
-        previous = _v17_numeric(f, "radiation_lag_1d")
-        f["radiation_change_ratio"] = current / previous.where(previous > 30)
-        f["weather_is_fixed_run"] = _v17_numeric(f, "weather_is_fixed_run", 0).fillna(0)
-        frames.append(f.sort_values("datetime").reset_index(drop=True))
-    train, target = frames
-    if len(target) != 24:
-        raise ValueError(f"{technology}: expected 24 target hours")
-    if not (pd.to_datetime(target["datetime"]).dt.date == target_day).all():
-        raise ValueError("Mixed target dates in generation forecast")
-    if weather_dependent:
-        features = _v17_generation_features(train) + ["radiation_change_ratio"]
-    else:
-        features = [c for c in GENERATION_FEATURES if c.startswith("gen_") or c in
-                    {"hour", "dow", "month", "is_weekend", "is_holiday", "hour_sin", "hour_cos", "doy_sin", "doy_cos"}]
-    return train, target, list(dict.fromkeys(features)), weather_dependent
-
-
-def _v18_radiation_prediction(train, target):
-    """Additional PV candidate: recent nonnegative spatial radiation regression.
-
-    A statistical programme forecast, not installed capacity or engineering PV
-    yield. Fits only past gross PBF, with no intercept so darkness stays zero.
-    """
-    features = [c for c in train if c.startswith("wx_") and c.endswith("_radiation")
-                and c in target and train[c].notna().mean() > .75]
-    if not features:
-        features = ["shortwave_radiation"]
-    recent = train.loc[pd.to_datetime(train["datetime"]) >=
-                       pd.to_datetime(train["datetime"]).max() - pd.Timedelta(days=120)].copy()
-    daytime = _v17_numeric(recent, "shortwave_radiation") > 30
-    recent = recent.loc[daytime].dropna(subset=["energy_mwh"] + features)
-    if len(recent) < 60 or not SKLEARN_AVAILABLE:
-        return _v17_numeric(target, "weather_adjusted_d1_mwh").to_numpy(dtype=float, copy=True)
-    from sklearn.linear_model import Ridge
-    x = recent[features].to_numpy(dtype=float, copy=True) / 1000.0
-    z = target[features].apply(pd.to_numeric, errors="coerce")
-    # A missing region falls back to the available national proxy, not zero sun.
-    for c in features:
-        z[c] = z[c].fillna(_v17_numeric(target, "shortwave_radiation"))
-    if z.isna().any().any():
-        raise ValueError("Incomplete radiation inputs in PV spatial candidate")
-    model = Ridge(alpha=0.5, fit_intercept=False, positive=True, solver="lbfgs", max_iter=3000, tol=1e-5)
-    _v17_fit(model, x, recent["energy_mwh"].to_numpy(float) / 1000.0,
-             _v17_sample_weights(recent, 45.0))
-    return np.maximum(_v17_predict(model, z.to_numpy(dtype=float, copy=True) / 1000.0) * 1000.0, 0.0)
-
-
-def _v18_generation_candidate_predictions(technology, train, target, features):
-    if SKLEARN_AVAILABLE and len(train) >= 24 * 45:
-        x, z = _v17_impute(train, target, features)
-        model = _v17_fit(_v17_model(iterations=200), x, train["energy_mwh"],
-                         _v17_sample_weights(train, 75.0))
-        raw = _v17_predict(model, z)
-    else:
-        reference = target.reindex(columns=["gen_lag_1d", "gen_lag_2d", "gen_lag_7d", "gen_same_hour_4w"])
-        raw = reference.bfill(axis=1).iloc[:, 0]
-        raw = raw.fillna(target["hour"].map(train.groupby("hour")["energy_mwh"].median())).to_numpy(float)
-    if not np.isfinite(raw).all():
-        raise ValueError(f"{technology}: no finite generation baseline")
-    model, anchor = _v17_generation_candidates(technology, target, raw)
-    names = {"Model": model, "Weather-D1" if technology in {"Solar PV", "Wind"} else "D1": anchor}
-    if technology == "Solar PV":
-        spatial = _v18_radiation_prediction(train, target)
-        names["Spatial-radiation"] = np.where(np.isfinite(spatial), spatial, model)
-    out = pd.DataFrame(names, index=target.index).clip(lower=0)
-    if technology == "Solar PV":
-        dark = _v17_numeric(target, "shortwave_radiation").fillna(np.inf).to_numpy() <= 2.0
-        out.loc[dark, :] = 0.0
-    return out
-
-
-def _v18_simplex_weights(count):
-    from itertools import product
-    grid = [np.array(x, dtype=float) / 4 for x in product(range(5), repeat=count) if sum(x) == 4]
-    return np.vstack(grid + [np.ones(count) / count])
-
-
-def _v18_adaptive_generation_mix(technology, pool, target, candidates):
-    """Hourly convex weights selected using ONLY strictly earlier OOS labels.
-
-    Similarity considers hour, weather change and candidate disagreement. This
-    does not force PV up/down and contains no target-day real prices/generation.
-    """
-    names = candidates.columns.tolist()
-    count = len(names)
-    weight_grid = _v18_simplex_weights(count)
-    points, rows = [], []
-    for i, (_, row) in enumerate(target.iterrows()):
-        d = pd.Timestamp(row["datetime"]).date()
-        past = pool.copy()
-        if not past.empty:
-            past = past.loc[(pd.to_datetime(past["datetime"]).dt.date < d) &
-                            (pd.to_datetime(past["datetime"]) >= pd.Timestamp(d) - pd.Timedelta(days=42))].copy()
-        weather_dependent = technology in {"Solar PV", "Wind", "Solar thermal"}
-        scope = "No prior OOS calibration, diversified fallback"
-        if not past.empty and weather_dependent:
-            fixed = past.loc[_v17_numeric(past, "weather_is_fixed_run", 0) == 1]
-            if pd.to_datetime(fixed["datetime"]).dt.date.nunique() >= V18_MIN_FIXED_WEATHER_DAYS:
-                past, scope = fixed, "Prior OOS fixed D-1 weather forecasts"
-            else:
-                scope = "Conditional OOS historical weather, limited fixed-run coverage"
-        elif not past.empty:
-            scope = "Prior OOS gross programmes, calendar and lag inputs"
-        wbest = np.ones(count) / count
-        calibration_rows, effective = 0, 0.0
-        if not past.empty and set(names).issubset(past.columns):
-            past = past.dropna(subset=["actual_gross_mwh"] + names)
-            if technology == "Solar PV" and float(row.get("shortwave_radiation", 0)) > 2:
-                past = past.loc[_v17_numeric(past, "shortwave_radiation") > 2]
-            if len(past) >= 24 and pd.to_datetime(past["datetime"]).dt.date.nunique() >= 5:
-                age = (pd.Timestamp(d) - pd.to_datetime(past["datetime"])).dt.total_seconds().to_numpy() / 86400
-                hdist = np.abs(past["hour"].to_numpy(float) - float(row["hour"]))
-                hdist = np.minimum(hdist, 24 - hdist)
-                sw = np.exp2(-age / 14.0) * np.exp(-0.5 * (hdist / 2.5) ** 2)
-                pmat = past[names].to_numpy(float)
-                x = candidates.iloc[i].to_numpy(float)
-                # Distinguish weather-adjusted references above/below the model.
-                delta = (pmat[:, 0] - pmat[:, 1]) / np.maximum(np.abs(pmat[:, :2]).mean(axis=1), 500.0)
-                xdelta = (x[0] - x[1]) / max(np.abs(x[:2]).mean(), 500.0)
-                sw *= np.exp(-0.5 * ((delta - xdelta) / .35) ** 2)
-                if technology == "Solar PV":
-                    ratio = _v17_numeric(past, "radiation_change_ratio").to_numpy(float)
-                    xr = float(row.get("radiation_change_ratio", np.nan))
-                    if np.isfinite(xr):
-                        dist = np.abs(np.log(np.maximum(ratio, .1)) - np.log(max(xr, .1)))
-                        sw *= np.exp(-np.nan_to_num(dist, nan=0.0) / .6)
-                effective = float(sw.sum() ** 2 / max(np.sum(sw * sw), 1e-12))
-                if effective < 8:
-                    sw = np.exp2(-age / 21.0) * np.exp(-hdist / 6.0)
-                    effective = float(sw.sum() ** 2 / max(np.sum(sw * sw), 1e-12))
-                if sw.sum() > 1e-9:
-                    alternatives = pmat @ weight_grid.T
-                    loss = np.average(np.abs(alternatives - past["actual_gross_mwh"].to_numpy(float)[:, None]), axis=0, weights=sw)
-                    # Small diversification penalty, scaled by historical error.
-                    loss += .02 * max(float(np.median(loss)), 1.) * np.sum(weight_grid ** 2, axis=1)
-                    wbest = weight_grid[int(np.argmin(loss))]
-                    calibration_rows = len(past)
-        values = candidates.iloc[i].to_numpy(float)
-        points.append(float(values @ wbest))
-        rows.append({**{f"weight_{name}": float(w) for name, w in zip(names, wbest)},
-                     "calibration_observations": calibration_rows,
-                     "calibration_effective_observations": effective, "calibration_scope": scope})
-    return np.asarray(points), pd.DataFrame(rows, index=target.index)
-
-
-def _v18_programme_profile(day: date, history: pd.DataFrame, value: str, nonnegative=True):
-    """Past-only daily programme forecast, for bilateral residuals and shares."""
-    h = _market_calendar(_v18_before(history, day)).dropna(subset=[value])
-    h = h.loc[h["date"] >= day - timedelta(days=100)].copy()
-    if h.empty:
-        raise ValueError(f"No earlier observations for {value}")
-    lookup = _hourly_lookup(h, value)
-    def features(d):
-        rows = []
-        for hour in range(24):
-            recent = h.loc[(h["date"] < d) & (h["date"] >= d - timedelta(days=70)) & (h["hour"] == hour)]
-            same = recent.loc[recent["dow"] == pd.Timestamp(d).dayofweek, value]
-            median = float(same.median()) if len(same) >= 3 else float(recent[value].median())
-            d1 = lookup.get((d - timedelta(days=1), hour), np.nan)
-            d7 = lookup.get((d - timedelta(days=7), hour), np.nan)
-            rows.append([d1, d7, median])
-        a = pd.DataFrame(rows, columns=["D1", "D7", "Weekday-median"])
-        fallback = a.median(axis=1)
-        return a.apply(lambda s: s.fillna(fallback))
-    target = features(day)
-    if target.isna().any().any():
-        raise ValueError(f"Missing target-hour programme reference for {value}")
-    pool = []
-    for d in sorted(h["date"].unique())[-28:]:
-        f = features(d)
-        truth = np.array([lookup.get((d, hour), np.nan) for hour in range(24)])
-        valid = np.isfinite(truth) & np.isfinite(f.to_numpy()).all(axis=1)
-        if valid.any():
-            block = f.loc[valid].copy()
-            block["truth"] = truth[valid]
-            block["age"] = (day - d).days
-            pool.append(block)
-    weights = np.ones(3) / 3
-    if pool:
-        p = pd.concat(pool)
-        if len(p) >= 120:
-            grid = _v18_simplex_weights(3)
-            err = np.abs(p[["D1", "D7", "Weekday-median"]].to_numpy() @ grid.T - p["truth"].to_numpy()[:, None])
-            scores = np.average(err, axis=0, weights=np.exp2(-p["age"].to_numpy() / 14.0))
-            weights = grid[int(np.argmin(scores))]
-    values = target.to_numpy() @ weights
-    if nonnegative:
-        values = np.maximum(values, 0)
-    out = _v17_day_grid(day)
-    out["prediction"] = values
-    out["d1"] = target["D1"].to_numpy()
-    out["d7"] = target["D7"].to_numpy()
-    out["weekday_median"] = target["Weekday-median"].to_numpy()
-    return out
-
-
-def _v18_history_balance(pbf, demand, bilateral, technologies):
-    """Use exact same gross-minus-residual identity in history and target.
-
-    No clipping of net generation: a clipped identity would hide a source
-    mismatch. Negative net values remain visible in diagnostics.
-    """
-    selected = list(dict.fromkeys(technologies))
-    structural = [t for t in selected if t != "Hydro UGH"]
-    if not structural:
-        raise ValueError("Select at least one structural-gap technology, not only Hydro UGH")
-    gross = pbf.pivot(index="datetime", columns="technology", values="gross_energy_mwh").reindex(columns=selected)
-    bil = pbf.pivot(index="datetime", columns="technology", values="bilateral_energy_mwh").reindex(columns=selected)
-    net = gross - bil
-    out = demand.merge(bilateral, on="datetime", how="inner", validate="one_to_one").set_index("datetime")
-    for t in selected:
-        slug = V18_COMPONENT_NAMES[t]
-        out[t] = net[t]
-        out[f"gross_{slug}_mwh"] = gross[t]
-        out[f"bilateral_{slug}_mwh"] = bil[t]
-    out["gross_non_thermal_mwh"] = gross[structural].sum(axis=1, min_count=len(structural))
-    out["structural_bilateral_mwh"] = bil[structural].sum(axis=1, min_count=len(structural))
-    out["residual_bilateral_mwh"] = out["bilateral_sales_mwh"] - out["structural_bilateral_mwh"]
-    out["non_thermal_mwh"] = net[structural].sum(axis=1, min_count=len(structural))
-    out["hydro_ugh_mwh"] = net["Hydro UGH"] if "Hydro UGH" in selected else 0.0
-    out["da_demand_mwh"] = out["pbf_demand_mwh"] - out["bilateral_sales_mwh"]
-    out["effective_demand_mwh"] = out["pbf_demand_mwh"] - out["residual_bilateral_mwh"]
-    out["thermal_gap_mwh"] = out["effective_demand_mwh"] - out["gross_non_thermal_mwh"]
-    out["gap_balance_reconciliation_mwh"] = out["thermal_gap_mwh"] - (out["da_demand_mwh"] - out["non_thermal_mwh"])
-    out["source_negative_net_generation"] = (net[structural] < -1.0).any(axis=1)
-    for t in structural:
-        out[f"{V18_COMPONENT_NAMES[t]}_mwh"] = net[t]
-    out = out.reset_index().dropna(subset=["thermal_gap_mwh"])
-    if len(out) and out["gap_balance_reconciliation_mwh"].abs().max() > V18_RECONCILIATION_TOLERANCE_MWH:
-        raise ValueError("Historical gross/net thermal-gap accounting does not reconcile")
-    return out.sort_values("datetime").reset_index(drop=True)
-
-
-def _v18_reconcile_target(demand, generation, residual):
-    selected = generation["technology"].unique().tolist()
-    structural = [t for t in selected if t != "Hydro UGH"]
-    out = demand.copy()
-    wide_g = generation.pivot(index="datetime", columns="technology", values="gross_forecast_mwh")
-    wide_b = generation.pivot(index="datetime", columns="technology", values="bilateral_forecast_mwh")
-    out = out.merge(residual[["datetime", "prediction"]].rename(columns={"prediction": "residual_bilateral_forecast_mwh"}),
-                    on="datetime", how="left", validate="one_to_one").set_index("datetime")
-    for t in selected:
-        slug = V18_COMPONENT_NAMES[t]
-        out[t] = wide_g[t] - wide_b[t]
-        out[f"gross_{slug}_mwh"] = wide_g[t]
-        out[f"bilateral_{slug}_mwh"] = wide_b[t]
-    out["gross_non_thermal_forecast_mwh"] = wide_g[structural].sum(axis=1, min_count=len(structural))
-    out["structural_bilateral_forecast_mwh"] = wide_b[structural].sum(axis=1, min_count=len(structural))
-    out["bilateral_sales_forecast_mwh"] = out["structural_bilateral_forecast_mwh"] + out["residual_bilateral_forecast_mwh"]
-    out["non_thermal_forecast_mwh"] = out["gross_non_thermal_forecast_mwh"] - out["structural_bilateral_forecast_mwh"]
-    out["da_demand_forecast_mwh"] = out["pbf_demand_forecast_mwh"] - out["bilateral_sales_forecast_mwh"]
-    out["effective_demand_forecast_mwh"] = out["pbf_demand_forecast_mwh"] - out["residual_bilateral_forecast_mwh"]
-    out["thermal_gap_forecast_mwh"] = out["effective_demand_forecast_mwh"] - out["gross_non_thermal_forecast_mwh"]
-    out["gap_balance_reconciliation_mwh"] = out["thermal_gap_forecast_mwh"] - (out["da_demand_forecast_mwh"] - out["non_thermal_forecast_mwh"])
-    out["hydro_ugh_forecast_mwh"] = out["Hydro UGH"] if "Hydro UGH" in selected else 0.0
-    out["residual_gap_after_hydro_ugh_mwh"] = out["thermal_gap_forecast_mwh"] - out["hydro_ugh_forecast_mwh"]
-    if out[["thermal_gap_forecast_mwh", "bilateral_sales_forecast_mwh"]].isna().any().any():
-        raise ValueError("Missing target balance components, no silent zero fill")
-    if out["gap_balance_reconciliation_mwh"].abs().max() > V18_RECONCILIATION_TOLERANCE_MWH:
-        raise ValueError("Target gross/net thermal-gap accounting does not reconcile")
-    out["negative_da_demand_flag"] = out["da_demand_forecast_mwh"] < 0
-    out["da_demand_share_of_total_pct"] = 100 * out["da_demand_forecast_mwh"] / out["pbf_demand_forecast_mwh"].replace(0, np.nan)
-    out["explicit_self_consumption_adjustment_mwh"] = 0.0
-    for src, dst in {"pbf_demand_forecast_mwh": "pbf_demand_mwh", "bilateral_sales_forecast_mwh": "bilateral_sales_mwh",
-                     "da_demand_forecast_mwh": "da_demand_mwh", "non_thermal_forecast_mwh": "non_thermal_mwh",
-                     "gross_non_thermal_forecast_mwh": "gross_non_thermal_mwh", "effective_demand_forecast_mwh": "effective_demand_mwh",
-                     "residual_bilateral_forecast_mwh": "residual_bilateral_mwh"}.items():
-        out[dst] = out[src]
-    for t in structural:
-        out[f"{V18_COMPONENT_NAMES[t]}_mwh"] = out[t]
-    out = out.reset_index()
-    out["date"] = pd.to_datetime(out["datetime"]).dt.date
-    out["hour"] = pd.to_datetime(out["datetime"]).dt.hour
-    return out
-
-
 def forecast_pbf_technology(technology: str, history: pd.DataFrame,
                             weather_history: pd.DataFrame, target_weather: pd.DataFrame):
-    """Forecast gross PBF; bilateral allocation is reconciled by the gap engine."""
-    train, target, features, weather_dependent = _v18_prepare_generation_frames(
-        technology, history, weather_history, target_weather)
-    days = sorted(train["date"].unique())
-    if len(days) < 35:
-        raise ValueError(f"{technology}: fewer than 35 days of gross generation history")
-    pool = pd.DataFrame()
-    evaluated = []
-    if len(days) >= 80:
-        replay_days = days[-V18_GENERATION_OOS_DAYS:]
-        for start in range(0, len(replay_days), V18_GENERATION_BLOCK_DAYS):
-            block = replay_days[start:start + V18_GENERATION_BLOCK_DAYS]
-            before = train.loc[train["date"] < block[0]].copy()
-            test = train.loc[train["date"].isin(block)].copy().reset_index(drop=True)
-            # Models are frozen at each block start. Each subsequent daily mix
-            # can see earlier OOS labels, never its own/future observations.
-            cand = _v18_generation_candidate_predictions(technology, before, test, features)
-            for day in block:
-                mask = test["date"] == day
-                f = test.loc[mask].reset_index(drop=True)
-                c = cand.loc[mask].reset_index(drop=True)
-                pred, diag = _v18_adaptive_generation_mix(technology, pool, f, c)
-                if not pool.empty and pd.to_datetime(pool["datetime"]).dt.date.nunique() >= 7:
-                    checked = f[["datetime", "hour", "energy_mwh", "weather_is_fixed_run"]].copy()
-                    checked["prediction"] = pred
-                    checked["calibration_scope"] = diag["calibration_scope"].to_numpy()
-                    evaluated.append(checked)
-                append = f[["datetime", "hour", "energy_mwh", "shortwave_radiation",
-                            "radiation_change_ratio", "weather_is_fixed_run"]].rename(columns={"energy_mwh": "actual_gross_mwh"})
-                for name in c:
-                    append[name] = c[name].to_numpy()
-                pool = pd.concat([pool, append], ignore_index=True)
-    candidates = _v18_generation_candidate_predictions(technology, train, target, features)
-    final, diag = _v18_adaptive_generation_mix(technology, pool, target, candidates)
-    columns = ["datetime", "date", "hour", "shortwave_radiation", "wind_speed_100m", "gen_lag_1d",
-               "gen_lag_2d", "gen_lag_7d", "gen_adjusted_d7", "gen_lag_1d_available",
-               "weather_adjusted_d1_mwh", "radiation_change_ratio"]
-    out = target.reindex(columns=columns).copy()
-    out["technology"] = technology
-    out["forecast_perimeter"] = "Gross PBF before bilateral allocation"
-    out["gross_forecast_mwh"] = np.maximum(final, 0.0)
-    # The caller replaces forecast_mwh with the reconciled non-bilateral value,
-    # to retain compatibility with the existing charts and CSV interfaces.
-    out["forecast_mwh"] = out["gross_forecast_mwh"]
-    out["model_gross_forecast_mwh"] = candidates["Model"].to_numpy()
-    out["anchor_used_mwh"] = candidates.iloc[:, 1].to_numpy()
-    for c in candidates:
-        out[f"candidate_{c}_mwh"] = candidates[c].to_numpy()
-    for c in diag:
-        out[c] = diag[c].to_numpy()
-    out["anchor_weight"] = diag[f"weight_{candidates.columns[1]}"].to_numpy()
-    out["candidate_disagreement_mwh"] = candidates.max(axis=1).to_numpy() - candidates.min(axis=1).to_numpy()
-    out["generation_above_historical_max"] = final > float(train["energy_mwh"].max())
-    validation = pd.concat(evaluated, ignore_index=True) if evaluated else pd.DataFrame()
-    stats = forecast_metrics(validation["energy_mwh"], validation["prediction"]) if not validation.empty else {"mae": np.nan, "mape": np.nan}
-    fixed_days = pd.to_datetime(pool.loc[_v17_numeric(pool, "weather_is_fixed_run", 0) == 1, "datetime"]).dt.date.nunique() if not pool.empty else 0
-    stats_row = {
-        "Technology": technology, "PBF perimeter": "Gross PBF; bilaterals reconciled separately",
-        "Model": "Gross programme ensemble with prior OOS hourly weights",
-        "D-1 blend weight": float(out["anchor_weight"].mean()),
-        "D-1 average gross (MW)": float(out["gen_lag_1d"].mean()),
-        "Forecast average gross (MW)": float(out["gross_forecast_mwh"].mean()),
+    technology_history = history.loc[history["technology"] == technology, ["datetime", "energy_mwh"]].copy()
+    technology_history = technology_history.sort_values("datetime")
+    target_date = pd.to_datetime(target_weather["datetime"]).dt.date.min()
+    # Defence in depth: even a caller supplying target/future observations is filtered.
+    technology_history = technology_history[pd.to_datetime(technology_history["datetime"]).dt.date < target_date]
+    history_weather = weather_history[pd.to_datetime(weather_history["datetime"]).dt.date < target_date].copy()
+    lookup = _hourly_lookup(technology_history, "energy_mwh")
+    radiation_lookup = _hourly_lookup(history_weather, "shortwave_radiation")
+    wind_lookup = _hourly_lookup(history_weather, "wind_speed_100m")
+    training = technology_history.merge(history_weather, on="datetime", how="inner")
+    training = _generation_lags(_generation_weather_features(_market_calendar(training)), lookup)
+    target = _generation_lags(_generation_weather_features(_market_calendar(target_weather)), lookup)
+    training = _v17_generation_anchor_features(training, technology, radiation_lookup, wind_lookup)
+    target = _v17_generation_anchor_features(target, technology, radiation_lookup, wind_lookup)
+    training = training.dropna(subset=["energy_mwh", "datetime"]).sort_values("datetime").reset_index(drop=True)
+    target = target.sort_values("datetime").reset_index(drop=True)
+    if len(target) != 24:
+        raise ValueError(f"Expected 24 complete target hours for {technology}.")
+    # Raw D-1 remains untouched; imputation is only used inside model matrices.
+    if target["gen_lag_1d"].notna().sum() == 0 and len(training) < 24 * 30:
+        raise ValueError(f"No usable history or D-1 programme for {technology}.")
+    features = _v17_generation_features(training)
+    stats = {"mae": np.nan, "mape": np.nan}
+    weight = float(GENERATION_D1_BLEND_WEIGHTS.get(technology, 0.20))
+    model_name = "Available-lag fallback"
+    if SKLEARN_AVAILABLE and len(training) >= 24 * 120:
+        dates = sorted(training["date"].unique())
+        cal_start, val_start = dates[-28], dates[-14]
+        train = training[training["date"] < cal_start]
+        calibration = training[(training["date"] >= cal_start) & (training["date"] < val_start)]
+        validation = training[training["date"] >= val_start]
+        x, z = _v17_impute(train, pd.concat([calibration, validation]), features)
+        model = _v17_fit(_v17_model(iterations=220), x, train["energy_mwh"], _v17_sample_weights(train))
+        preds = _v17_predict(model, z)
+        cm, ca = _v17_generation_candidates(technology, calibration, preds[:len(calibration)])
+        weight = _v17_choose_generation_weight(technology, calibration["energy_mwh"], cm, ca)
+        vm, va = _v17_generation_candidates(technology, validation, preds[len(calibration):])
+        stats = forecast_metrics(validation["energy_mwh"], (1 - weight) * vm + weight * va)
+        # The weight was chosen before this 14-day validation, not on its outcomes.
+        x, z = _v17_impute(training, target, features)
+        final_model = _v17_fit(_v17_model(iterations=240), x, training["energy_mwh"], _v17_sample_weights(training))
+        prediction = _v17_predict(final_model, z)
+        model_name = "Spatial-weather boosting + calibrated D-1 anchor"
+    else:
+        reference = target[["gen_lag_1d", "gen_lag_2d", "gen_lag_7d", "gen_same_hour_4w"]].bfill(axis=1).iloc[:, 0]
+        hourly = training.groupby("hour")["energy_mwh"].median()
+        prediction = reference.fillna(target["hour"].map(hourly)).to_numpy(float)
+        if not np.isfinite(prediction).all():
+            raise ValueError(f"Unfilled generation forecast for {technology}; refusing fabricated zeros.")
+    model_values, anchor = _v17_generation_candidates(technology, target, prediction)
+    final = (1 - weight) * model_values + weight * anchor
+    # A historical output quantile is not an installed-capacity limit. No cap to
+    # 90-day output is imposed; alert on extrapolation rather than deleting it.
+    output = target[["datetime", "date", "hour", "shortwave_radiation", "wind_speed_100m",
+                     "gen_lag_1d", "gen_lag_2d", "gen_lag_7d", "gen_adjusted_d7",
+                     "gen_lag_1d_available", "weather_adjusted_d1_mwh"]].copy()
+    output["technology"] = technology
+    output["model_net_forecast_mwh"] = model_values
+    output["anchor_used_mwh"] = anchor
+    output["anchor_weight"] = weight
+    output["forecast_mwh"] = np.maximum(final, 0.0)
+    output["generation_above_historical_max"] = final > float(training["energy_mwh"].max()) if len(training) else False
+    return output, {
+        "Technology": technology, "PBF perimeter": "Non-bilateral PBF generation",
+        "Model": model_name, "D-1 blend weight": weight,
+        "D-1 available hours": int(target["gen_lag_1d_available"].sum()),
+        "D-1 average (MW)": float(target["gen_lag_1d"].mean()),
+        "Forecast average (MW)": float(output["forecast_mwh"].mean()),
         "Validation MAE (MW)": stats["mae"], "Validation MAPE (%)": stats["mape"],
-        "Fixed-run OOS days": int(fixed_days), "Validation rows": len(validation),
-        "Validation scope": "; ".join(out["calibration_scope"].unique()),
+        "Validation scope": "14-day holdout; historical weather, not full operational weather uncertainty",
     }
-    return out, stats_row
 
 
 def generate_thermal_gap_forecast(target_day: date, lookback_days: int,
                                   selected_demand: pd.DataFrame, technologies: list[str], token: str) -> dict:
     _v17_day_grid(target_day)
-    technologies = list(dict.fromkeys(technologies))
-    if not any(t != "Hydro UGH" for t in technologies):
-        raise ValueError("Select at least one structural-gap technology")
-    start, end = target_day - timedelta(days=int(lookback_days) + 2), target_day - timedelta(days=1)
-    pbf = load_forecast_pbf_history(start, end, tuple(technologies), token)
-    demand_hist = load_pbf_demand_history(start, end, token)
-    bilateral_hist = load_total_bilateral_sales_history(start, end, token)
-    for name, data in [("PBF generation", pbf), ("PBF demand", demand_hist), ("bilaterals", bilateral_hist)]:
+    history_start = target_day - timedelta(days=int(lookback_days) + 2)
+    end = target_day - timedelta(days=1)
+    pbf = load_forecast_pbf_history(history_start, end, tuple(technologies), token)
+    demand_hist = load_pbf_demand_history(history_start, end, token)
+    bilateral_hist = load_total_bilateral_sales_history(history_start, end, token)
+    weather = load_generation_weather_history(history_start, target_day - timedelta(days=6))
+    target_weather = load_generation_weather_forecast(target_day)
+    for name, data in [("PBF", pbf), ("PBF demand", demand_hist), ("bilaterals", bilateral_hist), ("weather", weather)]:
         if data is None or data.empty:
-            raise ValueError(f"Missing {name} history")
-    pbf, demand_hist, bilateral_hist = [_v18_before(x, target_day) for x in (pbf, demand_hist, bilateral_hist)]
-    historical = _v18_history_balance(pbf, demand_hist, bilateral_hist, technologies)
-    if historical.empty:
-        raise ValueError("No complete reconciled historical PBF balances")
-    warnings = []
-    bad = int(historical["source_negative_net_generation"].sum())
-    if bad:
-        warnings.append(f"{bad} historical hours contain bilateral generation above gross PBF. Signed values retained for audit, not clipped.")
-    weather = load_generation_weather_history(start, target_day - timedelta(days=6)).copy()
-    if weather.empty:
-        raise ValueError("Missing generation weather history")
-    weather["weather_is_fixed_run"] = 0
-    weather["weather_run_utc"] = "Historical reanalysis"
-    replay = load_v18_recent_fixed_generation_weather(target_day, V18_WEATHER_CALIBRATION_DAYS)
-    if not replay["weather"].empty:
-        weather = pd.concat([weather, replay["weather"]], ignore_index=True).drop_duplicates("datetime", keep="last")
-    if replay["loaded_days"] < V18_WEATHER_CALIBRATION_DAYS:
-        warnings.append(f"Fixed-weather replay: {replay['loaded_days']}/{V18_WEATHER_CALIBRATION_DAYS} prior days available. Validation scope is reported by technology.")
-    target_weather = load_generation_weather_forecast(target_day).copy()
-    target_weather["weather_is_fixed_run"] = 1
+            raise ValueError(f"Missing {name} history.")
+    pbf = pbf[pd.to_datetime(pbf["datetime"]).dt.date < target_day].copy()
+    demand_hist = demand_hist[pd.to_datetime(demand_hist["datetime"]).dt.date < target_day].copy()
+    bilateral_hist = bilateral_hist[pd.to_datetime(bilateral_hist["datetime"]).dt.date < target_day].copy()
+    calibration = build_previous_day_calibration(target_day, technologies, pbf, demand_hist, bilateral_hist)
+    bilateral_forecast = forecast_total_bilateral_sales(target_day, bilateral_hist)
     frames, rows = [], []
     for technology in technologies:
-        h = pbf.loc[pbf["technology"] == technology].copy()
-        if h.empty:
-            raise ValueError(f"No gross PBF history for {technology}")
-        generation, stats = forecast_pbf_technology(technology, pbf, weather, target_weather)
-        if FORECAST_BILATERAL_INDICATORS.get(technology):
-            h["bilateral_share"] = _v17_numeric(h, "bilateral_energy_mwh") / _v17_numeric(h, "gross_energy_mwh").where(_v17_numeric(h, "gross_energy_mwh") > 1.)
-            share_history = h.dropna(subset=["bilateral_share"])
-            share_history = share_history.loc[share_history["bilateral_share"].between(0, 1)]
-            share = _v18_programme_profile(target_day, share_history, "bilateral_share")
-            generation = generation.merge(share[["datetime", "prediction"]].rename(columns={"prediction": "bilateral_share_forecast"}),
-                                          on="datetime", how="left", validate="one_to_one")
-            generation["bilateral_share_forecast"] = generation["bilateral_share_forecast"].clip(0, 1)
-        else:
-            generation["bilateral_share_forecast"] = 0.0
-        generation["bilateral_forecast_mwh"] = generation["gross_forecast_mwh"] * generation["bilateral_share_forecast"]
-        generation["forecast_mwh"] = generation["gross_forecast_mwh"] - generation["bilateral_forecast_mwh"]
-        generation["model_net_forecast_mwh"] = generation["model_gross_forecast_mwh"] * (1 - generation["bilateral_share_forecast"])
-        generation["forecast_perimeter"] = "forecast_mwh: net; gross_forecast_mwh: gross; gen_lag_*: gross"
-        stats["Forecast average net (MW)"] = float(generation["forecast_mwh"].mean())
-        frames.append(generation)
+        if pbf[pbf["technology"] == technology].empty:
+            raise ValueError(f"Missing {technology} history. It cannot be silently omitted from the gap.")
+        forecast, stats = forecast_pbf_technology(technology, pbf, weather, target_weather)
+        frames.append(forecast)
         rows.append(stats)
     generation = pd.concat(frames, ignore_index=True)
-    # This residual excludes the SAME structural-technology bilaterals as the
-    # gross generation block. Forecast it directly instead of unrelated B_total.
-    residual = _v18_programme_profile(target_day, historical, "residual_bilateral_mwh", nonnegative=False)
+    wide = generation.pivot(index="datetime", columns="technology", values="forecast_mwh").reset_index()
+    wide.columns.name = None
+    structural = [t for t in technologies if t != "Hydro UGH"]
+    wide["non_thermal_forecast_mwh"] = wide[structural].sum(axis=1, min_count=len(structural))
+    wide["hydro_ugh_forecast_mwh"] = _v17_numeric(wide, "Hydro UGH", 0.0)
     physical_history = load_hourly_peninsular_demand(target_day - timedelta(days=120), target_day - timedelta(days=2))
     bridge = _v17_bridge_pbf_demand(target_day, selected_demand, demand_hist, physical_history)
-    forecast = _v18_reconcile_target(bridge, generation, residual)
-    if forecast["negative_da_demand_flag"].any():
-        warnings.append("Some diagnostic DA-demand values are negative. No artificial cap was applied; review bilateral allocation/source perimeter. Gross/residual identity is preserved.")
-    if (forecast["residual_bilateral_forecast_mwh"] < 0).any():
-        warnings.append("Residual bilateral forecast is negative in some hours; review the configured bilateral coverage. No zero cap hides this source-perimeter issue.")
-    calibration = historical.loc[pd.to_datetime(historical["datetime"]).dt.date == end].copy()
-    calibration["hour"] = pd.to_datetime(calibration["datetime"]).dt.hour
-    calibration["actual_thermal_gap_mwh"] = calibration["thermal_gap_mwh"]
-    calibration["non_thermal_net_mwh"] = calibration["non_thermal_mwh"]
-    calibration["calibration_source"] = "ESIOS D-1 reconciled gross/residual balance"
-    ref = {"pbf_demand_mwh": "d1_total_pbf_demand_mwh", "bilateral_sales_mwh": "d1_bilateral_sales_mwh",
-           "da_demand_mwh": "d1_da_demand_mwh", "thermal_gap_mwh": "d1_actual_thermal_gap_mwh",
-           "non_thermal_mwh": "d1_non_thermal_net_mwh"}
+    forecast = wide.merge(bridge, on="datetime", how="inner")
+    forecast = forecast.merge(bilateral_forecast[["datetime", "bilateral_sales_forecast_mwh", "bilateral_lag_1d", "bilateral_lag_7d"]], on="datetime", how="left")
+    forecast["date"] = pd.to_datetime(forecast["datetime"]).dt.date
+    forecast["hour"] = pd.to_datetime(forecast["datetime"]).dt.hour
+    if forecast[["non_thermal_forecast_mwh", "bilateral_sales_forecast_mwh", "pbf_demand_forecast_mwh"]].isna().any().any():
+        raise ValueError("Incomplete target gap components; not substituting missing values with zeros.")
+    if (forecast["bilateral_sales_forecast_mwh"] > forecast["pbf_demand_forecast_mwh"]).any():
+        raise ValueError("Forecast bilaterals exceed total PBF demand. Review source units/perimeters; no artificial 95% cap applied.")
+    forecast["da_demand_forecast_mwh"] = forecast["pbf_demand_forecast_mwh"] - forecast["bilateral_sales_forecast_mwh"]
+    forecast["thermal_gap_forecast_mwh"] = forecast["da_demand_forecast_mwh"] - forecast["non_thermal_forecast_mwh"]
+    forecast["residual_gap_after_hydro_ugh_mwh"] = forecast["thermal_gap_forecast_mwh"] - forecast["hydro_ugh_forecast_mwh"]
+    forecast["da_demand_share_of_total_pct"] = 100 * forecast["da_demand_forecast_mwh"] / forecast["pbf_demand_forecast_mwh"].replace(0, np.nan)
+    forecast["explicit_self_consumption_adjustment_mwh"] = 0.0
+    ref_columns = {
+        "pbf_demand_mwh": "d1_total_pbf_demand_mwh", "bilateral_sales_mwh": "d1_bilateral_sales_mwh",
+        "da_demand_mwh": "d1_da_demand_mwh", "actual_thermal_gap_mwh": "d1_actual_thermal_gap_mwh",
+        "non_thermal_net_mwh": "d1_non_thermal_net_mwh",
+    }
     if not calibration.empty:
-        forecast = forecast.merge(calibration[["hour", *ref, "calibration_source"]].rename(columns=ref),
-                                  on="hour", how="left", validate="one_to_one")
+        reference = calibration[["hour", *ref_columns, "calibration_source"]].drop_duplicates("hour").rename(columns=ref_columns)
+        forecast = forecast.merge(reference, on="hour", how="left")
     else:
-        for c in ref.values():
-            forecast[c] = np.nan
-        forecast["calibration_source"] = "D-1 complete balance unavailable"
+        for column in ref_columns.values():
+            forecast[column] = np.nan
+        forecast["calibration_source"] = "D-1 reference unavailable"
     forecast["d1_pbf_demand_mwh"] = forecast["d1_total_pbf_demand_mwh"]
-    forecast["bilateral_lag_1d"] = forecast["d1_bilateral_sales_mwh"]
-    d7 = historical.loc[pd.to_datetime(historical["datetime"]).dt.date == target_day - timedelta(days=7)].copy()
-    d7["hour"] = pd.to_datetime(d7["datetime"]).dt.hour
-    forecast["bilateral_lag_7d"] = forecast["hour"].map(d7.set_index("hour")["bilateral_sales_mwh"])
+    hist_wide = pbf.pivot_table(index="datetime", columns="technology", values="energy_mwh", aggfunc="sum").reindex(columns=technologies)
+    hist_wide["non_thermal_mwh"] = hist_wide[structural].sum(axis=1, min_count=len(structural))
+    hist_wide["hydro_ugh_mwh"] = _v17_numeric(hist_wide, "Hydro UGH", 0.0)
+    historical = demand_hist.merge(bilateral_hist, on="datetime", how="inner").merge(hist_wide.reset_index(), on="datetime", how="inner")
+    historical["da_demand_mwh"] = historical["pbf_demand_mwh"] - historical["bilateral_sales_mwh"]
+    historical["thermal_gap_mwh"] = historical["da_demand_mwh"] - historical["non_thermal_mwh"]
+    historical = historical.dropna(subset=["thermal_gap_mwh"])
+    component_map = {"Solar PV": "solar_pv_mwh", "Wind": "wind_mwh", "Nuclear": "nuclear_mwh",
+                     "Solar thermal": "solar_thermal_mwh", "Run-of-river": "run_of_river_mwh", "Other renewables": "other_renewables_mwh"}
+    for tech, name in component_map.items():
+        if tech in structural:
+            historical[name] = historical[tech]
+            forecast[name] = forecast[tech]
+    # Canonical same-perimeter component fields consumed by the price engine.
+    for source, name in {"pbf_demand_forecast_mwh": "pbf_demand_mwh", "bilateral_sales_forecast_mwh": "bilateral_sales_mwh",
+                         "da_demand_forecast_mwh": "da_demand_mwh", "non_thermal_forecast_mwh": "non_thermal_mwh"}.items():
+        forecast[name] = forecast[source]
     forecast["weather_run_utc"] = f"{end}T00:00Z"
     forecast["engine_version"] = FORECAST_ENGINE_VERSION
     return {"forecast": forecast.sort_values("datetime").reset_index(drop=True),
-            "generation_long": generation.sort_values(["datetime", "technology"]).reset_index(drop=True),
-            "generation_stats": pd.DataFrame(rows), "historical": historical, "d1_calibration": calibration,
-            "bilateral_sales_forecast": forecast[["datetime", "bilateral_sales_forecast_mwh", "bilateral_lag_1d", "bilateral_lag_7d"]],
-            "bilateral_sales_history": bilateral_hist, "gap_perimeter": DA_GAP_PERIMETER,
-            "quality_warnings": warnings, "weather_replay": {k: v for k, v in replay.items() if k != "weather"}}
+            "generation_long": generation.sort_values(["datetime", "technology"]),
+            "generation_stats": pd.DataFrame(rows), "historical": historical.sort_values("datetime").reset_index(drop=True),
+            "d1_calibration": calibration, "bilateral_sales_forecast": bilateral_forecast,
+            "bilateral_sales_history": bilateral_hist, "gap_perimeter": DA_GAP_PERIMETER}
 
 
 def build_generation_forecast_chart(
@@ -4532,66 +4870,20 @@ def add_mibgas_features(
 # =========================================================
 # STEP 3 - FORECAST DA SPOT PRICE
 # =========================================================
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=16)
 def load_esios_price_history(
     start_day: date,
     end_day: date,
     _token: str,
 ) -> pd.DataFrame:
-    frames = []
-    current = start_day
+    # V18.2: fixed-grid block cache (see esios_hourly_history).
+    output = esios_hourly_history(PRICE_INDICATOR_ID, start_day, end_day, "average", _token)
 
-    while current <= end_day:
-        chunk_end = min(
-            end_day,
-            current + timedelta(days=13),
-        )
-        start_local = pd.Timestamp(
-            current,
-            tz="Europe/Madrid",
-        )
-        end_local = pd.Timestamp(
-            chunk_end + timedelta(days=1),
-            tz="Europe/Madrid",
-        )
-        params = {
-            "start_date": start_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "end_date": end_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "time_trunc": "hour",
-            "time_agg": "average",
-        }
-
-        for attempt in range(3):
-            try:
-                response = requests.get(
-                    f"{ESIOS_API_BASE}/{PRICE_INDICATOR_ID}",
-                    headers=esios_headers(_token),
-                    params=params,
-                    timeout=(15, 120),
-                )
-                response.raise_for_status()
-                parsed = parse_esios_values(response.json())
-                if not parsed.empty:
-                    chunk_lower = start_local.tz_localize(None)
-                    chunk_upper = end_local.tz_localize(None)
-                    parsed = parsed[(parsed["datetime"] >= chunk_lower) & (parsed["datetime"] < chunk_upper)]
-                    frames.append(parsed)
-                break
-            except requests.RequestException:
-                sleep(1.5 * (attempt + 1))
-
-        current = chunk_end + timedelta(days=1)
-
-    if not frames:
+    if output.empty:
         return pd.DataFrame(
             columns=["datetime", "price_eur_mwh"]
         )
 
-    output = pd.concat(frames, ignore_index=True)
     output["datetime"] = pd.to_datetime(
         output["datetime"],
         errors="coerce",
@@ -4626,7 +4918,24 @@ def _price_features(frame: pd.DataFrame, price_lookup: dict, gap_lookup: dict,
     available_week = weekly.notna().any(axis=1)
     out["same_hour_price_4w"] = np.nan
     out.loc[available_week, "same_hour_price_4w"] = weekly.loc[available_week].median(axis=1)
-    anchor_values = out[["price_lag_7d", "price_lag_1d", "same_hour_price_4w"]]
+    # V18.1: the short-lag term of the anchor uses the most recent day of the
+    # SAME day type. A Monday used to lean 35% on Sunday, whose solar valley is
+    # structurally deeper; it now uses Friday (or the last working day).
+    years = sorted({d.year for d in out["date"]} | {(d - timedelta(days=8)).year for d in out["date"]})
+    holidays_set = national_holidays(years)
+    out["price_lag_same_type"] = [
+        price_lookup.get((_v18_same_type_day(d, holidays_set), int(h)), np.nan)
+        if _v18_same_type_day(d, holidays_set) is not None else np.nan
+        for d, h in zip(out["date"], out["hour"])
+    ]
+    out["price_lag_same_type"] = out["price_lag_same_type"].fillna(out["price_lag_1d"])
+    same_type_solar = {}
+    for day in out["date"].unique():
+        ref = _v18_same_type_day(day, holidays_set)
+        vals = np.asarray([price_lookup.get((ref, h), np.nan) for h in range(10, 18)], float) if ref else np.array([np.nan])
+        same_type_solar[day] = float(np.nanmean(vals)) if np.isfinite(vals).any() else np.nan
+    out["price_same_type_solar_mean"] = out["date"].map(same_type_solar)
+    anchor_values = out[["price_lag_7d", "price_lag_same_type", "same_hour_price_4w"]]
     weights = np.array([0.45, 0.35, 0.20])
     denominator = anchor_values.notna().to_numpy() @ weights
     out["price_anchor"] = (anchor_values.fillna(0).to_numpy() @ weights) / np.where(denominator > 0, denominator, np.nan)
@@ -4656,10 +4965,10 @@ def _price_features(frame: pd.DataFrame, price_lookup: dict, gap_lookup: dict,
         out[c] = _v17_numeric(out, c)
         out[f"{c}_available"] = out[c].notna().astype(int)
     base = out["pbf_demand_mwh"].where(out["pbf_demand_mwh"] > 0)
-    out["solar_share"] = out["gross_solar_pv_mwh"] / base
-    out["wind_share"] = out["gross_wind_mwh"] / base
-    out["bilateral_share"] = out["residual_bilateral_mwh"] / base
-    out["gross_supply_share"] = out["gross_non_thermal_mwh"] / base
+    out["solar_share"] = out["solar_pv_mwh"] / base
+    out["wind_share"] = out["wind_mwh"] / base
+    out["bilateral_share"] = out["bilateral_sales_mwh"] / base
+    out["net_supply_share"] = out["non_thermal_mwh"] / base
     for name, hours in [("mean", range(24)), ("solar_mean", range(10, 18)), ("evening_mean", range(18, 23))]:
         lookup = {}
         for day in out["date"].unique():
@@ -4696,7 +5005,7 @@ def empirical_similar_gap_price_reference(historical_data: pd.DataFrame, target_
     if history.empty:
         raise ValueError("No complete comparable gap/price observations.")
     cols = ["thermal_gap_mwh", "gap_daily_mean", "gap_midday_mean", "gap_solar_vs_evening",
-            "pbf_demand_mwh", "gross_solar_pv_mwh", "gross_wind_mwh", "gross_nuclear_mwh",
+            "pbf_demand_mwh", "solar_pv_mwh", "wind_mwh", "nuclear_mwh",
             "mibgas_d1_eur_mwh", "hour_sin", "hour_cos", "doy_sin", "doy_cos", "is_weekend"]
     cols = [c for c in cols if c in history and c in target_data and history[c].notna().any()]
     matrix = history[cols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
@@ -4762,15 +5071,30 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     prices = prices[pd.to_datetime(prices["datetime"]).dt.date < target_day].copy()
     if prices.empty:
         raise ValueError("No strictly earlier spot-price history.")
+    # V18.2: floor reference for the optional post-processing (strictly earlier prices).
+    price_floor_reference = _v182_price_floor_reference(prices, target_day)
     gas_actuals, gas_message = load_mibgas_gdaes_actuals()
     gas_lookup, gas_source = build_mibgas_daily_lookup(gas_actuals,
         historical["datetime"].min().date() - timedelta(days=35), target_day - timedelta(days=1))
     price_lookup = _hourly_lookup(prices, "price_eur_mwh")
     gap_lookup = _hourly_lookup(historical, "thermal_gap_mwh")
+    # V18: ex-ante REE D+1 fundamentals for history and target, plus carbon.
+    ree_d1 = load_ree_d1_fundamentals(historical["datetime"].min().date(), target_day, token)
+    eua_lookup, eua_message = load_eua_daily_lookup()
+    ree_residual = (ree_d1["ree_d1_demand_mw"] - ree_d1["ree_d1_wind_mw"].fillna(0)
+                    - ree_d1["ree_d1_pv_mw"].fillna(0)).where(ree_d1["ree_d1_demand_mw"].notna())
+    ree_daily_mean = ree_residual.groupby(ree_d1["datetime"].dt.date).mean().dropna().to_dict()
+    historical = historical.drop(columns=[c for c in ree_d1 if c != "datetime" and c in historical]).merge(
+        ree_d1, on="datetime", how="left")
     training = _price_features(historical.merge(prices, on="datetime", how="inner"), price_lookup, gap_lookup, gas_lookup)
+    training = _v18_add_fundamental_features(training, eua_lookup, ree_daily_mean)
     target_frame = forecast_gap.copy()
     target_frame["thermal_gap_mwh"] = target_frame["thermal_gap_forecast_mwh"]
+    target_frame["datetime"] = pd.to_datetime(target_frame["datetime"])
+    target_frame = target_frame.drop(columns=[c for c in ree_d1 if c != "datetime" and c in target_frame]).merge(
+        ree_d1, on="datetime", how="left")
     target = _price_features(target_frame, price_lookup, gap_lookup, gas_lookup)
+    target = _v18_add_fundamental_features(target, eua_lookup, ree_daily_mean)
     training = training.dropna(subset=["price_eur_mwh", "price_anchor", "thermal_gap_mwh"]).reset_index(drop=True)
     target = target.reset_index(drop=True)
     if len(training) < 24 * 120:
@@ -4807,6 +5131,18 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     target_candidates, empirical = _v17_candidate_price_forecasts(training, target)
     target_candidates = target_candidates[candidate_names]
     final = target_candidates.to_numpy() @ weights
+    # V18: prequential hourly bias correction. The shrink is chosen on the
+    # validation block (0 = off if it does not reduce MAE), then applied with
+    # the median hourly error of earlier days of the same day type (workday or
+    # weekend/holiday) within the last V18_BIAS_WINDOW_DAYS before D.
+    raw_validation = validation_prediction.to_numpy(float)
+    bias_shrink = _v18_choose_bias_shrink(validation, raw_validation)
+    if bias_shrink > 0:
+        validation_prediction = pd.Series(_v18_bias_corrected(validation, raw_validation, bias_shrink),
+                                          index=validation.index)
+        target_type = _v18_day_types(target)[0]
+        target_bias = _v18_hourly_bias(validation, raw_validation, target_day, target_type)
+        final = final + bias_shrink * target["hour"].map(target_bias).to_numpy()
     if not np.isfinite(final).all():
         raise ValueError("Price model produced non-finite outputs.")
     output_columns = ["datetime", "date", "hour", "thermal_gap_mwh", "price_anchor", "price_lag_1d", "price_lag_7d", "same_hour_price_4w",
@@ -4814,16 +5150,13 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
                       "mibgas_change_d1_eur_mwh", "mibgas_change_vs_7d_eur_mwh", "mibgas_data_available", "mibgas_x_positive_gap"]
     output = target[output_columns].copy()
     output["forecast_price_eur_mwh"] = final
-    for candidate_name, candidate_weight in zip(candidate_names, weights):
-        slug = re.sub(r"[^a-z0-9]+", "_", candidate_name.lower()).strip("_")
-        output[f"candidate_{slug}_eur_mwh"] = target_candidates[candidate_name].to_numpy(dtype=float, copy=True)
-        output[f"weight_{slug}_pct"] = 100.0 * float(candidate_weight)
     output["raw_model_price_eur_mwh"] = target_candidates.get("Direct-price ML", target_candidates["Similar-gap"]).to_numpy()
     output["fundamental_price_eur_mwh"] = target_candidates.get("Fundamentals ML", target_candidates["Similar-gap"]).to_numpy()
     output["residual_model_price_eur_mwh"] = target_candidates.get("Residual ML", target_candidates["Anchor"]).to_numpy()
     output["negative_thermal_gap_flag"] = output["thermal_gap_mwh"] < 0
     output["guardrail_applied"] = False  # retained for old exporters, no price guardrails used
     output["price_upper_guardrail_eur_mwh"] = np.nan
+    output["price_floor_reference_eur_mwh"] = price_floor_reference
     output["engine_version"] = FORECAST_ENGINE_VERSION
     for c in empirical:
         output[c] = empirical[c].to_numpy()
@@ -4850,7 +5183,7 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     return {
         "forecast": output, "model_stats": forecast_metrics(validation["price_eur_mwh"], validation_prediction),
         "anchor_stats": forecast_metrics(validation["price_eur_mwh"], validation["price_anchor"]),
-        "model_name": "V18 gross/residual inputs, chronological price ensemble",
+        "model_name": "V17 chronological sparse ensemble: direct, fundamental, residual and gap analogues",
         "training_rows": len(training), "candidate_scores": pd.DataFrame(score_rows),
         "conditional_validation": vbacktest,
         "validation_scope": "Conditional on historical observed PBF components; Step 6 is the operational chain backtest. Source publication vintages are not fully audited.",
@@ -4859,13 +5192,26 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
         "gas_price_7d_avg_eur_mwh": float(target["mibgas_7d_avg_eur_mwh"].iloc[0]) if gas_available else np.nan,
         "gas_price_change_d1_eur_mwh": float(target["mibgas_change_d1_eur_mwh"].iloc[0]) if gas_available else np.nan,
         "gas_source": gas_source.get(target_day - timedelta(days=1), "Unavailable"),
+        "bias_correction_shrink": bias_shrink,
+        "ree_d1_available": bool(target["ree_d1_available"].min() > 0),
+        "eua_message": eua_message,
+        "eua_available": bool(target["eua_available"].max() > 0) if "eua_available" in target else False,
+        "price_floor_reference_eur_mwh": price_floor_reference,
     }
 
 
 def build_price_forecast_chart(price_forecast: pd.DataFrame):
     specs = {"forecast_price_eur_mwh": "Final forecast", "fundamental_price_eur_mwh": "Fundamentals model",
              "conditional_price_median_eur_mwh": "Similar-gap median", "price_anchor": "Price anchor",
-             "price_lag_1d": "Previous day", "price_lag_7d": "Same weekday previous week"}
+             "price_lag_1d": "Previous day", "price_lag_7d": "Same weekday previous week",
+             "raw_final_forecast_eur_mwh": "Raw V18 (before post-processing)"}
+    colors = ["#111827", "#0F766E", "#A855F7", "#64748B", "#F97316", "#60A5FA", "#9CA3AF"]
+    if "raw_final_forecast_eur_mwh" in price_forecast and np.allclose(
+            pd.to_numeric(price_forecast["raw_final_forecast_eur_mwh"], errors="coerce"),
+            pd.to_numeric(price_forecast["forecast_price_eur_mwh"], errors="coerce"), equal_nan=True):
+        # Nothing was adjusted: do not draw a duplicate line.
+        specs.pop("raw_final_forecast_eur_mwh")
+        colors = colors[:-1]
     frames = [price_forecast[["datetime", c]].rename(columns={c: "price"}).assign(series=label)
               for c, label in specs.items() if c in price_forecast]
     plot = pd.concat(frames, ignore_index=True)
@@ -4873,7 +5219,7 @@ def build_price_forecast_chart(price_forecast: pd.DataFrame):
         x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
         y=alt.Y("price:Q", title="Price (EUR/MWh)", scale=alt.Scale(zero=False)),
         color=alt.Color("series:N", title="Price series", scale=alt.Scale(
-            domain=list(specs.values()), range=["#111827", "#0F766E", "#A855F7", "#64748B", "#F97316", "#60A5FA"])),
+            domain=list(specs.values()), range=colors)),
         strokeDash=alt.StrokeDash("series:N", legend=None),
         tooltip=[alt.Tooltip("datetime:T", format="%d-%m-%Y %H:%M"), "series:N", alt.Tooltip("price:Q", format=",.2f")],
     )
@@ -6239,8 +6585,86 @@ def build_bess_schedule_table(
 # =========================================================
 # YTD DAILY WALK-FORWARD BACKTEST
 # =========================================================
-YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v18"
-YTD_BACKTEST_CHECKPOINT_VERSION = "v18_gross_reconciled_adaptive"
+# V18.2 rows also store the 24 hourly forecast/real prices (so the level
+# correction and floor can be evaluated without re-running the chain) and the
+# target-day demand error. Older checkpoints lack those fields and are not
+# mixed in.
+YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v18_2"
+YTD_BACKTEST_CHECKPOINT_VERSION = "v18_2_level_floor"
+YTD_HOURLY_COLUMNS = ["hourly_hours", "hourly_forecast_eur_mwh", "hourly_actual_eur_mwh"]
+
+
+def _json_floats(values, digits: int = 3) -> str:
+    output = []
+    for value in values:
+        number = pd.to_numeric(value, errors="coerce")
+        output.append(round(float(number), digits) if pd.notna(number) and np.isfinite(number) else None)
+    return json.dumps(output)
+
+
+def _parse_json_floats(text) -> np.ndarray:
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return np.array([], dtype=float)
+    try:
+        values = json.loads(str(text))
+    except (TypeError, ValueError):
+        return np.array([], dtype=float)
+    return np.asarray([np.nan if value is None else value for value in values], dtype=float)
+
+
+def target_day_demand_accuracy(target_day: date, demand_forecast: pd.DataFrame,
+                               token: str) -> dict:
+    """Target-day demand forecast vs REAL demand (loaded only after the forecast).
+
+    Compares the model curve, the trend-adjusted D-7 curve, the curve actually
+    used for the gap and REE's official D+1 forecast with realised hourly
+    peninsular demand.
+    """
+    output = {
+        "demand_actual_avg_mw": np.nan, "demand_forecast_avg_mw": np.nan,
+        "demand_target_mae_mw": np.nan, "demand_target_mape_pct": np.nan,
+        "demand_target_bias_mw": np.nan, "demand_d7trend_target_mape_pct": np.nan,
+        "demand_selected_target_mape_pct": np.nan,
+        "ree_d1_demand_target_mae_mw": np.nan, "ree_d1_demand_target_mape_pct": np.nan,
+        "demand_target_hours": 0, "demand_target_status": "",
+    }
+    try:
+        actual = load_hourly_peninsular_demand(target_day, target_day)
+        if actual.empty:
+            output["demand_target_status"] = "Real demand not yet available"
+            return output
+        frame = demand_forecast.merge(actual.rename(columns={"demand_mw": "actual_demand_mw"}),
+                                      on="datetime", how="inner")
+        try:
+            ree = load_ree_official_demand_forecast(target_day, token)["forecast"]
+            frame = frame.drop(columns=["ree_forecast_mw"], errors="ignore").merge(
+                ree[["datetime", "ree_forecast_mw"]], on="datetime", how="left")
+        except Exception:
+            frame["ree_forecast_mw"] = np.nan
+        if len(frame) < 23:
+            output["demand_target_status"] = f"Only {len(frame)} matching hours"
+            return output
+        y = frame["actual_demand_mw"].to_numpy(float)
+        model = forecast_metrics(y, frame["forecast_mw"])
+        output.update({
+            "demand_actual_avg_mw": float(np.nanmean(y)),
+            "demand_forecast_avg_mw": float(frame["forecast_mw"].mean()),
+            "demand_target_mae_mw": model["mae"],
+            "demand_target_mape_pct": model["mape"],
+            "demand_target_bias_mw": float(np.nanmean(frame["forecast_mw"].to_numpy(float) - y)),
+            "demand_d7trend_target_mape_pct": forecast_metrics(y, frame["trend_adjusted_lag_7d"])["mape"],
+            "demand_target_hours": int(len(frame)),
+            "demand_target_status": "ok",
+        })
+        if "selected_demand_mw" in frame:
+            output["demand_selected_target_mape_pct"] = forecast_metrics(y, frame["selected_demand_mw"])["mape"]
+        if frame["ree_forecast_mw"].notna().sum() >= 23:
+            ree_stats = forecast_metrics(y, frame["ree_forecast_mw"])
+            output["ree_d1_demand_target_mae_mw"] = ree_stats["mae"]
+            output["ree_d1_demand_target_mape_pct"] = ree_stats["mape"]
+    except Exception as exc:
+        output["demand_target_status"] = f"{type(exc).__name__}: {exc}"[:200]
+    return output
 
 
 def _safe_ratio(
@@ -6286,7 +6710,6 @@ def run_one_walk_forward_backtest_day(
     - PBF, bilateral programmes, spot prices and gas inputs: through D-1.
     - Realised target-day prices are loaded only after the forecast is built.
     """
-    engine_cache_marker = "v18_gross_reconciled_adaptive"
     forecast_as_of_day = target_day - timedelta(days=1)
 
     demand_result = generate_day_ahead_forecast(
@@ -6303,6 +6726,26 @@ def run_one_walk_forward_backtest_day(
             demand_forecast["forecast_mw"]
         )
         demand_source_label = "Model forecast"
+    elif demand_source.startswith("REE"):
+        # V18.2: lets Step 1 recreate D-1 when it uses REE's official curve.
+        ree_result = load_ree_official_demand_forecast(target_day, _token)
+        demand_forecast = demand_forecast.merge(
+            ree_result["forecast"][["datetime", "ree_forecast_mw"]],
+            on="datetime",
+            how="left",
+        )
+        if (
+            not ree_result["available"]
+            or demand_forecast["ree_forecast_mw"].notna().sum() < 23
+        ):
+            raise ValueError(
+                "The official REE D+1 demand forecast is not available "
+                "for this delivery day."
+            )
+        demand_forecast["selected_demand_mw"] = (
+            demand_forecast["ree_forecast_mw"]
+        )
+        demand_source_label = "REE official D+1 forecast"
     else:
         demand_forecast["selected_demand_mw"] = (
             demand_forecast["trend_adjusted_lag_7d"]
@@ -6384,6 +6827,27 @@ def run_one_walk_forward_backtest_day(
         )
 
     price_metrics = price_realization_metrics(comparison)
+
+    # V18.2: keep the raw hourly curves so post-processing can be evaluated
+    # later without re-running the chain, plus the target-day demand error.
+    hourly_record = {
+        "hourly_hours": json.dumps(
+            [int(value) for value in pd.to_datetime(comparison["datetime"]).dt.hour]
+        ),
+        "hourly_forecast_eur_mwh": _json_floats(comparison["forecast_price_eur_mwh"]),
+        "hourly_actual_eur_mwh": _json_floats(comparison["actual_price_eur_mwh"]),
+        "price_floor_reference_eur_mwh": float(
+            pd.to_numeric(price_result.get("price_floor_reference_eur_mwh", np.nan), errors="coerce")
+        ),
+        "gas_d1_eur_mwh": float(
+            pd.to_numeric(price_result.get("gas_price_d1_eur_mwh", np.nan), errors="coerce")
+        ),
+        "gas_available": int(pd.notna(price_result.get("gas_price_d1_eur_mwh", np.nan))),
+        "ree_d1_inputs_available": int(bool(price_result.get("ree_d1_available", False))),
+        "eua_available": int(bool(price_result.get("eua_available", False))),
+        "v18_bias_shrink": float(price_result.get("bias_correction_shrink", np.nan)),
+    }
+    demand_accuracy = target_day_demand_accuracy(target_day, demand_forecast, _token)
 
     perfect_schedule = optimize_chronological_tb4_schedule(
         comparison,
@@ -6498,7 +6962,7 @@ def run_one_walk_forward_backtest_day(
     forecast_prices = comparison["forecast_price_eur_mwh"]
 
     return {
-        "checkpoint_version": engine_cache_marker,
+        "checkpoint_version": YTD_BACKTEST_CHECKPOINT_VERSION,
         "target_day": target_day.isoformat(),
         "as_of_day": forecast_as_of_day.isoformat(),
         "status": "ok",
@@ -6629,6 +7093,8 @@ def run_one_walk_forward_backtest_day(
         "demand_model_validation_mape_pct": float(
             demand_result["model_stats"]["mape"]
         ),
+        **demand_accuracy,
+        **hourly_record,
         **ytd_curve_values,
     }
 
@@ -6766,6 +7232,205 @@ def aggregate_walk_forward_monthly(
     )
 
     return result
+
+
+# =========================================================
+# V18.2: raw vs post-processed evaluation of the walk-forward rows
+# =========================================================
+def _fast_chronological_tb4(prices, rte: float = BESS_RTE,
+                            charge_hours: int = BESS_CHARGE_HOURS,
+                            discharge_hours: int = BESS_DISCHARGE_HOURS):
+    """NumPy twin of optimize_chronological_tb4_schedule.
+
+    Same candidate splits, same 'first occurrence' tie-breaking and the same
+    revenue formula; returns (charge_idx, discharge_idx, expected_revenue).
+    """
+    p = np.asarray(prices, dtype=float)
+    if len(p) < charge_hours + discharge_hours or not np.isfinite(p).all():
+        return None
+    eta_charge = float(np.sqrt(rte))
+    eta_discharge = float(np.sqrt(rte))
+    best = None
+    for split in range(charge_hours - 1, len(p) - discharge_hours):
+        charge = np.sort(np.argsort(p[: split + 1], kind="stable")[:charge_hours])
+        discharge = np.sort(np.argsort(-p[split + 1:], kind="stable")[:discharge_hours]) + split + 1
+        revenue = float(BESS_POWER_MW * eta_discharge * p[discharge].sum()) - float(
+            BESS_POWER_MW / eta_charge * p[charge].sum())
+        if best is None or revenue > best[2]:
+            best = (charge, discharge, revenue)
+    return best
+
+
+def _fast_settle(schedule, actual_prices, rte: float = BESS_RTE) -> float:
+    """Realised revenue of a schedule valued at actual prices."""
+    if schedule is None:
+        return np.nan
+    a = np.asarray(actual_prices, dtype=float)
+    charge, discharge, _ = schedule
+    return float(BESS_POWER_MW * float(np.sqrt(rte)) * a[discharge].sum()) - float(
+        BESS_POWER_MW / float(np.sqrt(rte)) * a[charge].sum())
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def evaluate_price_postprocessing(daily: pd.DataFrame, level_lambda: float,
+                                  floor_mode: str) -> pd.DataFrame:
+    """Per-day raw vs post-processed metrics from the stored hourly curves.
+
+    The D-1 error comes from the previous calendar day's stored RAW curve and
+    realised prices, i.e. exactly what was known before the D auction. A day
+    whose previous day is missing gets no level shift.
+    """
+    needed = {"target_day", *YTD_HOURLY_COLUMNS}
+    if daily is None or daily.empty or not needed.issubset(daily.columns):
+        return pd.DataFrame()
+    curves = {}
+    for row in daily.to_dict(orient="records"):
+        forecast = _parse_json_floats(row.get("hourly_forecast_eur_mwh"))
+        actual = _parse_json_floats(row.get("hourly_actual_eur_mwh"))
+        if len(forecast) < 23 or len(forecast) != len(actual):
+            continue
+        valid = np.isfinite(forecast) & np.isfinite(actual)
+        if valid.sum() < 23:
+            continue
+        day = pd.Timestamp(row["target_day"]).date()
+        curves[day] = (forecast[valid], actual[valid], row.get("price_floor_reference_eur_mwh", np.nan))
+    rows = []
+    for day in sorted(curves):
+        forecast, actual, floor_reference = curves[day]
+        previous = curves.get(day - timedelta(days=1))
+        previous_error = (float(previous[0].mean() - previous[1].mean())
+                          if previous is not None else np.nan)
+        level_shift = float(level_lambda) * previous_error if np.isfinite(previous_error) else 0.0
+        floor_kind, floor_value = _v182_floor_spec(floor_mode, floor_reference)
+        adjusted = postprocess_price_curve(forecast, level_shift, floor_kind, floor_value)
+        perfect = _fast_chronological_tb4(actual)
+        raw_schedule = _fast_chronological_tb4(forecast)
+        adjusted_schedule = _fast_chronological_tb4(adjusted)
+        if perfect is None or raw_schedule is None or adjusted_schedule is None:
+            continue
+        rows.append({
+            "target_day": day,
+            "previous_day_error_eur_mwh": previous_error,
+            "level_shift_eur_mwh": level_shift,
+            "floor_value_eur_mwh": floor_value,
+            "hours_below_floor": (int(np.sum(forecast - level_shift < floor_value))
+                                  if floor_kind != "off" else 0),
+            "raw_mae_eur_mwh": float(np.mean(np.abs(forecast - actual))),
+            "adjusted_mae_eur_mwh": float(np.mean(np.abs(adjusted - actual))),
+            "raw_rmse_eur_mwh": float(np.sqrt(np.mean((forecast - actual) ** 2))),
+            "adjusted_rmse_eur_mwh": float(np.sqrt(np.mean((adjusted - actual) ** 2))),
+            "raw_baseload_error_eur_mwh": float(forecast.mean() - actual.mean()),
+            "adjusted_baseload_error_eur_mwh": float(adjusted.mean() - actual.mean()),
+            "perfect_revenue_eur_mw": float(perfect[2]),
+            "raw_realised_revenue_eur_mw": _fast_settle(raw_schedule, actual),
+            "adjusted_realised_revenue_eur_mw": _fast_settle(adjusted_schedule, actual),
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_postprocessing(evaluation: pd.DataFrame) -> pd.DataFrame:
+    """Raw V18 vs post-processed: one row per metric."""
+    if evaluation is None or evaluation.empty:
+        return pd.DataFrame()
+    perfect = evaluation["perfect_revenue_eur_mw"].sum()
+
+    def _capture(column: str) -> float:
+        return 100.0 * evaluation[column].sum() / perfect if abs(perfect) > 1e-9 else np.nan
+
+    rows = [
+        ("Hourly MAE (€/MWh)", evaluation["raw_mae_eur_mwh"].mean(), evaluation["adjusted_mae_eur_mwh"].mean()),
+        ("Hourly RMSE (€/MWh)", evaluation["raw_rmse_eur_mwh"].mean(), evaluation["adjusted_rmse_eur_mwh"].mean()),
+        ("Mean |baseload error| (€/MWh)", evaluation["raw_baseload_error_eur_mwh"].abs().mean(),
+         evaluation["adjusted_baseload_error_eur_mwh"].abs().mean()),
+        ("Mean baseload bias (€/MWh)", evaluation["raw_baseload_error_eur_mwh"].mean(),
+         evaluation["adjusted_baseload_error_eur_mwh"].mean()),
+        ("BESS capture vs perfect foresight (%)", _capture("raw_realised_revenue_eur_mw"),
+         _capture("adjusted_realised_revenue_eur_mw")),
+        ("Realised BESS revenue (€/MW)", evaluation["raw_realised_revenue_eur_mw"].sum(),
+         evaluation["adjusted_realised_revenue_eur_mw"].sum()),
+    ]
+    output = pd.DataFrame(rows, columns=["Metric", "Raw V18", "Post-processed"])
+    output["Change"] = output["Post-processed"] - output["Raw V18"]
+    return output
+
+
+def postprocessing_variant_table(daily: pd.DataFrame, level_lambda: float,
+                                 floor_mode: str) -> pd.DataFrame:
+    """Separate the contribution of the level correction and of the floor."""
+    variants = [
+        ("Raw V18", 0.0, "Off"),
+        ("Floor only", 0.0, floor_mode),
+        (f"Level correction only (λ = {level_lambda:.2f})", level_lambda, "Off"),
+        ("Level correction + floor", level_lambda, floor_mode),
+    ]
+    variants += [(f"λ = {value:.2f} + floor", value, floor_mode)
+                 for value in (0.25, 0.5, 0.75, 1.0) if abs(value - level_lambda) > 1e-9]
+    rows = []
+    for name, value, mode in variants:
+        evaluation = evaluate_price_postprocessing(daily, float(value), mode)
+        if evaluation.empty:
+            continue
+        perfect = evaluation["perfect_revenue_eur_mw"].sum()
+        rows.append({
+            "Variant": name,
+            "Days": len(evaluation),
+            "Hourly MAE (€/MWh)": evaluation["adjusted_mae_eur_mwh"].mean(),
+            "Mean |baseload error| (€/MWh)": evaluation["adjusted_baseload_error_eur_mwh"].abs().mean(),
+            "BESS capture (%)": (100.0 * evaluation["adjusted_realised_revenue_eur_mw"].sum() / perfect
+                                 if abs(perfect) > 1e-9 else np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
+def monthly_postprocessing_summary(evaluation: pd.DataFrame) -> pd.DataFrame:
+    if evaluation is None or evaluation.empty:
+        return pd.DataFrame()
+    frame = evaluation.copy()
+    frame["month"] = pd.to_datetime(frame["target_day"]).dt.to_period("M").astype(str)
+    grouped = frame.groupby("month")
+    output = grouped.agg(
+        days=("target_day", "count"),
+        raw_mae_eur_mwh=("raw_mae_eur_mwh", "mean"),
+        adjusted_mae_eur_mwh=("adjusted_mae_eur_mwh", "mean"),
+        perfect_revenue_eur_mw=("perfect_revenue_eur_mw", "sum"),
+        raw_realised_revenue_eur_mw=("raw_realised_revenue_eur_mw", "sum"),
+        adjusted_realised_revenue_eur_mw=("adjusted_realised_revenue_eur_mw", "sum"),
+    ).reset_index()
+    output["raw_abs_baseload_error_eur_mwh"] = grouped["raw_baseload_error_eur_mwh"].apply(
+        lambda s: s.abs().mean()).to_numpy()
+    output["adjusted_abs_baseload_error_eur_mwh"] = grouped["adjusted_baseload_error_eur_mwh"].apply(
+        lambda s: s.abs().mean()).to_numpy()
+    perfect = output["perfect_revenue_eur_mw"].replace(0.0, np.nan)
+    output["raw_capture_pct"] = 100.0 * output["raw_realised_revenue_eur_mw"] / perfect
+    output["adjusted_capture_pct"] = 100.0 * output["adjusted_realised_revenue_eur_mw"] / perfect
+    return output
+
+
+def build_demand_accuracy_chart(successful: pd.DataFrame):
+    """Daily target-day demand MAPE: model vs REE D+1 vs trend-adjusted D-7."""
+    columns = {
+        "demand_target_mape_pct": "Model forecast",
+        "ree_d1_demand_target_mape_pct": "REE official D+1",
+        "demand_d7trend_target_mape_pct": "Previous week + trend",
+    }
+    available = [c for c in columns if c in successful.columns]
+    if not available:
+        return None
+    plot = successful[["target_day", *available]].copy()
+    plot["target_day"] = pd.to_datetime(plot["target_day"])
+    plot = plot.melt("target_day", var_name="series", value_name="mape").dropna(subset=["mape"])
+    if plot.empty:
+        return None
+    plot["series"] = plot["series"].map(columns)
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2).encode(
+        x=alt.X("target_day:T", title=None),
+        y=alt.Y("mape:Q", title="Target-day demand MAPE (%)"),
+        color=alt.Color("series:N", title=None, scale=alt.Scale(
+            domain=list(columns.values()), range=[CORP_GREEN_DARK, CORP_GREEN, TEMPERATURE_ORANGE])),
+        tooltip=[alt.Tooltip("target_day:T", format="%d-%m-%Y"), "series:N",
+                 alt.Tooltip("mape:Q", format=",.2f")],
+    )
+    return configure_chart(chart, height=300)
 
 
 def build_ytd_cumulative_revenue_chart(
@@ -7254,13 +7919,51 @@ forecast_generation_technologies = st.multiselect(
     options=list(FORECAST_NON_THERMAL_INDICATORS.keys()),
     default=FORECAST_NON_THERMAL_DEFAULT,
     help=(
-        "Structural gap = PBF demand minus GROSS structural generation minus residual bilaterals. "
-        "Gross/net and bilateral representations are reconciled. Hydro UGH "
+        "Structural thermal gap = PBF-calibrated demand minus forecast NET "
+        "wind, solar, nuclear, run-of-river and other renewables. Hydro UGH "
         "is flexible and is not deducted from the structural gap. "
         "Run-of-river corresponds to Hydro non-UGH."
     ),
     key="forecast_generation_technologies",
 )
+
+pp1, pp2, pp3 = st.columns([1.0, 1.0, 1.35])
+with pp1:
+    live_level_correction = st.checkbox(
+        "D-1 level correction",
+        value=True,
+        help=(
+            "Shifts the whole price curve by λ × yesterday's baseload error. "
+            "Yesterday's auction has already cleared when tomorrow is forecast, "
+            "so the error is known. Yesterday's forecast is recreated once "
+            "(cached), so the first run takes roughly twice as long. The shift "
+            "is the same for every hour and does not change the BESS hours."
+        ),
+        key="pp_live_level_correction",
+    )
+with pp2:
+    live_level_lambda = st.slider(
+        "Level-correction weight λ",
+        min_value=0.0,
+        max_value=1.0,
+        value=LEVEL_CORRECTION_DEFAULT_LAMBDA,
+        step=0.05,
+        disabled=not live_level_correction,
+        help="0 = off, 1 = remove all of yesterday's level error. Step 6 shows the YTD effect of each value.",
+        key="pp_live_level_lambda",
+    )
+with pp3:
+    live_floor_mode = st.selectbox(
+        "Price floor",
+        PRICE_FLOOR_MODES,
+        index=0,
+        help=(
+            "Soft floor: hours forecast below the 1st percentile of the last "
+            "365 days of real prices are compressed towards it (slope 0.10), "
+            "keeping their order for the BESS optimiser."
+        ),
+        key="pp_live_floor_mode",
+    )
 
 forecast_as_of_day = forecast_target_day - timedelta(days=1)
 forecast_is_historical = forecast_target_day <= date.today()
@@ -7294,7 +7997,7 @@ if st.button(
 ):
     forecast_stage = "Input validation"
     try:
-        st.session_state.pop("day_ahead_result_v18_gross_reconciled_adaptive", None)
+        st.session_state.pop("day_ahead_result_v17_2_cow_fix", None)
         if not forecast_generation_technologies:
             raise ValueError(
                 "Select at least one PBF generation technology."
@@ -7383,17 +8086,56 @@ if st.button(
                 token,
             )
 
+        # V18.2 post-processing: D-1 level correction and price floor.
+        forecast_stage = "Price post-processing"
+        level_shift = 0.0
+        postprocessing_details = {
+            "level_correction_enabled": bool(live_level_correction),
+            "lambda": float(live_level_lambda) if live_level_correction else 0.0,
+            "previous_day": forecast_as_of_day,
+            "previous_day_error_eur_mwh": np.nan,
+            "status": "Level correction off",
+        }
+        if live_level_correction and live_level_lambda > 0:
+            with st.spinner(
+                "Recreating yesterday's forecast to measure its level error..."
+            ):
+                try:
+                    previous_error = previous_day_operational_error(
+                        target_day=forecast_target_day,
+                        lookback_days=int(forecast_lookback),
+                        temperature_mode=temperature_mode,
+                        trend_alpha=float(forecast_trend_alpha),
+                        demand_source=downstream_demand_source,
+                        technologies=list(forecast_generation_technologies),
+                        token=token,
+                    )
+                    level_shift = float(live_level_lambda) * float(
+                        previous_error["previous_day_error_eur_mwh"]
+                    )
+                    postprocessing_details.update(previous_error)
+                    postprocessing_details["status"] = "ok"
+                except Exception as exc:
+                    level_shift = 0.0
+                    postprocessing_details["status"] = (
+                        f"Level correction skipped: {type(exc).__name__}: {exc}"
+                    )[:300]
+        price_result = apply_price_postprocessing(
+            price_result,
+            level_shift,
+            live_floor_mode,
+            postprocessing_details,
+        )
+
         # Loaded only after the forecast has been produced to prevent leakage.
         forecast_stage = "Post-forecast realised-price comparison"
-        try:
-            realised_prices = load_esios_price_history(
-                forecast_target_day, forecast_target_day, token,
-            )
-        except Exception as exc:
-            realised_prices = pd.DataFrame(columns=["datetime", "price_eur_mwh"])
-            st.warning(f"Forecast completed; realised-price comparison unavailable: {exc}")
+        realised_prices = load_esios_price_history(
+            forecast_target_day,
+            forecast_target_day,
+            token,
+        )
 
-        st.session_state["day_ahead_result_v18_gross_reconciled_adaptive"] = {
+        st.session_state["day_ahead_result_v17_2_cow_fix"] = {
             **demand_result,
             "forecast": forecast_for_market,
             "demand_source_label": demand_source_label,
@@ -7421,7 +8163,7 @@ if st.button(
             st.write({k: v for k, v in details.items() if k != "traceback"})
             st.code(details["traceback"], language="text")
 
-forecast_result = st.session_state.get("day_ahead_result_v18_gross_reconciled_adaptive")
+forecast_result = st.session_state.get("day_ahead_result_v17_2_cow_fix")
 if forecast_result:
     if forecast_result.get("target_day") != forecast_target_day:
         st.info(f"Showing the last successful forecast for {forecast_result.get('target_day')}. Press Generate to run the selected date.")
@@ -7545,36 +8287,6 @@ if forecast_result:
 
         thermal_forecast = thermal_result["forecast"]
         generation_long = thermal_result["generation_long"]
-
-        st.info(
-            "V18 forecasts gross PBF and the matching residual bilateral programme. "
-            "The non-bilateral chart is a reconciled display; changing structural bilateral "
-            "allocation alone cannot change the thermal gap."
-        )
-        for warning in thermal_result.get("quality_warnings", []):
-            st.warning(warning)
-        dleft, dright = st.columns(2)
-        with dleft:
-            st.download_button(
-                "Download FULL thermal-gap forecast CSV",
-                thermal_forecast.to_csv(index=False).encode("utf-8"),
-                file_name=f"full_thermal_gap_forecast_{forecast_result.get('target_day')}.csv",
-                mime="text/csv", use_container_width=True, key="v18_full_gap_export",
-            )
-        with dright:
-            st.download_button(
-                "Download generation candidates and weights CSV",
-                generation_long.to_csv(index=False).encode("utf-8"),
-                file_name=f"generation_candidates_{forecast_result.get('target_day')}.csv",
-                mime="text/csv", use_container_width=True, key="v18_generation_export",
-            )
-        st.caption(
-            "Gross/net gap accounting residual: "
-            f"{thermal_forecast['gap_balance_reconciliation_mwh'].abs().max():.8f} MWh. "
-            "This checks accounting, not forecast accuracy. The first run also retrieves "
-            "up to 28 earlier fixed weather runs for calibration; subsequent runs reuse the cache."
-        )
-
 
         st.caption(
             "The solid black line is total forecast PBF demand. The dashed "
@@ -7711,10 +8423,7 @@ if forecast_result:
             st.markdown(
                 """
                 - **DA residual demand** is total programmed PBF demand minus total bilateral PBF sales (indicator 10235).
-                - Each technology is forecast as **gross PBF generation** first. The non-bilateral display is gross minus an estimated bilateral allocation.
-                - **Residual bilaterals = total bilateral sales minus the selected structural-technology bilaterals**. This residual is forecast directly.
-                - Nuclear bilateral reallocations cancel between demand and supply; they are not treated as a physical outage.
-                - PV candidate weights use strictly earlier out-of-sample errors, weather changes and model disagreement.
+                - Each technology is forecast as **non-bilateral PBF generation**: total PBF minus its bilateral programme.
                 - The price-relevant gap is **DA residual demand minus non-bilateral low-MC generation**.
                 - **Run-of-river** corresponds to Hydro non-UGH and is treated as non-dispatchable.
                 - **Hydro UGH is forecast separately but is not deducted**, because its dispatch responds to price and scarcity.
@@ -7836,21 +8545,50 @@ if forecast_result:
             use_container_width=True,
         )
 
+        postprocessing = price_result.get("postprocessing") or {}
+        if postprocessing:
+            level_text = "D-1 level correction off"
+            if postprocessing.get("status") == "ok":
+                level_text = (
+                    f"D-1 level correction {-postprocessing.get('level_shift_eur_mwh', 0.0):+,.2f} €/MWh "
+                    f"(λ = {postprocessing.get('lambda', 0.0):.2f} × yesterday's error "
+                    f"{postprocessing.get('previous_day_error_eur_mwh', np.nan):+,.2f} €/MWh on "
+                    f"{pd.Timestamp(postprocessing.get('previous_day')):%d/%m/%Y}; "
+                    f"{postprocessing.get('source', '')})"
+                )
+            elif postprocessing.get("level_correction_enabled"):
+                level_text = postprocessing.get("status", "D-1 level correction unavailable")
+            floor_kind = postprocessing.get("floor_kind", "off")
+            floor_text = (
+                "no price floor"
+                if floor_kind == "off"
+                else (
+                    f"{floor_kind} floor at {postprocessing.get('floor_value_eur_mwh', np.nan):,.2f} €/MWh "
+                    f"({postprocessing.get('hours_below_floor', 0)} h affected)"
+                )
+            )
+            st.info(
+                f"Post-processing: {level_text}; {floor_text}. Raw V18 baseload "
+                f"{postprocessing.get('raw_baseload_eur_mwh', np.nan):,.2f} €/MWh → final "
+                f"{postprocessing.get('adjusted_baseload_eur_mwh', np.nan):,.2f} €/MWh."
+            )
+
         st.caption(
             f"Price model: {price_result['model_name']}. "
             f"Conditional validation MAE: {price_result['model_stats']['mae']:,.2f} EUR/MWh "
             f"versus {price_result['anchor_stats']['mae']:,.2f} for the anchor. "
             "Candidate weights are selected using earlier, out-of-sample predictions. "
-            "No seasonal shape, zero-price floor or negative-gap cap is imposed. "
+            "No seasonal shape or negative-gap cap is imposed; the optional V18.2 "
+            "post-processing above only shifts the level and applies the selected floor. "
             "The shaded band is indicative conditional residual P10-P90, not a "
             "fully calibrated interval including input-forecast uncertainty. "
             f"{price_result.get('validation_scope', '')}"
         )
-        with st.expander("V18 candidate weights and conditional validation"):
+        with st.expander("V17 candidate weights and conditional validation"):
             st.dataframe(price_result.get("candidate_scores", pd.DataFrame()), use_container_width=True, hide_index=True)
             validation_export = price_result.get("conditional_validation", pd.DataFrame())
             st.download_button("Download conditional price validation CSV", validation_export.to_csv(index=False).encode("utf-8"),
-                               file_name="v18_conditional_price_validation.csv", mime="text/csv")
+                               file_name="v17_conditional_price_validation.csv", mime="text/csv")
 
 
         st.caption(
@@ -8496,11 +9234,6 @@ if forecast_result:
             if c not in {"datetime", "date", "hour", "thermal_gap_mwh", "engine_version"}
         ]
 
-        requested_price_output_columns += [
-            c for c in price_forecast.columns
-            if c.startswith("candidate_") or c.startswith("weight_")
-        ]
-        requested_price_output_columns = list(dict.fromkeys(requested_price_output_columns))
         available_price_output_columns = [
             column
             for column in requested_price_output_columns
@@ -8528,17 +9261,14 @@ if forecast_result:
         missing_generation_columns = [c for c in generation_export if c == "datetime" or c not in complete_output]
         complete_output = complete_output.merge(generation_export[missing_generation_columns], on="datetime", how="left")
 
-        with st.expander("V18 complete post-clearing gap diagnosis (not an ex-ante input)"):
+        with st.expander("V17 post-clearing gap diagnosis (not an ex-ante input)"):
             st.caption(
                 "Compares the forecast with the published target-day PBF, not metered physical generation. "
                 "Positive contributions mean the component made the forecast gap too high. "
                 "These target-day outcomes are never fed back into the forecast."
             )
-            diagnostic_hash = hashlib.sha256(
-                (thermal_forecast.to_csv(index=False) + price_forecast.to_csv(index=False)).encode("utf-8")
-            ).hexdigest()[:16]
-            diagnostic_key = f"{diagnostic_hash}_v18_gap_diagnostic_{forecast_result.get('target_day')}_{'|'.join(forecast_result.get('generation_technologies', []))}"
-            if st.button("Load post-clearing PBF diagnosis", key="v18_load_gap_diagnosis"):
+            diagnostic_key = f"v17_gap_diagnostic_{forecast_result.get('target_day')}_{'|'.join(forecast_result.get('generation_technologies', []))}"
+            if st.button("Load post-clearing PBF diagnosis", key="v17_load_gap_diagnosis"):
                 try:
                     with st.spinner("Loading published target-day PBF for ex-post diagnosis only..."):
                         diagnostic = build_post_clearing_gap_diagnostic(
@@ -8881,7 +9611,7 @@ if load_checkpoint and checkpoint_upload is not None:
             )
         )
         if "checkpoint_version" not in uploaded_checkpoint or not uploaded_checkpoint["checkpoint_version"].eq(YTD_BACKTEST_CHECKPOINT_VERSION).all():
-            raise ValueError("This checkpoint uses another engine version. Do not combine results from different engine versions.")
+            raise ValueError(f"This checkpoint was produced by another engine version (expected {YTD_BACKTEST_CHECKPOINT_VERSION}). Results from different versions are not combined.")
         st.session_state[
             YTD_BACKTEST_STATE_KEY
         ] = uploaded_checkpoint
@@ -9018,7 +9748,7 @@ if run_ytd_batch:
                         trend_alpha=float(
                             ytd_trend_alpha
                         ),
-                        demand_source=(
+                        demand_source=_canonical_demand_source(
                             ytd_demand_source
                         ),
                         technologies_tuple=tuple(
@@ -9133,6 +9863,8 @@ if not ytd_results.empty:
                 "perfect_discharge_hours",
                 "forecast_charge_hours",
                 "forecast_discharge_hours",
+                "demand_target_status",
+                *YTD_HOURLY_COLUMNS,
             }
         ]
         for column in numeric_columns:
@@ -9343,11 +10075,228 @@ if not ytd_results.empty:
             hide_index=True,
         )
 
+        # -------------------------------------------------
+        # V18.2: price post-processing, raw vs adjusted
+        # -------------------------------------------------
+        section_header(
+            "Price post-processing: raw V18 vs D-1 level correction + floor"
+        )
+        st.caption(
+            "Evaluated on the stored hourly curves of the days above, without "
+            "re-running the chain. The D-1 error of each day is the raw error of "
+            "the previous calendar day, which is known before that day's auction; "
+            "a day whose previous day is missing gets no shift (start the range one "
+            "day earlier to include its first day). Changing these settings only "
+            "re-evaluates stored days (but, like any widget, it interrupts a batch "
+            "that is running); choosing λ on this same period is in-sample."
+        )
+        ev1, ev2 = st.columns([1.0, 1.35])
+        with ev1:
+            ytd_eval_lambda = st.slider(
+                "Evaluate level-correction weight λ",
+                min_value=0.0,
+                max_value=1.0,
+                value=LEVEL_CORRECTION_DEFAULT_LAMBDA,
+                step=0.05,
+                key="ytd_eval_lambda",
+            )
+        with ev2:
+            ytd_eval_floor_mode = st.selectbox(
+                "Evaluate price floor",
+                PRICE_FLOOR_MODES,
+                index=0,
+                key="ytd_eval_floor_mode",
+            )
+
+        evaluation_input = ytd_range_results[
+            ytd_range_results["status"] == "ok"
+        ].copy()
+        evaluation_columns = [
+            column
+            for column in [
+                "target_day",
+                *YTD_HOURLY_COLUMNS,
+                "price_floor_reference_eur_mwh",
+            ]
+            if column in evaluation_input.columns
+        ]
+        evaluation_input = evaluation_input[evaluation_columns].reset_index(drop=True)
+        postprocessing_evaluation = evaluate_price_postprocessing(
+            evaluation_input,
+            float(ytd_eval_lambda),
+            ytd_eval_floor_mode,
+        )
+
+        if postprocessing_evaluation.empty:
+            st.info(
+                "No day with stored hourly curves yet. Days processed by this "
+                f"version ({YTD_BACKTEST_CHECKPOINT_VERSION}) store them automatically."
+            )
+        else:
+            shifted_days = int(
+                postprocessing_evaluation["previous_day_error_eur_mwh"].notna().sum()
+            )
+            st.caption(
+                f"{len(postprocessing_evaluation)} days evaluated; {shifted_days} had a "
+                "D-1 error available."
+            )
+            postprocessing_summary = summarize_postprocessing(
+                postprocessing_evaluation
+            )
+            st.dataframe(
+                postprocessing_summary.style.format(
+                    {
+                        "Raw V18": "{:,.2f}",
+                        "Post-processed": "{:,.2f}",
+                        "Change": "{:+,.2f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.subheader("Contribution of each correction")
+            st.dataframe(
+                postprocessing_variant_table(
+                    evaluation_input,
+                    float(ytd_eval_lambda),
+                    ytd_eval_floor_mode,
+                ).style.format(
+                    {
+                        "Hourly MAE (€/MWh)": "{:,.2f}",
+                        "Mean |baseload error| (€/MWh)": "{:,.2f}",
+                        "BESS capture (%)": "{:,.1f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.subheader("Monthly raw vs post-processed")
+            st.dataframe(
+                monthly_postprocessing_summary(
+                    postprocessing_evaluation
+                ).style.format(
+                    {
+                        "raw_mae_eur_mwh": "{:,.2f}",
+                        "adjusted_mae_eur_mwh": "{:,.2f}",
+                        "raw_abs_baseload_error_eur_mwh": "{:,.2f}",
+                        "adjusted_abs_baseload_error_eur_mwh": "{:,.2f}",
+                        "perfect_revenue_eur_mw": "{:,.0f}",
+                        "raw_realised_revenue_eur_mw": "{:,.0f}",
+                        "adjusted_realised_revenue_eur_mw": "{:,.0f}",
+                        "raw_capture_pct": "{:,.1f}%",
+                        "adjusted_capture_pct": "{:,.1f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander("Daily raw vs post-processed"):
+                st.dataframe(
+                    postprocessing_evaluation,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # -------------------------------------------------
+        # V18.2: target-day demand forecast vs real demand
+        # -------------------------------------------------
+        if "demand_target_mape_pct" in successful_ytd.columns:
+            section_header(
+                "Demand forecast vs real demand (target day)"
+            )
+            demand_ok = successful_ytd[
+                successful_ytd["demand_target_mape_pct"].notna()
+            ].copy()
+            if demand_ok.empty:
+                st.info(
+                    "Real demand is not yet available for the processed days."
+                )
+            else:
+                model_mape = demand_ok["demand_target_mape_pct"].mean()
+                ree_mape = demand_ok["ree_d1_demand_target_mape_pct"].mean()
+                d7_mape = demand_ok["demand_d7trend_target_mape_pct"].mean()
+                dm1, dm2, dm3, dm4, dm5 = st.columns(5)
+                dm1.metric(
+                    "Model accuracy (100 − MAPE)",
+                    f"{100.0 - model_mape:,.2f}%",
+                )
+                dm2.metric(
+                    "Model MAPE",
+                    f"{model_mape:,.2f}%",
+                )
+                dm3.metric(
+                    "Model MAE",
+                    f"{demand_ok['demand_target_mae_mw'].mean():,.0f} MW",
+                )
+                dm4.metric(
+                    "REE official D+1 MAPE",
+                    f"{ree_mape:,.2f}%" if pd.notna(ree_mape) else "-",
+                )
+                dm5.metric(
+                    "Previous week + trend MAPE",
+                    f"{d7_mape:,.2f}%" if pd.notna(d7_mape) else "-",
+                )
+                st.caption(
+                    f"{len(demand_ok)} days. Hourly forecast for the delivery day against "
+                    "real REData peninsular demand, loaded only after the forecast. Unlike "
+                    "'demand_model_validation_mape_pct' (42-day validation with realised "
+                    "weather), this uses the forecast weather actually available at D-1."
+                )
+                demand_chart = build_demand_accuracy_chart(demand_ok)
+                if demand_chart is not None:
+                    st.altair_chart(
+                        demand_chart,
+                        use_container_width=True,
+                    )
+                demand_monthly = demand_ok.assign(
+                    month=pd.to_datetime(demand_ok["target_day"]).dt.to_period("M").astype(str)
+                ).groupby("month", as_index=False).agg(
+                    days=("target_day", "count"),
+                    model_mape_pct=("demand_target_mape_pct", "mean"),
+                    model_mae_mw=("demand_target_mae_mw", "mean"),
+                    model_bias_mw=("demand_target_bias_mw", "mean"),
+                    ree_d1_mape_pct=("ree_d1_demand_target_mape_pct", "mean"),
+                    previous_week_trend_mape_pct=("demand_d7trend_target_mape_pct", "mean"),
+                )
+                demand_monthly["model_accuracy_pct"] = 100.0 - demand_monthly["model_mape_pct"]
+                st.dataframe(
+                    demand_monthly.style.format(
+                        {
+                            "model_mape_pct": "{:,.2f}%",
+                            "model_mae_mw": "{:,.0f}",
+                            "model_bias_mw": "{:+,.0f}",
+                            "ree_d1_mape_pct": "{:,.2f}%",
+                            "previous_week_trend_mape_pct": "{:,.2f}%",
+                            "model_accuracy_pct": "{:,.2f}%",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        if "gas_available" in successful_ytd.columns:
+            missing_gas_days = int((successful_ytd["gas_available"] == 0).sum())
+            if missing_gas_days:
+                st.warning(
+                    f"MIBGAS gas price was unavailable on {missing_gas_days} of "
+                    f"{len(successful_ytd)} processed days (column gas_available = 0). "
+                    "The price model then runs without gas; check data/mibgas_2026_cache.csv."
+                )
+
         with st.expander(
             "Daily YTD walk-forward results"
         ):
             st.dataframe(
-                successful_ytd.sort_values(
+                successful_ytd.drop(
+                    columns=[
+                        column
+                        for column in YTD_HOURLY_COLUMNS
+                        if column in successful_ytd.columns
+                    ]
+                ).sort_values(
                     "target_day"
                 ),
                 use_container_width=True,
