@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -941,7 +942,10 @@ def _v17_candidate_price_forecasts(train, target):
         lear_features = [c for c in _v17_price_feature_columns(train)
                          if c not in {"hour", "hour_sin", "hour_cos", "is_solar_block"}]
         try:
-            candidates["LEAR"] = _v18_lear_forecast(train, target, lear_features)
+            lear = np.asarray(_v18_lear_forecast(train, target, lear_features), dtype=float)
+            # V18.2: an hour LEAR cannot price falls back to the anchor instead of
+            # failing the whole delivery day.
+            candidates["LEAR"] = np.where(np.isfinite(lear), lear, candidates["Anchor"].to_numpy(float))
         except Exception:
             candidates["LEAR"] = candidates["Anchor"].to_numpy()
     if not np.isfinite(candidates.to_numpy()).all():
@@ -1006,7 +1010,7 @@ def build_post_clearing_gap_diagnostic(target_day: date, technologies: list[str]
 # at forecast time the gap comes from a different (forecast) source. V18 adds
 # REE's sealed D+1 forecasts, which are ex-ante in history AND at forecast time
 # (published ~10:50 D-1, never revised), so train and target see the same thing.
-FORECAST_ENGINE_VERSION = "v18_1_daytype_anchor_bias"
+FORECAST_ENGINE_VERSION = "v18_2_level_floor"  # V18.1 model + V18.2 fixes (EUA lag, LEAR guard)
 
 # ESIOS "Previsión diaria D+1" series (sealed D-1, no post-publication revision).
 # 1775 demand is already used above. Check 1777/1779 once in ESIOS: if either
@@ -1057,38 +1061,13 @@ def _v18_same_type_day(day: date, holidays_set: set):
     return None
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=16)
 def _v18_fetch_esios_hourly_average(indicator_id: int, start_day: date,
                                     end_day: date, _token: str) -> pd.DataFrame:
-    """Hourly average MW of one ESIOS indicator, chunked like the PBF loader."""
-    frames, chunk_start = [], start_day
-    while chunk_start <= end_day:
-        chunk_end = min(end_day, chunk_start + timedelta(days=13))
-        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
-        end_local = pd.Timestamp(chunk_end + timedelta(days=1), tz="Europe/Madrid")
-        params = {
-            "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "time_trunc": "hour",
-            "time_agg": "average",
-        }
-        for attempt in range(3):
-            try:
-                response = requests.get(f"{ESIOS_API_BASE}/{indicator_id}",
-                                        headers=esios_headers(_token),
-                                        params=params, timeout=(15, 120))
-                response.raise_for_status()
-                parsed = parse_esios_values(response.json())
-                if not parsed.empty:
-                    lower, upper = start_local.tz_localize(None), end_local.tz_localize(None)
-                    frames.append(parsed[(parsed["datetime"] >= lower) & (parsed["datetime"] < upper)])
-                break
-            except requests.RequestException:
-                sleep(1.5 * (attempt + 1))
-        chunk_start = chunk_end + timedelta(days=1)
-    if not frames:
+    """Hourly average MW of one ESIOS indicator (V18.2: fixed-grid block cache)."""
+    out = esios_hourly_history(indicator_id, start_day, end_day, "average", _token)
+    if out.empty:
         return pd.DataFrame(columns=["datetime", "value"])
-    out = pd.concat(frames, ignore_index=True)
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     return (out.dropna(subset=["datetime", "value"])
             .groupby("datetime", as_index=False)["value"].mean()
@@ -1146,8 +1125,12 @@ def load_eua_daily_lookup() -> tuple[dict, str]:
 
 
 def _v18_last_settle(lookup: dict, delivery_day: date, max_back: int = 5) -> float:
-    """Latest settle strictly before delivery day D (known before the D-1 auction)."""
-    for lag in range(1, max_back + 1):
+    """Latest EUA settle known before the D-1 12:00 auction.
+
+    V18.2: the settlement of D-1 itself is only published after the close of
+    trading on D-1, i.e. after the auction for D, so the search starts at D-2.
+    """
+    for lag in range(2, max_back + 2):
         value = lookup.get(delivery_day - timedelta(days=lag))
         if value is not None and np.isfinite(value):
             return float(value)
@@ -1212,8 +1195,15 @@ def _v18_lear_forecast(train: pd.DataFrame, target: pd.DataFrame, features: list
             continue
         scaler = StandardScaler().fit(x_all[tr])
         model = LassoLarsIC(criterion="aic", max_iter=500)
-        model.fit(np.nan_to_num(scaler.transform(x_all[tr])), forward(train.loc[tr, "price_eur_mwh"]))
-        prediction[te] = inverse(model.predict(np.nan_to_num(scaler.transform(z_all[te]))))
+        z_train = forward(train.loc[tr, "price_eur_mwh"])
+        model.fit(np.nan_to_num(scaler.transform(x_all[tr])), z_train)
+        z_pred = model.predict(np.nan_to_num(scaler.transform(z_all[te])))
+        # V18.2: a linear model can extrapolate far outside the asinh range seen
+        # in training, and sinh() then overflows to inf ("Non-finite candidate
+        # prices" failures). Keep the prediction within the training range plus
+        # a generous margin before inverting.
+        z_low, z_high = float(np.nanmin(z_train)) - 1.0, float(np.nanmax(z_train)) + 1.0
+        prediction[te] = inverse(np.clip(z_pred, z_low, z_high))
     return prediction
 
 
@@ -1262,6 +1252,361 @@ def _v18_choose_bias_shrink(validation: pd.DataFrame, prediction: np.ndarray) ->
         if mae < best_mae - 0.05:
             best_shrink, best_mae = shrink, mae
     return best_shrink
+
+
+# =========================================================
+# V18.2: operational price post-processing (level and floor)
+# =========================================================
+# Both corrections are applied AFTER the V18 model. The raw model, its weights
+# and its caches are untouched, so the YTD backtest reports raw and adjusted
+# results from the same run.
+#
+# 1) D-1 level correction. In the Jan-Feb 2026 walk-forward about three
+#    quarters of the hourly MAE was a wrong daily level, and that level error
+#    was persistent (lag-1 autocorrelation ~0.6). When the forecast for D is
+#    made on D-1, the auction for D-1 has already cleared, so yesterday's
+#    error of the full operational chain is known:
+#        error(D-1)     = raw forecast baseload(D-1) - realised baseload(D-1)
+#        adjusted(D, h) = raw(D, h) - lambda * error(D-1)
+#    The shift is identical for all hours, so it never changes the BESS
+#    charge/discharge selection; it only moves the level. The V18 hourly bias
+#    correction cannot see this error because its validation block uses
+#    observed PBF gaps instead of the forecast gap.
+# 2) Price floor. The model has no lower bound and produced negative
+#    baseloads in Feb-2026 while realised prices stayed positive. The default
+#    soft floor is the 1st percentile of realised hourly prices in the 365
+#    days before D. Values below it are compressed (slope 0.10) rather than
+#    clipped, so the hourly order used by the BESS optimiser is preserved.
+PRICE_POSTPROCESSING_VERSION = "v18_2_level_floor"
+LEVEL_CORRECTION_DEFAULT_LAMBDA = 0.5
+PRICE_FLOOR_QUANTILE = 0.01
+PRICE_FLOOR_LOOKBACK_DAYS = 365
+PRICE_SOFT_FLOOR_SLOPE = 0.10
+PRICE_FLOOR_MODES = [
+    "Soft floor at the 1st percentile of the last 365 days",
+    "Hard floor at 0 EUR/MWh",
+    "Off",
+]
+
+
+def _v182_price_floor_reference(prices: pd.DataFrame, target_day: date) -> float:
+    """1st percentile of realised hourly prices in the 365 days before D."""
+    if prices is None or prices.empty or "price_eur_mwh" not in prices:
+        return np.nan
+    days = pd.to_datetime(prices["datetime"], errors="coerce").dt.date
+    window = (days < target_day) & (days >= target_day - timedelta(days=PRICE_FLOOR_LOOKBACK_DAYS))
+    values = pd.to_numeric(prices.loc[window, "price_eur_mwh"], errors="coerce").dropna()
+    if len(values) < 24 * 60:
+        return np.nan
+    return float(values.quantile(PRICE_FLOOR_QUANTILE))
+
+
+def _v182_floor_spec(floor_mode: str, floor_reference: float) -> tuple[str, float]:
+    """Translate the UI floor choice into ("soft"|"hard"|"off", value)."""
+    reference = pd.to_numeric(floor_reference, errors="coerce")
+    if floor_mode == PRICE_FLOOR_MODES[0]:
+        return ("soft", float(reference)) if pd.notna(reference) else ("off", np.nan)
+    if floor_mode == PRICE_FLOOR_MODES[1]:
+        return "hard", 0.0
+    return "off", np.nan
+
+
+def postprocess_price_curve(values, level_shift: float = 0.0, floor_kind: str = "off",
+                            floor_value: float = np.nan) -> np.ndarray:
+    """Subtract the D-1 level shift, then apply the floor (monotonic in input)."""
+    shift = float(level_shift) if pd.notna(level_shift) else 0.0
+    adjusted = np.asarray(values, dtype=float) - shift
+    if floor_kind == "soft" and pd.notna(floor_value):
+        adjusted = np.where(adjusted < floor_value,
+                            floor_value + PRICE_SOFT_FLOOR_SLOPE * (adjusted - floor_value), adjusted)
+    elif floor_kind == "hard" and pd.notna(floor_value):
+        adjusted = np.maximum(adjusted, floor_value)
+    return adjusted
+
+
+def apply_price_postprocessing(price_result: dict, level_shift: float, floor_mode: str,
+                               details: dict | None = None) -> dict:
+    """Return a copy of price_result whose final curve is post-processed.
+
+    The raw V18 curve is kept in raw_final_forecast_eur_mwh. Steps 3-5 read
+    forecast_price_eur_mwh, so they all use the adjusted curve.
+    """
+    result = dict(price_result)
+    forecast = price_result["forecast"].copy()
+    floor_kind, floor_value = _v182_floor_spec(
+        floor_mode, price_result.get("price_floor_reference_eur_mwh", np.nan))
+    raw = pd.to_numeric(forecast["forecast_price_eur_mwh"], errors="coerce").to_numpy(float)
+    adjusted = postprocess_price_curve(raw, level_shift, floor_kind, floor_value)
+    forecast["raw_final_forecast_eur_mwh"] = raw
+    forecast["forecast_price_eur_mwh"] = adjusted
+    for column in ["forecast_p10_eur_mwh", "forecast_p90_eur_mwh"]:
+        if column in forecast:
+            forecast[column] = postprocess_price_curve(
+                pd.to_numeric(forecast[column], errors="coerce"), level_shift, floor_kind, floor_value)
+    forecast["level_correction_eur_mwh"] = -float(level_shift)
+    forecast["price_floor_eur_mwh"] = floor_value if floor_kind != "off" else np.nan
+    result["forecast"] = forecast
+    result["postprocessing"] = {
+        **(details or {}),
+        "version": PRICE_POSTPROCESSING_VERSION,
+        "level_shift_eur_mwh": float(level_shift),
+        "floor_mode": floor_mode,
+        "floor_kind": floor_kind,
+        "floor_value_eur_mwh": floor_value,
+        "hours_below_floor": int(np.sum(raw - float(level_shift) < floor_value)) if floor_kind != "off" else 0,
+        "raw_baseload_eur_mwh": float(np.nanmean(raw)),
+        "adjusted_baseload_eur_mwh": float(np.nanmean(adjusted)),
+    }
+    return result
+
+
+def _canonical_demand_source(label: str) -> str:
+    """One label per demand curve, so Step 1 and Step 6 share cached days."""
+    text = str(label)
+    if text.startswith("Model"):
+        return "Model forecast"
+    if text.startswith("REE"):
+        return "REE official D+1 forecast"
+    return "Previous week + recent trend"
+
+
+def previous_day_operational_error(target_day: date, lookback_days: int, temperature_mode: str,
+                                   trend_alpha: float, demand_source: str,
+                                   technologies: list[str], token: str) -> dict:
+    """Raw error of yesterday's full operational forecast (known on D-1).
+
+    Re-uses a Step 6 walk-forward row computed with identical settings when one
+    is in the session; otherwise yesterday's forecast is recreated (cached).
+    """
+    previous_day = target_day - timedelta(days=1)
+    canonical = _canonical_demand_source(demand_source)
+    technologies_text = " | ".join(technologies)
+    stored = normalize_walk_forward_results(st.session_state.get(YTD_BACKTEST_STATE_KEY, pd.DataFrame()))
+
+    def _column(frame: pd.DataFrame, name: str) -> pd.Series:
+        return frame[name] if name in frame else pd.Series(np.nan, index=frame.index)
+
+    if not stored.empty:
+        match = stored[
+            (stored["target_day"] == previous_day)
+            & (stored["status"] == "ok")
+            & (_column(stored, "demand_source").astype(str) == canonical)
+            & (pd.to_numeric(_column(stored, "lookback_days"), errors="coerce") == int(lookback_days))
+            & (_column(stored, "temperature_mode").astype(str) == str(temperature_mode))
+            & ((pd.to_numeric(_column(stored, "trend_alpha"), errors="coerce") - float(trend_alpha)).abs() < 1e-9)
+            & (_column(stored, "technologies").astype(str) == technologies_text)
+        ]
+        if not match.empty:
+            row = match.iloc[-1]
+            forecast_baseload = float(row["forecast_baseload_eur_mwh"])
+            actual_baseload = float(row["actual_baseload_eur_mwh"])
+            if np.isfinite(forecast_baseload) and np.isfinite(actual_baseload):
+                return {
+                    "previous_day": previous_day,
+                    "previous_day_error_eur_mwh": forecast_baseload - actual_baseload,
+                    "previous_day_forecast_baseload_eur_mwh": forecast_baseload,
+                    "previous_day_actual_baseload_eur_mwh": actual_baseload,
+                    "source": "Step 6 walk-forward row for D-1",
+                }
+    row = run_one_walk_forward_backtest_day(
+        target_day=previous_day,
+        lookback_days=int(lookback_days),
+        temperature_mode=temperature_mode,
+        trend_alpha=float(trend_alpha),
+        demand_source=canonical,
+        technologies_tuple=tuple(technologies),
+        _token=token,
+    )
+    return {
+        "previous_day": previous_day,
+        "previous_day_error_eur_mwh": float(row["forecast_baseload_eur_mwh"]) - float(row["actual_baseload_eur_mwh"]),
+        "previous_day_forecast_baseload_eur_mwh": float(row["forecast_baseload_eur_mwh"]),
+        "previous_day_actual_baseload_eur_mwh": float(row["actual_baseload_eur_mwh"]),
+        "source": "Recreated D-1 operational forecast",
+    }
+
+
+# =========================================================
+# V18.2: fixed-grid history cache (same data, far fewer API calls)
+# =========================================================
+# Every walk-forward day used to download its whole 550-day history again
+# (roughly 700 ESIOS requests plus REData and Open-Meteo), because each day
+# asks for a window shifted by one day and the cache key changed. History is
+# now fetched in fixed calendar blocks that are identical for every target
+# day. A block that ended at least HISTORY_CLOSED_LAG_DAYS ago is final and is
+# cached for a week; the most recent block is refreshed every 30 minutes. The
+# requested window is cut out of the blocks afterwards, so nothing after the
+# requested end date ever reaches a model.
+HISTORY_GRID_ANCHOR = date(2020, 1, 6)  # a Monday
+ESIOS_BLOCK_DAYS = 14
+REDATA_BLOCK_DAYS = 7
+HISTORY_CLOSED_LAG_DAYS = 3
+ARCHIVE_CLOSED_LAG_DAYS = 10
+
+
+def _fixed_blocks(start_day: date, end_day: date, block_days: int) -> list[tuple[date, date]]:
+    """Fixed [start, end] blocks of block_days days covering start..end."""
+    if start_day > end_day:
+        return []
+    offset = (start_day - HISTORY_GRID_ANCHOR).days // block_days
+    block_start = HISTORY_GRID_ANCHOR + timedelta(days=offset * block_days)
+    blocks = []
+    while block_start <= end_day:
+        block_end = block_start + timedelta(days=block_days - 1)
+        blocks.append((block_start, block_end))
+        block_start = block_end + timedelta(days=1)
+    return blocks
+
+
+def _month_blocks(start_day: date, end_day: date) -> list[tuple[date, date]]:
+    """Calendar-month blocks covering start..end."""
+    blocks = []
+    month_start = start_day.replace(day=1)
+    while month_start <= end_day:
+        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        blocks.append((month_start, next_month - timedelta(days=1)))
+        month_start = next_month
+    return blocks
+
+
+def _block_is_closed(block_end: date, lag_days: int) -> bool:
+    return block_end <= date.today() - timedelta(days=lag_days)
+
+
+def _esios_block_request(indicator_id: int, block_start: date, block_end: date,
+                         time_agg: str, token: str) -> pd.DataFrame:
+    """One ESIOS request for one fixed block. Raises after three failed tries,
+    so a failure is never cached as an empty block."""
+    start_local = pd.Timestamp(block_start, tz="Europe/Madrid")
+    end_local = pd.Timestamp(block_end + timedelta(days=1), tz="Europe/Madrid")
+    params = {
+        "start_date": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_date": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time_trunc": "hour",
+        "time_agg": time_agg,
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(f"{ESIOS_API_BASE}/{indicator_id}", headers=esios_headers(token),
+                                    params=params, timeout=(15, 120))
+            response.raise_for_status()
+            parsed = parse_esios_values(response.json())
+            if parsed.empty:
+                return pd.DataFrame(columns=["datetime", "value"])
+            lower, upper = start_local.tz_localize(None), end_local.tz_localize(None)
+            parsed = parsed[(parsed["datetime"] >= lower) & (parsed["datetime"] < upper)]
+            return parsed[["datetime", "value"]].reset_index(drop=True)
+        except requests.RequestException as exc:
+            last_error = exc
+            sleep(1.5 * (attempt + 1))
+    raise RuntimeError(
+        f"ESIOS indicator {indicator_id} {block_start}..{block_end} unavailable after 3 attempts "
+        f"({type(last_error).__name__})."
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=7 * 86400, max_entries=20000)
+def _esios_closed_block(indicator_id: int, block_start: date, block_end: date,
+                        time_agg: str, _token: str) -> pd.DataFrame:
+    return _esios_block_request(indicator_id, block_start, block_end, time_agg, _token)
+
+
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=2000)
+def _esios_recent_block(indicator_id: int, block_start: date, block_end: date,
+                        time_agg: str, _token: str) -> pd.DataFrame:
+    return _esios_block_request(indicator_id, block_start, block_end, time_agg, _token)
+
+
+def esios_hourly_history(indicator_id: int, start_day: date, end_day: date,
+                         time_agg: str, token: str) -> pd.DataFrame:
+    """Hourly ESIOS values (datetime, value) for start_day..end_day."""
+    frames = []
+    for block_start, block_end in _fixed_blocks(start_day, end_day, ESIOS_BLOCK_DAYS):
+        loader = (_esios_closed_block if _block_is_closed(block_end, HISTORY_CLOSED_LAG_DAYS)
+                  else _esios_recent_block)
+        try:
+            block = loader(int(indicator_id), block_start, block_end, str(time_agg), token)
+        except Exception:
+            # Same behaviour as before: a block that still fails after three
+            # attempts is skipped. Exceptions are not cached, so it is retried
+            # on the next call.
+            continue
+        if block is not None and not block.empty:
+            frames.append(block)
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "value"])
+    out = pd.concat(frames, ignore_index=True)
+    lower, upper = pd.Timestamp(start_day), pd.Timestamp(end_day + timedelta(days=1))
+    return out[(out["datetime"] >= lower) & (out["datetime"] < upper)].reset_index(drop=True)
+
+
+def _archive_block_request(points: tuple, variables: tuple, model: str,
+                           block_start: date, block_end: date) -> list:
+    """One Open-Meteo archive request; keeps only the hourly arrays."""
+    params = {
+        "latitude": ",".join(str(point[0]) for point in points),
+        "longitude": ",".join(str(point[1]) for point in points),
+        "start_date": block_start.isoformat(),
+        "end_date": block_end.isoformat(),
+        "hourly": ",".join(variables),
+        "timezone": "Europe/Madrid",
+        "models": model,
+    }
+    response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=180)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict):
+        payload = [payload]
+    return [
+        {"hourly": {key: list((item.get("hourly", {}) or {}).get(key, []) or [])
+                    for key in ("time", *variables)}}
+        for item in payload
+    ]
+
+
+@st.cache_data(show_spinner=False, ttl=7 * 86400, max_entries=2000)
+def _archive_closed_block(points: tuple, variables: tuple, model: str,
+                          block_start: date, block_end: date) -> list:
+    return _archive_block_request(points, variables, model, block_start, block_end)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
+def _archive_recent_block(points: tuple, variables: tuple, model: str,
+                          block_start: date, block_end: date) -> list:
+    return _archive_block_request(points, variables, model, block_start, block_end)
+
+
+def open_meteo_archive_payload(points: tuple, variables: tuple, model: str,
+                               start_day: date, end_day: date) -> list:
+    """Payload equivalent to ONE archive request for start_day..end_day.
+
+    Complete past months are cached; per point, the arrays of all months are
+    concatenated and cut to the requested dates, so downstream processing
+    (including the radiation shift) sees exactly the series a single request
+    would have returned.
+    """
+    combined = [{"hourly": {key: [] for key in ("time", *variables)}} for _ in points]
+    for block_start, block_end in _month_blocks(start_day, end_day):
+        if _block_is_closed(block_end, ARCHIVE_CLOSED_LAG_DAYS):
+            part = _archive_closed_block(points, variables, model, block_start, block_end)
+        else:
+            part = _archive_recent_block(points, variables, model, block_start, min(block_end, end_day))
+        for index, item in enumerate(part[:len(points)]):
+            hourly = item["hourly"]
+            times = hourly.get("time", [])
+            for key in ("time", *variables):
+                values = hourly.get(key, [])
+                if key != "time" and len(values) != len(times):
+                    values = [None] * len(times)
+                combined[index]["hourly"][key].extend(values)
+    lower, upper = f"{start_day.isoformat()}T00:00", f"{end_day.isoformat()}T23:59"
+    for item in combined:
+        hourly = item["hourly"]
+        keep = [i for i, stamp in enumerate(hourly["time"]) if lower <= str(stamp) <= upper]
+        for key in list(hourly):
+            hourly[key] = [hourly[key][i] for i in keep]
+    return combined
 
 
 # =========================================================
@@ -1596,18 +1941,30 @@ def _fetch_hourly_demand_chunk(start_day: date, end_day: date) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=7 * 86400, max_entries=5000)
+def _redata_demand_closed_block(block_start: date, block_end: date) -> pd.DataFrame:
+    return _fetch_hourly_demand_chunk(block_start, block_end)
+
+
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=500)
+def _redata_demand_recent_block(block_start: date, block_end: date) -> pd.DataFrame:
+    return _fetch_hourly_demand_chunk(block_start, block_end)
+
+
+def _redata_demand_block(block_start: date, block_end: date) -> pd.DataFrame:
+    if _block_is_closed(block_end, HISTORY_CLOSED_LAG_DAYS):
+        return _redata_demand_closed_block(block_start, block_end)
+    return _redata_demand_recent_block(block_start, block_end)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=16)
 def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFrame:
-    chunks = []
-    current = start_day
-    while current <= end_day:
-        chunk_end = min(end_day, current + timedelta(days=6))
-        chunks.append((current, chunk_end))
-        current = chunk_end + timedelta(days=1)
+    # V18.2: fixed 7-day blocks shared by every target day (see history cache).
+    chunks = _fixed_blocks(start_day, end_day, REDATA_BLOCK_DAYS)
 
     frames = []
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(_fetch_hourly_demand_chunk, s, e): (s, e) for s, e in chunks}
+        futures = {executor.submit(_redata_demand_block, s, e): (s, e) for s, e in chunks}
         for future in as_completed(futures):
             try:
                 frame = future.result()
@@ -1622,6 +1979,8 @@ def load_hourly_peninsular_demand(start_day: date, end_day: date) -> pd.DataFram
     out = pd.concat(frames, ignore_index=True)
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
     out["demand_mw"] = pd.to_numeric(out["demand_mw"], errors="coerce")
+    out = out[(out["datetime"] >= pd.Timestamp(start_day))
+              & (out["datetime"] < pd.Timestamp(end_day + timedelta(days=1)))]
     return (
         out.dropna(subset=["datetime", "demand_mw"])
         .groupby("datetime", as_index=False)["demand_mw"].mean()
@@ -1856,24 +2215,18 @@ def _temperature_points(mode: str) -> list[dict]:
     return SPAIN_TEMPERATURE_POINTS
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=8)
 def load_hourly_temperature_history(start_day: date, end_day: date, mode: str) -> pd.DataFrame:
     points = _temperature_points(mode)
     safe_end = min(end_day, date.today() - timedelta(days=5))
     if start_day > safe_end:
         return pd.DataFrame(columns=["datetime", "temperature_c"])
-    params = {
-        "latitude": ",".join(str(p["latitude"]) for p in points),
-        "longitude": ",".join(str(p["longitude"]) for p in points),
-        "start_date": start_day.isoformat(),
-        "end_date": safe_end.isoformat(),
-        "hourly": "temperature_2m",
-        "timezone": "Europe/Madrid",
-        "models": "era5_land",
-    }
-    response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=180)
-    response.raise_for_status()
-    return _weighted_hourly_temperature(response.json(), points)
+    # V18.2: monthly archive blocks shared by every target day.
+    payload = open_meteo_archive_payload(
+        tuple((p["latitude"], p["longitude"]) for p in points),
+        ("temperature_2m",), "era5_land", start_day, safe_end,
+    )
+    return _weighted_hourly_temperature(payload, points)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -2444,57 +2797,12 @@ def fetch_one_pbf_indicator_hourly(
 
     time_agg=sum ensures that, after the quarter-hour market transition, the
     four quarter-hour programmed-energy values are summed into the hourly MWh.
+    V18.2: history comes from the fixed-grid block cache.
     """
-    frames = []
-    chunk_start = start_day
-
-    while chunk_start <= end_day:
-        chunk_end = min(end_day, chunk_start + timedelta(days=13))
-
-        start_local = pd.Timestamp(chunk_start, tz="Europe/Madrid")
-        end_local = pd.Timestamp(
-            chunk_end + timedelta(days=1),
-            tz="Europe/Madrid",
-        )
-
-        params = {
-            "start_date": start_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "end_date": end_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "time_trunc": "hour",
-            "time_agg": "sum",
-        }
-
-        for attempt in range(3):
-            try:
-                response = requests.get(
-                    f"{ESIOS_API_BASE}/{indicator_id}",
-                    headers=esios_headers(token),
-                    params=params,
-                    timeout=(15, 120),
-                )
-                response.raise_for_status()
-
-                parsed = parse_esios_values(response.json())
-                if not parsed.empty:
-                    chunk_lower = start_local.tz_localize(None)
-                    chunk_upper = end_local.tz_localize(None)
-                    parsed = parsed[(parsed["datetime"] >= chunk_lower) & (parsed["datetime"] < chunk_upper)]
-                    frames.append(parsed)
-                break
-
-            except requests.RequestException:
-                sleep(1.5 * (attempt + 1))
-
-        chunk_start = chunk_end + timedelta(days=1)
-
-    if not frames:
+    out = esios_hourly_history(indicator_id, start_day, end_day, "sum", token)
+    if out.empty:
         return pd.DataFrame(columns=["datetime", "energy_mwh"])
 
-    out = pd.concat(frames, ignore_index=True)
     out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.floor("h")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     out = out.dropna(subset=["datetime", "value"])
@@ -3008,7 +3316,7 @@ def _weighted_generation_weather(payload, variable_suffix: str = "") -> pd.DataF
     return result.sort_values("datetime").reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=8)
 def load_generation_weather_history(
     start_day: date,
     end_day: date,
@@ -3019,28 +3327,14 @@ def load_generation_weather_history(
             columns=["datetime"] + GENERATION_WEATHER_VARIABLES
         )
 
-    params = {
-        "latitude": ",".join(
-            str(point["latitude"])
-            for point in GENERATION_WEATHER_POINTS
-        ),
-        "longitude": ",".join(
-            str(point["longitude"])
-            for point in GENERATION_WEATHER_POINTS
-        ),
-        "start_date": start_day.isoformat(),
-        "end_date": safe_end.isoformat(),
-        "hourly": ",".join(GENERATION_WEATHER_VARIABLES),
-        "timezone": "Europe/Madrid",
-        "models": "era5",
-    }
-    response = requests.get(
-        OPEN_METEO_ARCHIVE_URL,
-        params=params,
-        timeout=180,
+    # V18.2: monthly archive blocks shared by every target day. The combined
+    # payload is identical to one request, so the radiation shift in
+    # _weighted_generation_weather behaves exactly as before.
+    payload = open_meteo_archive_payload(
+        tuple((point["latitude"], point["longitude"]) for point in GENERATION_WEATHER_POINTS),
+        tuple(GENERATION_WEATHER_VARIABLES), "era5", start_day, safe_end,
     )
-    response.raise_for_status()
-    return _weighted_generation_weather(response.json())
+    return _weighted_generation_weather(payload)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -3179,7 +3473,7 @@ GENERATION_FEATURES = [
 ]
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
 def load_forecast_pbf_history(
     start_day: date,
     end_day: date,
@@ -3344,7 +3638,7 @@ def load_forecast_pbf_history(
     )
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
 def load_pbf_demand_history(
     start_day: date,
     end_day: date,
@@ -3371,7 +3665,7 @@ def load_pbf_demand_history(
     )
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
 def load_total_bilateral_sales_history(
     start_day: date,
     end_day: date,
@@ -4580,66 +4874,20 @@ def add_mibgas_features(
 # =========================================================
 # STEP 3 - FORECAST DA SPOT PRICE
 # =========================================================
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=16)
 def load_esios_price_history(
     start_day: date,
     end_day: date,
     _token: str,
 ) -> pd.DataFrame:
-    frames = []
-    current = start_day
+    # V18.2: fixed-grid block cache (see esios_hourly_history).
+    output = esios_hourly_history(PRICE_INDICATOR_ID, start_day, end_day, "average", _token)
 
-    while current <= end_day:
-        chunk_end = min(
-            end_day,
-            current + timedelta(days=13),
-        )
-        start_local = pd.Timestamp(
-            current,
-            tz="Europe/Madrid",
-        )
-        end_local = pd.Timestamp(
-            chunk_end + timedelta(days=1),
-            tz="Europe/Madrid",
-        )
-        params = {
-            "start_date": start_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "end_date": end_local.tz_convert("UTC").strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "time_trunc": "hour",
-            "time_agg": "average",
-        }
-
-        for attempt in range(3):
-            try:
-                response = requests.get(
-                    f"{ESIOS_API_BASE}/{PRICE_INDICATOR_ID}",
-                    headers=esios_headers(_token),
-                    params=params,
-                    timeout=(15, 120),
-                )
-                response.raise_for_status()
-                parsed = parse_esios_values(response.json())
-                if not parsed.empty:
-                    chunk_lower = start_local.tz_localize(None)
-                    chunk_upper = end_local.tz_localize(None)
-                    parsed = parsed[(parsed["datetime"] >= chunk_lower) & (parsed["datetime"] < chunk_upper)]
-                    frames.append(parsed)
-                break
-            except requests.RequestException:
-                sleep(1.5 * (attempt + 1))
-
-        current = chunk_end + timedelta(days=1)
-
-    if not frames:
+    if output.empty:
         return pd.DataFrame(
             columns=["datetime", "price_eur_mwh"]
         )
 
-    output = pd.concat(frames, ignore_index=True)
     output["datetime"] = pd.to_datetime(
         output["datetime"],
         errors="coerce",
@@ -4827,6 +5075,8 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     prices = prices[pd.to_datetime(prices["datetime"]).dt.date < target_day].copy()
     if prices.empty:
         raise ValueError("No strictly earlier spot-price history.")
+    # V18.2: floor reference for the optional post-processing (strictly earlier prices).
+    price_floor_reference = _v182_price_floor_reference(prices, target_day)
     gas_actuals, gas_message = load_mibgas_gdaes_actuals()
     gas_lookup, gas_source = build_mibgas_daily_lookup(gas_actuals,
         historical["datetime"].min().date() - timedelta(days=35), target_day - timedelta(days=1))
@@ -4910,6 +5160,7 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
     output["negative_thermal_gap_flag"] = output["thermal_gap_mwh"] < 0
     output["guardrail_applied"] = False  # retained for old exporters, no price guardrails used
     output["price_upper_guardrail_eur_mwh"] = np.nan
+    output["price_floor_reference_eur_mwh"] = price_floor_reference
     output["engine_version"] = FORECAST_ENGINE_VERSION
     for c in empirical:
         output[c] = empirical[c].to_numpy()
@@ -4948,13 +5199,23 @@ def generate_price_forecast(target_day: date, historical_gap: pd.DataFrame,
         "bias_correction_shrink": bias_shrink,
         "ree_d1_available": bool(target["ree_d1_available"].min() > 0),
         "eua_message": eua_message,
+        "eua_available": bool(target["eua_available"].max() > 0) if "eua_available" in target else False,
+        "price_floor_reference_eur_mwh": price_floor_reference,
     }
 
 
 def build_price_forecast_chart(price_forecast: pd.DataFrame):
     specs = {"forecast_price_eur_mwh": "Final forecast", "fundamental_price_eur_mwh": "Fundamentals model",
              "conditional_price_median_eur_mwh": "Similar-gap median", "price_anchor": "Price anchor",
-             "price_lag_1d": "Previous day", "price_lag_7d": "Same weekday previous week"}
+             "price_lag_1d": "Previous day", "price_lag_7d": "Same weekday previous week",
+             "raw_final_forecast_eur_mwh": "Raw V18 (before post-processing)"}
+    colors = ["#111827", "#0F766E", "#A855F7", "#64748B", "#F97316", "#60A5FA", "#9CA3AF"]
+    if "raw_final_forecast_eur_mwh" in price_forecast and np.allclose(
+            pd.to_numeric(price_forecast["raw_final_forecast_eur_mwh"], errors="coerce"),
+            pd.to_numeric(price_forecast["forecast_price_eur_mwh"], errors="coerce"), equal_nan=True):
+        # Nothing was adjusted: do not draw a duplicate line.
+        specs.pop("raw_final_forecast_eur_mwh")
+        colors = colors[:-1]
     frames = [price_forecast[["datetime", c]].rename(columns={c: "price"}).assign(series=label)
               for c, label in specs.items() if c in price_forecast]
     plot = pd.concat(frames, ignore_index=True)
@@ -4962,7 +5223,7 @@ def build_price_forecast_chart(price_forecast: pd.DataFrame):
         x=alt.X("datetime:T", title=None, axis=alt.Axis(format="%H:%M", labelAngle=0)),
         y=alt.Y("price:Q", title="Price (EUR/MWh)", scale=alt.Scale(zero=False)),
         color=alt.Color("series:N", title="Price series", scale=alt.Scale(
-            domain=list(specs.values()), range=["#111827", "#0F766E", "#A855F7", "#64748B", "#F97316", "#60A5FA"])),
+            domain=list(specs.values()), range=colors)),
         strokeDash=alt.StrokeDash("series:N", legend=None),
         tooltip=[alt.Tooltip("datetime:T", format="%d-%m-%Y %H:%M"), "series:N", alt.Tooltip("price:Q", format=",.2f")],
     )
@@ -6328,8 +6589,99 @@ def build_bess_schedule_table(
 # =========================================================
 # YTD DAILY WALK-FORWARD BACKTEST
 # =========================================================
-YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v17_2"
-YTD_BACKTEST_CHECKPOINT_VERSION = "v17_2_cow_fix"
+# V18.2 rows also store the 24 hourly forecast/real prices (so the level
+# correction and floor can be evaluated without re-running the chain) and the
+# target-day demand error. Older checkpoints lack those fields and are not
+# mixed in.
+YTD_BACKTEST_STATE_KEY = "ytd_walk_forward_results_v18_2"
+YTD_BACKTEST_CHECKPOINT_VERSION = "v18_2_level_floor"
+YTD_HOURLY_CORE_COLUMNS = ["hourly_hours", "hourly_forecast_eur_mwh", "hourly_actual_eur_mwh"]
+# Sub-model curves and the analogue probability of a near-zero price, stored
+# per hour so the error can be traced to a component without re-running.
+YTD_HOURLY_CURVES = {
+    "hourly_curve_direct_ml": ("raw_model_price_eur_mwh", "Direct-price ML"),
+    "hourly_curve_residual_ml": ("residual_model_price_eur_mwh", "Residual ML"),
+    "hourly_curve_fundamentals_ml": ("fundamental_price_eur_mwh", "Fundamentals ML"),
+    "hourly_curve_similar_gap": ("conditional_price_median_eur_mwh", "Similar-gap median"),
+    "hourly_curve_anchor": ("price_anchor", "Price anchor"),
+    "hourly_curve_previous_day": ("price_lag_1d", "Previous day (D-1)"),
+    "hourly_curve_previous_week": ("price_lag_7d", "Previous week (D-7)"),
+    "hourly_prob_below_5_pct": ("probability_price_below_5_pct", "Analogue P(price ≤ 5 €/MWh)"),
+}
+YTD_HOURLY_COLUMNS = YTD_HOURLY_CORE_COLUMNS + list(YTD_HOURLY_CURVES)
+
+
+def _json_floats(values, digits: int = 3) -> str:
+    output = []
+    for value in values:
+        number = pd.to_numeric(value, errors="coerce")
+        output.append(round(float(number), digits) if pd.notna(number) and np.isfinite(number) else None)
+    return json.dumps(output)
+
+
+def _parse_json_floats(text) -> np.ndarray:
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return np.array([], dtype=float)
+    try:
+        values = json.loads(str(text))
+    except (TypeError, ValueError):
+        return np.array([], dtype=float)
+    return np.asarray([np.nan if value is None else value for value in values], dtype=float)
+
+
+def target_day_demand_accuracy(target_day: date, demand_forecast: pd.DataFrame,
+                               token: str) -> dict:
+    """Target-day demand forecast vs REAL demand (loaded only after the forecast).
+
+    Compares the model curve, the trend-adjusted D-7 curve, the curve actually
+    used for the gap and REE's official D+1 forecast with realised hourly
+    peninsular demand.
+    """
+    output = {
+        "demand_actual_avg_mw": np.nan, "demand_forecast_avg_mw": np.nan,
+        "demand_target_mae_mw": np.nan, "demand_target_mape_pct": np.nan,
+        "demand_target_bias_mw": np.nan, "demand_d7trend_target_mape_pct": np.nan,
+        "demand_selected_target_mape_pct": np.nan,
+        "ree_d1_demand_target_mae_mw": np.nan, "ree_d1_demand_target_mape_pct": np.nan,
+        "demand_target_hours": 0, "demand_target_status": "",
+    }
+    try:
+        actual = load_hourly_peninsular_demand(target_day, target_day)
+        if actual.empty:
+            output["demand_target_status"] = "Real demand not yet available"
+            return output
+        frame = demand_forecast.merge(actual.rename(columns={"demand_mw": "actual_demand_mw"}),
+                                      on="datetime", how="inner")
+        try:
+            ree = load_ree_official_demand_forecast(target_day, token)["forecast"]
+            frame = frame.drop(columns=["ree_forecast_mw"], errors="ignore").merge(
+                ree[["datetime", "ree_forecast_mw"]], on="datetime", how="left")
+        except Exception:
+            frame["ree_forecast_mw"] = np.nan
+        if len(frame) < 23:
+            output["demand_target_status"] = f"Only {len(frame)} matching hours"
+            return output
+        y = frame["actual_demand_mw"].to_numpy(float)
+        model = forecast_metrics(y, frame["forecast_mw"])
+        output.update({
+            "demand_actual_avg_mw": float(np.nanmean(y)),
+            "demand_forecast_avg_mw": float(frame["forecast_mw"].mean()),
+            "demand_target_mae_mw": model["mae"],
+            "demand_target_mape_pct": model["mape"],
+            "demand_target_bias_mw": float(np.nanmean(frame["forecast_mw"].to_numpy(float) - y)),
+            "demand_d7trend_target_mape_pct": forecast_metrics(y, frame["trend_adjusted_lag_7d"])["mape"],
+            "demand_target_hours": int(len(frame)),
+            "demand_target_status": "ok",
+        })
+        if "selected_demand_mw" in frame:
+            output["demand_selected_target_mape_pct"] = forecast_metrics(y, frame["selected_demand_mw"])["mape"]
+        if frame["ree_forecast_mw"].notna().sum() >= 23:
+            ree_stats = forecast_metrics(y, frame["ree_forecast_mw"])
+            output["ree_d1_demand_target_mae_mw"] = ree_stats["mae"]
+            output["ree_d1_demand_target_mape_pct"] = ree_stats["mape"]
+    except Exception as exc:
+        output["demand_target_status"] = f"{type(exc).__name__}: {exc}"[:200]
+    return output
 
 
 def _safe_ratio(
@@ -6391,6 +6743,26 @@ def run_one_walk_forward_backtest_day(
             demand_forecast["forecast_mw"]
         )
         demand_source_label = "Model forecast"
+    elif demand_source.startswith("REE"):
+        # V18.2: lets Step 1 recreate D-1 when it uses REE's official curve.
+        ree_result = load_ree_official_demand_forecast(target_day, _token)
+        demand_forecast = demand_forecast.merge(
+            ree_result["forecast"][["datetime", "ree_forecast_mw"]],
+            on="datetime",
+            how="left",
+        )
+        if (
+            not ree_result["available"]
+            or demand_forecast["ree_forecast_mw"].notna().sum() < 23
+        ):
+            raise ValueError(
+                "The official REE D+1 demand forecast is not available "
+                "for this delivery day."
+            )
+        demand_forecast["selected_demand_mw"] = (
+            demand_forecast["ree_forecast_mw"]
+        )
+        demand_source_label = "REE official D+1 forecast"
     else:
         demand_forecast["selected_demand_mw"] = (
             demand_forecast["trend_adjusted_lag_7d"]
@@ -6472,6 +6844,37 @@ def run_one_walk_forward_backtest_day(
         )
 
     price_metrics = price_realization_metrics(comparison)
+
+    # V18.2: keep the raw hourly curves so post-processing can be evaluated
+    # later without re-running the chain, plus the target-day demand error.
+    hourly_record = {
+        "hourly_hours": json.dumps(
+            [int(value) for value in pd.to_datetime(comparison["datetime"]).dt.hour]
+        ),
+        "hourly_forecast_eur_mwh": _json_floats(comparison["forecast_price_eur_mwh"]),
+        "hourly_actual_eur_mwh": _json_floats(comparison["actual_price_eur_mwh"]),
+        "price_floor_reference_eur_mwh": float(
+            pd.to_numeric(price_result.get("price_floor_reference_eur_mwh", np.nan), errors="coerce")
+        ),
+        "gas_d1_eur_mwh": float(
+            pd.to_numeric(price_result.get("gas_price_d1_eur_mwh", np.nan), errors="coerce")
+        ),
+        "gas_available": int(pd.notna(price_result.get("gas_price_d1_eur_mwh", np.nan))),
+        "ree_d1_inputs_available": int(bool(price_result.get("ree_d1_available", False))),
+        "eua_available": int(bool(price_result.get("eua_available", False))),
+        "v18_bias_shrink": float(price_result.get("bias_correction_shrink", np.nan)),
+    }
+    curve_frame = comparison[["datetime"]].merge(
+        price_forecast[["datetime", *[source for source, _ in YTD_HOURLY_CURVES.values()
+                                      if source in price_forecast.columns]]],
+        on="datetime",
+        how="left",
+    )
+    for column, (source, _) in YTD_HOURLY_CURVES.items():
+        hourly_record[column] = _json_floats(
+            curve_frame[source] if source in curve_frame else [np.nan] * len(curve_frame)
+        )
+    demand_accuracy = target_day_demand_accuracy(target_day, demand_forecast, _token)
 
     perfect_schedule = optimize_chronological_tb4_schedule(
         comparison,
@@ -6717,8 +7120,36 @@ def run_one_walk_forward_backtest_day(
         "demand_model_validation_mape_pct": float(
             demand_result["model_stats"]["mape"]
         ),
+        **demand_accuracy,
+        **hourly_record,
         **ytd_curve_values,
     }
+
+
+YTD_PROCESSING_ORDERS = [
+    "Spread across the range (representative partial results)",
+    "Chronological",
+]
+
+
+def spread_processing_order(days: list[date], stride: int = 6) -> list[date]:
+    """Interleave a date range so that any prefix covers the whole range.
+
+    Pass 1 takes pairs of consecutive days at positions 0-1, 6-7, 12-13, ...
+    (the pairs let the D-1 level correction be evaluated early, and a stride
+    of 6 rotates the weekday), pass 2 positions 3-4, pass 3 positions 2 and 5.
+    """
+    ordered_days = sorted(days)
+    order, seen = [], set()
+    for offsets in ((0, 1), (3, 4), (2, 5)):
+        for base in range(0, len(ordered_days), stride):
+            for offset in offsets:
+                position = base + offset
+                if position < len(ordered_days) and position not in seen:
+                    order.append(ordered_days[position])
+                    seen.add(position)
+    order.extend(day for position, day in enumerate(ordered_days) if position not in seen)
+    return order
 
 
 def failed_walk_forward_row(
@@ -6854,6 +7285,436 @@ def aggregate_walk_forward_monthly(
     )
 
     return result
+
+
+# =========================================================
+# V18.2: raw vs post-processed evaluation of the walk-forward rows
+# =========================================================
+def _fast_chronological_tb4(prices, rte: float = BESS_RTE,
+                            charge_hours: int = BESS_CHARGE_HOURS,
+                            discharge_hours: int = BESS_DISCHARGE_HOURS):
+    """NumPy twin of optimize_chronological_tb4_schedule.
+
+    Same candidate splits, same 'first occurrence' tie-breaking and the same
+    revenue formula; returns (charge_idx, discharge_idx, expected_revenue).
+    """
+    p = np.asarray(prices, dtype=float)
+    if len(p) < charge_hours + discharge_hours or not np.isfinite(p).all():
+        return None
+    eta_charge = float(np.sqrt(rte))
+    eta_discharge = float(np.sqrt(rte))
+    best = None
+    for split in range(charge_hours - 1, len(p) - discharge_hours):
+        charge = np.sort(np.argsort(p[: split + 1], kind="stable")[:charge_hours])
+        discharge = np.sort(np.argsort(-p[split + 1:], kind="stable")[:discharge_hours]) + split + 1
+        revenue = float(BESS_POWER_MW * eta_discharge * p[discharge].sum()) - float(
+            BESS_POWER_MW / eta_charge * p[charge].sum())
+        if best is None or revenue > best[2]:
+            best = (charge, discharge, revenue)
+    return best
+
+
+def _fast_settle(schedule, actual_prices, rte: float = BESS_RTE) -> float:
+    """Realised revenue of a schedule valued at actual prices."""
+    if schedule is None:
+        return np.nan
+    a = np.asarray(actual_prices, dtype=float)
+    charge, discharge, _ = schedule
+    return float(BESS_POWER_MW * float(np.sqrt(rte)) * a[discharge].sum()) - float(
+        BESS_POWER_MW / float(np.sqrt(rte)) * a[charge].sum())
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def evaluate_price_postprocessing(daily: pd.DataFrame, level_lambda: float,
+                                  floor_mode: str) -> pd.DataFrame:
+    """Per-day raw vs post-processed metrics from the stored hourly curves.
+
+    The D-1 error comes from the previous calendar day's stored RAW curve and
+    realised prices, i.e. exactly what was known before the D auction. A day
+    whose previous day is missing gets no level shift.
+    """
+    needed = {"target_day", *YTD_HOURLY_CORE_COLUMNS}
+    if daily is None or daily.empty or not needed.issubset(daily.columns):
+        return pd.DataFrame()
+    curves = {}
+    for row in daily.to_dict(orient="records"):
+        forecast = _parse_json_floats(row.get("hourly_forecast_eur_mwh"))
+        actual = _parse_json_floats(row.get("hourly_actual_eur_mwh"))
+        if len(forecast) < 23 or len(forecast) != len(actual):
+            continue
+        valid = np.isfinite(forecast) & np.isfinite(actual)
+        if valid.sum() < 23:
+            continue
+        day = pd.Timestamp(row["target_day"]).date()
+        curves[day] = (forecast[valid], actual[valid], row.get("price_floor_reference_eur_mwh", np.nan))
+    rows = []
+    for day in sorted(curves):
+        forecast, actual, floor_reference = curves[day]
+        previous = curves.get(day - timedelta(days=1))
+        previous_error = (float(previous[0].mean() - previous[1].mean())
+                          if previous is not None else np.nan)
+        level_shift = float(level_lambda) * previous_error if np.isfinite(previous_error) else 0.0
+        floor_kind, floor_value = _v182_floor_spec(floor_mode, floor_reference)
+        adjusted = postprocess_price_curve(forecast, level_shift, floor_kind, floor_value)
+        perfect = _fast_chronological_tb4(actual)
+        raw_schedule = _fast_chronological_tb4(forecast)
+        adjusted_schedule = _fast_chronological_tb4(adjusted)
+        if perfect is None or raw_schedule is None or adjusted_schedule is None:
+            continue
+        rows.append({
+            "target_day": day,
+            "previous_day_error_eur_mwh": previous_error,
+            "level_shift_eur_mwh": level_shift,
+            "floor_value_eur_mwh": floor_value,
+            "hours_below_floor": (int(np.sum(forecast - level_shift < floor_value))
+                                  if floor_kind != "off" else 0),
+            "raw_mae_eur_mwh": float(np.mean(np.abs(forecast - actual))),
+            "adjusted_mae_eur_mwh": float(np.mean(np.abs(adjusted - actual))),
+            "raw_rmse_eur_mwh": float(np.sqrt(np.mean((forecast - actual) ** 2))),
+            "adjusted_rmse_eur_mwh": float(np.sqrt(np.mean((adjusted - actual) ** 2))),
+            "raw_baseload_error_eur_mwh": float(forecast.mean() - actual.mean()),
+            "adjusted_baseload_error_eur_mwh": float(adjusted.mean() - actual.mean()),
+            "perfect_revenue_eur_mw": float(perfect[2]),
+            "raw_realised_revenue_eur_mw": _fast_settle(raw_schedule, actual),
+            "adjusted_realised_revenue_eur_mw": _fast_settle(adjusted_schedule, actual),
+        })
+    return pd.DataFrame(rows)
+
+
+def summarize_postprocessing(evaluation: pd.DataFrame) -> pd.DataFrame:
+    """Raw V18 vs post-processed: one row per metric."""
+    if evaluation is None or evaluation.empty:
+        return pd.DataFrame()
+    perfect = evaluation["perfect_revenue_eur_mw"].sum()
+
+    def _capture(column: str) -> float:
+        return 100.0 * evaluation[column].sum() / perfect if abs(perfect) > 1e-9 else np.nan
+
+    rows = [
+        ("Hourly MAE (€/MWh)", evaluation["raw_mae_eur_mwh"].mean(), evaluation["adjusted_mae_eur_mwh"].mean()),
+        ("Hourly RMSE (€/MWh)", evaluation["raw_rmse_eur_mwh"].mean(), evaluation["adjusted_rmse_eur_mwh"].mean()),
+        ("Mean |baseload error| (€/MWh)", evaluation["raw_baseload_error_eur_mwh"].abs().mean(),
+         evaluation["adjusted_baseload_error_eur_mwh"].abs().mean()),
+        ("Mean baseload bias (€/MWh)", evaluation["raw_baseload_error_eur_mwh"].mean(),
+         evaluation["adjusted_baseload_error_eur_mwh"].mean()),
+        ("BESS capture vs perfect foresight (%)", _capture("raw_realised_revenue_eur_mw"),
+         _capture("adjusted_realised_revenue_eur_mw")),
+        ("Realised BESS revenue (€/MW)", evaluation["raw_realised_revenue_eur_mw"].sum(),
+         evaluation["adjusted_realised_revenue_eur_mw"].sum()),
+    ]
+    output = pd.DataFrame(rows, columns=["Metric", "Raw V18", "Post-processed"])
+    output["Change"] = output["Post-processed"] - output["Raw V18"]
+    return output
+
+
+def postprocessing_variant_table(daily: pd.DataFrame, level_lambda: float,
+                                 floor_mode: str) -> pd.DataFrame:
+    """Separate the contribution of the level correction and of the floor."""
+    variants = [
+        ("Raw V18", 0.0, "Off"),
+        ("Floor only", 0.0, floor_mode),
+        (f"Level correction only (λ = {level_lambda:.2f})", level_lambda, "Off"),
+        ("Level correction + floor", level_lambda, floor_mode),
+    ]
+    variants += [(f"λ = {value:.2f} + floor", value, floor_mode)
+                 for value in (0.25, 0.5, 0.75, 1.0) if abs(value - level_lambda) > 1e-9]
+    rows = []
+    for name, value, mode in variants:
+        evaluation = evaluate_price_postprocessing(daily, float(value), mode)
+        if evaluation.empty:
+            continue
+        perfect = evaluation["perfect_revenue_eur_mw"].sum()
+        rows.append({
+            "Variant": name,
+            "Days": len(evaluation),
+            "Hourly MAE (€/MWh)": evaluation["adjusted_mae_eur_mwh"].mean(),
+            "Mean |baseload error| (€/MWh)": evaluation["adjusted_baseload_error_eur_mwh"].abs().mean(),
+            "BESS capture (%)": (100.0 * evaluation["adjusted_realised_revenue_eur_mw"].sum() / perfect
+                                 if abs(perfect) > 1e-9 else np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
+def monthly_postprocessing_summary(evaluation: pd.DataFrame) -> pd.DataFrame:
+    if evaluation is None or evaluation.empty:
+        return pd.DataFrame()
+    frame = evaluation.copy()
+    frame["month"] = pd.to_datetime(frame["target_day"]).dt.to_period("M").astype(str)
+    grouped = frame.groupby("month")
+    output = grouped.agg(
+        days=("target_day", "count"),
+        raw_mae_eur_mwh=("raw_mae_eur_mwh", "mean"),
+        adjusted_mae_eur_mwh=("adjusted_mae_eur_mwh", "mean"),
+        perfect_revenue_eur_mw=("perfect_revenue_eur_mw", "sum"),
+        raw_realised_revenue_eur_mw=("raw_realised_revenue_eur_mw", "sum"),
+        adjusted_realised_revenue_eur_mw=("adjusted_realised_revenue_eur_mw", "sum"),
+    ).reset_index()
+    output["raw_abs_baseload_error_eur_mwh"] = grouped["raw_baseload_error_eur_mwh"].apply(
+        lambda s: s.abs().mean()).to_numpy()
+    output["adjusted_abs_baseload_error_eur_mwh"] = grouped["adjusted_baseload_error_eur_mwh"].apply(
+        lambda s: s.abs().mean()).to_numpy()
+    perfect = output["perfect_revenue_eur_mw"].replace(0.0, np.nan)
+    output["raw_capture_pct"] = 100.0 * output["raw_realised_revenue_eur_mw"] / perfect
+    output["adjusted_capture_pct"] = 100.0 * output["adjusted_realised_revenue_eur_mw"] / perfect
+    return output
+
+
+PRICE_HOUR_BLOCKS = {
+    "Night 00-05": range(0, 6),
+    "Morning ramp 06-09": range(6, 10),
+    "Solar 10-17": range(10, 18),
+    "Evening 18-23": range(18, 24),
+}
+WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def build_price_error_diagnostics(daily: pd.DataFrame) -> dict:
+    """Error diagnostics from the stored hourly curves (nothing is re-run).
+
+    Answers: how accurate is the price forecast, is the error spread over
+    many days or concentrated in a few, is it a level or a shape problem,
+    does it persist, in which hours/weekdays/months, and which sub-model is
+    closest to reality.
+    """
+    if daily is None or daily.empty or not set(YTD_HOURLY_CORE_COLUMNS).issubset(daily.columns):
+        return {}
+    frames, capture = [], {}
+    for row in daily.to_dict(orient="records"):
+        hours = _parse_json_floats(row.get("hourly_hours"))
+        forecast = _parse_json_floats(row.get("hourly_forecast_eur_mwh"))
+        actual = _parse_json_floats(row.get("hourly_actual_eur_mwh"))
+        if len(forecast) < 23 or len(forecast) != len(actual) or len(hours) != len(forecast):
+            continue
+        day = pd.Timestamp(row["target_day"]).date()
+        record = {"target_day": [day] * len(hours), "hour": hours.astype(int),
+                  "forecast": forecast, "actual": actual}
+        for column in YTD_HOURLY_CURVES:
+            values = _parse_json_floats(row.get(column))
+            record[column] = values if len(values) == len(hours) else np.full(len(hours), np.nan)
+        frames.append(pd.DataFrame(record))
+        capture[day] = pd.to_numeric(row.get("revenue_capture_pct", np.nan), errors="coerce")
+    if not frames:
+        return {}
+    hourly = pd.concat(frames, ignore_index=True)
+    hourly = hourly[np.isfinite(hourly["forecast"]) & np.isfinite(hourly["actual"])].copy()
+    hourly["error"] = hourly["forecast"] - hourly["actual"]
+    hourly["abs_error"] = hourly["error"].abs()
+    block_of_hour = {hour: name for name, hours in PRICE_HOUR_BLOCKS.items() for hour in hours}
+    hourly["block"] = hourly["hour"].map(block_of_hour)
+
+    daily_stats = hourly.groupby("target_day").agg(
+        mae=("abs_error", "mean"), bias=("error", "mean"),
+        actual_mean=("actual", "mean"), forecast_mean=("forecast", "mean"),
+        abs_error_sum=("abs_error", "sum"), hours=("hour", "count"),
+    ).reset_index()
+    hourly = hourly.merge(daily_stats[["target_day", "bias"]].rename(columns={"bias": "day_bias"}),
+                          on="target_day", how="left")
+    hourly["shape_abs_error"] = (hourly["error"] - hourly["day_bias"]).abs()
+    shape = hourly.groupby("target_day")["shape_abs_error"].mean().rename("shape_mae")
+    solar = hourly[hourly["block"] == "Solar 10-17"].groupby("target_day")["error"].mean().rename("solar_bias")
+    daily_stats = daily_stats.merge(shape, on="target_day", how="left").merge(solar, on="target_day", how="left")
+    daily_stats["level_abs_error"] = daily_stats["bias"].abs()
+    stamps = pd.to_datetime(daily_stats["target_day"])
+    daily_stats["weekday"] = stamps.dt.dayofweek.map(dict(enumerate(WEEKDAY_NAMES)))
+    daily_stats["month"] = stamps.dt.to_period("M").astype(str)
+    daily_stats["bess_capture_pct"] = daily_stats["target_day"].map(capture)
+    daily_stats = daily_stats.sort_values("target_day").reset_index(drop=True)
+
+    n_days = len(daily_stats)
+    ranked = daily_stats.sort_values("abs_error_sum", ascending=False)
+    total_abs = float(ranked["abs_error_sum"].sum())
+    worst_k = max(1, int(np.ceil(0.10 * n_days)))
+    concentration = pd.DataFrame({
+        "share_of_days_pct": 100.0 * np.arange(1, n_days + 1) / n_days,
+        "share_of_error_pct": 100.0 * ranked["abs_error_sum"].cumsum().to_numpy() / total_abs if total_abs > 0 else np.nan,
+    })
+
+    consecutive = pd.Series(pd.to_datetime(daily_stats["target_day"])).diff().dt.days.eq(1).to_numpy()
+    bias = daily_stats["bias"].to_numpy(float)
+    autocorrelation = (float(np.corrcoef(bias[1:][consecutive[1:]], bias[:-1][consecutive[1:]])[0, 1])
+                       if consecutive[1:].sum() >= 5 else np.nan)
+
+    # Streaks: consecutive calendar days whose daily level error keeps its sign.
+    streak_id = ((np.sign(daily_stats["bias"]) != np.sign(daily_stats["bias"]).shift())
+                 | ~pd.Series(consecutive, index=daily_stats.index)).cumsum()
+    streaks = daily_stats.groupby(streak_id).agg(
+        start=("target_day", "min"), end=("target_day", "max"), days=("target_day", "count"),
+        mean_level_error_eur_mwh=("bias", "mean"), mean_mae_eur_mwh=("mae", "mean"),
+    ).reset_index(drop=True)
+    streaks = streaks[streaks["days"] >= 4].sort_values("days", ascending=False).reset_index(drop=True)
+
+    kpis = {
+        "days": n_days,
+        "hourly_mae": float(hourly["abs_error"].mean()),
+        "median_daily_mae": float(daily_stats["mae"].median()),
+        "p90_daily_mae": float(daily_stats["mae"].quantile(0.90)),
+        "wape_accuracy_pct": (100.0 * (1.0 - hourly["abs_error"].sum() / hourly["actual"].abs().sum())
+                              if hourly["actual"].abs().sum() > 0 else np.nan),
+        "worst_days": worst_k,
+        "worst_share_pct": 100.0 * float(ranked["abs_error_sum"].head(worst_k).sum()) / total_abs if total_abs > 0 else np.nan,
+        "mae_without_worst": float(ranked.iloc[worst_k:]["mae"].mean()) if n_days > worst_k else np.nan,
+        "level_share_pct": 100.0 * float(daily_stats["level_abs_error"].mean() / daily_stats["mae"].mean())
+        if daily_stats["mae"].mean() > 0 else np.nan,
+        "mean_bias": float(hourly["error"].mean()),
+        "lag1_autocorrelation": autocorrelation,
+        "longest_streak_days": int(streaks["days"].max()) if not streaks.empty else 0,
+    }
+
+    def _breakdown(frame: pd.DataFrame, key: str, order: list | None = None) -> pd.DataFrame:
+        table = frame.groupby(key).agg(
+            hours=("abs_error", "size"), mae_eur_mwh=("abs_error", "mean"), bias_eur_mwh=("error", "mean"),
+            actual_mean_eur_mwh=("actual", "mean"), forecast_mean_eur_mwh=("forecast", "mean"),
+            abs_error_sum=("abs_error", "sum"),
+        ).reset_index()
+        table["share_of_error_pct"] = 100.0 * table["abs_error_sum"] / table["abs_error_sum"].sum()
+        table = table.drop(columns=["abs_error_sum"])
+        if order:
+            table[key] = pd.Categorical(table[key], categories=order, ordered=True)
+            table = table.sort_values(key)
+        return table.reset_index(drop=True)
+
+    hourly["weekday"] = pd.to_datetime(hourly["target_day"]).dt.dayofweek.map(dict(enumerate(WEEKDAY_NAMES)))
+    hourly["month"] = pd.to_datetime(hourly["target_day"]).dt.to_period("M").astype(str)
+    by_block = _breakdown(hourly, "block", list(PRICE_HOUR_BLOCKS))
+    by_weekday = _breakdown(hourly, "weekday", WEEKDAY_NAMES)
+    by_month = _breakdown(hourly, "month")
+
+    curve_rows = []
+    curve_specs = {"forecast": "Final forecast"}
+    curve_specs.update({column: label for column, (_, label) in YTD_HOURLY_CURVES.items()
+                        if column != "hourly_prob_below_5_pct"})
+    solar_mask = hourly["block"] == "Solar 10-17"
+    for column, label in curve_specs.items():
+        valid = np.isfinite(hourly[column]) & np.isfinite(hourly["actual"])
+        if valid.sum() < 24:
+            continue
+        error = hourly.loc[valid, column] - hourly.loc[valid, "actual"]
+        curve_rows.append({
+            "Curve": label,
+            "Hours": int(valid.sum()),
+            "MAE (€/MWh)": float(error.abs().mean()),
+            "Solar-hours MAE (€/MWh)": float(error[solar_mask[valid]].abs().mean()) if (solar_mask & valid).any() else np.nan,
+            "Other-hours MAE (€/MWh)": float(error[~solar_mask[valid]].abs().mean()) if (~solar_mask & valid).any() else np.nan,
+            "Bias (€/MWh)": float(error.mean()),
+        })
+    by_curve = pd.DataFrame(curve_rows).sort_values("MAE (€/MWh)").reset_index(drop=True) if curve_rows else pd.DataFrame()
+
+    regime = pd.DataFrame()
+    probability = hourly.loc[solar_mask, ["hourly_prob_below_5_pct", "forecast", "actual"]].dropna()
+    if len(probability) >= 24:
+        probability["bucket"] = pd.cut(probability["hourly_prob_below_5_pct"], [-0.1, 20, 50, 80, 100.1],
+                                       labels=["0-20%", "20-50%", "50-80%", "80-100%"])
+        regime = probability.groupby("bucket", observed=True).agg(
+            solar_hours=("actual", "size"),
+            real_price_le_5_pct=("actual", lambda s: 100.0 * float((s <= 5).mean())),
+            mean_real_eur_mwh=("actual", "mean"), mean_forecast_eur_mwh=("forecast", "mean"),
+        ).reset_index().rename(columns={"bucket": "analogue P(price ≤ 5)"})
+
+    worst = daily_stats.sort_values("mae", ascending=False).head(10)[
+        ["target_day", "weekday", "mae", "bias", "shape_mae", "solar_bias", "actual_mean", "bess_capture_pct"]
+    ].rename(columns={
+        "mae": "MAE (€/MWh)", "bias": "Level error (€/MWh)", "shape_mae": "MAE without level (€/MWh)",
+        "solar_bias": "Solar-hours error (€/MWh)", "actual_mean": "Real baseload (€/MWh)",
+        "bess_capture_pct": "BESS capture (%)",
+    }).reset_index(drop=True)
+
+    return {
+        "kpis": kpis, "daily": daily_stats, "hourly": hourly[["target_day", "hour", "error"]],
+        "concentration": concentration, "by_block": by_block, "by_weekday": by_weekday,
+        "by_month": by_month, "by_curve": by_curve, "regime": regime, "streaks": streaks,
+        "worst": worst,
+    }
+
+
+def build_daily_error_chart(daily_stats: pd.DataFrame):
+    """Daily MAE (bars) and signed daily level error (line)."""
+    if daily_stats is None or daily_stats.empty:
+        return None
+    plot = daily_stats[["target_day", "mae", "bias", "shape_mae", "solar_bias"]].copy()
+    plot["target_day"] = pd.to_datetime(plot["target_day"])
+    tooltip = [alt.Tooltip("target_day:T", format="%a %d-%m-%Y", title="Day"),
+               alt.Tooltip("mae:Q", format=",.1f", title="MAE"),
+               alt.Tooltip("bias:Q", format="+,.1f", title="Level error"),
+               alt.Tooltip("shape_mae:Q", format=",.1f", title="MAE without level"),
+               alt.Tooltip("solar_bias:Q", format="+,.1f", title="Solar-hours error")]
+    bars = alt.Chart(plot).mark_bar(color="#CBD5E1").encode(
+        x=alt.X("target_day:T", title=None),
+        y=alt.Y("mae:Q", title="€/MWh"),
+        tooltip=tooltip,
+    )
+    line = alt.Chart(plot).mark_line(color=CORP_GREEN_DARK, point=alt.OverlayMarkDef(size=18)).encode(
+        x="target_day:T", y="bias:Q", tooltip=tooltip,
+    )
+    zero = alt.Chart(pd.DataFrame({"y": [0.0]})).mark_rule(color="#64748B", strokeDash=[4, 3]).encode(y="y:Q")
+    return configure_chart(alt.layer(bars, zero, line), height=300)
+
+
+def build_error_concentration_chart(concentration: pd.DataFrame):
+    """Share of total error explained by the worst X% of days."""
+    if concentration is None or concentration.empty:
+        return None
+    reference = pd.DataFrame({"share_of_days_pct": [0.0, 100.0], "share_of_error_pct": [0.0, 100.0]})
+    curve = alt.Chart(concentration).mark_line(color=CORP_GREEN_DARK, strokeWidth=2.5).encode(
+        x=alt.X("share_of_days_pct:Q", title="Worst days (% of days, worst first)"),
+        y=alt.Y("share_of_error_pct:Q", title="% of total absolute error"),
+        tooltip=[alt.Tooltip("share_of_days_pct:Q", format=",.0f", title="% of days"),
+                 alt.Tooltip("share_of_error_pct:Q", format=",.0f", title="% of error")],
+    )
+    diagonal = alt.Chart(reference).mark_line(color="#94A3B8", strokeDash=[5, 4]).encode(
+        x="share_of_days_pct:Q", y="share_of_error_pct:Q")
+    return configure_chart(alt.layer(diagonal, curve), height=300)
+
+
+def build_error_heatmap(hourly: pd.DataFrame):
+    """Signed hourly error by day (x) and hour (y): red = forecast too high."""
+    if hourly is None or hourly.empty:
+        return None
+    plot = pd.DataFrame({
+        "day": pd.to_datetime(hourly["target_day"]).dt.strftime("%Y-%m-%d"),
+        "hour": hourly["hour"].astype(int),
+        "error": hourly["error"].astype(float),
+    })
+    plot["error_clipped"] = plot["error"].clip(-80, 80)
+    return configure_chart(
+        alt.Chart(plot).mark_rect().encode(
+            x=alt.X("day:O", title=None, sort=None,
+                    axis=alt.Axis(labelAngle=-90, labelOverlap=True, labelExpr="slice(datum.value, 5)")),
+            y=alt.Y("hour:O", title="Hour", sort="ascending"),
+            color=alt.Color("error_clipped:Q", title="Forecast − real (€/MWh)",
+                            scale=alt.Scale(scheme="redblue", domain=[-80, 80], reverse=True)),
+            tooltip=[alt.Tooltip("day:N", title="Day"), alt.Tooltip("hour:O", title="Hour"),
+                     alt.Tooltip("error:Q", format="+,.1f", title="Error")],
+        ),
+        height=360,
+    )
+
+
+def build_demand_accuracy_chart(successful: pd.DataFrame):
+    """Daily target-day demand MAPE: model vs REE D+1 vs trend-adjusted D-7."""
+    columns = {
+        "demand_target_mape_pct": "Model forecast",
+        "ree_d1_demand_target_mape_pct": "REE official D+1",
+        "demand_d7trend_target_mape_pct": "Previous week + trend",
+    }
+    available = [c for c in columns if c in successful.columns]
+    if not available:
+        return None
+    plot = successful[["target_day", *available]].copy()
+    plot["target_day"] = pd.to_datetime(plot["target_day"])
+    plot = plot.melt("target_day", var_name="series", value_name="mape").dropna(subset=["mape"])
+    if plot.empty:
+        return None
+    plot["series"] = plot["series"].map(columns)
+    chart = alt.Chart(plot).mark_line(point=True, strokeWidth=2).encode(
+        x=alt.X("target_day:T", title=None),
+        y=alt.Y("mape:Q", title="Target-day demand MAPE (%)"),
+        color=alt.Color("series:N", title=None, scale=alt.Scale(
+            domain=list(columns.values()), range=[CORP_GREEN_DARK, CORP_GREEN, TEMPERATURE_ORANGE])),
+        tooltip=[alt.Tooltip("target_day:T", format="%d-%m-%Y"), "series:N",
+                 alt.Tooltip("mape:Q", format=",.2f")],
+    )
+    return configure_chart(chart, height=300)
 
 
 def build_ytd_cumulative_revenue_chart(
@@ -7350,6 +8211,44 @@ forecast_generation_technologies = st.multiselect(
     key="forecast_generation_technologies",
 )
 
+pp1, pp2, pp3 = st.columns([1.0, 1.0, 1.35])
+with pp1:
+    live_level_correction = st.checkbox(
+        "D-1 level correction",
+        value=True,
+        help=(
+            "Shifts the whole price curve by λ × yesterday's baseload error. "
+            "Yesterday's auction has already cleared when tomorrow is forecast, "
+            "so the error is known. Yesterday's forecast is recreated once "
+            "(cached), so the first run takes roughly twice as long. The shift "
+            "is the same for every hour and does not change the BESS hours."
+        ),
+        key="pp_live_level_correction",
+    )
+with pp2:
+    live_level_lambda = st.slider(
+        "Level-correction weight λ",
+        min_value=0.0,
+        max_value=1.0,
+        value=LEVEL_CORRECTION_DEFAULT_LAMBDA,
+        step=0.05,
+        disabled=not live_level_correction,
+        help="0 = off, 1 = remove all of yesterday's level error. Step 6 shows the YTD effect of each value.",
+        key="pp_live_level_lambda",
+    )
+with pp3:
+    live_floor_mode = st.selectbox(
+        "Price floor",
+        PRICE_FLOOR_MODES,
+        index=0,
+        help=(
+            "Soft floor: hours forecast below the 1st percentile of the last "
+            "365 days of real prices are compressed towards it (slope 0.10), "
+            "keeping their order for the BESS optimiser."
+        ),
+        key="pp_live_floor_mode",
+    )
+
 forecast_as_of_day = forecast_target_day - timedelta(days=1)
 forecast_is_historical = forecast_target_day <= date.today()
 weather_input_label = f"Fixed {FIXED_WEATHER_MODEL} run: {forecast_as_of_day} 00 UTC"
@@ -7470,6 +8369,47 @@ if st.button(
                 thermal_result["forecast"],
                 token,
             )
+
+        # V18.2 post-processing: D-1 level correction and price floor.
+        forecast_stage = "Price post-processing"
+        level_shift = 0.0
+        postprocessing_details = {
+            "level_correction_enabled": bool(live_level_correction),
+            "lambda": float(live_level_lambda) if live_level_correction else 0.0,
+            "previous_day": forecast_as_of_day,
+            "previous_day_error_eur_mwh": np.nan,
+            "status": "Level correction off",
+        }
+        if live_level_correction and live_level_lambda > 0:
+            with st.spinner(
+                "Recreating yesterday's forecast to measure its level error..."
+            ):
+                try:
+                    previous_error = previous_day_operational_error(
+                        target_day=forecast_target_day,
+                        lookback_days=int(forecast_lookback),
+                        temperature_mode=temperature_mode,
+                        trend_alpha=float(forecast_trend_alpha),
+                        demand_source=downstream_demand_source,
+                        technologies=list(forecast_generation_technologies),
+                        token=token,
+                    )
+                    level_shift = float(live_level_lambda) * float(
+                        previous_error["previous_day_error_eur_mwh"]
+                    )
+                    postprocessing_details.update(previous_error)
+                    postprocessing_details["status"] = "ok"
+                except Exception as exc:
+                    level_shift = 0.0
+                    postprocessing_details["status"] = (
+                        f"Level correction skipped: {type(exc).__name__}: {exc}"
+                    )[:300]
+        price_result = apply_price_postprocessing(
+            price_result,
+            level_shift,
+            live_floor_mode,
+            postprocessing_details,
+        )
 
         # Loaded only after the forecast has been produced to prevent leakage.
         forecast_stage = "Post-forecast realised-price comparison"
@@ -7889,12 +8829,41 @@ if forecast_result:
             use_container_width=True,
         )
 
+        postprocessing = price_result.get("postprocessing") or {}
+        if postprocessing:
+            level_text = "D-1 level correction off"
+            if postprocessing.get("status") == "ok":
+                level_text = (
+                    f"D-1 level correction {-postprocessing.get('level_shift_eur_mwh', 0.0):+,.2f} €/MWh "
+                    f"(λ = {postprocessing.get('lambda', 0.0):.2f} × yesterday's error "
+                    f"{postprocessing.get('previous_day_error_eur_mwh', np.nan):+,.2f} €/MWh on "
+                    f"{pd.Timestamp(postprocessing.get('previous_day')):%d/%m/%Y}; "
+                    f"{postprocessing.get('source', '')})"
+                )
+            elif postprocessing.get("level_correction_enabled"):
+                level_text = postprocessing.get("status", "D-1 level correction unavailable")
+            floor_kind = postprocessing.get("floor_kind", "off")
+            floor_text = (
+                "no price floor"
+                if floor_kind == "off"
+                else (
+                    f"{floor_kind} floor at {postprocessing.get('floor_value_eur_mwh', np.nan):,.2f} €/MWh "
+                    f"({postprocessing.get('hours_below_floor', 0)} h affected)"
+                )
+            )
+            st.info(
+                f"Post-processing: {level_text}; {floor_text}. Raw V18 baseload "
+                f"{postprocessing.get('raw_baseload_eur_mwh', np.nan):,.2f} €/MWh → final "
+                f"{postprocessing.get('adjusted_baseload_eur_mwh', np.nan):,.2f} €/MWh."
+            )
+
         st.caption(
             f"Price model: {price_result['model_name']}. "
             f"Conditional validation MAE: {price_result['model_stats']['mae']:,.2f} EUR/MWh "
             f"versus {price_result['anchor_stats']['mae']:,.2f} for the anchor. "
             "Candidate weights are selected using earlier, out-of-sample predictions. "
-            "No seasonal shape, zero-price floor or negative-gap cap is imposed. "
+            "No seasonal shape or negative-gap cap is imposed; the optional V18.2 "
+            "post-processing above only shifts the level and applies the selected floor. "
             "The shaded band is indicative conditional residual P10-P90, not a "
             "fully calibrated interval including input-forecast uncertainty. "
             f"{price_result.get('validation_scope', '')}"
@@ -8886,6 +9855,19 @@ ytd_technologies = st.multiselect(
     key="ytd_walk_forward_technologies",
 )
 
+ytd_processing_order = st.selectbox(
+    "Processing order",
+    YTD_PROCESSING_ORDERS,
+    index=0,
+    help=(
+        "Spread: days are processed interleaved across the whole range "
+        "(pairs of consecutive days first), so after a few batches the "
+        "results are already representative of the full period and keep "
+        "improving until every day is done. Chronological: day by day."
+    ),
+    key="ytd_processing_order",
+)
+
 checkpoint_upload = st.file_uploader(
     "Optional: upload a previous YTD checkpoint CSV",
     type=["csv"],
@@ -8926,7 +9908,7 @@ if load_checkpoint and checkpoint_upload is not None:
             )
         )
         if "checkpoint_version" not in uploaded_checkpoint or not uploaded_checkpoint["checkpoint_version"].eq(YTD_BACKTEST_CHECKPOINT_VERSION).all():
-            raise ValueError("This checkpoint uses another engine version. Do not combine V16 and V17 results.")
+            raise ValueError(f"This checkpoint was produced by another engine version (expected {YTD_BACKTEST_CHECKPOINT_VERSION}). Results from different versions are not combined.")
         st.session_state[
             YTD_BACKTEST_STATE_KEY
         ] = uploaded_checkpoint
@@ -8969,6 +9951,16 @@ for target_day_value in all_target_days:
         pending_target_days.append(target_day_value)
     elif status == "error" and ytd_retry_failed:
         pending_target_days.append(target_day_value)
+
+if ytd_processing_order == YTD_PROCESSING_ORDERS[0]:
+    spread_rank = {
+        day_value: rank
+        for rank, day_value in enumerate(spread_processing_order(all_target_days))
+    }
+    pending_target_days = sorted(
+        pending_target_days,
+        key=lambda day_value: spread_rank.get(day_value, len(spread_rank)),
+    )
 
 batch_size_map = {
     "3 days": 3,
@@ -9063,7 +10055,7 @@ if run_ytd_batch:
                         trend_alpha=float(
                             ytd_trend_alpha
                         ),
-                        demand_source=(
+                        demand_source=_canonical_demand_source(
                             ytd_demand_source
                         ),
                         technologies_tuple=tuple(
@@ -9178,6 +10170,8 @@ if not ytd_results.empty:
                 "perfect_discharge_hours",
                 "forecast_charge_hours",
                 "forecast_discharge_hours",
+                "demand_target_status",
+                *YTD_HOURLY_COLUMNS,
             }
         ]
         for column in numeric_columns:
@@ -9388,11 +10382,401 @@ if not ytd_results.empty:
             hide_index=True,
         )
 
+        # -------------------------------------------------
+        # V18.2: price post-processing, raw vs adjusted
+        # -------------------------------------------------
+        section_header(
+            "Price post-processing: raw V18 vs D-1 level correction + floor"
+        )
+        st.caption(
+            "Evaluated on the stored hourly curves of the days above, without "
+            "re-running the chain. The D-1 error of each day is the raw error of "
+            "the previous calendar day, which is known before that day's auction; "
+            "a day whose previous day is missing gets no shift (start the range one "
+            "day earlier to include its first day). Changing these settings only "
+            "re-evaluates stored days (but, like any widget, it interrupts a batch "
+            "that is running); choosing λ on this same period is in-sample."
+        )
+        ev1, ev2 = st.columns([1.0, 1.35])
+        with ev1:
+            ytd_eval_lambda = st.slider(
+                "Evaluate level-correction weight λ",
+                min_value=0.0,
+                max_value=1.0,
+                value=LEVEL_CORRECTION_DEFAULT_LAMBDA,
+                step=0.05,
+                key="ytd_eval_lambda",
+            )
+        with ev2:
+            ytd_eval_floor_mode = st.selectbox(
+                "Evaluate price floor",
+                PRICE_FLOOR_MODES,
+                index=0,
+                key="ytd_eval_floor_mode",
+            )
+
+        evaluation_input = ytd_range_results[
+            ytd_range_results["status"] == "ok"
+        ].copy()
+        evaluation_columns = [
+            column
+            for column in [
+                "target_day",
+                *YTD_HOURLY_CORE_COLUMNS,
+                "price_floor_reference_eur_mwh",
+            ]
+            if column in evaluation_input.columns
+        ]
+        evaluation_input = evaluation_input[evaluation_columns].reset_index(drop=True)
+        postprocessing_evaluation = evaluate_price_postprocessing(
+            evaluation_input,
+            float(ytd_eval_lambda),
+            ytd_eval_floor_mode,
+        )
+
+        if postprocessing_evaluation.empty:
+            st.info(
+                "No day with stored hourly curves yet. Days processed by this "
+                f"version ({YTD_BACKTEST_CHECKPOINT_VERSION}) store them automatically."
+            )
+        else:
+            shifted_days = int(
+                postprocessing_evaluation["previous_day_error_eur_mwh"].notna().sum()
+            )
+            st.caption(
+                f"{len(postprocessing_evaluation)} days evaluated; {shifted_days} had a "
+                "D-1 error available."
+            )
+            postprocessing_summary = summarize_postprocessing(
+                postprocessing_evaluation
+            )
+            st.dataframe(
+                postprocessing_summary.style.format(
+                    {
+                        "Raw V18": "{:,.2f}",
+                        "Post-processed": "{:,.2f}",
+                        "Change": "{:+,.2f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.subheader("Contribution of each correction")
+            st.dataframe(
+                postprocessing_variant_table(
+                    evaluation_input,
+                    float(ytd_eval_lambda),
+                    ytd_eval_floor_mode,
+                ).style.format(
+                    {
+                        "Hourly MAE (€/MWh)": "{:,.2f}",
+                        "Mean |baseload error| (€/MWh)": "{:,.2f}",
+                        "BESS capture (%)": "{:,.1f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.subheader("Monthly raw vs post-processed")
+            st.dataframe(
+                monthly_postprocessing_summary(
+                    postprocessing_evaluation
+                ).style.format(
+                    {
+                        "raw_mae_eur_mwh": "{:,.2f}",
+                        "adjusted_mae_eur_mwh": "{:,.2f}",
+                        "raw_abs_baseload_error_eur_mwh": "{:,.2f}",
+                        "adjusted_abs_baseload_error_eur_mwh": "{:,.2f}",
+                        "perfect_revenue_eur_mw": "{:,.0f}",
+                        "raw_realised_revenue_eur_mw": "{:,.0f}",
+                        "adjusted_realised_revenue_eur_mw": "{:,.0f}",
+                        "raw_capture_pct": "{:,.1f}%",
+                        "adjusted_capture_pct": "{:,.1f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander("Daily raw vs post-processed"):
+                st.dataframe(
+                    postprocessing_evaluation,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # -------------------------------------------------
+        # V18.2: price forecast error diagnostics
+        # -------------------------------------------------
+        diagnostics_input = ytd_range_results[
+            ytd_range_results["status"] == "ok"
+        ]
+        diagnostics_input = diagnostics_input[
+            [
+                column
+                for column in [
+                    "target_day",
+                    *YTD_HOURLY_COLUMNS,
+                    "revenue_capture_pct",
+                ]
+                if column in diagnostics_input.columns
+            ]
+        ].reset_index(drop=True)
+        diagnostics = build_price_error_diagnostics(diagnostics_input)
+        if diagnostics:
+            section_header("Price forecast error diagnostics")
+            kpis = diagnostics["kpis"]
+            st.caption(
+                f"{kpis['days']} processed days, computed from the stored hourly curves "
+                "(instant, nothing is re-run). With the spread processing order, partial "
+                "results already describe the whole range. WAPE accuracy = 100 − Σ|error| / "
+                "Σ|real price|; unlike MAPE it stays meaningful when prices are near zero."
+            )
+            ek1, ek2, ek3, ek4, ek5, ek6 = st.columns(6)
+            ek1.metric("Hourly MAE", f"{kpis['hourly_mae']:,.1f} €/MWh")
+            ek2.metric("Median daily MAE", f"{kpis['median_daily_mae']:,.1f} €/MWh",
+                       help="Typical day. Much lower than the mean means a few bad days dominate.")
+            ek3.metric("WAPE accuracy", f"{kpis['wape_accuracy_pct']:,.1f}%" if pd.notna(kpis["wape_accuracy_pct"]) else "-")
+            ek4.metric(
+                f"Error from worst {kpis['worst_days']} days",
+                f"{kpis['worst_share_pct']:,.0f}%" if pd.notna(kpis["worst_share_pct"]) else "-",
+                help="Share of the total absolute error caused by the worst 10% of days. "
+                     "About 10% means the error is spread evenly; much more means a few days dominate.",
+            )
+            ek5.metric("MAE without those days", f"{kpis['mae_without_worst']:,.1f} €/MWh" if pd.notna(kpis["mae_without_worst"]) else "-")
+            ek6.metric(
+                "Level share of the error",
+                f"{kpis['level_share_pct']:,.0f}%" if pd.notna(kpis["level_share_pct"]) else "-",
+                help="Mean |daily level error| / mean MAE. High = the curve is shifted; "
+                     "low = the shape (e.g. the solar valley) is wrong.",
+            )
+            el1, el2, el3 = st.columns(3)
+            el1.metric("Mean bias (forecast − real)", f"{kpis['mean_bias']:+,.1f} €/MWh")
+            el2.metric(
+                "Day-to-day persistence of the level error",
+                f"{kpis['lag1_autocorrelation']:,.2f}" if pd.notna(kpis["lag1_autocorrelation"]) else "-",
+                help="Correlation between consecutive days' level errors. Near 0 = random; "
+                     "above ~0.5 = errors come in episodes (the D-1 correction can help).",
+            )
+            el3.metric("Longest same-sign streak", f"{kpis['longest_streak_days']} days")
+
+            st.subheader("Daily error over time")
+            st.caption("Bars: daily MAE. Line: daily level error (positive = forecast too high).")
+            daily_error_chart = build_daily_error_chart(diagnostics["daily"])
+            if daily_error_chart is not None:
+                st.altair_chart(daily_error_chart, use_container_width=True)
+
+            dg1, dg2 = st.columns([1.0, 1.25])
+            with dg1:
+                st.subheader("Few bad days or everywhere?")
+                concentration_chart = build_error_concentration_chart(diagnostics["concentration"])
+                if concentration_chart is not None:
+                    st.altair_chart(concentration_chart, use_container_width=True)
+                st.caption("The closer the curve is to the dashed diagonal, the more evenly the error is spread.")
+            with dg2:
+                st.subheader("Error by hour block")
+                st.dataframe(
+                    diagnostics["by_block"].style.format(
+                        {
+                            "mae_eur_mwh": "{:,.1f}",
+                            "bias_eur_mwh": "{:+,.1f}",
+                            "actual_mean_eur_mwh": "{:,.1f}",
+                            "forecast_mean_eur_mwh": "{:,.1f}",
+                            "share_of_error_pct": "{:,.0f}%",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.subheader("Hourly error map")
+            st.caption("Red: forecast above the real price; blue: below. Vertical stripes = whole-day level errors; "
+                       "a horizontal band at midday = solar-valley errors.")
+            heatmap = build_error_heatmap(diagnostics["hourly"])
+            if heatmap is not None:
+                st.altair_chart(heatmap, use_container_width=True)
+
+            dw1, dw2 = st.columns(2)
+            breakdown_format = {
+                "mae_eur_mwh": "{:,.1f}",
+                "bias_eur_mwh": "{:+,.1f}",
+                "actual_mean_eur_mwh": "{:,.1f}",
+                "forecast_mean_eur_mwh": "{:,.1f}",
+                "share_of_error_pct": "{:,.0f}%",
+            }
+            with dw1:
+                st.subheader("By weekday")
+                st.dataframe(diagnostics["by_weekday"].style.format(breakdown_format),
+                             use_container_width=True, hide_index=True)
+            with dw2:
+                st.subheader("By month")
+                st.dataframe(diagnostics["by_month"].style.format(breakdown_format),
+                             use_container_width=True, hide_index=True)
+
+            if not diagnostics["by_curve"].empty:
+                st.subheader("Accuracy of each sub-model and reference curve")
+                st.caption("Same days and hours for all curves. A component that beats the final forecast "
+                           "in some hours is a candidate for a better blend there.")
+                st.dataframe(
+                    diagnostics["by_curve"].style.format(
+                        {
+                            "MAE (€/MWh)": "{:,.1f}",
+                            "Solar-hours MAE (€/MWh)": "{:,.1f}",
+                            "Other-hours MAE (€/MWh)": "{:,.1f}",
+                            "Bias (€/MWh)": "{:+,.1f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if not diagnostics["regime"].empty:
+                st.subheader("Midday regime check (10-17 h)")
+                st.caption("Does the analogue probability of a near-zero price separate the days on which the "
+                           "solar valley really goes to ~0? If the real share rises clearly with the bucket while "
+                           "the forecast stays in the middle, a regime rule would help.")
+                st.dataframe(
+                    diagnostics["regime"].style.format(
+                        {
+                            "real_price_le_5_pct": "{:,.0f}%",
+                            "mean_real_eur_mwh": "{:,.1f}",
+                            "mean_forecast_eur_mwh": "{:,.1f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            ds1, ds2 = st.columns([1.0, 1.4])
+            with ds1:
+                st.subheader("Error streaks (4+ days, same sign)")
+                if diagnostics["streaks"].empty:
+                    st.info("No streak of 4 or more consecutive days with the same error sign.")
+                else:
+                    st.dataframe(
+                        diagnostics["streaks"].style.format(
+                            {"mean_level_error_eur_mwh": "{:+,.1f}", "mean_mae_eur_mwh": "{:,.1f}"}
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            with ds2:
+                st.subheader("Worst days")
+                st.dataframe(
+                    diagnostics["worst"].style.format(
+                        {
+                            "MAE (€/MWh)": "{:,.1f}",
+                            "Level error (€/MWh)": "{:+,.1f}",
+                            "MAE without level (€/MWh)": "{:,.1f}",
+                            "Solar-hours error (€/MWh)": "{:+,.1f}",
+                            "Real baseload (€/MWh)": "{:,.1f}",
+                            "BESS capture (%)": "{:,.1f}%",
+                        },
+                        na_rep="-",
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # -------------------------------------------------
+        # V18.2: target-day demand forecast vs real demand
+        # -------------------------------------------------
+        if "demand_target_mape_pct" in successful_ytd.columns:
+            section_header(
+                "Demand forecast vs real demand (target day)"
+            )
+            demand_ok = successful_ytd[
+                successful_ytd["demand_target_mape_pct"].notna()
+            ].copy()
+            if demand_ok.empty:
+                st.info(
+                    "Real demand is not yet available for the processed days."
+                )
+            else:
+                model_mape = demand_ok["demand_target_mape_pct"].mean()
+                ree_mape = demand_ok["ree_d1_demand_target_mape_pct"].mean()
+                d7_mape = demand_ok["demand_d7trend_target_mape_pct"].mean()
+                dm1, dm2, dm3, dm4, dm5 = st.columns(5)
+                dm1.metric(
+                    "Model accuracy (100 − MAPE)",
+                    f"{100.0 - model_mape:,.2f}%",
+                )
+                dm2.metric(
+                    "Model MAPE",
+                    f"{model_mape:,.2f}%",
+                )
+                dm3.metric(
+                    "Model MAE",
+                    f"{demand_ok['demand_target_mae_mw'].mean():,.0f} MW",
+                )
+                dm4.metric(
+                    "REE official D+1 MAPE",
+                    f"{ree_mape:,.2f}%" if pd.notna(ree_mape) else "-",
+                )
+                dm5.metric(
+                    "Previous week + trend MAPE",
+                    f"{d7_mape:,.2f}%" if pd.notna(d7_mape) else "-",
+                )
+                st.caption(
+                    f"{len(demand_ok)} days. Hourly forecast for the delivery day against "
+                    "real REData peninsular demand, loaded only after the forecast. Unlike "
+                    "'demand_model_validation_mape_pct' (42-day validation with realised "
+                    "weather), this uses the forecast weather actually available at D-1."
+                )
+                demand_chart = build_demand_accuracy_chart(demand_ok)
+                if demand_chart is not None:
+                    st.altair_chart(
+                        demand_chart,
+                        use_container_width=True,
+                    )
+                demand_monthly = demand_ok.assign(
+                    month=pd.to_datetime(demand_ok["target_day"]).dt.to_period("M").astype(str)
+                ).groupby("month", as_index=False).agg(
+                    days=("target_day", "count"),
+                    model_mape_pct=("demand_target_mape_pct", "mean"),
+                    model_mae_mw=("demand_target_mae_mw", "mean"),
+                    model_bias_mw=("demand_target_bias_mw", "mean"),
+                    ree_d1_mape_pct=("ree_d1_demand_target_mape_pct", "mean"),
+                    previous_week_trend_mape_pct=("demand_d7trend_target_mape_pct", "mean"),
+                )
+                demand_monthly["model_accuracy_pct"] = 100.0 - demand_monthly["model_mape_pct"]
+                st.dataframe(
+                    demand_monthly.style.format(
+                        {
+                            "model_mape_pct": "{:,.2f}%",
+                            "model_mae_mw": "{:,.0f}",
+                            "model_bias_mw": "{:+,.0f}",
+                            "ree_d1_mape_pct": "{:,.2f}%",
+                            "previous_week_trend_mape_pct": "{:,.2f}%",
+                            "model_accuracy_pct": "{:,.2f}%",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        if "gas_available" in successful_ytd.columns:
+            missing_gas_days = int((successful_ytd["gas_available"] == 0).sum())
+            if missing_gas_days:
+                st.warning(
+                    f"MIBGAS gas price was unavailable on {missing_gas_days} of "
+                    f"{len(successful_ytd)} processed days (column gas_available = 0). "
+                    "The price model then runs without gas; check data/mibgas_2026_cache.csv."
+                )
+
         with st.expander(
             "Daily YTD walk-forward results"
         ):
             st.dataframe(
-                successful_ytd.sort_values(
+                successful_ytd.drop(
+                    columns=[
+                        column
+                        for column in YTD_HOURLY_COLUMNS
+                        if column in successful_ytd.columns
+                    ]
+                ).sort_values(
                     "target_day"
                 ),
                 use_container_width=True,
